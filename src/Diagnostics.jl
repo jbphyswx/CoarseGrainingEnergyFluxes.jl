@@ -8,14 +8,14 @@ using ..Derivatives
 using StaticArrays
 using LinearAlgebra
 
-export PiWorkspace, compute_Pi!, compute_filtering_spectrum
+export ΠWorkspace, compute_Π!, compute_filtering_spectrum
 
 """
-    PiWorkspace{T, A}
+    ΠWorkspace{T, A}
 
 Pre-allocated arrays for computing cross-scale energy flux Π to avoid heap allocations in scale loops.
 """
-struct PiWorkspace{T<:AbstractFloat, A<:AbstractArray{T}}
+struct ΠWorkspace{T<:AbstractFloat, A<:AbstractArray{T}}
     # Filtered velocity components (local coordinates)
     u_filt::A
     v_filt::A
@@ -58,7 +58,7 @@ struct PiWorkspace{T<:AbstractFloat, A<:AbstractArray{T}}
 end
 
 # Workspace constructor based on grid structure and float type
-function PiWorkspace(grid::AbstractGrid{G,T}; dims::Integer = 2) where {G, T<:AbstractFloat}
+function ΠWorkspace(grid::AbstractGrid{G,T}; dims::Integer = 2) where {G, T<:AbstractFloat}
     sz = size_tuple(grid)
     A = Matrix{T}
     
@@ -96,7 +96,7 @@ function PiWorkspace(grid::AbstractGrid{G,T}; dims::Integer = 2) where {G, T<:Ab
     
     scratch = zeros(T, sz...)
     
-    return PiWorkspace{T, A}(
+    return ΠWorkspace{T, A}(
         u_filt, v_filt, w_filt,
         ux, uy, uz, ux_filt, uy_filt, uz_filt,
         uu_filt, uv_filt, uw_filt, vv_filt, vw_filt, ww_filt,
@@ -111,11 +111,11 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    compute_Pi!(Π, u, v, w, grid, kernel, scale; ρ₀, workspace, backend, mask_strategy)
+    compute_Π!(Π, u, v, w, grid, kernel, scale; ρ₀, workspace, backend, mask_strategy)
 
 Compute the cross-scale energy transfer Π = -ρ₀ S̄_ij τ_ij at filter scale `scale` (ℓ), writing to `Π`.
 """
-function compute_Pi!(
+function compute_Π!(
     Π::AbstractMatrix{T},
     u::AbstractMatrix{T},
     v::AbstractMatrix{T},
@@ -124,13 +124,13 @@ function compute_Pi!(
     kernel::AbstractFilterKernel,
     scale::T;
     ρ₀::T = T(1025.0),
-    workspace::Union{Nothing, PiWorkspace} = nothing,
+    workspace::Union{Nothing, ΠWorkspace} = nothing,
     backend::AbstractExecutionBackend = AutoBackend(),
     mask_strategy::Symbol = :renormalize
 ) where {T<:AbstractFloat, G<:AbstractGeometry{T}}
     
     # 1. Fetch or create pre-allocated workspace
-    ws = workspace === nothing ? PiWorkspace(grid) : workspace
+    ws = workspace === nothing ? ΠWorkspace(grid) : workspace
     Nlon, Nlat = size_tuple(grid)
     
     has_w = w !== nothing

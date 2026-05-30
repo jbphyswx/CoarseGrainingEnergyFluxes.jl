@@ -49,8 +49,8 @@ export AbstractStencilOrder, SecondOrderStencil
 export ddx!, ddy!, ddz!
 
 # Re-export public components from Diagnostics
-using .Diagnostics: PiWorkspace, compute_Pi!, compute_filtering_spectrum
-export PiWorkspace, compute_Pi!, compute_filtering_spectrum
+using .Diagnostics: ΠWorkspace, compute_Π!, compute_filtering_spectrum
+export ΠWorkspace, compute_Π!, compute_filtering_spectrum
 
 # Re-export public components from Pipeline
 using .Pipeline: CoarseGrainResult, coarse_grain
@@ -72,7 +72,7 @@ export CoarseGrainResult, coarse_grain
         filter_field!(out, u, grid, GaussianKernel(), 4000.0)
         
         Π = zeros(6, 6)
-        compute_Pi!(Π, u, v, nothing, grid, TopHatKernel(), 4000.0)
+        compute_Π!(Π, u, v, nothing, grid, TopHatKernel(), 4000.0)
     end
 end
 

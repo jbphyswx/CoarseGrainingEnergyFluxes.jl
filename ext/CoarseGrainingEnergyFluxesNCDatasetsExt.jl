@@ -74,7 +74,7 @@ function save_result_netcdf(
         # Define 3D energy flux maps: (Nlon, Nlat, Nscales)
         v_Pi = defVar(ds, "Pi", T, ("lon", "lat", "scale"))
         for s in 1:Nscales
-            v_Pi[:, :, s] = res.Pi[s]
+            v_Pi[:, :, s] = res.Π[s]
         end
         v_Pi.attrib["long_name"] = "Cross-scale kinetic energy flux (Π)"
         v_Pi.attrib["units"] = "W/m³"

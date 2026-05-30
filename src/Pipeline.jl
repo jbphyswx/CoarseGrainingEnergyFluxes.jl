@@ -17,7 +17,7 @@ Hold results of a complete coarse-graining analysis.
 """
 struct CoarseGrainResult{T<:AbstractFloat, A<:AbstractArray{T}}
     scales::Vector{T}
-    Pi::Vector{A}
+    Π::Vector{A}
     spectrum::Vector{T}
 end
 
@@ -43,16 +43,16 @@ function coarse_grain(
     Nlon, Nlat = size_tuple(grid)
     
     # 1. Pre-allocate results vectors
-    Pi_maps = [zeros(T, Nlon, Nlat) for _ in 1:Nscales]
+    Π_maps = [zeros(T, Nlon, Nlat) for _ in 1:Nscales]
     
     # 2. Pre-allocate a single, reusable workspace for the entire scale sweep
-    workspace = PiWorkspace(grid)
+    workspace = ΠWorkspace(grid)
     
     # 3. Sweep through scales and compute the cross-scale energy transfer Π maps
     for s_idx in 1:Nscales
         scale = scales[s_idx]
-        compute_Pi!(
-            Pi_maps[s_idx],
+        compute_Π!(
+            Π_maps[s_idx],
             u, v, w,
             grid,
             kernel,
@@ -77,7 +77,7 @@ function coarse_grain(
     
     return CoarseGrainResult{T, Matrix{T}}(
         Vector{T}(scales),
-        Pi_maps,
+        Π_maps,
         spectrum
     )
 end

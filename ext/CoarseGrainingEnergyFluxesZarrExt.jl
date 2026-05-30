@@ -42,7 +42,7 @@ function save_result_zarr(
                      attrs=Dict("units" => "W/m³", "long_name" => "Kinetic energy flux (Π)"))
     
     for s in 1:Nscales
-        Pi_arr[:, :, s] = res.Pi[s]
+        Pi_arr[:, :, s] = res.Π[s]
     end
     
     return store_path

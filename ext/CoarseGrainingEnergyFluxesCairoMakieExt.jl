@@ -3,14 +3,14 @@ module CoarseGrainingEnergyFluxesCairoMakieExt
 using CoarseGrainingEnergyFluxes
 using CairoMakie
 
-export plot_Pi_map, plot_spectrum
+export plot_Π_map, plot_spectrum
 
 """
-    plot_Pi_map(res, scale_idx, grid; kwargs...)
+    plot_Π_map(res, scale_idx, grid; kwargs...)
 
 Create and save a high-quality heatmap visualization of the 2D energy transfer Π map at the specified scale index.
 """
-function plot_Pi_map(
+function plot_Π_map(
     res::CoarseGrainResult{T},
     scale_idx::Integer,
     grid::StructuredGrid{G,T};
@@ -20,7 +20,7 @@ function plot_Pi_map(
     
     1 <= scale_idx <= length(res.scales) || throw(BoundsError(res.scales, scale_idx))
     
-    Pi_map = res.Pi[scale_idx]
+    Π_map = res.Π[scale_idx]
     scale = res.scales[scale_idx]
     
     # Pre-allocate layout and figure
@@ -32,11 +32,11 @@ function plot_Pi_map(
         title = title === nothing ? "Kinetic Energy Flux (Π) at Scale ℓ = $(round(scale/1000, digits=1)) km" : title
     )
     
-    # Symmetric limits for divergant/cascade colormap (:balance)
-    max_val = maximum(abs.(Pi_map))
+    # Symmetric limits for divergent/cascade colormap (:balance)
+    max_val = maximum(abs.(Π_map))
     limits = (-max_val, max_val)
     
-    hm = heatmap!(ax, grid.lon, grid.lat, Pi_map, colormap = colormap, colorrange = limits)
+    hm = heatmap!(ax, grid.lon, grid.lat, Π_map, colormap = colormap, colorrange = limits)
     Colorbar(fig[1, 2], hm, label = "Π (W / m³)")
     
     return fig

@@ -161,9 +161,13 @@ using StaticArrays
         end
         
         Π = zeros(21, 21)
-        compute_Pi!(Π, u, v, nothing, grid, TopHatKernel(), 10000.0)
+        compute_Π!(Π, u, v, nothing, grid, TopHatKernel(), 10000.0)
         
         # Kinetic energy transfer must be zero (rigid body rotation is pure laminar cascade-free flow)
         @test Π[11, 11] ≈ 0.0 atol=1e-12
+        
+        # Test Pipeline integration with unicode Π
+        res = coarse_grain(u, v, grid; scales=[10000.0], kernel=TopHatKernel())
+        @test res.Π[1] ≈ Π
     end
 end
