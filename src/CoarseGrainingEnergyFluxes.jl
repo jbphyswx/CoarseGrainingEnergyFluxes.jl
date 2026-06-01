@@ -37,9 +37,9 @@ using .Helmholtz: helmholtz_decompose!, solve_poisson!
 export helmholtz_decompose!, solve_poisson!
 
 # Re-export public components from Filtering
-using .Filtering: AbstractExecutionBackend, SerialBackend, ThreadedBackend, DistributedBackend, GPUBackend, AutoBackend
+using .Filtering: AbstractExecutionBackend, SerialBackend, ThreadedBackend, DistributedBackend, GPUBackend, FINUFFTBackend, AutoBackend
 using .Filtering: filter_field!
-export AbstractExecutionBackend, SerialBackend, ThreadedBackend, DistributedBackend, GPUBackend, AutoBackend
+export AbstractExecutionBackend, SerialBackend, ThreadedBackend, DistributedBackend, GPUBackend, FINUFFTBackend, AutoBackend
 export filter_field!
 
 # Re-export public components from Derivatives

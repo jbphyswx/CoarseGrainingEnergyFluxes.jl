@@ -10,6 +10,19 @@ export distance, area_element, to_planetary_cartesian, from_planetary_cartesian
     AbstractGeometry{T<:AbstractFloat}
 
 Abstract supertype for all coordinate systems and geometry metrics.
+
+# Type Parameters
+- `T`: Floating point type (Float32 or Float64) for coordinate calculations
+
+# Implementations
+- `CartesianGeometry{T}`: Cartesian coordinates with uniform grid spacing
+- `SphericalGeometry{T}`: Spherical coordinates on a planet surface
+
+# Examples
+```julia
+geom_cart = CartesianGeometry(1000.0, 1000.0)  # 1km x 1km grid
+geom_sph = SphericalGeometry(6.371e6)          # Earth-like sphere
+```
 """
 abstract type AbstractGeometry{T<:AbstractFloat} end
 
@@ -17,6 +30,23 @@ abstract type AbstractGeometry{T<:AbstractFloat} end
     CartesianGeometry{T<:AbstractFloat}
 
 Represent Cartesian coordinates with grid spacings `dx`, `dy`, and optionally `dz`.
+
+# Fields
+- `dx::T`: Grid spacing in x-direction (meters)
+- `dy::T`: Grid spacing in y-direction (meters)  
+- `dz::T`: Grid spacing in z-direction (meters), zero for 2D grids
+
+# Constructors
+```julia
+CartesianGeometry(dx, dy)        # 2D grid
+CartesianGeometry(dx, dy, dz)    # 3D grid
+```
+
+# Examples
+```julia
+geom = CartesianGeometry(2000.0, 2000.0)  # 2km x 2km grid
+area = area_element(geom)  # Returns 4e6 m²
+```
 """
 struct CartesianGeometry{T<:AbstractFloat} <: AbstractGeometry{T}
     dx::T
@@ -32,6 +62,29 @@ CartesianGeometry{T}(dx, dy) where {T<:AbstractFloat} = CartesianGeometry{T}(con
     SphericalGeometry{T<:AbstractFloat}
 
 Represent spherical coordinates on a planet of radius `R`.
+
+# Fields
+- `R::T`: Planet radius in meters (default: 6.371e6 for Earth)
+
+# Constructors
+```julia
+SphericalGeometry()               # Default Earth radius (6371 km)
+SphericalGeometry(R)              # Custom radius in meters
+SphericalGeometry{Float32}()        # Explicit type parameter
+```
+
+# Notes
+- Uses Haversine formula for great-circle distance calculations
+- Supports proper periodic boundary handling in longitude (0° ↔ 360°)
+- Essential for global ocean/atmosphere calculations
+
+# Examples
+```julia
+geom = SphericalGeometry()  # Earth-like sphere
+p1 = SVector{2,Float64}(0.0, 0.0)  # (lon, lat) in radians
+p2 = SVector{2,Float64}(0.0, π/2)  # North pole
+d = distance(geom, p1, p2)  # Quarter circumference
+```
 """
 struct SphericalGeometry{T<:AbstractFloat} <: AbstractGeometry{T}
     R::T
@@ -120,24 +173,25 @@ Convert spherical local velocity components (East, North, Radial) into global pl
 This is essential for spherical filtering to ensure commutativity with spatial derivatives.
 """
 @inline function to_planetary_cartesian(
-    ::SphericalGeometry{T},
-    u_east::T,
-    u_north::T,
-    u_vertical::T,
-    λ::T,
-    φ::T
+    geo::SphericalGeometry{T},
+    u_east::Real,
+    u_north::Real,
+    u_vertical::Real,
+    λ::Real,
+    φ::Real
 ) where {T<:AbstractFloat}
-    # Local-to-Global basis rotation matrix columns:
-    # e_east = [-sin(λ), cos(λ), 0]
-    # e_north = [-sin(φ)cos(λ), -sin(φ)sin(λ), cos(φ)]
-    # e_radial = [cos(φ)cos(λ), cos(φ)sin(λ), sin(φ)]
+    u_east_T = convert(T, u_east)
+    u_north_T = convert(T, u_north)
+    u_vertical_T = convert(T, u_vertical)
+    λ_T = convert(T, λ)
+    φ_T = convert(T, φ)
     
-    sinλ, cosλ = sin(λ), cos(λ)
-    sinφ, cosφ = sin(φ), cos(φ)
+    sinλ, cosλ = sin(λ_T), cos(λ_T)
+    sinφ, cosφ = sin(φ_T), cos(φ_T)
     
-    ux = u_east * (-sinλ) + u_north * (-sinφ * cosλ) + u_vertical * (cosφ * cosλ)
-    uy = u_east * (cosλ)  + u_north * (-sinφ * sinλ) + u_vertical * (cosφ * sinλ)
-    uz =                    u_north * cosφ           + u_vertical * sinφ
+    ux = u_east_T * (-sinλ) + u_north_T * (-sinφ * cosλ) + u_vertical_T * (cosφ * cosλ)
+    uy = u_east_T * (cosλ)  + u_north_T * (-sinφ * sinλ) + u_vertical_T * (cosφ * sinλ)
+    uz =                      u_north_T * cosφ           + u_vertical_T * sinφ
     
     return SVector{3,T}(ux, uy, uz)
 end
@@ -145,10 +199,10 @@ end
 # 2D spherical version (assumes zero vertical velocity)
 @inline function to_planetary_cartesian(
     geo::SphericalGeometry{T},
-    u_east::T,
-    u_north::T,
-    λ::T,
-    φ::T
+    u_east::Real,
+    u_north::Real,
+    λ::Real,
+    φ::Real
 ) where {T<:AbstractFloat}
     return to_planetary_cartesian(geo, u_east, u_north, zero(T), λ, φ)
 end
@@ -159,19 +213,25 @@ end
 Convert global planetary Cartesian velocity components back to local East, North, Radial.
 """
 @inline function from_planetary_cartesian(
-    ::SphericalGeometry{T},
-    ux::T,
-    uy::T,
-    uz::T,
-    λ::T,
-    φ::T
+    geo::SphericalGeometry{T},
+    ux::Real,
+    uy::Real,
+    uz::Real,
+    λ::Real,
+    φ::Real
 ) where {T<:AbstractFloat}
-    sinλ, cosλ = sin(λ), cos(λ)
-    sinφ, cosφ = sin(φ), cos(φ)
+    ux_T = convert(T, ux)
+    uy_T = convert(T, uy)
+    uz_T = convert(T, uz)
+    λ_T = convert(T, λ)
+    φ_T = convert(T, φ)
     
-    u_east     = ux * (-sinλ) + uy * cosλ
-    u_north    = ux * (-sinφ * cosλ) + uy * (-sinφ * sinλ) + uz * cosφ
-    u_vertical = ux * (cosφ * cosλ)  + uy * (cosφ * sinλ)  + uz * sinφ
+    sinλ, cosλ = sin(λ_T), cos(λ_T)
+    sinφ, cosφ = sin(φ_T), cos(φ_T)
+    
+    u_east     = ux_T * (-sinλ) + uy_T * cosλ
+    u_north    = ux_T * (-sinφ * cosλ) + uy_T * (-sinφ * sinλ) + uz_T * cosφ
+    u_vertical = ux_T * (cosφ * cosλ)  + uy_T * (cosφ * sinλ)  + uz_T * sinφ
     
     return SVector{3,T}(u_east, u_north, u_vertical)
 end

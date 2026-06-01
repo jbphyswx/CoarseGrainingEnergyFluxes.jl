@@ -90,15 +90,19 @@ function ddx!(
                 continue
             end
             
-            has_p = i < Nlon && iswet(grid, i+1, j)
-            has_m = i > 1    && iswet(grid, i-1, j)
+            # Periodic boundary handling for longitude (spherical grids wrap around)
+            i_p = i < Nlon ? i + 1 : 1      # wrap to first point
+            i_m = i > 1 ? i - 1 : Nlon      # wrap to last point
+            
+            has_p = iswet(grid, i_p, j)
+            has_m = iswet(grid, i_m, j)
             
             if has_p && has_m
-                ∂f∂x[i, j] = (f[i+1, j] - f[i-1, j]) / T(2) * inv_denom
+                ∂f∂x[i, j] = (f[i_p, j] - f[i_m, j]) / T(2) * inv_denom
             elseif has_p
-                ∂f∂x[i, j] = (f[i+1, j] - f[i, j]) * inv_denom
+                ∂f∂x[i, j] = (f[i_p, j] - f[i, j]) * inv_denom
             elseif has_m
-                ∂f∂x[i, j] = (f[i, j] - f[i-1, j]) * inv_denom
+                ∂f∂x[i, j] = (f[i, j] - f[i_m, j]) * inv_denom
             else
                 ∂f∂x[i, j] = zero(T)
             end

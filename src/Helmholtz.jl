@@ -19,7 +19,8 @@ function solve_poisson!(
     grid::StructuredGrid{G,T};
     max_iter::Integer = 1000,
     tol::T = T(1e-5),
-    ω::T = T(1.85) # Relaxation factor for SOR
+    ω::T = T(1.85), # Relaxation factor for SOR
+    boundary::Symbol = :neumann
 ) where {T<:AbstractFloat, G<:AbstractGeometry{T}}
     Nlon, Nlat = size_tuple(grid)
     
@@ -51,11 +52,18 @@ function solve_poisson!(
                     if ((i + j) % 2) == color
                         iswet(grid, i, j) || continue
                         
-                        # Fetch neighbors with Neumann boundary conditions (ghost cells reflect boundary values)
-                        Φ_ip = i < Nlon && iswet(grid, i+1, j) ? Φ[i+1, j] : Φ[i, j]
-                        Φ_im = i > 1    && iswet(grid, i-1, j) ? Φ[i-1, j] : Φ[i, j]
-                        Φ_jp = j < Nlat && iswet(grid, i, j+1) ? Φ[i, j+1] : Φ[i, j]
-                        Φ_jm = j > 1    && iswet(grid, i, j-1) ? Φ[i, j-1] : Φ[i, j]
+                        # Fetch neighbors with Neumann or Dirichlet boundary conditions
+                        if boundary === :neumann
+                            Φ_ip = i < Nlon && iswet(grid, i+1, j) ? Φ[i+1, j] : Φ[i, j]
+                            Φ_im = i > 1    && iswet(grid, i-1, j) ? Φ[i-1, j] : Φ[i, j]
+                            Φ_jp = j < Nlat && iswet(grid, i, j+1) ? Φ[i, j+1] : Φ[i, j]
+                            Φ_jm = j > 1    && iswet(grid, i, j-1) ? Φ[i, j-1] : Φ[i, j]
+                        else # :dirichlet (zero flow potential on boundaries)
+                            Φ_ip = i < Nlon && iswet(grid, i+1, j) ? Φ[i+1, j] : zero(T)
+                            Φ_im = i > 1    && iswet(grid, i-1, j) ? Φ[i-1, j] : zero(T)
+                            Φ_jp = j < Nlat && iswet(grid, i, j+1) ? Φ[i, j+1] : zero(T)
+                            Φ_jm = j > 1    && iswet(grid, i, j-1) ? Φ[i, j-1] : zero(T)
+                        end
                         
                         # Discretized Laplace step
                         if G <: CartesianGeometry{T}
@@ -102,12 +110,14 @@ function helmholtz_decompose!(
     v_rot::AbstractMatrix{T},
     u_div::AbstractMatrix{T},
     v_div::AbstractMatrix{T},
-    u::AbstractMatrix{T},
-    v::AbstractMatrix{T},
+    u::AbstractMatrix,
+    v::AbstractMatrix,
     grid::StructuredGrid{G,T};
     max_iter::Integer = 1000,
     tol::T = T(1e-5),
-    ω::T = T(1.85)
+    ω::T = T(1.85),
+    boundary_χ::Symbol = :neumann,
+    boundary_ψ::Symbol = :dirichlet
 ) where {T<:AbstractFloat, G<:AbstractGeometry{T}}
     Nlon, Nlat = size_tuple(grid)
     
@@ -138,10 +148,10 @@ function helmholtz_decompose!(
             jp = j < Nlat && iswet(grid, i, j+1) ? j+1 : j
             jm = j > 1    && iswet(grid, i, j-1) ? j-1 : j
             
-            h_x = ip == im ? dx : (ip - im) * dx
-            h_y = jp == jm ? dy : (jp - jm) * dy
-            
             if G <: CartesianGeometry{T}
+                h_x = ip == im ? dx : (ip - im) * dx
+                h_y = jp == jm ? dy : (jp - jm) * dy
+
                 # Divergence: ∂u/∂x + ∂v/∂y
                 dudx = (u[ip, j] - u[im, j]) / h_x
                 dvdy = (v[i, jp] - v[i, jm]) / h_y
@@ -155,32 +165,53 @@ function helmholtz_decompose!(
                 φ = grid.lat[j]
                 cosφ = cos(φ)
                 
-                # Spherical derivatives
+                # Spherical derivatives (h_λ and h_φ can be 0 for isolated wet points)
                 h_λ = (ip - im) * dλ
                 h_φ = (jp - jm) * dφ
                 
                 # Divergence: 1/(R cosφ) * [ ∂u/∂λ + ∂/∂φ(v cosφ) ]
-                dudλ = (u[ip, j] - u[im, j]) / h_λ
+                dudλ = ip == im ? zero(T) : (u[ip, j] - u[im, j]) / h_λ
                 v_cos_jp = v[i, jp] * cos(grid.lat[jp])
                 v_cos_jm = v[i, jm] * cos(grid.lat[jm])
-                d_vcos_dφ = (v_cos_jp - v_cos_jm) / h_φ
+                d_vcos_dφ = jp == jm ? zero(T) : (v_cos_jp - v_cos_jm) / h_φ
                 
                 div_f[i, j] = (dudλ + d_vcos_dφ) / (R * cosφ)
                 
                 # Vorticity: 1/(R cosφ) * [ ∂v/∂λ - ∂/∂φ(u cosφ) ]
-                dvdλ = (v[ip, j] - v[im, j]) / h_λ
+                dvdλ = ip == im ? zero(T) : (v[ip, j] - v[im, j]) / h_λ
                 u_cos_jp = u[i, jp] * cos(grid.lat[jp])
                 u_cos_jm = u[i, jm] * cos(grid.lat[jm])
-                d_ucos_dφ = (u_cos_jp - u_cos_jm) / h_φ
+                d_ucos_dφ = jp == jm ? zero(T) : (u_cos_jp - u_cos_jm) / h_φ
                 
                 vort_f[i, j] = (dvdλ - d_ucos_dφ) / (R * cosφ)
             end
         end
     end
     
+    # 2.5. Divergence Balancing for Neumann Solvability compatibility condition (Fredholm alternative)
+    total_div = zero(T)
+    total_area = zero(T)
+    for j in 1:Nlat
+        for i in 1:Nlon
+            if iswet(grid, i, j)
+                total_div += div_f[i, j] * area(grid, i, j)
+                total_area += area(grid, i, j)
+            end
+        end
+    end
+    
+    mean_div = total_div / total_area
+    for j in 1:Nlat
+        for i in 1:Nlon
+            if iswet(grid, i, j)
+                div_f[i, j] -= mean_div
+            end
+        end
+    end
+
     # 3. Solve ∇² χ = Divergence and ∇² ψ = Vorticity
-    solve_poisson!(χ, div_f, grid; max_iter=max_iter, tol=tol, ω=ω)
-    solve_poisson!(ψ, vort_f, grid; max_iter=max_iter, tol=tol, ω=ω)
+    solve_poisson!(χ, div_f, grid; max_iter=max_iter, tol=tol, ω=ω, boundary=boundary_χ)
+    solve_poisson!(ψ, vort_f, grid; max_iter=max_iter, tol=tol, ω=ω, boundary=boundary_ψ)
     
     # 4. Compute divergent and rotational velocities from potentials
     for j in 1:Nlat
@@ -198,10 +229,10 @@ function helmholtz_decompose!(
             jp = j < Nlat && iswet(grid, i, j+1) ? j+1 : j
             jm = j > 1    && iswet(grid, i, j-1) ? j-1 : j
             
-            h_x = ip == im ? dx : (ip - im) * dx
-            h_y = jp == jm ? dy : (jp - jm) * dy
-            
             if G <: CartesianGeometry{T}
+                h_x = ip == im ? dx : (ip - im) * dx
+                h_y = jp == jm ? dy : (jp - jm) * dy
+
                 # Divergent velocity u_div = ∇ χ
                 u_div[i, j] = (χ[ip, j] - χ[im, j]) / h_x
                 v_div[i, j] = (χ[i, jp] - χ[i, jm]) / h_y
@@ -216,12 +247,12 @@ function helmholtz_decompose!(
                 h_φ = (jp - jm) * dφ
                 
                 # u_div_λ = 1/(R cosφ) ∂χ/∂λ,  v_div_φ = 1/R ∂χ/∂φ
-                u_div[i, j] = (χ[ip, j] - χ[im, j]) / (h_λ * R * cosφ)
-                v_div[i, j] = (χ[i, jp] - χ[i, jm]) / (h_φ * R)
+                u_div[i, j] = ip == im ? zero(T) : (χ[ip, j] - χ[im, j]) / (h_λ * R * cosφ)
+                v_div[i, j] = jp == jm ? zero(T) : (χ[i, jp] - χ[i, jm]) / (h_φ * R)
                 
                 # u_rot_λ = -1/R ∂ψ/∂φ,  v_rot_φ = 1/(R cosφ) ∂ψ/∂λ
-                u_rot[i, j] = -(ψ[i, jp] - ψ[i, jm]) / (h_φ * R)
-                v_rot[i, j] = (ψ[ip, j] - ψ[im, j]) / (h_λ * R * cosφ)
+                u_rot[i, j] = jp == jm ? zero(T) : -(ψ[i, jp] - ψ[i, jm]) / (h_φ * R)
+                v_rot[i, j] = ip == im ? zero(T) : (ψ[ip, j] - ψ[im, j]) / (h_λ * R * cosφ)
             end
         end
     end

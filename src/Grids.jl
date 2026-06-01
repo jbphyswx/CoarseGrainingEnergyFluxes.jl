@@ -51,17 +51,19 @@ end
 # Helper constructor that pre-computes cell areas automatically from geometry and coordinates
 function StructuredGrid(
     geometry::G,
-    lon::V,
-    lat::V,
-    mask::B
+    lon::AbstractVector,
+    lat::AbstractVector,
+    mask::AbstractMatrix{Bool}
 ) where {
     T<:AbstractFloat,
-    G<:AbstractGeometry{T},
-    V<:AbstractVector{T},
-    B<:AbstractMatrix{Bool}
+    G<:AbstractGeometry{T}
 }
-    Nlon = length(lon)
-    Nlat = length(lat)
+    # Convert lon and lat vectors to the geometry float type T
+    lon_T = convert(Vector{T}, lon)
+    lat_T = convert(Vector{T}, lat)
+    
+    Nlon = length(lon_T)
+    Nlat = length(lat_T)
     
     # Pre-allocate areas matrix
     areas = Matrix{T}(undef, Nlon, Nlat)
@@ -75,18 +77,18 @@ function StructuredGrid(
         # Spherical cell area varies with latitude
         # Assuming lon/lat coordinates are cell centers, we estimate dλ and dφ
         # If coordinates are uniform, we can calculate standard dλ, dφ
-        dλ = Nlon > 1 ? lon[2] - lon[1] : T(0)
-        dφ = Nlat > 1 ? lat[2] - lat[1] : T(0)
+        dλ = Nlon > 1 ? lon_T[2] - lon_T[1] : T(0)
+        dφ = Nlat > 1 ? lat_T[2] - lat_T[1] : T(0)
         
         for j in 1:Nlat
-            A_lat = area_element(geometry, lat[j], dλ, dφ)
+            A_lat = area_element(geometry, lat_T[j], dλ, dφ)
             for i in 1:Nlon
                 areas[i, j] = A_lat
             end
         end
     end
     
-    return StructuredGrid{G, T, V, typeof(areas), B}(geometry, lon, lat, areas, mask)
+    return StructuredGrid{G, T, typeof(lon_T), typeof(areas), typeof(mask)}(geometry, lon_T, lat_T, areas, mask)
 end
 
 # ---------------------------------------------------------------------------
@@ -114,7 +116,7 @@ end
 size_tuple(grid::CurvilinearGrid) = size(grid.mask)
 
 @inline function coords(grid::CurvilinearGrid{G,T}, i::Integer, j::Integer) where {G,T}
-    return SVector{2,T}(grid.lon[i, j], grid.lat[j, j])
+    return SVector{2,T}(grid.lon[i, j], grid.lat[i, j])
 end
 
 @inline area(grid::CurvilinearGrid, i::Integer, j::Integer) = grid.areas[i, j]

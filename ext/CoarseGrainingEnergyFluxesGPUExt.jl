@@ -5,6 +5,30 @@ using KernelAbstractions
 using StaticArrays
 
 import CoarseGrainingEnergyFluxes.Filtering: gpu_filter_field!
+import CoarseGrainingEnergyFluxes: TopHatKernel, GaussianKernel, SharpSpectralKernel, kernel_radius
+
+# GPU-compatible kernel weight function (no dispatch, uses if-else)
+@inline function kernel_weight_gpu(kernel, d, scale, T)
+    rad = kernel_radius(kernel, scale)
+    if d > rad
+        return zero(T)
+    end
+    
+    if kernel isa TopHatKernel
+        # TopHat: constant inside radius
+        return one(T)
+    elseif kernel isa GaussianKernel
+        # Gaussian: exp(-d^2 / (2*σ^2)) with σ = scale/√12
+        σ = scale / sqrt(T(12))
+        return exp(-d^2 / (T(2) * σ^2))
+    elseif kernel isa SharpSpectralKernel
+        # SharpSpectral: constant up to cutoff
+        return one(T)
+    else
+        # Default to TopHat
+        return one(T)
+    end
+end
 
 # Bessel function approximation on device for TopHat transfer function
 @kernel function gpu_filter_kernel!(
@@ -73,8 +97,8 @@ import CoarseGrainingEnergyFluxes.Filtering: gpu_filter_field!
                 end
                 
                 if d <= rad
-                    # Kernel weight: TopHat or Gaussian
-                    w_k = d <= scale / T(2) ? one(T) : zero(T) # Default to TopHat evaluated on GPU
+                    # Kernel weight based on kernel type
+                    w_k = kernel_weight_gpu(kernel, d, scale, T)
                     w = w_k * areas[ii, jj]
                     
                     weight_norm += w

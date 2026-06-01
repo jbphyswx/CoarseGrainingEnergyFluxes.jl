@@ -5,7 +5,7 @@ using ..Grids
 using ..Kernels
 using StaticArrays
 
-export AbstractExecutionBackend, SerialBackend, ThreadedBackend, DistributedBackend, GPUBackend, AutoBackend
+export AbstractExecutionBackend, SerialBackend, ThreadedBackend, DistributedBackend, GPUBackend, FINUFFTBackend, AutoBackend
 export filter_field!, filter_field_zero!, filter_field_renorm!
 
 # ---------------------------------------------------------------------------
@@ -20,6 +20,7 @@ struct DistributedBackend <: AbstractExecutionBackend end
 struct GPUBackend{B}      <: AbstractExecutionBackend
     backend::B
 end
+struct FINUFFTBackend     <: AbstractExecutionBackend end
 struct AutoBackend        <: AbstractExecutionBackend end
 
 # Default fallback functions for thread/distributed backends in case their extensions are not loaded
@@ -35,21 +36,53 @@ function gpu_filter_field!(args...; kwargs...)
     throw(ArgumentError("GPU backend is unavailable. Load the KernelAbstractions package or use SerialBackend()."))
 end
 
+function finufft_filter_field!(args...; kwargs...)
+    throw(ArgumentError("FINUFFT backend is unavailable. Load the FINUFFT package first."))
+end
+
 # ---------------------------------------------------------------------------
 # Public Filtering API
 # ---------------------------------------------------------------------------
 
 """
-    filter_field!(out, field, grid, kernel, scale; mask_strategy, workspace, backend)
+    filter_field!(out, field, grid, kernel, scale; mask_strategy=:renormalize, workspace=nothing, backend=AutoBackend())
 
-Filter a 2D `field` on a `grid` using `kernel` at characteristic width `scale` (ℓ), writing the result to `out`.
-Supported land-masking strategies:
-- `:zero`: treats dry cells as zero velocity and renormalizes the kernel.
-- `:renormalize` / `:deformable`: deforms/renormalizes the kernel dynamically to exclude land points entirely from both the numerator and denominator.
+Filter a 2D field on a grid using a kernel at characteristic width scale (ℓ), writing the result to out.
+
+# Arguments
+- `out::AbstractArray{T}`: Output array for filtered field (modified in-place)
+- `field::AbstractArray`: Input field to filter (2D or 3D)
+- `grid::AbstractGrid`: Grid geometry and coordinates
+- `kernel::AbstractFilterKernel`: Filter kernel (TopHatKernel, GaussianKernel, etc.)
+- `scale::T`: Filter scale ℓ in meters
+
+# Keyword Arguments
+- `mask_strategy::Symbol=:renormalize`: Land masking strategy
+  - `:zero`: Treats dry cells as zero velocity, renormalizes over wet+land
+  - `:renormalize` / `:deformable`: Excludes land points entirely from numerator and denominator
+- `workspace=nothing`: Pre-allocated workspace for intermediate calculations
+- `backend::AbstractExecutionBackend=AutoBackend()`: Execution backend (SerialBackend, ThreadedBackend, etc.)
+
+# Returns
+- `out`: The filtered field (same array as input)
+
+# Notes
+- For spherical grids, automatically handles periodic longitude wrapping (0° ↔ 360°)
+- Uses proper great-circle distance (Haversine) for spherical geometry
+- Thread-safe and supports multiple execution backends via dispatch
+
+# Examples
+```julia
+geom = CartesianGeometry(1000.0, 1000.0)
+grid = StructuredGrid(geom, lon, lat, mask)
+field = rand(100, 100)
+out = zeros(100, 100)
+filter_field!(out, field, grid, TopHatKernel(), 5000.0; mask_strategy=:renormalize)
+```
 """
 function filter_field!(
     out::AbstractArray{T},
-    field::AbstractArray{T},
+    field::AbstractArray,
     grid::AbstractGrid,
     kernel::AbstractFilterKernel,
     scale::T;
@@ -76,6 +109,8 @@ function filter_field!(
         distributed_filter_field!(out, field, grid, kernel, scale, mask_strategy, workspace)
     elseif resolved_backend <: GPUBackend
         gpu_filter_field!(resolved_backend, out, field, grid, kernel, scale, mask_strategy, workspace)
+    elseif resolved_backend <: FINUFFTBackend
+        finufft_filter_field!(out, field, grid, kernel, scale; mask_strategy=mask_strategy, workspace=workspace)
     end
     
     return out
@@ -84,7 +119,7 @@ end
 # 3D volume filtering method (simple layer-by-layer fallback, can be specialized)
 function filter_field!(
     out::AbstractArray{T,3},
-    field::AbstractArray{T,3},
+    field::AbstractArray{<:Any,3},
     grid::AbstractGrid,
     kernel::AbstractFilterKernel,
     scale::T;
@@ -126,7 +161,7 @@ Serial implementation of the `:zero` masking strategy (land cells have zero valu
 """
 function filter_field_zero!(
     out::AbstractMatrix{T},
-    field::AbstractMatrix{T},
+    field::AbstractMatrix,
     grid::StructuredGrid{G,T},
     kernel::AbstractFilterKernel,
     scale::T,
@@ -150,13 +185,49 @@ function filter_field_zero!(
     
     fill!(out, zero(T))
     
+    # Pre-compute kernel weights for spherical geometry
+    # For each target latitude j, pre-compute kernel weights for all possible (di, dj) offsets
+    kernel_weights = nothing
+    if G <: SphericalGeometry{T}
+        max_dj = ceil(Int, rad / (R * dφ))
+        max_di = ceil(Int, rad / (R * dλ * cos(min(abs(grid.lat[1]), abs(grid.lat[end])))))
+        
+        # kernel_weights[j_target][dj_idx, di_idx] = (weight, area) for offset (di, dj)
+        # dj_idx ranges from 1 to 2*max_dj+1, di_idx from 1 to 2*max_di+1
+        kernel_weights = Vector{Matrix{Tuple{T,T}}}(undef, Nlat)
+        
+        for j in 1:Nlat
+            target_pt = coords(grid, 1, j)  # use first longitude as reference
+            kw = Matrix{Tuple{T,T}}(undef, 2*max_dj+1, 2*max_di+1)
+            
+            for dj_idx in 1:(2*max_dj+1)
+                dj = dj_idx - max_dj - 1
+                jj = clamp(j + dj, 1, Nlat)
+                for di_idx in 1:(2*max_di+1)
+                    di = di_idx - max_di - 1
+                    ii = clamp(1 + di, 1, Nlon)
+                    
+                    neigh_pt = coords(grid, ii, jj)
+                    d = distance(grid.geometry, target_pt, neigh_pt)
+                    
+                    if d <= rad
+                        kw[dj_idx, di_idx] = (kernel_weight(kernel, d, scale), area(grid, ii, jj))
+                    else
+                        kw[dj_idx, di_idx] = (zero(T), zero(T))
+                    end
+                end
+            end
+            kernel_weights[j] = kw
+        end
+    end
+    
     # Column-major nested loop
     for j in 1:Nlat
         φ_target = grid.lat[j]
         
         # Calculate latitude bounds for Spherical geometry
         if G <: SphericalGeometry{T}
-            dj_lim = ceil(Int, rad / (R * dφ))
+            dj_lim = (dφ > 0) ? ceil(Int, rad / (R * dφ)) : 0
         end
         
         for i in 1:Nlon
@@ -167,7 +238,11 @@ function filter_field_zero!(
             # Calculate longitude bounds for Spherical geometry (depends on latitude)
             if G <: SphericalGeometry{T}
                 cosφ = cos(φ_target)
-                di_lim = abs(cosφ) > T(1e-12) ? ceil(Int, rad / (R * cosφ * dλ)) : 0
+                if dλ > 0 && abs(cosφ) > T(1e-12)
+                    di_lim = ceil(Int, rad / (R * cosφ * dλ))
+                else
+                    di_lim = 0
+                end
             end
             
             weighted_sum = zero(T)
@@ -182,17 +257,75 @@ function filter_field_zero!(
                 i_end   = min(Nlon, i + di_lim)
                 
                 for ii in i_start:i_end
-                    # Fetch neighbor coords and distance
-                    neigh_pt = coords(grid, ii, jj)
-                    d = distance(grid.geometry, target_pt, neigh_pt)
-                    
-                    if d <= rad
-                        w = kernel_weight(kernel, d, scale) * area(grid, ii, jj)
-                        weight_norm += w
+                    if G <: CartesianGeometry{T}
+                        # Cartesian: compute on-the-fly (fast, uniform grid)
+                        neigh_pt = coords(grid, ii, jj)
+                        d = distance(grid.geometry, target_pt, neigh_pt)
+                        if d <= rad
+                            w = kernel_weight(kernel, d, scale) * area(grid, ii, jj)
+                            weight_norm += w
+                            if iswet(grid, ii, jj)
+                                weighted_sum += w * field[ii, jj]
+                            end
+                        end
+                    else
+                        # Spherical: use pre-computed kernel weights
+                        dj = jj - j
+                        di = ii - i
+                        max_dj = (size(kernel_weights[j], 1) - 1) ÷ 2
+                        max_di = (size(kernel_weights[j], 2) - 1) ÷ 2
+                        dj_idx = dj + max_dj + 1
+                        di_idx = di + max_di + 1
                         
-                        # Only integrate wet cells (dry cells treated as zero value)
-                        if iswet(grid, ii, jj)
-                            weighted_sum += w * field[ii, jj]
+                        if 1 <= dj_idx <= 2*max_dj+1 && 1 <= di_idx <= 2*max_di+1
+                            w_kern, w_area = kernel_weights[j][dj_idx, di_idx]
+                            if w_kern > zero(T)
+                                w = w_kern * w_area
+                                weight_norm += w
+                                if iswet(grid, ii, jj)
+                                    weighted_sum += w * field[ii, jj]
+                                end
+                            end
+                        end
+                    end
+                end
+                
+                # Handle periodic longitude wrapping for spherical grids
+                # If near the boundary, also check points on the opposite side
+                if G <: SphericalGeometry{T}
+                    # Check if we need to wrap around (near longitude boundaries)
+                    wrap_left = i - di_lim < 1
+                    wrap_right = i + di_lim > Nlon
+                    
+                    if wrap_left
+                        # Check points on the right edge (wrapped around)
+                        for ii_wrap in (Nlon + i - di_lim):Nlon
+                            neigh_pt = coords(grid, ii_wrap, jj)
+                            d = distance(grid.geometry, target_pt, neigh_pt)
+                            
+                            if d <= rad
+                                w = kernel_weight(kernel, d, scale) * area(grid, ii_wrap, jj)
+                                weight_norm += w
+                                if iswet(grid, ii_wrap, jj)
+                                    weighted_sum += w * field[ii_wrap, jj]
+                                end
+                            end
+                        end
+                    end
+                    
+                    if wrap_right
+                        # Check points on the left edge (wrapped around)
+                        for ii_wrap in 1:(i + di_lim - Nlon)
+                            neigh_pt = coords(grid, ii_wrap, jj)
+                            d = distance(grid.geometry, target_pt, neigh_pt)
+                            
+                            if d <= rad
+                                w = kernel_weight(kernel, d, scale) * area(grid, ii_wrap, jj)
+                                weight_norm += w
+                                if iswet(grid, ii_wrap, jj)
+                                    weighted_sum += w * field[ii_wrap, jj]
+                                end
+                            end
                         end
                     end
                 end
@@ -211,7 +344,7 @@ Serial implementation of the `:renormalize` masking strategy (land points comple
 """
 function filter_field_renorm!(
     out::AbstractMatrix{T},
-    field::AbstractMatrix{T},
+    field::AbstractMatrix,
     grid::StructuredGrid{G,T},
     kernel::AbstractFilterKernel,
     scale::T,
@@ -237,7 +370,7 @@ function filter_field_renorm!(
         φ_target = grid.lat[j]
         
         if G <: SphericalGeometry{T}
-            dj_lim = ceil(Int, rad / (R * dφ))
+            dj_lim = (dφ > 0) ? ceil(Int, rad / (R * dφ)) : 0
         end
         
         for i in 1:Nlon
@@ -247,7 +380,11 @@ function filter_field_renorm!(
             
             if G <: SphericalGeometry{T}
                 cosφ = cos(φ_target)
-                di_lim = abs(cosφ) > T(1e-12) ? ceil(Int, rad / (R * cosφ * dλ)) : 0
+                if dλ > 0 && abs(cosφ) > T(1e-12)
+                    di_lim = ceil(Int, rad / (R * cosφ * dλ))
+                else
+                    di_lim = 0
+                end
             end
             
             weighted_sum = zero(T)
@@ -264,13 +401,56 @@ function filter_field_renorm!(
                     # In `:renormalize` strategy, land points are completely ignored
                     iswet(grid, ii, jj) || continue
                     
-                    neigh_pt = coords(grid, ii, jj)
-                    d = distance(grid.geometry, target_pt, neigh_pt)
+                    # Fetch neighbor coords and distance (compile-time dispatch)
+                    if G <: CartesianGeometry{T}
+                        neigh_pt = coords(grid, ii, jj)
+                        d = distance(grid.geometry, target_pt, neigh_pt)
+                    else
+                        # Use proper great-circle distance for spherical geometry
+                        neigh_pt = coords(grid, ii, jj)
+                        d = distance(grid.geometry, target_pt, neigh_pt)
+                    end
                     
                     if d <= rad
                         w = kernel_weight(kernel, d, scale) * area(grid, ii, jj)
                         weight_norm += w
                         weighted_sum += w * field[ii, jj]
+                    end
+                end
+                
+                # Handle periodic longitude wrapping for spherical grids
+                if G <: SphericalGeometry{T}
+                    wrap_left = i - di_lim < 1
+                    wrap_right = i + di_lim > Nlon
+                    
+                    if wrap_left
+                        for ii_wrap in (Nlon + i - di_lim):Nlon
+                            iswet(grid, ii_wrap, jj) || continue
+                            
+                            neigh_pt = coords(grid, ii_wrap, jj)
+                            d = distance(grid.geometry, target_pt, neigh_pt)
+                            
+                            if d <= rad
+                                w = kernel_weight(kernel, d, scale) * area(grid, ii_wrap, jj)
+                                weight_norm += w
+                                weighted_sum += w * field[ii_wrap, jj]
+                            end
+                        end
+                    end
+                    
+                    if wrap_right
+                        for ii_wrap in 1:(i + di_lim - Nlon)
+                            iswet(grid, ii_wrap, jj) || continue
+                            
+                            neigh_pt = coords(grid, ii_wrap, jj)
+                            d = distance(grid.geometry, target_pt, neigh_pt)
+                            
+                            if d <= rad
+                                w = kernel_weight(kernel, d, scale) * area(grid, ii_wrap, jj)
+                                weight_norm += w
+                                weighted_sum += w * field[ii_wrap, jj]
+                            end
+                        end
                     end
                 end
             end

@@ -111,15 +111,61 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    compute_Π!(Π, u, v, w, grid, kernel, scale; ρ₀, workspace, backend, mask_strategy)
+    compute_Π!(Π, u, v, w, grid, kernel, scale; ρ₀=1025.0, workspace=nothing, backend=AutoBackend(), mask_strategy=:renormalize)
 
-Compute the cross-scale energy transfer Π = -ρ₀ S̄_ij τ_ij at filter scale `scale` (ℓ), writing to `Π`.
+Compute the cross-scale kinetic energy flux Π = -ρ₀ S̄_ij τ_ij at filter scale ℓ.
+
+This implements the coarse-graining framework of Aluie et al. (2018) for computing
+energy transfer across scales in turbulent flows. Positive Π indicates forward cascade
+(energy from large to small scales), negative Π indicates inverse cascade.
+
+# Arguments
+- `Π::AbstractMatrix{T}`: Output array for energy flux (modified in-place)
+- `u::AbstractMatrix`: Eastward/zonal velocity component
+- `v::AbstractMatrix`: Northward/meridional velocity component  
+- `w::Union{Nothing,AbstractMatrix}`: Vertical velocity (nothing for 2D calculations)
+- `grid::StructuredGrid`: Grid geometry and coordinates
+- `kernel::AbstractFilterKernel`: Filter kernel
+- `scale::T`: Filter scale ℓ in meters
+
+# Keyword Arguments
+- `ρ₀::T=1025.0`: Reference density (kg/m³), default seawater value
+- `workspace=nothing`: Pre-allocated ΠWorkspace for intermediate arrays
+- `backend::AbstractExecutionBackend=AutoBackend()`: Execution backend
+- `mask_strategy::Symbol=:renormalize`: Land masking strategy
+
+# Physics
+The cross-scale energy flux is computed as:
+```
+Π = -ρ₀ * S̄_ij * τ_ij
+```
+where:
+- `S̄_ij = 0.5 * (∂ū_i/∂x_j + ∂ū_j/∂x_i)` is the resolved strain rate tensor
+- `τ_ij = [u_i*u_j]̄ - ū_i*ū_j` is the subfilter-scale (SFS) stress tensor
+- Overbar denotes filtered quantities
+
+For spherical geometry, velocity components are transformed to planetary Cartesian
+coordinates before filtering to ensure commutativity with derivatives (Aluie 2019).
+
+# Returns
+- `Π`: Energy flux array (same as input), units of W/m³
+
+# Examples
+```julia
+Π = zeros(100, 100)
+compute_Π!(Π, u, v, nothing, grid, TopHatKernel(), 30000.0; ρ₀=1025.0)
+# Π now contains energy flux at 30 km scale
+```
+
+# References
+- Aluie et al. (2018): https://doi.org/10.1175/JPO-D-17-0100.1
+- Aluie (2019): https://doi.org/10.1007/s13137-019-0123-9
 """
 function compute_Π!(
     Π::AbstractMatrix{T},
-    u::AbstractMatrix{T},
-    v::AbstractMatrix{T},
-    w::Union{Nothing, AbstractMatrix{T}}, # nothing or zeros for 2D
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    w::Union{Nothing, AbstractMatrix}, # nothing or zeros for 2D
     grid::StructuredGrid{G,T},
     kernel::AbstractFilterKernel,
     scale::T;
@@ -414,17 +460,50 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    compute_filtering_spectrum(u, v, w, grid, kernel, scales; ρ₀, backend, mask_strategy)
+    compute_filtering_spectrum(u, v, w, grid, kernel, scales; ρ₀=1025.0, backend=AutoBackend(), mask_strategy=:renormalize)
 
-Compute the filtering energy spectrum E(ℓ) = 0.5 * ρ₀ * ⟨|ū_ℓ|²⟩ (area-weighted spatial average).
+Compute the filtering kinetic energy spectrum E(ℓ) = 0.5 * ρ₀ * ⟨|ū_ℓ|²⟩.
+
+The filtering spectrum characterizes the distribution of kinetic energy across
+scales through coarse-grained (filtered) velocities.
+
+# Arguments
+- `u::AbstractMatrix`: Eastward/zonal velocity component
+- `v::AbstractMatrix`: Northward/meridional velocity component
+- `w::Union{Nothing,AbstractMatrix}`: Vertical velocity (nothing for 2D)
+- `grid::StructuredGrid`: Grid geometry with cell areas for weighting
+- `kernel::AbstractFilterKernel`: Filter kernel
+- `scales::AbstractVector`: Vector of filter scales ℓ in meters
+
+# Keyword Arguments
+- `ρ₀::T=1025.0`: Reference density (kg/m³)
+- `backend::AbstractExecutionBackend=AutoBackend()`: Execution backend
+- `mask_strategy::Symbol=:renormalize`: Land masking strategy
+
+# Returns
+- `spectrum::Vector{T}`: Energy spectrum values at each scale (m²/s²)
+
+# Notes
+The spectrum is computed as an area-weighted spatial average:
+```
+E(ℓ) = 0.5 * ρ₀ * ∫ |ū_ℓ|² dA / ∫ dA
+```
+where the integrals are over the wet domain.
+
+# Examples
+```julia
+scales = collect(10000.0:10000.0:100000.0)  # 10-100 km
+spectrum = compute_filtering_spectrum(u, v, grid, TopHatKernel(), scales)
+# spectrum[i] is energy at scale scales[i]
+```
 """
 function compute_filtering_spectrum(
-    u::AbstractMatrix{T},
-    v::AbstractMatrix{T},
-    w::Union{Nothing, AbstractMatrix{T}},
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    w::Union{Nothing, AbstractMatrix},
     grid::StructuredGrid{G,T},
     kernel::AbstractFilterKernel,
-    scales::AbstractVector{T};
+    scales::AbstractVector;
     ρ₀::T = T(1025.0),
     backend::AbstractExecutionBackend = AutoBackend(),
     mask_strategy::Symbol = :renormalize
@@ -451,7 +530,7 @@ function compute_filtering_spectrum(
     
     # Sweep through scales
     for s_idx in 1:Nscales
-        ℓ = scales[s_idx]
+        ℓ = T(scales[s_idx])
         
         # Filter velocity fields at this scale
         filter_field!(u_filt, u, grid, kernel, ℓ; mask_strategy=mask_strategy, backend=backend)

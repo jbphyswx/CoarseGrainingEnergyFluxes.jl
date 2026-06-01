@@ -11,9 +11,23 @@ using StaticArrays
 export CoarseGrainResult, coarse_grain
 
 """
-    CoarseGrainResult{T, A}
+    CoarseGrainResult{T<:AbstractFloat, A<:AbstractArray{T}}
 
-Hold results of a complete coarse-graining analysis.
+Container for results of a complete coarse-graining multiscale analysis.
+
+# Fields
+- `scales::Vector{T}`: Filter scales ℓ in meters
+- `Π::Vector{A}`: Energy flux maps at each scale (W/m³)
+- `spectrum::Vector{T}`: Filtering energy spectrum at each scale (m²/s²)
+
+# Examples
+```julia
+res = coarse_grain(u, v, grid; scales=[10e3, 20e3, 30e3], kernel=TopHatKernel())
+# Access results:
+res.scales[1]      # First scale (10 km)
+res.Π[1]           # Energy flux map at 10 km
+res.spectrum[1]    # Energy at 10 km scale
+```
 """
 struct CoarseGrainResult{T<:AbstractFloat, A<:AbstractArray{T}}
     scales::Vector{T}
@@ -22,17 +36,64 @@ struct CoarseGrainResult{T<:AbstractFloat, A<:AbstractArray{T}}
 end
 
 """
-    coarse_grain(u, v, w, grid; scales, kernel, backend, mask_strategy)
+    coarse_grain(u, v, w, grid; scales, kernel=TopHatKernel(), ρ₀=1025.0, backend=AutoBackend(), mask_strategy=:renormalize)
+    coarse_grain(u, v, grid; scales, ...)  # 2D convenience wrapper
 
-Orchestrate the entire coarse-graining analysis by sweeping across multiple filter scales `scales`.
-Pre-allocates work arrays once and runs the multiscale sweep loop with maximum efficiency.
+Perform complete coarse-graining analysis across multiple filter scales.
+
+This is the high-level orchestration function that runs the full pipeline:
+1. Pre-allocates reusable workspace arrays
+2. Sweeps through all filter scales
+3. Computes cross-scale energy flux Π at each scale
+4. Computes filtering energy spectrum E(ℓ)
+
+# Arguments
+- `u::AbstractMatrix`: Eastward/zonal velocity component (m/s)
+- `v::AbstractMatrix`: Northward/meridional velocity component (m/s)
+- `w::Union{Nothing,AbstractMatrix}`: Vertical velocity (nothing for 2D)
+- `grid::StructuredGrid`: Grid geometry and land mask
+
+# Keyword Arguments
+- `scales::AbstractVector`: Vector of filter scales ℓ in meters (e.g., `10e3:10e3:100e3`)
+- `kernel::AbstractFilterKernel=TopHatKernel()`: Filter kernel
+- `ρ₀::T=1025.0`: Reference density (kg/m³)
+- `backend::AbstractExecutionBackend=AutoBackend()`: Execution backend
+- `mask_strategy::Symbol=:renormalize`: Land masking strategy
+
+# Returns
+- `CoarseGrainResult`: Container with scales, Π maps, and spectrum
+
+# Examples
+```julia
+# Load velocity data
+u, v = load_velocity_data()  # Your I/O function
+
+# Create grid
+geom = SphericalGeometry(6371000.0)
+grid = StructuredGrid(geom, lon_rad, lat_rad, mask)
+
+# Run coarse-graining from 10 km to 100 km
+scales = collect(10e3:10e3:100e3)
+res = coarse_grain(u, v, grid; scales=scales, kernel=TopHatKernel())
+
+# Plot spectrum
+plot(res.scales, res.spectrum, xscale=:log10, yscale=:log10)
+
+# Plot flux at 30 km
+heatmap(res.Π[3])  # 3rd scale is 30 km
+```
+
+# Performance Notes
+- Workspace arrays are pre-allocated once and reused across scales
+- The function automatically selects appropriate execution backend
+- For large grids, consider using ThreadedBackend or GPU extensions
 """
 function coarse_grain(
-    u::AbstractMatrix{T},
-    v::AbstractMatrix{T},
-    w::Union{Nothing, AbstractMatrix{T}},
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    w::Union{Nothing, AbstractMatrix},
     grid::StructuredGrid{G,T};
-    scales::AbstractVector{T},
+    scales::AbstractVector,
     kernel::AbstractFilterKernel = TopHatKernel(),
     ρ₀::T = T(1025.0),
     backend::AbstractExecutionBackend = AutoBackend(),
@@ -50,7 +111,7 @@ function coarse_grain(
     
     # 3. Sweep through scales and compute the cross-scale energy transfer Π maps
     for s_idx in 1:Nscales
-        scale = scales[s_idx]
+        scale = T(scales[s_idx])
         compute_Π!(
             Π_maps[s_idx],
             u, v, w,
@@ -84,10 +145,10 @@ end
 
 # 2.5D Cartesian constructor wrapper (standard ocean/atmosphere model outputs without vertical velocity)
 function coarse_grain(
-    u::AbstractMatrix{T},
-    v::AbstractMatrix{T},
+    u::AbstractMatrix,
+    v::AbstractMatrix,
     grid::StructuredGrid{G,T};
-    scales::AbstractVector{T},
+    scales::AbstractVector,
     kernel::AbstractFilterKernel = TopHatKernel(),
     ρ₀::T = T(1025.0),
     backend::AbstractExecutionBackend = AutoBackend(),
