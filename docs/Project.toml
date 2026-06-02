@@ -1,3 +1,11 @@
 [deps]
 CoarseGrainingEnergyFluxes = "a8c2fbc6-778a-4d2b-8a8c-9c98efc7e8cf"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+
+[compat]
+julia = "1.9"
+Documenter = "1"
+
+[sources]
+CoarseGrainingEnergyFluxes = { path = ".." }
+
