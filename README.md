@@ -16,6 +16,24 @@ These are defined via the filtered velocity field ū_ℓ and the sub-scale stres
 where τ_ℓ = (u ⊗ u)̄_ℓ − ū_ℓ ⊗ ū_ℓ
 ```
 
+## Results
+
+### Spatial Filtering at Multiple Scales
+
+![Filtering Scales](docs/assets/filtering_scales.png)
+
+### Cross-Scale Energy Flux Π(x, ℓ)
+
+![Energy Flux](docs/assets/energy_flux_pi.png)
+
+### Filtering Energy Spectrum E(ℓ) and Mean |Π|
+
+![Spectrum](docs/assets/energy_spectrum.png)
+
+### Validation: Rigid-Body Rotation → Π = 0
+
+![Rigid Rotation Validation](docs/assets/rigid_rotation_validation.png)
+
 ## Quick Start
 
 ```julia

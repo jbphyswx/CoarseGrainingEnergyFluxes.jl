@@ -1,5 +1,23 @@
 # Examples
 
+## Visual Results
+
+### Spatial Filtering at Multiple Scales
+
+![Filtering Scales](../assets/filtering_scales.png)
+
+### Cross-Scale Energy Flux Π(x, ℓ)
+
+![Energy Flux](../assets/energy_flux_pi.png)
+
+### Filtering Energy Spectrum E(ℓ) and Mean |Π|
+
+![Spectrum](../assets/energy_spectrum.png)
+
+### Validation: Rigid-Body Rotation → Π = 0
+
+![Rigid Rotation Validation](../assets/rigid_rotation_validation.png)
+
 ## Cartesian Periodic Domain
 
 ```julia
