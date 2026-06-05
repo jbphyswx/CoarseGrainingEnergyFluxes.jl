@@ -50,7 +50,7 @@ end
     if i <= Nlon && j <= Nlat
         if !mask[i, j]
             out[i, j] = zero(eltype(out))
-            return
+            # return # this is invalid  # eturn statement not permitted in a kernel function gpu_filter_kernel! (I just commmented it out but Agents:: check if this needs to be fixed further before removing)
         end
         
         # Local variables
