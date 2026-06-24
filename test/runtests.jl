@@ -271,6 +271,41 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         Test.@test val_30 < val_0 * 0.5  # Should be significantly lower than at 0°
     end
 
+    # Regional domains must NOT wrap in longitude (the previous code wrapped every spherical grid,
+    # double-counting near boundaries when the footprint exceeded a regional domain).
+    Test.@testset "Regional vs periodic longitude" begin
+        geom = CGEF.SphericalGeometry(6371000.0)
+        lat = deg2rad.(collect(-4.0:2.0:4.0))
+
+        # Regional lon span -> auto-detected NON-periodic
+        lon_reg = deg2rad.(collect(0.0:2.0:20.0))   # 11 points, 20° span
+        mask_reg = trues(length(lon_reg), length(lat))
+        grid_reg = CGEF.StructuredGrid(geom, lon_reg, lat, mask_reg)
+        Test.@test CGEF.isperiodic(grid_reg, 1) == false
+
+        # Full-circle lon span -> auto-detected periodic
+        lon_glob = deg2rad.(collect(0.0:5.0:355.0))
+        mask_glob = trues(length(lon_glob), length(lat))
+        grid_glob = CGEF.StructuredGrid(geom, lon_glob, lat, mask_glob)
+        Test.@test CGEF.isperiodic(grid_glob, 1) == true
+
+        # Explicit override in both directions
+        Test.@test CGEF.isperiodic(CGEF.StructuredGrid(geom, lon_reg, lat, mask_reg; periodic = true), 1) == true
+        Test.@test CGEF.isperiodic(CGEF.StructuredGrid(geom, lon_glob, lat, mask_glob; periodic = false), 1) == false
+
+        # The periodicity flag must actually change filtering: with a footprint wider than the
+        # regional domain, wrapping double-counts and yields a different (incorrect) field.
+        grid_forced = CGEF.StructuredGrid(geom, lon_reg, lat, mask_reg; periodic = true)
+        field = Float64[i for i in 1:length(lon_reg), _ in 1:length(lat)]  # ramp in lon
+        scale = deg2rad(30.0) * 6371000.0   # footprint wider than the 20° domain
+        out_nowrap = zeros(size(field))
+        out_wrap = zeros(size(field))
+        CGEF.filter_field!(out_nowrap, field, grid_reg, CGEF.TopHatKernel(), scale)
+        CGEF.filter_field!(out_wrap, field, grid_forced, CGEF.TopHatKernel(), scale)
+        Test.@test !any(isnan, out_nowrap)
+        Test.@test !(out_nowrap ≈ out_wrap)
+    end
+
     # Test kernel normalization (weights must sum to 1.0 for uniform field)
     Test.@testset "Kernel Normalization" begin
         geom = CGEF.SphericalGeometry(6371000.0)

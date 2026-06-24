@@ -19,9 +19,9 @@ export distance, area_element, to_planetary_cartesian, from_planetary_cartesian
 
 # Re-export public components from Grids
 using .Grids: AbstractGrid, StructuredGrid, CurvilinearGrid, UnstructuredGrid
-using .Grids: coords, area, iswet, grid_geometry, size_tuple
+using .Grids: coords, area, iswet, grid_geometry, size_tuple, isperiodic
 export AbstractGrid, StructuredGrid, CurvilinearGrid, UnstructuredGrid
-export coords, area, iswet, grid_geometry, size_tuple
+export coords, area, iswet, grid_geometry, size_tuple, isperiodic
 
 # Re-export public components from Kernels
 using .Kernels: AbstractFilterKernel, TopHatKernel, GaussianKernel, SharpSpectralKernel

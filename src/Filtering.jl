@@ -289,9 +289,9 @@ function filter_field_zero!(
                     end
                 end
                 
-                # Handle periodic longitude wrapping for spherical grids
-                # If near the boundary, also check points on the opposite side
-                if G <: Geometry.SphericalGeometry{T}
+                # Handle periodic longitude wrapping — ONLY when the lon axis is actually periodic
+                # (e.g. a full-circle global grid), never for a regional domain.
+                if G <: Geometry.SphericalGeometry{T} && Grids.isperiodic(grid, 1)
                     # Check if we need to wrap around (near longitude boundaries)
                     wrap_left = i - di_lim < 1
                     wrap_right = i + di_lim > Nlon
@@ -417,8 +417,9 @@ function filter_field_renorm!(
                     end
                 end
                 
-                # Handle periodic longitude wrapping for spherical grids
-                if G <: Geometry.SphericalGeometry{T}
+                # Handle periodic longitude wrapping — ONLY when the lon axis is actually periodic
+                # (e.g. a full-circle global grid), never for a regional domain.
+                if G <: Geometry.SphericalGeometry{T} && Grids.isperiodic(grid, 1)
                     wrap_left = i - di_lim < 1
                     wrap_right = i + di_lim > Nlon
                     
