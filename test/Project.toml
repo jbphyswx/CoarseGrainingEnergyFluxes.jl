@@ -8,6 +8,7 @@ FINUFFT = "d8beea63-0952-562e-9c6a-8e8ef7364055"
 FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
 JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+NUFSHT = "e99b67a3-9706-455a-90e2-85b195a33206"
 OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 SharedArrays = "1a1011a3-84de-559e-8e89-a11a2f7dc383"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
@@ -15,3 +16,4 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
 CoarseGrainingEnergyFluxes = { path = ".." }
+NUFSHT = { url = "https://github.com/jbphyswx/NUFSHT.jl" }

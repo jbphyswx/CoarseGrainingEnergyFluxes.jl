@@ -6,6 +6,7 @@ using JET: JET
 using FFTW: FFTW  # triggers the spectral-filtering extension
 using FINUFFT: FINUFFT  # triggers the scattered-Cartesian spectral extension
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH  # triggers the uniform-spherical spectral extension
+using NUFSHT: NUFSHT  # triggers the scattered-spherical spectral extension
 using OhMyThreads: OhMyThreads  # triggers the threaded-backend extension
 using Distributed: Distributed  # with SharedArrays, triggers the distributed-backend extension
 using SharedArrays: SharedArrays
@@ -33,6 +34,7 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
             :CoarseGrainingEnergyFluxesFFTWExt,
             :CoarseGrainingEnergyFluxesFINUFFTExt,
             :CoarseGrainingEnergyFluxesFastSphericalHarmonicsExt,
+            :CoarseGrainingEnergyFluxesNUFSHTExt,
             :CoarseGrainingEnergyFluxesOhMyThreadsExt,
             :CoarseGrainingEnergyFluxesDistributedExt,
             :CoarseGrainingEnergyFluxesGPUExt,
@@ -346,6 +348,33 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         # Grid that is not an FSH grid (M ≠ 2N-1) is rejected.
         badgrid = CGEF.StructuredGrid(geom, collect(0.0:0.1:1.0), collect(0.0:0.1:1.0), trues(11, 11))
         Test.@test_throws ArgumentError CGEF.filter_field!(zeros(11, 11), rand(11, 11), badgrid, ker, ℓ; method = CGEF.Spectral())
+    end
+
+    # Scattered-spherical spectral filtering (NUFSHT): on a Clenshaw–Curtis grid passed as scattered
+    # points the adjoint analysis is exact, so a single degree-l harmonic is scaled by exactly Ĝ(k_l).
+    Test.@testset "Spectral NUFSHT filtering" begin
+        L = 12; N = L + 1; M = 2N - 1
+        Θ, Φ = FSH.sph_points(N)
+        R = 6.371e6
+        geom = CGEF.SphericalGeometry(R)
+        lat = Float64[]; lon = Float64[]
+        for θ in Θ, φ in Φ
+            push!(lat, π/2 - θ); push!(lon, φ)
+        end
+        npts = length(lat)
+        ug = CGEF.UnstructuredGrid(geom, lon, lat, ones(npts), trues(npts), Vector{Vector{Int}}())
+
+        l, m = 4, 1
+        C0 = zeros(N, M); C0[FSH.sph_mode(l, m)] = 1.0
+        Fgrid = FSH.sph_evaluate(C0)
+        field = Float64[Fgrid[it, ip] for it in 1:N for ip in 1:M]
+
+        scale = 2e6; ker = CGEF.GaussianKernel()
+        out = zeros(npts)
+        CGEF.filter_field!(out, field, ug, ker, scale; method = CGEF.Spectral())
+        kl = sqrt(l*(l+1)) / R
+        Ghat = exp(-kl^2 * scale^2 / 24)
+        Test.@test out ≈ Ghat .* field rtol = 1e-7
     end
 
     # Threaded backend must agree with serial EXACTLY (shared footprint engine), including masking
