@@ -1,36 +1,66 @@
 # CoarseGrainingEnergyFluxes.jl
 
-Spatial coarse-graining analysis of energy fluxes in geophysical fluid dynamics. Computes cross-scale kinetic energy transfer Π(x, ℓ) and filtering energy spectra E(ℓ) from velocity fields on Cartesian or spherical grids.
+Spatial coarse-graining (Aluie/FlowSieve-style) analysis of energy fluxes in geophysical fluid
+dynamics: cross-scale kinetic-energy transfer Π(x, ℓ), the filtering spectrum, and related
+diagnostics from velocity fields on Cartesian or spherical grids.
+
+![Coarse-graining pipeline](docs/src/assets/hero.png)
 
 ## What This Package Does
 
-Coarse-graining (spatial filtering) decomposes turbulent flows into scale-dependent contributions. This package computes:
-
-- **Cross-scale energy flux** Π(x, ℓ): the local rate of kinetic energy transfer across scale ℓ
-- **Filtering energy spectrum** E(ℓ): the domain-averaged kinetic energy at scale ℓ
-
-These are defined via the filtered velocity field ū_ℓ and the sub-scale stress tensor τ_ℓ:
+Coarse-graining (spatial filtering) decomposes a turbulent flow into scale-dependent contributions
+and measures the energy transferred between them. Given the filtered velocity ū_ℓ and the sub-scale
+stress τ_ℓ = (u⊗u)̄_ℓ − ū_ℓ⊗ū_ℓ, the cross-scale kinetic-energy flux is
 
 ```
-Π(x, ℓ) = −τ_ℓ : S̄_ℓ
-where τ_ℓ = (u ⊗ u)̄_ℓ − ū_ℓ ⊗ ū_ℓ
+Π(x, ℓ) = −ρ₀ τ_ℓ : S̄_ℓ
 ```
+
+(Π > 0 forward cascade, Π < 0 inverse cascade). The package also computes the **filtering spectrum**
+(Sadek & Aluie 2018), the **rotational/divergent (Helmholtz)** split of Π, the **tracer/buoyancy
+variance flux**, and the Leonard/Cross/Reynolds stress decomposition — on masked, regional, or global
+domains, with real-space (direct-sum) or spectral (FFTW / FINUFFT / spherical-harmonic / NUFSHT)
+backends and serial/threaded/GPU/distributed/MPI execution.
 
 ## Results
 
-### Spatial Filtering at Multiple Scales
+### Spatial filtering across scales
+Filtering coarsens a field as ℓ grows — shown for a deterministic fractal pattern and an eddy+noise flow.
 
 ![Filtering Scales](docs/src/assets/filtering_scales.png)
 
-### Cross-Scale Energy Flux Π(x, ℓ)
+### Filter kernels and their spectral transfer
+Top-hat vs Gaussian (α = 6 Pope / α = 4 FlowSieve) real-space shapes, and the sharp-spectral vs Gaussian transfer functions.
 
-![Energy Flux](docs/src/assets/energy_flux_pi.png)
+![Kernels](docs/src/assets/kernels.png)
 
-### Filtering Energy Spectrum E(ℓ) and Mean |Π|
+### The filtering spectrum (recovers the Fourier slope)
+Cumulative coarse KE E(ℓ) and the spectral density Ẽ(k_ℓ); the sharp-spectral kernel recovers the k⁻³ slope, while a Gaussian smooths it.
 
-![Spectrum](docs/src/assets/energy_spectrum.png)
+![Filtering spectrum](docs/src/assets/filtering_spectrum.png)
 
-### Validation: Rigid-Body Rotation → Π = 0
+### Rotational / divergent (Helmholtz) decomposition of Π
+Π splits exactly into rotational, cross, and divergent channels.
+
+![Helmholtz decomposition](docs/src/assets/helmholtz_decomposition.png)
+
+### Cross-scale tracer / buoyancy-variance flux
+The scalar analogue of Π (buoyancy ⇒ available-potential-energy transfer).
+
+![Tracer flux](docs/src/assets/tracer_flux.png)
+
+### Land masks: deformable vs zero-fill
+The deformable kernel renormalizes over water; the difference between strategies is concentrated at coastlines.
+
+![Masking](docs/src/assets/masking.png)
+
+### Spectral filtering on the sphere
+Global spherical-harmonic filtering (the FFTW / FINUFFT / FastSphericalHarmonics / NUFSHT backends cover Cartesian/spherical × uniform/scattered).
+
+![Spherical filtering](docs/src/assets/spherical_filtering.png)
+
+### Validation: rigid-body rotation → Π = 0
+Pure rotation has no deformation, so the flux must vanish (to machine precision).
 
 ![Rigid Rotation Validation](docs/src/assets/rigid_rotation_validation.png)
 

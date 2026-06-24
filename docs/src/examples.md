@@ -9,16 +9,31 @@ using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 
 ## Visual Results
 
-### Spatial Filtering at Multiple Scales
+### The coarse-graining pipeline
+![Coarse-graining pipeline](assets/hero.png)
+
+### Spatial filtering across scales
 ![Filtering Scales](assets/filtering_scales.png)
 
-### Cross-Scale Energy Flux Π(x, ℓ)
-![Energy Flux](assets/energy_flux_pi.png)
+### Filter kernels and spectral transfer
+![Kernels](assets/kernels.png)
 
-### Filtering Energy Spectrum and Mean |Π|
-![Spectrum](assets/energy_spectrum.png)
+### The filtering spectrum (recovers the Fourier slope)
+![Filtering spectrum](assets/filtering_spectrum.png)
 
-### Validation: Rigid-Body Rotation → Π = 0
+### Rotational / divergent (Helmholtz) decomposition of Π
+![Helmholtz decomposition](assets/helmholtz_decomposition.png)
+
+### Cross-scale tracer / buoyancy-variance flux
+![Tracer flux](assets/tracer_flux.png)
+
+### Land masks: deformable vs zero-fill
+![Masking](assets/masking.png)
+
+### Spectral filtering on the sphere
+![Spherical filtering](assets/spherical_filtering.png)
+
+### Validation: rigid-body rotation → Π = 0
 ![Rigid Rotation Validation](assets/rigid_rotation_validation.png)
 
 ## Cartesian domain — flux at one scale and across scales
