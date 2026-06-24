@@ -37,8 +37,10 @@ export AbstractExecutionBackend, SerialBackend, ThreadedBackend, GPUBackend, Aut
     DistributedBackend, MPIBackend, local_backend, is_distributed
 
 # Re-export public components from Filtering
-using .Filtering: filter_field!, AbstractMaskStrategy, ZeroFill, Deformable
-export filter_field!, AbstractMaskStrategy, ZeroFill, Deformable
+using .Filtering: filter_field!, filter_fields!, AbstractMaskStrategy, ZeroFill, Deformable
+using .Filtering: AbstractFilterPlan, plan_filter, filter_apply!
+export filter_field!, filter_fields!, AbstractMaskStrategy, ZeroFill, Deformable
+export AbstractFilterPlan, plan_filter, filter_apply!
 
 # Re-export public components from Derivatives
 using .Derivatives: AbstractStencilOrder, SecondOrderStencil

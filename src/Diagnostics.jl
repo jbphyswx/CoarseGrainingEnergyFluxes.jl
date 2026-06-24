@@ -177,6 +177,10 @@ function compute_Π!(
     # 1. Fetch or create pre-allocated workspace
     ws = workspace === nothing ? ΠWorkspace(grid) : workspace
     Nlon, Nlat = Grids.size_tuple(grid)
+
+    # Build the filter footprint/plan ONCE for this scale; reused for every velocity component and
+    # quadratic product below (instead of rebuilding it on each of the ~9 filterings).
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
     
     has_w = w !== nothing
     
@@ -185,30 +189,30 @@ function compute_Π!(
         # Cartesian Case
         # -------------------------------------------------------------------
         # Filter velocity components
-        Filtering.filter_field!(ws.u_filt, u, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
-        Filtering.filter_field!(ws.v_filt, v, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_apply!(ws.u_filt, u, plan)
+        Filtering.filter_apply!(ws.v_filt, v, plan)
         if has_w
-            Filtering.filter_field!(ws.w_filt, w, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+            Filtering.filter_apply!(ws.w_filt, w, plan)
         end
         
         # Filter products: u², uv, vv, etc.
         # uu
         @. ws.scratch = u * u
-        Filtering.filter_field!(ws.uu_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_apply!(ws.uu_filt, ws.scratch, plan)
         # uv
         @. ws.scratch = u * v
-        Filtering.filter_field!(ws.uv_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_apply!(ws.uv_filt, ws.scratch, plan)
         # vv
         @. ws.scratch = v * v
-        Filtering.filter_field!(ws.vv_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_apply!(ws.vv_filt, ws.scratch, plan)
         
         if has_w
             @. ws.scratch = u * w
-            Filtering.filter_field!(ws.uw_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+            Filtering.filter_apply!(ws.uw_filt, ws.scratch, plan)
             @. ws.scratch = v * w
-            Filtering.filter_field!(ws.vw_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+            Filtering.filter_apply!(ws.vw_filt, ws.scratch, plan)
             @. ws.scratch = w * w
-            Filtering.filter_field!(ws.ww_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+            Filtering.filter_apply!(ws.ww_filt, ws.scratch, plan)
         end
         
         # Compute subfilter stresses: τ_ij = [u_i u_j]̄ - ū_i ū_j
@@ -271,23 +275,23 @@ function compute_Π!(
         end
         
         # Filter planetary Cartesian components
-        Filtering.filter_field!(ws.ux_filt, ws.ux, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
-        Filtering.filter_field!(ws.uy_filt, ws.uy, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
-        Filtering.filter_field!(ws.uz_filt, ws.uz, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_apply!(ws.ux_filt, ws.ux, plan)
+        Filtering.filter_apply!(ws.uy_filt, ws.uy, plan)
+        Filtering.filter_apply!(ws.uz_filt, ws.uz, plan)
         
         # Filter planetary products: X-X, X-Y, X-Z, Y-Y, Y-Z, Z-Z
         @. ws.scratch = ws.ux * ws.ux
-        Filtering.filter_field!(ws.uu_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_apply!(ws.uu_filt, ws.scratch, plan)
         @. ws.scratch = ws.ux * ws.uy
-        Filtering.filter_field!(ws.uv_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_apply!(ws.uv_filt, ws.scratch, plan)
         @. ws.scratch = ws.ux * ws.uz
-        Filtering.filter_field!(ws.uw_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_apply!(ws.uw_filt, ws.scratch, plan)
         @. ws.scratch = ws.uy * ws.uy
-        Filtering.filter_field!(ws.vv_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_apply!(ws.vv_filt, ws.scratch, plan)
         @. ws.scratch = ws.uy * ws.uz
-        Filtering.filter_field!(ws.vw_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_apply!(ws.vw_filt, ws.scratch, plan)
         @. ws.scratch = ws.uz * ws.uz
-        Filtering.filter_field!(ws.ww_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_apply!(ws.ww_filt, ws.scratch, plan)
         
         # Transform filtered planetary velocities back to local coordinates (u_filt, v_filt, w_filt)
         for j in 1:Nlat
@@ -530,12 +534,13 @@ function compute_filtering_spectrum(
     # Sweep through scales
     for s_idx in 1:Nscales
         ℓ = T(scales[s_idx])
-        
+        plan = Filtering.plan_filter(grid, kernel, ℓ; mask_strategy=mask_strategy, backend=backend)
+
         # Filter velocity fields at this scale
-        Filtering.filter_field!(u_filt, u, grid, kernel, ℓ; mask_strategy=mask_strategy, backend=backend)
-        Filtering.filter_field!(v_filt, v, grid, kernel, ℓ; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_apply!(u_filt, u, plan)
+        Filtering.filter_apply!(v_filt, v, plan)
         if w !== nothing
-            Filtering.filter_field!(w_filt, w, grid, kernel, ℓ; mask_strategy=mask_strategy, backend=backend)
+            Filtering.filter_apply!(w_filt, w, plan)
         end
         
         # Compute spatial average energy: E(ℓ) = 0.5 * ρ₀ * ∫ |ū_ℓ|² dA / ∫ dA

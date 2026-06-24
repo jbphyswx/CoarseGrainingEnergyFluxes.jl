@@ -7,7 +7,8 @@ using ..Backends: Backends
 using StaticArrays: StaticArrays as SA
 
 export AbstractMaskStrategy, ZeroFill, Deformable
-export filter_field!
+export filter_field!, filter_fields!
+export AbstractFilterPlan, plan_filter, filter_apply!
 
 # ---------------------------------------------------------------------------
 # Land-masking strategy (singleton types — specializable, unlike Symbol dispatch)
@@ -310,6 +311,92 @@ function serial_filter_field!(
 ) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
     fp = build_footprint(grid, kernel, scale)
     return apply_footprint!(out, field, grid, fp, strategy, Grids.isperiodic(grid, 1))
+end
+
+# ---------------------------------------------------------------------------
+# Reusable filter plans: build the footprint ONCE, apply to many fields/scales
+# ---------------------------------------------------------------------------
+
+"""
+    AbstractFilterPlan
+
+A prebuilt filter (grid + kernel + scale + mask strategy + backend) that can be applied to many
+fields without redoing setup. Physical-space backends precompute a `FilterFootprint`; spectral
+backends (FFTW/FINUFFT/SHT extensions, Phase 5) hold cached transform plans.
+"""
+abstract type AbstractFilterPlan end
+
+"Physical-space plan: a precomputed footprint reused across all longitudes, fields, and layers."
+struct PhysicalFilterPlan{T<:AbstractFloat, FP<:FilterFootprint{T}, G<:Grids.StructuredGrid, S<:AbstractMaskStrategy} <: AbstractFilterPlan
+    footprint::FP
+    grid::G
+    strategy::S
+    periodic_lon::Bool
+end
+
+"Fallback plan for backends without a precomputed footprint yet — defers to `filter_field!`."
+struct FallbackFilterPlan{G<:Grids.AbstractGrid, K<:Kernels.AbstractFilterKernel, T<:AbstractFloat, S<:AbstractMaskStrategy, B<:Backends.AbstractExecutionBackend} <: AbstractFilterPlan
+    grid::G
+    kernel::K
+    scale::T
+    strategy::S
+    backend::B
+end
+
+"""
+    plan_filter(grid, kernel, scale; mask_strategy=Deformable(), backend=AutoBackend()) -> AbstractFilterPlan
+
+Build a reusable filter plan. For serial CPU execution this precomputes the footprint once (reused
+across every field and depth layer); other backends get a deferring fallback plan (optimized in
+later phases). Apply with `filter_apply!(out, field, plan)`.
+"""
+function plan_filter(
+    grid::Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    mask_strategy::AbstractMaskStrategy = Deformable(),
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+) where {G<:Geometry.AbstractGeometry{T}} where {T<:AbstractFloat}
+    resolved = Backends.resolve_backend(backend)
+    if resolved isa Backends.SerialBackend
+        fp = build_footprint(grid, kernel, scale)
+        return PhysicalFilterPlan(fp, grid, mask_strategy, Grids.isperiodic(grid, 1))
+    else
+        return FallbackFilterPlan(grid, kernel, scale, mask_strategy, resolved)
+    end
+end
+
+"""
+    filter_apply!(out, field, plan) -> out
+
+Apply a prebuilt [`plan_filter`](@ref) to a single 2D field.
+"""
+filter_apply!(out::AbstractMatrix, field::AbstractMatrix, plan::PhysicalFilterPlan) =
+    apply_footprint!(out, field, plan.grid, plan.footprint, plan.strategy, plan.periodic_lon)
+
+filter_apply!(out::AbstractMatrix, field::AbstractMatrix, plan::FallbackFilterPlan) =
+    filter_field!(out, field, plan.grid, plan.kernel, plan.scale; mask_strategy = plan.strategy, backend = plan.backend)
+
+"""
+    filter_fields!(outs, fields, grid, kernel, scale; mask_strategy=Deformable(), backend=AutoBackend())
+
+Filter several fields that share the same grid/kernel/scale, building the footprint/plan ONCE.
+`outs` and `fields` are iterables of matching 2D arrays (e.g. tuples of velocity components).
+"""
+function filter_fields!(
+    outs,
+    fields,
+    grid::Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    mask_strategy::AbstractMaskStrategy = Deformable(),
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+) where {G<:Geometry.AbstractGeometry{T}} where {T<:AbstractFloat}
+    plan = plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
+    for (out, field) in zip(outs, fields)
+        filter_apply!(out, field, plan)
+    end
+    return outs
 end
 
 end # module

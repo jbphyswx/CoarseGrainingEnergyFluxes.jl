@@ -175,6 +175,40 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         )
     end
 
+    # Reusable filter plans + batched multi-field filtering
+    Test.@testset "Filter plans & batching" begin
+        geom = CGEF.CartesianGeometry(1000.0, 1000.0)
+        lon = collect(0.0:1000.0:30e3)
+        lat = collect(0.0:1000.0:30e3)
+        grid = CGEF.StructuredGrid(geom, lon, lat, trues(length(lon), length(lat)))
+        u = rand(length(lon), length(lat))
+        v = rand(length(lon), length(lat))
+        kern = CGEF.TopHatKernel()
+        scale = 5000.0
+
+        # A prebuilt plan applied to a field matches a direct filter_field! call.
+        plan = CGEF.plan_filter(grid, kern, scale)
+        out_plan = zeros(size(u))
+        out_direct = zeros(size(u))
+        CGEF.filter_apply!(out_plan, u, plan)
+        CGEF.filter_field!(out_direct, u, grid, kern, scale)
+        Test.@test out_plan ≈ out_direct
+
+        # Batched filter_fields! matches per-field filtering.
+        ou = zeros(size(u)); ov = zeros(size(v))
+        CGEF.filter_fields!((ou, ov), (u, v), grid, kern, scale)
+        ru = zeros(size(u)); rv = zeros(size(v))
+        CGEF.filter_field!(ru, u, grid, kern, scale)
+        CGEF.filter_field!(rv, v, grid, kern, scale)
+        Test.@test ou ≈ ru
+        Test.@test ov ≈ rv
+
+        # Reapplying a prebuilt plan must NOT rebuild the footprint (a rebuild would allocate the
+        # offset/weight vectors, ~kBs); a reused plan allocates essentially nothing.
+        CGEF.filter_apply!(out_plan, u, plan)  # warm up
+        Test.@test (@allocated CGEF.filter_apply!(out_plan, u, plan)) < 256
+    end
+
     # spatial finite differences and boundary stencil fallbacks
     Test.@testset "Derivatives" begin
         geom = CGEF.CartesianGeometry(2.0, 2.0)
