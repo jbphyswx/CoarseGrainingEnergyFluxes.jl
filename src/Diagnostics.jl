@@ -8,6 +8,7 @@ using ..Derivatives: Derivatives
 using ..Backends: Backends
 
 export ΠWorkspace, compute_Π!, cumulative_energy, filtering_spectrum
+export tau_decomposition
 
 """
     ΠWorkspace{T, A}
@@ -620,6 +621,63 @@ function spectral_density(C::AbstractVector{T}, k::AbstractVector) where {T<:Abs
         end
     end
     return g
+end
+
+# ---------------------------------------------------------------------------
+# Subfilter-stress decomposition (Germano 1992): τ = Leonard + Cross + Reynolds
+# ---------------------------------------------------------------------------
+
+"""
+    tau_decomposition(u, v, grid, kernel, scale; backend=AutoBackend(), mask_strategy=Deformable())
+        -> (; L, C, R)
+
+Split the 2D subfilter-scale stress `τ_ij = ⟨u_i u_j⟩ - ū_i ū_j` into Leonard, Cross, and Reynolds
+contributions (Germano 1992, *JFM* 238, using generalized central moments so each piece is
+individually Galilean-invariant). With `ū = G * u` the filtered velocity and `u' = u - ū` the
+residual, and the generalized second moment `M(f, g) = (fg)‾ - f̄ ḡ`:
+
+- Leonard  `L_ij = M(ū_i, ū_j)`            (resolved–resolved),
+- Cross    `C_ij = M(ū_i, u'_j) + M(u'_i, ū_j)`,
+- Reynolds `R_ij = M(u'_i, u'_j)`          (subfilter–subfilter; backscatter),
+
+with `L + C + R = τ` exactly. Returns a named tuple of named tuples, each holding the symmetric
+2D components `(; xx, xy, yy)` as arrays.
+"""
+function tau_decomposition(
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    grid::Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+    # Filter operator (linear): allocate a fresh output (this is a diagnostic, not an inner loop).
+    flt(f) = (o = zeros(T, size(f)); Filtering.filter_apply!(o, f, plan); o)
+
+    ub = flt(u);  vb = flt(v)          # ū, v̄
+    up = u .- ub; vp = v .- vb         # residuals u', v'
+    ubb = flt(ub); vbb = flt(vb)       # double-filtered ū̄, v̄̄
+    upb = flt(up); vpb = flt(vp)       # filtered residuals ū', v̄'
+
+    # Generalized second moment M(f,g) = (fg)‾ - f̄ ḡ, with f̄ = flt(f).
+    L = (
+        xx = flt(ub .* ub) .- ubb .* ubb,
+        xy = flt(ub .* vb) .- ubb .* vbb,
+        yy = flt(vb .* vb) .- vbb .* vbb,
+    )
+    C = (
+        xx = T(2) .* (flt(ub .* up) .- ubb .* upb),
+        xy = (flt(ub .* vp) .- ubb .* vpb) .+ (flt(up .* vb) .- upb .* vbb),
+        yy = T(2) .* (flt(vb .* vp) .- vbb .* vpb),
+    )
+    R = (
+        xx = flt(up .* up) .- upb .* upb,
+        xy = flt(up .* vp) .- upb .* vpb,
+        yy = flt(vp .* vp) .- vpb .* vpb,
+    )
+    return (; L = L, C = C, R = R)
 end
 
 end # module

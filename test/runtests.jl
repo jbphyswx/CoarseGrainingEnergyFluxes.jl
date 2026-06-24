@@ -772,4 +772,36 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         kk = collect(1.0:1.0:5.0)
         Test.@test CGEF.spectral_density(kk .^ 2, kk)[3] ≈ 2 * kk[3]
     end
+
+    # Germano subfilter-stress decomposition: L + C + R == τ (exact closure)
+    Test.@testset "Stress decomposition (Leonard/Cross/Reynolds)" begin
+        geom = CGEF.CartesianGeometry(1000.0, 1000.0)
+        lon = collect(0.0:1000.0:30e3)
+        lat = collect(0.0:1000.0:30e3)
+        grid = CGEF.StructuredGrid(geom, lon, lat, trues(length(lon), length(lat)))
+        u = rand(length(lon), length(lat))
+        v = rand(length(lon), length(lat))
+        kern = CGEF.TopHatKernel()
+        scale = 5000.0
+
+        d = CGEF.tau_decomposition(u, v, grid, kern, scale)
+
+        # Reference τ_ij = filter(u_i u_j) - ū_i ū_j with the same filter.
+        ub = zeros(size(u)); vb = zeros(size(v))
+        CGEF.filter_field!(ub, u, grid, kern, scale)
+        CGEF.filter_field!(vb, v, grid, kern, scale)
+        uu = zeros(size(u)); uv = zeros(size(u)); vv = zeros(size(u))
+        CGEF.filter_field!(uu, u .* u, grid, kern, scale)
+        CGEF.filter_field!(uv, u .* v, grid, kern, scale)
+        CGEF.filter_field!(vv, v .* v, grid, kern, scale)
+        τxx = uu .- ub .^ 2
+        τxy = uv .- ub .* vb
+        τyy = vv .- vb .^ 2
+
+        Test.@test d.L.xx .+ d.C.xx .+ d.R.xx ≈ τxx
+        Test.@test d.L.xy .+ d.C.xy .+ d.R.xy ≈ τxy
+        Test.@test d.L.yy .+ d.C.yy .+ d.R.yy ≈ τyy
+        # Reynolds (subfilter–subfilter) stress trace is non-negative (Jensen).
+        Test.@test all(d.R.xx .+ d.R.yy .>= -1e-10)
+    end
 end
