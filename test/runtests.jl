@@ -364,6 +364,47 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         Test.@test osg ≈ oss
     end
 
+    # True n-D Cartesian filtering (1D + 3D) via the general footprint engine.
+    Test.@testset "n-D filtering (1D + true 3D Cartesian)" begin
+        # --- 1D ---
+        geom1 = CGEF.CartesianGeometry(1.0, 1.0)
+        x = collect(0.0:1.0:50.0)
+        grid1 = CGEF.StructuredGrid(geom1, x, trues(length(x)))
+        Test.@test CGEF.size_tuple(grid1) == (length(x),)
+        # constant -> constant (normalization)
+        o1 = zeros(length(x))
+        CGEF.filter_field!(o1, fill(7.0, length(x)), grid1, CGEF.TopHatKernel(), 6.0)
+        Test.@test all(≈(7.0), o1[10:40])
+        # sub-grid scale -> identity (only the self cell is in support)
+        g1 = rand(length(x)); oi = zeros(length(x))
+        CGEF.filter_field!(oi, g1, grid1, CGEF.TopHatKernel(), 0.5)
+        Test.@test oi ≈ g1
+
+        # --- 3D (dz ≫ footprint, so only the in-plane disk contributes) ---
+        geom3 = CGEF.CartesianGeometry(1.0, 1.0, 100.0)
+        x3 = collect(0.0:1.0:20.0); y3 = collect(0.0:1.0:20.0); z3 = collect(0.0:100.0:300.0)
+        nx, ny, nz = length(x3), length(y3), length(z3)
+        grid3 = CGEF.StructuredGrid(geom3, x3, y3, z3, trues(nx, ny, nz))
+        Test.@test CGEF.size_tuple(grid3) == (nx, ny, nz)
+        # constant -> constant
+        o3 = zeros(nx, ny, nz)
+        CGEF.filter_field!(o3, fill(3.5, nx, ny, nz), grid3, CGEF.TopHatKernel(), 6.0)
+        Test.@test all(≈(3.5), o3)
+
+        # A z-invariant 3D field must reduce EXACTLY to the 2D filter of its slice (dz ≫ rad ⇒ no
+        # vertical neighbours), validating the n-D engine against the 2D engine.
+        f2d = rand(nx, ny)
+        f3z = repeat(reshape(f2d, nx, ny, 1), 1, 1, nz)
+        o3z = zeros(nx, ny, nz)
+        CGEF.filter_field!(o3z, f3z, grid3, CGEF.TopHatKernel(), 6.0)
+        grid2 = CGEF.StructuredGrid(CGEF.CartesianGeometry(1.0, 1.0), x3, y3, trues(nx, ny))
+        o2 = zeros(nx, ny)
+        CGEF.filter_field!(o2, f2d, grid2, CGEF.TopHatKernel(), 6.0)
+        for k in 1:nz
+            Test.@test o3z[:, :, k] ≈ o2
+        end
+    end
+
     # spatial finite differences and boundary stencil fallbacks
     Test.@testset "Derivatives" begin
         geom = CGEF.CartesianGeometry(2.0, 2.0)

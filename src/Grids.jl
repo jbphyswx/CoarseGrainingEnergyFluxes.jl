@@ -149,6 +149,48 @@ function StructuredGrid(
     )
 end
 
+"""
+    StructuredGrid(geometry, x, mask; periodic = false)
+
+Build a 1D Cartesian grid (cell length `dx`). `periodic` is a `Bool` (default `false`).
+"""
+function StructuredGrid(
+    geometry::G,
+    x::AbstractVector,
+    mask::AbstractVector{Bool};
+    periodic::Bool = false,
+) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
+    x_T = convert(Vector{T}, x)
+    measure = fill(geometry.dx, length(x_T))
+    return StructuredGrid{G, T, 1, typeof(x_T), typeof(measure), typeof(mask)}(
+        geometry, (x_T,), measure, mask, (periodic,),
+    )
+end
+
+"""
+    StructuredGrid(geometry, x, y, z, mask; periodic = (false, false, false))
+
+Build a 3D Cartesian grid (cell volume `dx·dy·dz`; the geometry must carry a non-zero `dz`).
+`periodic` is a `Bool` (applied to x) or an `NTuple{3,Bool}`.
+"""
+function StructuredGrid(
+    geometry::G,
+    x::AbstractVector,
+    y::AbstractVector,
+    z::AbstractVector,
+    mask::AbstractArray{Bool,3};
+    periodic = (false, false, false),
+) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
+    x_T = convert(Vector{T}, x)
+    y_T = convert(Vector{T}, y)
+    z_T = convert(Vector{T}, z)
+    measure = fill(geometry.dx * geometry.dy * geometry.dz, size(mask))
+    per = periodic isa Bool ? (periodic, false, false) : NTuple{3,Bool}(periodic)
+    return StructuredGrid{G, T, 3, typeof(x_T), typeof(measure), typeof(mask)}(
+        geometry, (x_T, y_T, z_T), measure, mask, per,
+    )
+end
+
 # ---------------------------------------------------------------------------
 # Curvilinear Grid
 # ---------------------------------------------------------------------------

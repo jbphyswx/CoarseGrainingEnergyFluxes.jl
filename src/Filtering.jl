@@ -172,7 +172,7 @@ end
 function filter_field!(
     out::AbstractArray{T,3},
     field::AbstractArray{<:Any,3},
-    grid::Grids.StructuredGrid,
+    grid::Grids.StructuredGrid{<:Geometry.AbstractGeometry,T,2},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     mask_strategy::AbstractMaskStrategy = Deformable(),
@@ -221,13 +221,26 @@ end
 @inline _band(::FilterFootprint, ::Grids.StructuredGrid{<:Geometry.SphericalGeometry}, j::Integer) = j
 
 """
+    FilterFootprintND{N, T}
+
+General N-dimensional footprint: in-support neighbour offsets (`NTuple{N,Int}`) and their geometric
+weights `w = kernel_weight(distance) · cell_measure`. Used for 1D and 3D (Cartesian,
+translation-invariant ⇒ a single offset set); the 2D path uses the optimized per-row
+`FilterFootprint`.
+"""
+struct FilterFootprintND{N, T<:AbstractFloat}
+    offsets::Vector{NTuple{N,Int}}
+    w::Vector{T}
+end
+
+"""
     build_footprint(grid, kernel, scale) -> FilterFootprint
 
 Precompute the (type-stable) convolution footprint once; reusable across all longitudes, scales'
 worth of fields, and depth layers.
 """
 function build_footprint(
-    grid::Grids.StructuredGrid{G,T},
+    grid::Grids.StructuredGrid{G,T,2},
     kernel::Kernels.AbstractFilterKernel,
     scale::T,
 ) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
@@ -360,19 +373,105 @@ function apply_footprint_row!(
     return out
 end
 
-"Serial 2D filter: build the footprint once, then convolve."
+# ---------------------------------------------------------------------------
+# General N-dimensional engine (1D + 3D Cartesian); the 2D path uses the per-row engine above.
+# ---------------------------------------------------------------------------
+
+@inline _cartesian_spacing(geo::Geometry.CartesianGeometry, d::Integer) = d == 1 ? geo.dx : (d == 2 ? geo.dy : geo.dz)
+
+# Dispatched on N = 1 and N = 3 so it never collides with the N = 2 build_footprint above.
+build_footprint(grid::Grids.StructuredGrid{G,T,1}, kernel::Kernels.AbstractFilterKernel, scale::T) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}} =
+    _build_footprint_nd(grid, kernel, scale)
+build_footprint(grid::Grids.StructuredGrid{G,T,3}, kernel::Kernels.AbstractFilterKernel, scale::T) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}} =
+    _build_footprint_nd(grid, kernel, scale)
+
+function _build_footprint_nd(
+    grid::Grids.StructuredGrid{G,T,N},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T,
+) where {N, T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
+    rad = Kernels.kernel_radius(kernel, scale)
+    spacing = ntuple(d -> _cartesian_spacing(grid.geometry, d), N)
+    A = grid.measure[ntuple(_ -> 1, N)...]   # uniform Cartesian cell measure
+    lim = ntuple(d -> spacing[d] > 0 ? ceil(Int, rad / spacing[d]) : 0, N)
+    offsets = NTuple{N,Int}[]
+    w = T[]
+    for off in CartesianIndices(ntuple(d -> (-lim[d]):lim[d], N))
+        o = Tuple(off)
+        d2 = zero(T)
+        for d in 1:N
+            d2 += (T(o[d]) * spacing[d])^2
+        end
+        dist = sqrt(d2)
+        if dist <= rad
+            push!(offsets, o)
+            push!(w, Kernels.kernel_weight(kernel, dist, scale) * A)
+        end
+    end
+    return FilterFootprintND{N,T}(offsets, w)
+end
+
+# Shifted neighbour multi-index with per-axis periodic wrap; returns (index, in-bounds?).
+@inline function _shift_index(I::NTuple{N,Int}, o::NTuple{N,Int}, dims::NTuple{N,Int}, periodic::NTuple{N,Bool}) where {N}
+    J = ntuple(N) do d
+        jj = I[d] + o[d]
+        (jj < 1 || jj > dims[d]) ? (periodic[d] ? mod1(jj, dims[d]) : 0) : jj
+    end
+    return J, !any(==(0), J)
+end
+
+function apply_footprint_nd!(
+    out::AbstractArray{T,N},
+    field::AbstractArray,
+    grid::Grids.StructuredGrid{G,T,N},
+    fp::FilterFootprintND{N,T},
+    strategy::AbstractMaskStrategy,
+) where {N, T<:AbstractFloat, G}
+    dims = Grids.size_tuple(grid)
+    periodic = grid.periodic
+    mask = grid.mask
+    fill!(out, zero(T))
+    @inbounds for I in CartesianIndices(out)
+        mask[I] || continue
+        Ti = Tuple(I)
+        ws = zero(T)
+        wn = zero(T)
+        for k in eachindex(fp.offsets)
+            J, valid = _shift_index(Ti, fp.offsets[k], dims, periodic)
+            valid || continue
+            wet = mask[J...]
+            wk = fp.w[k]
+            if strategy isa ZeroFill
+                wn += wk
+                wet && (ws += wk * field[J...])
+            elseif wet
+                wn += wk
+                ws += wk * field[J...]
+            end
+        end
+        out[I] = wn > T(1e-15) ? ws / wn : zero(T)
+    end
+    return out
+end
+
+"Serial filter: build the footprint once, then convolve (2D per-row engine, or general n-D engine)."
 function serial_filter_field!(
-    out::AbstractMatrix{T},
-    field::AbstractMatrix,
+    out::AbstractArray{T},
+    field::AbstractArray,
     grid::Grids.StructuredGrid{G,T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T,
     strategy::AbstractMaskStrategy,
     workspace,
 ) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
-    fp = build_footprint(grid, kernel, scale)
-    return apply_footprint!(out, field, grid, fp, strategy, Grids.isperiodic(grid, 1))
+    return _apply_serial!(out, field, grid, build_footprint(grid, kernel, scale), strategy)
 end
+
+# Dispatch the apply on the footprint kind.
+_apply_serial!(out, field, grid, fp::FilterFootprint, strategy) =
+    apply_footprint!(out, field, grid, fp, strategy, Grids.isperiodic(grid, 1))
+_apply_serial!(out, field, grid, fp::FilterFootprintND, strategy) =
+    apply_footprint_nd!(out, field, grid, fp, strategy)
 
 # ---------------------------------------------------------------------------
 # Reusable filter plans: build the footprint ONCE, apply to many fields/scales
@@ -388,11 +487,10 @@ backends (FFTW/FINUFFT/SHT extensions, Phase 5) hold cached transform plans.
 abstract type AbstractFilterPlan end
 
 "Physical-space plan: a precomputed footprint reused across all longitudes, fields, and layers."
-struct PhysicalFilterPlan{T<:AbstractFloat, FP<:FilterFootprint{T}, G<:Grids.StructuredGrid, S<:AbstractMaskStrategy} <: AbstractFilterPlan
-    footprint::FP
+struct PhysicalFilterPlan{FP, G<:Grids.StructuredGrid, S<:AbstractMaskStrategy} <: AbstractFilterPlan
+    footprint::FP   # FilterFootprint (2D) or FilterFootprintND (1D/3D)
     grid::G
     strategy::S
-    periodic_lon::Bool
 end
 
 "Fallback plan for backends without a precomputed footprint yet — defers to `filter_field!`."
@@ -425,7 +523,7 @@ function plan_filter(
     resolved = Backends.resolve_backend(backend)
     if resolved isa Backends.SerialBackend
         fp = build_footprint(grid, kernel, scale)
-        return PhysicalFilterPlan(fp, grid, mask_strategy, Grids.isperiodic(grid, 1))
+        return PhysicalFilterPlan(fp, grid, mask_strategy)
     else
         return FallbackFilterPlan(grid, kernel, scale, mask_strategy, resolved)
     end
@@ -436,10 +534,10 @@ end
 
 Apply a prebuilt [`plan_filter`](@ref) to a single 2D field.
 """
-filter_apply!(out::AbstractMatrix, field::AbstractMatrix, plan::PhysicalFilterPlan) =
-    apply_footprint!(out, field, plan.grid, plan.footprint, plan.strategy, plan.periodic_lon)
+filter_apply!(out::AbstractArray, field::AbstractArray, plan::PhysicalFilterPlan) =
+    _apply_serial!(out, field, plan.grid, plan.footprint, plan.strategy)
 
-filter_apply!(out::AbstractMatrix, field::AbstractMatrix, plan::FallbackFilterPlan) =
+filter_apply!(out::AbstractArray, field::AbstractArray, plan::FallbackFilterPlan) =
     filter_field!(out, field, plan.grid, plan.kernel, plan.scale; mask_strategy = plan.strategy, backend = plan.backend)
 
 """
