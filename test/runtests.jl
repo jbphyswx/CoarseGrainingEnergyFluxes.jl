@@ -145,6 +145,36 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         Test.@test_nowarn CGEF.filter_field!(out_sph, field_sph, grid_sph, CGEF.TopHatKernel(), 1e6)
     end
 
+    # Execution backend lattice (Backends.jl)
+    Test.@testset "Backends" begin
+        # resolve_backend returns INSTANCES; AutoBackend picks a concrete local backend
+        Test.@test CGEF.Backends.resolve_backend(CGEF.SerialBackend()) === CGEF.SerialBackend()
+        Test.@test CGEF.Backends.resolve_backend(CGEF.AutoBackend()) isa Union{CGEF.SerialBackend, CGEF.ThreadedBackend}
+
+        # distribution wrappers are parametric over an inner local backend
+        Test.@test CGEF.DistributedBackend(CGEF.SerialBackend()) isa CGEF.DistributedBackend
+        Test.@test CGEF.MPIBackend() isa CGEF.MPIBackend
+        Test.@test CGEF.DistributedBackend().inner === CGEF.SerialBackend()
+        Test.@test CGEF.local_backend(CGEF.DistributedBackend(CGEF.ThreadedBackend())) === CGEF.ThreadedBackend()
+        Test.@test CGEF.is_distributed(CGEF.MPIBackend()) && !CGEF.is_distributed(CGEF.SerialBackend())
+
+        geom = CGEF.CartesianGeometry(1000.0, 1000.0)
+        lon = collect(0.0:1000.0:20e3)
+        lat = collect(0.0:1000.0:20e3)
+        grid = CGEF.StructuredGrid(geom, lon, lat, trues(length(lon), length(lat)))
+        field = rand(length(lon), length(lat))
+        out_serial = zeros(size(field))
+        out_default = zeros(size(field))
+        CGEF.filter_field!(out_serial, field, grid, CGEF.TopHatKernel(), 5000.0; backend = CGEF.SerialBackend())
+        CGEF.filter_field!(out_default, field, grid, CGEF.TopHatKernel(), 5000.0)  # AutoBackend
+        Test.@test out_serial ≈ out_default
+
+        # An unloaded backend errors helpfully rather than silently mis-dispatching
+        Test.@test_throws ArgumentError CGEF.filter_field!(
+            out_serial, field, grid, CGEF.TopHatKernel(), 5000.0; backend = CGEF.GPUBackend(:fake_device),
+        )
+    end
+
     # spatial finite differences and boundary stencil fallbacks
     Test.@testset "Derivatives" begin
         geom = CGEF.CartesianGeometry(2.0, 2.0)

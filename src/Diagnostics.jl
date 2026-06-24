@@ -5,6 +5,7 @@ using ..Grids: Grids
 using ..Kernels: Kernels
 using ..Filtering: Filtering
 using ..Derivatives: Derivatives
+using ..Backends: Backends
 
 export ΠWorkspace, compute_Π!, compute_filtering_spectrum
 
@@ -169,7 +170,7 @@ function compute_Π!(
     scale::T;
     ρ₀::T = T(1025.0),
     workspace::Union{Nothing, ΠWorkspace} = nothing,
-    backend::Filtering.AbstractExecutionBackend = Filtering.AutoBackend(),
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
     mask_strategy::Symbol = :renormalize
 ) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
     
@@ -503,7 +504,7 @@ function compute_filtering_spectrum(
     kernel::Kernels.AbstractFilterKernel,
     scales::AbstractVector;
     ρ₀::T = T(1025.0),
-    backend::Filtering.AbstractExecutionBackend = Filtering.AutoBackend(),
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
     mask_strategy::Symbol = :renormalize
 ) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
     

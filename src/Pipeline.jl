@@ -6,6 +6,7 @@ using ..Kernels: Kernels
 using ..Filtering: Filtering
 using ..Derivatives: Derivatives
 using ..Diagnostics: Diagnostics
+using ..Backends: Backends
 
 export CoarseGrainResult, coarse_grain
 
@@ -95,7 +96,7 @@ function coarse_grain(
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     ρ₀::T = T(1025.0),
-    backend::Filtering.AbstractExecutionBackend = Filtering.AutoBackend(),
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
     mask_strategy::Symbol = :renormalize
 ) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
     
@@ -150,7 +151,7 @@ function coarse_grain(
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     ρ₀::T = T(1025.0),
-    backend::Filtering.AbstractExecutionBackend = Filtering.AutoBackend(),
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
     mask_strategy::Symbol = :renormalize
 ) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
     return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, ρ₀=ρ₀, backend=backend, mask_strategy=mask_strategy)

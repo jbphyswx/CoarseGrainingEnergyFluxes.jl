@@ -3,40 +3,35 @@ module Filtering
 using ..Geometry: Geometry
 using ..Grids: Grids
 using ..Kernels: Kernels
+using ..Backends: Backends
 
-export AbstractExecutionBackend, SerialBackend, ThreadedBackend, DistributedBackend, GPUBackend, FINUFFTBackend, AutoBackend
 export filter_field!, filter_field_zero!, filter_field_renorm!
 
 # ---------------------------------------------------------------------------
-# Execution Backends
+# Extension hook points
 # ---------------------------------------------------------------------------
+# Fallbacks that error until the relevant backend extension is loaded. Each execution-backend
+# extension overrides its hook; the public `filter_field!` dispatches here based on the resolved
+# backend. (Backend TYPES live in `Types`; these are the per-backend filtering implementations.)
 
-abstract type AbstractExecutionBackend end
-
-struct SerialBackend      <: AbstractExecutionBackend end
-struct ThreadedBackend    <: AbstractExecutionBackend end
-struct DistributedBackend <: AbstractExecutionBackend end
-struct GPUBackend{B}      <: AbstractExecutionBackend
-    backend::B
-end
-struct FINUFFTBackend     <: AbstractExecutionBackend end
-struct AutoBackend        <: AbstractExecutionBackend end
-
-# Default fallback functions for thread/distributed backends in case their extensions are not loaded
 function threaded_filter_field!(args...; kwargs...)
-    throw(ArgumentError("Threaded backend is unavailable. Load the OhMyThreads package or use SerialBackend()."))
+    throw(ArgumentError("ThreadedBackend is unavailable — run `using OhMyThreads` (or use SerialBackend())."))
 end
 
 function distributed_filter_field!(args...; kwargs...)
-    throw(ArgumentError("Distributed backend is unavailable. Load the Distributed package or use SerialBackend()."))
+    throw(ArgumentError("DistributedBackend is unavailable — run `using Distributed` (or use SerialBackend())."))
 end
 
 function gpu_filter_field!(args...; kwargs...)
-    throw(ArgumentError("GPU backend is unavailable. Load the KernelAbstractions package or use SerialBackend()."))
+    throw(ArgumentError("GPUBackend is unavailable — run `using KernelAbstractions` + a GPU backend (or use SerialBackend())."))
+end
+
+function mpi_filter_field!(args...; kwargs...)
+    throw(ArgumentError("MPIBackend is unavailable — run `using MPI` (or use SerialBackend())."))
 end
 
 function finufft_filter_field!(args...; kwargs...)
-    throw(ArgumentError("FINUFFT backend is unavailable. Load the FINUFFT package first."))
+    throw(ArgumentError("FINUFFT filtering is unavailable — run `using FINUFFT`."))
 end
 
 # ---------------------------------------------------------------------------
@@ -60,7 +55,7 @@ Filter a 2D field on a grid using a kernel at characteristic width scale (ℓ), 
   - `:zero`: Treats dry cells as zero velocity, renormalizes over wet+land
   - `:renormalize` / `:deformable`: Excludes land points entirely from numerator and denominator
 - `workspace=nothing`: Pre-allocated workspace for intermediate calculations
-- `backend::AbstractExecutionBackend=AutoBackend()`: Execution backend (SerialBackend, ThreadedBackend, etc.)
+- `backend::AbstractExecutionBackend=AutoBackend()`: Execution backend (SerialBackend, ThreadedBackend, GPUBackend, …)
 
 # Returns
 - `out`: The filtered field (same array as input)
@@ -87,14 +82,14 @@ function filter_field!(
     scale::T;
     mask_strategy::Symbol = :renormalize,
     workspace = nothing,
-    backend::AbstractExecutionBackend = AutoBackend()
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend()
 ) where {T<:AbstractFloat}
     
-    # 1. Resolve AutoBackend based on context
-    resolved_backend = resolve_backend(backend)
-    
-    # 2. Dispatch to the appropriate execution backend
-    if resolved_backend <: SerialBackend
+    # 1. Resolve AutoBackend to a concrete backend instance.
+    resolved = Backends.resolve_backend(backend)
+
+    # 2. Dispatch to the appropriate execution backend (extensions override the hook functions).
+    if resolved isa Backends.SerialBackend
         if mask_strategy == :zero
             filter_field_zero!(out, field, grid, kernel, scale, workspace)
         elseif mask_strategy == :renormalize || mask_strategy == :deformable
@@ -102,16 +97,18 @@ function filter_field!(
         else
             throw(ArgumentError("Unknown masking strategy: $mask_strategy"))
         end
-    elseif resolved_backend <: ThreadedBackend
+    elseif resolved isa Backends.ThreadedBackend
         threaded_filter_field!(out, field, grid, kernel, scale, mask_strategy, workspace)
-    elseif resolved_backend <: DistributedBackend
+    elseif resolved isa Backends.DistributedBackend
         distributed_filter_field!(out, field, grid, kernel, scale, mask_strategy, workspace)
-    elseif resolved_backend <: GPUBackend
-        gpu_filter_field!(resolved_backend, out, field, grid, kernel, scale, mask_strategy, workspace)
-    elseif resolved_backend <: FINUFFTBackend
-        finufft_filter_field!(out, field, grid, kernel, scale; mask_strategy=mask_strategy, workspace=workspace)
+    elseif resolved isa Backends.GPUBackend
+        gpu_filter_field!(resolved, out, field, grid, kernel, scale, mask_strategy, workspace)
+    elseif resolved isa Backends.MPIBackend
+        mpi_filter_field!(out, field, grid, kernel, scale, mask_strategy, workspace)
+    else
+        throw(ArgumentError("Unsupported backend: $(typeof(resolved))"))
     end
-    
+
     return out
 end
 
@@ -124,7 +121,7 @@ function filter_field!(
     scale::T;
     mask_strategy::Symbol = :renormalize,
     workspace = nothing,
-    backend::AbstractExecutionBackend = AutoBackend()
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend()
 ) where {T<:AbstractFloat}
     Ndepth = size(field, 3)
     for k in 1:Ndepth
@@ -133,20 +130,6 @@ function filter_field!(
         filter_field!(out_layer, field_layer, grid, kernel, scale; mask_strategy=mask_strategy, workspace=workspace, backend=backend)
     end
     return out
-end
-
-# Helper to automatically resolve backend
-function resolve_backend(backend::AbstractExecutionBackend)
-    if backend isa AutoBackend
-        # Check threads count
-        if Threads.nthreads() > 1
-            return ThreadedBackend
-        else
-            return SerialBackend
-        end
-    else
-        return typeof(backend)
-    end
 end
 
 # ---------------------------------------------------------------------------
