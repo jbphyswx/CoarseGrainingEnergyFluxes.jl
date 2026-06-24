@@ -8,7 +8,7 @@ using ..Derivatives: Derivatives
 using ..Backends: Backends
 
 export ΠWorkspace, compute_Π!, cumulative_energy, filtering_spectrum
-export tau_decomposition, compute_Π_decomposed
+export tau_decomposition, compute_Π_decomposed, tracer_variance_flux
 
 """
     ΠWorkspace{T, A}
@@ -815,6 +815,54 @@ function compute_Π_decomposed(
 
     Πr = contract(τr); Πc = contract(τc); Πd = contract(τd)
     return (; total = Πr .+ Πc .+ Πd, rotational = Πr, cross = Πc, divergent = Πd)
+end
+
+# ---------------------------------------------------------------------------
+# Cross-scale tracer-variance flux (scalar analog of Π; buoyancy ⇒ APE transfer)
+# ---------------------------------------------------------------------------
+
+"""
+    tracer_variance_flux(u, v, θ, grid, kernel, scale; backend=AutoBackend(), mask_strategy=Deformable())
+        -> Πθ
+
+Cross-scale flux of the tracer variance ½⟨θ'²⟩ at filter scale ℓ (the scalar analog of the kinetic
+energy flux Π; Aluie & Eyink):
+
+    Πθ(x) = -∂_j θ̄ · τ_j(u, θ),   τ_j = ⟨u_j θ⟩ - ū_j θ̄  (the subfilter tracer flux),
+
+with the same sign convention as [`compute_Π!`](@ref): `Πθ > 0` is a forward cascade of tracer
+variance toward small scales, `Πθ < 0` an inverse cascade.
+
+Taking `θ` to be the **buoyancy** `b = -g ρ'/ρ₀` makes this the cross-scale transfer of buoyancy
+variance (the available-potential-energy-related transfer). Unlike the full Lees & Aluie (2019)
+baropycnal work — which additionally requires the pressure field — this needs only `(u, v, θ)`.
+
+Cartesian 2D (uses the physical-gradient derivatives `ddx!`/`ddy!`); spherical/3D deferred.
+"""
+function tracer_variance_flux(
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    θ::AbstractMatrix,
+    grid::Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+    flt(f) = (o = zeros(T, size(f)); Filtering.filter_apply!(o, f, plan); o)
+
+    ū = flt(u); v̄ = flt(v); θ̄ = flt(θ)
+    # Subfilter tracer flux τ_j = ⟨u_j θ⟩ - ū_j θ̄.
+    τx = flt(u .* θ) .- ū .* θ̄
+    τy = flt(v .* θ) .- v̄ .* θ̄
+
+    # Resolved tracer gradient ∂_j θ̄.
+    gx = similar(θ̄); Derivatives.ddx!(gx, θ̄, grid)
+    gy = similar(θ̄); Derivatives.ddy!(gy, θ̄, grid)
+
+    mask = grid.mask
+    return ifelse.(mask, .-(τx .* gx .+ τy .* gy), zero(T))
 end
 
 end # module

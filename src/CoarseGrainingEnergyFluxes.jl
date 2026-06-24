@@ -53,9 +53,9 @@ export ddx!, ddy!, ddz!
 
 # Re-export public components from Diagnostics
 using .Diagnostics: ΠWorkspace, compute_Π!, cumulative_energy, filtering_spectrum, spectral_density,
-    tau_decomposition, compute_Π_decomposed
+    tau_decomposition, compute_Π_decomposed, tracer_variance_flux
 export ΠWorkspace, compute_Π!, cumulative_energy, filtering_spectrum, spectral_density,
-    tau_decomposition, compute_Π_decomposed
+    tau_decomposition, compute_Π_decomposed, tracer_variance_flux
 
 # Re-export public components from Pipeline
 using .Pipeline: CoarseGrainResult, coarse_grain

@@ -1046,6 +1046,36 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         Test.@test dec_r.rotational ≈ Πfull
     end
 
+    # Cross-scale tracer-variance flux (scalar analog of Π).
+    Test.@testset "Tracer variance flux" begin
+        geom = CGEF.CartesianGeometry(1000.0, 1000.0)
+        x = collect(0.0:1000.0:30e3); y = collect(0.0:1000.0:30e3)
+        grid = CGEF.StructuredGrid(geom, x, y, trues(length(x), length(y)))
+        u = rand(length(x), length(y)) .- 0.5
+        v = rand(length(x), length(y)) .- 0.5
+        θ = rand(length(x), length(y))
+        kern = CGEF.TopHatKernel(); scale = 5000.0
+
+        # (1) constant tracer ⇒ zero gradient ⇒ zero flux.
+        Πc = CGEF.tracer_variance_flux(u, v, fill(2.5, size(θ)), grid, kern, scale)
+        Test.@test maximum(abs, Πc) < 1e-9
+
+        # (2) matches the explicit definition Πθ = -(τx ∂x θ̄ + τy ∂y θ̄) built from primitives.
+        Πθ = CGEF.tracer_variance_flux(u, v, θ, grid, kern, scale)
+        ub = zeros(size(u)); vb = zeros(size(v)); θb = zeros(size(θ))
+        CGEF.filter_field!(ub, u, grid, kern, scale)
+        CGEF.filter_field!(vb, v, grid, kern, scale)
+        CGEF.filter_field!(θb, θ, grid, kern, scale)
+        uθ = zeros(size(u)); vθ = zeros(size(u))
+        CGEF.filter_field!(uθ, u .* θ, grid, kern, scale)
+        CGEF.filter_field!(vθ, v .* θ, grid, kern, scale)
+        τx = uθ .- ub .* θb; τy = vθ .- vb .* θb
+        gx = zeros(size(θ)); gy = zeros(size(θ))
+        CGEF.ddx!(gx, θb, grid); CGEF.ddy!(gy, θb, grid)
+        ref = .-(τx .* gx .+ τy .* gy)
+        Test.@test Πθ ≈ ref
+    end
+
     # The CairoMakie viz functions are parent-owned stubs; without the extension loaded they must
     # raise a helpful error (the real methods are exercised when `using CairoMakie`).
     Test.@testset "Visualization stubs" begin
