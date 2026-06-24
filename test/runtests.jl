@@ -62,20 +62,25 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
     # Kernel shape evaluation and support range tests
     Test.@testset "Kernels" begin
         th = CGEF.TopHatKernel()
-        g  = CGEF.GaussianKernel()
+        g  = CGEF.GaussianKernel()            # default Pope convention, α = 6
+        g4 = CGEF.GaussianKernel(; α = 4.0)   # FlowSieve convention
         ss = CGEF.SharpSpectralKernel()
 
         # Width 100 km
         ℓ = 100000.0
         Test.@test CGEF.kernel_weight(th, 10000.0, ℓ) == 1.0
         Test.@test CGEF.kernel_weight(th, 60000.0, ℓ) == 0.0
-
         Test.@test CGEF.kernel_radius(th, ℓ) == ℓ / 2
-        Test.@test CGEF.kernel_radius(g, ℓ) == 3 * ℓ
 
-        # Test generic evaluation limits
+        # Gaussian: exponent is configurable; default 6 (Pope), 4 reproduces FlowSieve
         Test.@test CGEF.kernel_weight(g, 0.0, ℓ) == 1.0
         Test.@test CGEF.kernel_weight(g, ℓ, ℓ) ≈ exp(-6.0)
+        Test.@test CGEF.kernel_weight(g4, ℓ, ℓ) ≈ exp(-4.0)
+
+        # Gaussian footprint truncates where the weight is negligible (~2ℓ for α=6, not the old 3ℓ)
+        r = CGEF.kernel_radius(g, ℓ)
+        Test.@test 1.5ℓ < r < 2.5ℓ
+        Test.@test CGEF.kernel_weight(g, r, ℓ) < 1e-9
     end
 
     # Grids constructor and area calculations
