@@ -1020,4 +1020,13 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         # Reynolds (subfilter–subfilter) stress trace is non-negative (Jensen).
         Test.@test all(d.R.xx .+ d.R.yy .>= -1e-10)
     end
+
+    # The CairoMakie viz functions are parent-owned stubs; without the extension loaded they must
+    # raise a helpful error (the real methods are exercised when `using CairoMakie`).
+    Test.@testset "Visualization stubs" begin
+        Test.@test isdefined(CGEF, :plot_Π_map)
+        Test.@test isdefined(CGEF, :plot_spectrum)
+        Test.@test_throws ArgumentError CGEF.plot_Π_map(nothing, 1, nothing)
+        Test.@test_throws ArgumentError CGEF.plot_spectrum(nothing)
+    end
 end

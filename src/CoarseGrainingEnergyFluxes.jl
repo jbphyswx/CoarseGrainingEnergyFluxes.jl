@@ -11,6 +11,7 @@ include("Filtering.jl")
 include("Derivatives.jl")
 include("Diagnostics.jl")
 include("Pipeline.jl")
+include("Visualization.jl")
 
 # Re-export public components from Geometry
 using .Geometry: AbstractGeometry, CartesianGeometry, SphericalGeometry
@@ -57,6 +58,10 @@ export ΠWorkspace, compute_Π!, cumulative_energy, filtering_spectrum, spectral
 # Re-export public components from Pipeline
 using .Pipeline: CoarseGrainResult, coarse_grain
 export CoarseGrainResult, coarse_grain
+
+# Visualization stubs (real methods provided by the CairoMakie package extension)
+using .Visualization: plot_Π_map, plot_spectrum
+export plot_Π_map, plot_spectrum
 
 # Precompile workload to minimize Time To First Execution (TTFX)
 @setup_workload begin

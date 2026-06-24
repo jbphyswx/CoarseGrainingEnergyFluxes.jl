@@ -1,66 +1,78 @@
 module CoarseGrainingEnergyFluxesCairoMakieExt
 
-using CoarseGrainingEnergyFluxes
-using CairoMakie
+using CairoMakie: CairoMakie
+using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 
-export plot_Π_map, plot_spectrum
+# Methods for the parent-owned visualization stubs (`CGEF.plot_Π_map`, `CGEF.plot_spectrum`). Every
+# Makie call stays qualified (`CairoMakie.Figure`, …) per the package's explicit-import policy.
 
 """
-    plot_Π_map(res, scale_idx, grid; kwargs...)
+    plot_Π_map(res, scale_idx, grid; colormap=:balance, title=nothing) -> Figure
 
-Create and save a high-quality heatmap visualization of the 2D energy transfer Π map at the specified scale index.
+Heatmap of the energy-flux map `res.Π[scale_idx]` with a symmetric divergent color range so forward
+(Π>0) and inverse (Π<0) cascade read at a glance.
 """
-function plot_Π_map(
-    res::CoarseGrainResult{T},
+function CGEF.plot_Π_map(
+    res::CGEF.CoarseGrainResult{T},
     scale_idx::Integer,
-    grid::StructuredGrid{G,T};
+    grid::CGEF.StructuredGrid{G,T};
     colormap = :balance,
-    title = nothing
+    title = nothing,
 ) where {T<:AbstractFloat, G}
-    
     1 <= scale_idx <= length(res.scales) || throw(BoundsError(res.scales, scale_idx))
-    
+
     Π_map = res.Π[scale_idx]
     scale = res.scales[scale_idx]
-    
-    # Pre-allocate layout and figure
-    fig = Figure(resolution = (800, 650))
-    ax = Axis(
-        fig[1, 1],
-        xlabel = G <: SphericalGeometry ? "Longitude (rad)" : "X (meters)",
-        ylabel = G <: SphericalGeometry ? "Latitude (rad)" : "Y (meters)",
-        title = title === nothing ? "Kinetic Energy Flux (Π) at Scale ℓ = $(round(scale/1000, digits=1)) km" : title
+    spherical = G <: CGEF.SphericalGeometry
+
+    fig = CairoMakie.Figure(size = (800, 650))
+    ax = CairoMakie.Axis(
+        fig[1, 1];
+        xlabel = spherical ? "Longitude (rad)" : "X (m)",
+        ylabel = spherical ? "Latitude (rad)" : "Y (m)",
+        title = title === nothing ?
+            "Energy flux Π at ℓ = $(round(scale / 1000; digits = 1)) km" : title,
     )
-    
-    # Symmetric limits for divergent/cascade colormap (:balance)
-    max_val = maximum(abs.(Π_map))
-    limits = (-max_val, max_val)
-    
-    hm = heatmap!(ax, grid.lon, grid.lat, Π_map, colormap = colormap, colorrange = limits)
-    Colorbar(fig[1, 2], hm, label = "Π (W / m³)")
-    
+
+    # Symmetric limits centered on zero for the divergent cascade colormap.
+    max_val = maximum(abs, Π_map)
+    colorrange = max_val > 0 ? (-max_val, max_val) : (-one(T), one(T))
+
+    hm = CairoMakie.heatmap!(ax, grid.lon, grid.lat, Π_map; colormap = colormap, colorrange = colorrange)
+    CairoMakie.Colorbar(fig[1, 2], hm; label = "Π (W m⁻³)")
     return fig
 end
 
 """
-    plot_spectrum(res; kwargs...)
+    plot_spectrum(res; which=:density) -> Figure
 
-Plot the filtering energy spectrum E(ℓ) vs scale ℓ on log-log axes.
+`which = :density` plots the filtering spectral density `Ẽ(k_ℓ)` vs filtering wavenumber `k_ℓ`
+(log x, linear y — the density may dip negative near the endpoints); `which = :cumulative` plots the
+cumulative coarse KE vs scale `ℓ` on log–log axes.
 """
-function plot_spectrum(res::CoarseGrainResult{T}) where {T<:AbstractFloat}
-    fig = Figure(resolution = (700, 500))
-    ax = Axis(
-        fig[1, 1],
-        xscale = log10,
-        yscale = log10,
-        xlabel = "Scale ℓ (meters)",
-        ylabel = "Filtering Energy Spectrum E(ℓ) (m²/s²)",
-        title = "Filtering Kinetic Energy Spectrum"
-    )
-    
-    lines!(ax, res.scales, res.spectrum, color = :royalblue, linewidth = 2.5)
-    scatter!(ax, res.scales, res.spectrum, color = :royalblue, markersize = 8)
-    
+function CGEF.plot_spectrum(res::CGEF.CoarseGrainResult{T}; which::Symbol = :density) where {T<:AbstractFloat}
+    fig = CairoMakie.Figure(size = (700, 500))
+    if which === :cumulative
+        ax = CairoMakie.Axis(
+            fig[1, 1];
+            xscale = log10, yscale = log10,
+            xlabel = "Scale ℓ (m)", ylabel = "Cumulative coarse KE  ½ρ₀⟨|ū_ℓ|²⟩ (J m⁻³)",
+            title = "Cumulative coarse-grained kinetic energy",
+        )
+        CairoMakie.lines!(ax, res.scales, res.cumulative_energy; color = :royalblue, linewidth = 2.5)
+        CairoMakie.scatter!(ax, res.scales, res.cumulative_energy; color = :royalblue, markersize = 8)
+    elseif which === :density
+        ax = CairoMakie.Axis(
+            fig[1, 1];
+            xscale = log10,
+            xlabel = "Filtering wavenumber k_ℓ", ylabel = "Filtering spectral density Ẽ(k_ℓ)",
+            title = "Filtering spectrum (Sadek & Aluie 2018)",
+        )
+        CairoMakie.lines!(ax, res.wavenumber, res.filtering_spectrum; color = :firebrick, linewidth = 2.5)
+        CairoMakie.scatter!(ax, res.wavenumber, res.filtering_spectrum; color = :firebrick, markersize = 8)
+    else
+        throw(ArgumentError("`which` must be :density or :cumulative, got :$which"))
+    end
     return fig
 end
 
