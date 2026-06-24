@@ -282,7 +282,8 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         sv = fill(Float32(0.5), length(slon), length(slat))
         sres = CGEF.coarse_grain(su, sv, sgrid; scales=[50000.0], kernel=CGEF.TopHatKernel())
         Test.@test !any(isnan, sres.Π[1])
-        Test.@test !any(isnan, sres.spectrum)
+        Test.@test !any(isnan, sres.cumulative_energy)
+        Test.@test !any(isnan, sres.filtering_spectrum)
     end
 
     # Test periodic boundary handling for spherical grids
@@ -724,32 +725,37 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         end
     end
 
-    # Mathematical correctness: Area-weighted spectrum normalization
-    Test.@testset "Spectrum Normalization" begin
-        # For uniform velocity field, the *cumulative* coarse KE equals the kinetic energy
-        # E(ℓ) = 0.5 * ρ₀ * (u² + v²) for all ℓ
-
+    # Cumulative coarse KE (Sadek-Aluie Eq.15) vs the filtering spectral density (Eq.14)
+    Test.@testset "Filtering spectrum" begin
         geom = CGEF.CartesianGeometry(2000.0, 2000.0)
         lon = collect(0.0:2000.0:100e3)
         lat = collect(0.0:2000.0:100e3)
-        mask = trues(length(lon), length(lat))
-        grid = CGEF.StructuredGrid(geom, lon, lat, mask)
+        grid = CGEF.StructuredGrid(geom, lon, lat, trues(length(lon), length(lat)))
 
         U = 0.5  # m/s
         V = 0.3  # m/s
         u = fill(U, length(lon), length(lat))
         v = fill(V, length(lon), length(lat))
-
         ρ₀ = 1025.0
         expected_energy = 0.5 * ρ₀ * (U^2 + V^2)
-
         scales = [5000.0, 10000.0, 20000.0, 40000.0]
-        spectrum = CGEF.compute_filtering_spectrum(u, v, nothing, grid, CGEF.TopHatKernel(), scales; ρ₀=ρ₀)
 
-        # TODO(Phase 4): `compute_filtering_spectrum` currently returns the CUMULATIVE coarse KE
-        # (Sadek & Aluie 2018, Eq. 15), NOT the filtering spectral density (their Eq. 14, the
-        # k_ℓ-derivative). This testset asserts the wrong contract, so it is skipped until the
-        # Phase-4 split into `cumulative_energy` + `filtering_spectrum`.
-        Test.@test_skip all(E ≈ expected_energy for E in spectrum)
+        # A uniform field is unchanged by filtering, so the CUMULATIVE coarse KE equals the kinetic
+        # energy at every scale (Eq. 15).
+        cumE = CGEF.cumulative_energy(u, v, nothing, grid, CGEF.TopHatKernel(), scales; ρ₀=ρ₀)
+        for E in cumE
+            Test.@test E ≈ expected_energy rtol=1e-6
+        end
+
+        # Since the cumulative energy is constant in ℓ, the filtering spectral DENSITY (its
+        # k_ℓ-derivative, Eq. 14) must be ≈ 0 everywhere — NOT equal to the energy.
+        kℓ, Ẽ = CGEF.filtering_spectrum(u, v, nothing, grid, CGEF.TopHatKernel(), scales; ρ₀=ρ₀, L=1.0)
+        Test.@test length(kℓ) == length(scales)
+        Test.@test all(abs.(Ẽ) .< 1e-6 * expected_energy)
+
+        # spectral_density reproduces a known derivative: C(k)=k² ⇒ dC/dk = 2k (central differences
+        # are exact for a quadratic on a uniform grid).
+        kk = collect(1.0:1.0:5.0)
+        Test.@test CGEF.spectral_density(kk .^ 2, kk)[3] ≈ 2 * kk[3]
     end
 end

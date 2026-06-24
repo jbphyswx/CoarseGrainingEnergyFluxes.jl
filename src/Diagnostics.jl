@@ -7,7 +7,7 @@ using ..Filtering: Filtering
 using ..Derivatives: Derivatives
 using ..Backends: Backends
 
-export ΠWorkspace, compute_Π!, compute_filtering_spectrum
+export ΠWorkspace, compute_Π!, cumulative_energy, filtering_spectrum
 
 """
     ΠWorkspace{T, A}
@@ -463,12 +463,12 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    compute_filtering_spectrum(u, v, w, grid, kernel, scales; ρ₀=1025.0, backend=AutoBackend(), mask_strategy=Deformable())
+    cumulative_energy(u, v, w, grid, kernel, scales; ρ₀=1025.0, backend=AutoBackend(), mask_strategy=Deformable())
 
-Compute the filtering kinetic energy spectrum E(ℓ) = 0.5 * ρ₀ * ⟨|ū_ℓ|²⟩.
-
-The filtering spectrum characterizes the distribution of kinetic energy across
-scales through coarse-grained (filtered) velocities.
+Cumulative coarse-grained kinetic energy `E(ℓ) = 0.5 ρ₀ ⟨|ū_ℓ|²⟩` at each filter scale
+(Sadek & Aluie 2018, PRF, Eq. 15). This is the CUMULATIVE quantity; the filtering spectral DENSITY
+(comparable to a Fourier energy spectrum) is its derivative w.r.t. filtering wavenumber — see
+[`filtering_spectrum`](@ref).
 
 # Arguments
 - `u::AbstractMatrix`: Eastward/zonal velocity component
@@ -496,11 +496,14 @@ where the integrals are over the wet domain.
 # Examples
 ```julia
 scales = collect(10000.0:10000.0:100000.0)  # 10-100 km
-spectrum = compute_filtering_spectrum(u, v, grid, TopHatKernel(), scales)
-# spectrum[i] is energy at scale scales[i]
+E = cumulative_energy(u, v, nothing, grid, TopHatKernel(), scales)
+# E[i] is the cumulative coarse KE at scale scales[i]
 ```
+
+# References
+- Sadek & Aluie (2018), *Phys. Rev. Fluids* 3, 124610 — extracting the spectrum by filtering.
 """
-function compute_filtering_spectrum(
+function cumulative_energy(
     u::AbstractMatrix,
     v::AbstractMatrix,
     w::Union{Nothing, AbstractMatrix},
@@ -561,6 +564,62 @@ function compute_filtering_spectrum(
     end
     
     return spectrum
+end
+
+"""
+    filtering_spectrum(u, v, w, grid, kernel, scales; ρ₀=1025.0, L=1, backend=AutoBackend(), mask_strategy=Deformable())
+        -> (k_ℓ, Ẽ)
+
+Filtering spectral DENSITY (Sadek & Aluie 2018, PRF, Eq. 14): the derivative of the cumulative
+coarse-grained KE w.r.t. the filtering wavenumber `k_ℓ = L/ℓ`,
+
+    Ẽ(k_ℓ) = d/dk_ℓ [ ½ρ₀⟨|ū_ℓ|²⟩ ] = -(ℓ²/L) d/dℓ[ ½ρ₀⟨|ū_ℓ|²⟩ ].
+
+Unlike [`cumulative_energy`](@ref) (the cumulative quantity, Eq. 15), this is the spectral density
+comparable to a Fourier energy spectrum. `L` is the region length: pass the domain size for the
+Sadek–Aluie convention `k_ℓ = L/ℓ`; the default `L = 1` gives the FlowSieve convention `k_ℓ = 1/ℓ`.
+`scales` need not be uniform. Returns the filtering wavenumbers `k_ℓ` and the density `Ẽ` per scale.
+
+# References
+- Sadek & Aluie (2018), *Phys. Rev. Fluids* 3, 124610.
+"""
+function filtering_spectrum(
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    w::Union{Nothing, AbstractMatrix},
+    grid::Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scales::AbstractVector;
+    ρ₀::T = T(1025.0),
+    L::Real = one(T),
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
+    cum = cumulative_energy(u, v, w, grid, kernel, scales; ρ₀=ρ₀, backend=backend, mask_strategy=mask_strategy)
+    kℓ = T(L) ./ T.(collect(scales))
+    return kℓ, spectral_density(cum, kℓ)
+end
+
+"""
+    spectral_density(C, k) -> dC/dk
+
+Non-uniform finite-difference derivative of cumulative values `C` w.r.t. `k` (central in the
+interior, one-sided at the ends). Returns zeros for fewer than two points.
+"""
+function spectral_density(C::AbstractVector{T}, k::AbstractVector) where {T<:AbstractFloat}
+    n = length(C)
+    g = zeros(T, n)
+    n < 2 && return g
+    @inbounds for i in 1:n
+        if i == 1
+            g[i] = (C[2] - C[1]) / (k[2] - k[1])
+        elseif i == n
+            g[i] = (C[n] - C[n-1]) / (k[n] - k[n-1])
+        else
+            g[i] = (C[i+1] - C[i-1]) / (k[i+1] - k[i-1])
+        end
+    end
+    return g
 end
 
 end # module
