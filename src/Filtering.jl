@@ -87,16 +87,18 @@ function mpi_filter_field!(args...; kwargs...)
     throw(ArgumentError("MPIBackend is unavailable — run `using MPI` (or use SerialBackend())."))
 end
 
-function finufft_filter_field!(args...; kwargs...)
-    throw(ArgumentError("FINUFFT filtering is unavailable — run `using FINUFFT`."))
-end
-
-# Build a spectral filter plan (overridden by FFTW / FastSphericalHarmonics / FINUFFT / NUFSHT
-# extensions, dispatched on the grid geometry). Errors until a compatible extension is loaded.
+# Build a spectral filter plan. Every spectral backend is a thin transform adapter that overrides
+# this for its grid type (forward transform → multiply by `spectral_transfer` → inverse transform):
+#   FFTW    StructuredGrid{Cartesian}     (uniform periodic Cartesian)
+#   FINUFFT UnstructuredGrid{Cartesian}   (scattered / non-uniform Cartesian)
+#   SHT     StructuredGrid{Spherical}     (uniform spherical, Gauss–Legendre × equiangular)
+#   NUFSHT  UnstructuredGrid{Spherical}   (scattered spherical)
+# Errors until a compatible extension is loaded.
 function spectral_filter_plan(grid, kernel, scale; kwargs...)
     throw(ArgumentError(
         "Spectral filtering is unavailable for $(typeof(grid)) — load a spectral backend " *
-        "(e.g. `using FFTW` for a uniform periodic Cartesian grid).",
+        "(`using FFTW` uniform Cartesian, `using FINUFFT` scattered Cartesian, " *
+        "`using FastSphericalHarmonics` uniform spherical, `using NUFSHT` scattered spherical).",
     ))
 end
 
@@ -537,6 +539,24 @@ end
 # every other grid (1D, true 3D, and the curvilinear/unstructured stubs) uses the serial engine.
 _row_parallelizable(::Grids.StructuredGrid{G,T,2}) where {G,T} = true
 _row_parallelizable(::Grids.AbstractGrid) = false
+
+# Non-structured grids (curvilinear / scattered) have no real-space footprint engine; their only
+# filtering path is a transform-backed spectral plan (FINUFFT / NUFSHT extensions). Structured grids
+# use the more specific method above, so this never shadows it.
+function plan_filter(
+    grid::Grids.AbstractGrid,
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    mask_strategy::AbstractMaskStrategy = Deformable(),
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    method::AbstractFilterMethod = Spectral(),
+) where {T<:AbstractFloat}
+    method isa Spectral || throw(ArgumentError(
+        "Only spectral filtering (`method = Spectral()`) is available for $(typeof(grid)); the " *
+        "real-space direct-sum engine requires a StructuredGrid.",
+    ))
+    return spectral_filter_plan(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
+end
 
 """
     filter_apply!(out, field, plan) -> out

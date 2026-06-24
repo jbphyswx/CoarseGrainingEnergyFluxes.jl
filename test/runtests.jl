@@ -4,6 +4,7 @@ using Aqua: Aqua
 using ExplicitImports: ExplicitImports as EI
 using JET: JET
 using FFTW: FFTW  # triggers the spectral-filtering extension
+using FINUFFT: FINUFFT  # triggers the scattered-Cartesian spectral extension
 using OhMyThreads: OhMyThreads  # triggers the threaded-backend extension
 using Distributed: Distributed  # with SharedArrays, triggers the distributed-backend extension
 using SharedArrays: SharedArrays
@@ -29,6 +30,7 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         # Per-extension checks (each loaded backend extension must also be import-clean).
         for extname in (
             :CoarseGrainingEnergyFluxesFFTWExt,
+            :CoarseGrainingEnergyFluxesFINUFFTExt,
             :CoarseGrainingEnergyFluxesOhMyThreadsExt,
             :CoarseGrainingEnergyFluxesDistributedExt,
             :CoarseGrainingEnergyFluxesGPUExt,
@@ -283,6 +285,37 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         # Non-periodic grid: spectral FFT must refuse.
         npgrid = CGEF.StructuredGrid(geom, x, y, trues(N, N))  # periodic = (false, false)
         Test.@test_throws ArgumentError CGEF.filter_field!(out, field, npgrid, g, ℓ; method = CGEF.Spectral())
+    end
+
+    # Scattered-Cartesian spectral filtering (FINUFFT): on a uniform periodic lattice it must
+    # reproduce the FFTW result, and it must preserve the mean of a constant field.
+    Test.@testset "Spectral FINUFFT filtering" begin
+        Nx, Ny = 32, 24
+        dx = dy = 1.0
+        geom = CGEF.CartesianGeometry(dx, dy)
+        x = collect(0.0:dx:dx*(Nx - 1)); y = collect(0.0:dy:dy*(Ny - 1))
+        u = [sin(2π*xi/(Nx*dx)) + 0.5cos(4π*yj/(Ny*dy)) + 0.3sin(6π*xi/(Nx*dx)) for xi in x, yj in y]
+        g = CGEF.GaussianKernel(); ℓ = 4.0
+
+        # FFTW reference on the structured grid.
+        sg = CGEF.StructuredGrid(geom, x, y, trues(Nx, Ny); periodic = (true, true))
+        outf = zeros(Nx, Ny)
+        CGEF.filter_field!(outf, u, sg, g, ℓ; method = CGEF.Spectral())
+
+        # The same points as a scattered (unstructured) grid; FINUFFT spectral filter.
+        ptsx = vec([xi for xi in x, _ in y]); ptsy = vec([yj for _ in x, yj in y])
+        ug = CGEF.UnstructuredGrid(geom, ptsx, ptsy, fill(dx*dy, Nx*Ny), trues(Nx*Ny), Vector{Vector{Int}}())
+        outu = zeros(Nx*Ny)
+        CGEF.filter_field!(outu, vec(u), ug, g, ℓ; method = CGEF.Spectral())
+        Test.@test reshape(outu, Nx, Ny) ≈ outf atol = 1e-7
+
+        # Constant field ⇒ mean preserved (Ĝ(0)=1) for the scattered transform.
+        cout = zeros(Nx*Ny)
+        CGEF.filter_field!(cout, fill(3.7, Nx*Ny), ug, g, ℓ; method = CGEF.Spectral())
+        Test.@test all(≈(3.7; atol = 1e-6), cout)
+
+        # TopHat spectral still errors (shared transfer function).
+        Test.@test_throws ArgumentError CGEF.filter_field!(outu, vec(u), ug, CGEF.TopHatKernel(), ℓ; method = CGEF.Spectral())
     end
 
     # Threaded backend must agree with serial EXACTLY (shared footprint engine), including masking

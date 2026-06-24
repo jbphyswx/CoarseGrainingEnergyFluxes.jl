@@ -8,20 +8,10 @@ using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 # multiply in Fourier space, so cost is O(N log N) and INDEPENDENT of the filter scale (vs the
 # direct sum's O(N · footprint)). Plans + the transfer-function array are built once and reused.
 #
-# The filter is applied as a multiply by the kernel's spectral transfer function Ĝ(|k|, ℓ),
-# normalized to 1 at k = 0 (so the domain mean is preserved). Masking is NOT applied (FFT assumes a
-# homogeneous periodic domain); use the direct-sum method for masked/regional grids.
-
-# Isotropic transfer functions Ĝ(|k|, ℓ).
-@inline _transfer(k::CGEF.GaussianKernel, kmag::T, ℓ::T) where {T} = exp(-kmag^2 * ℓ^2 / (T(4) * T(k.α)))
-@inline _transfer(::CGEF.SharpSpectralKernel, kmag::T, ℓ::T) where {T} = kmag <= T(π) / ℓ ? one(T) : zero(T)
-@inline function _transfer(::CGEF.TopHatKernel, kmag::T, ℓ::T) where {T}
-    throw(ArgumentError(
-        "Spectral filtering with TopHatKernel is not supported (its 2D transfer function is an " *
-        "oscillatory Airy pattern that rings). Use `method = DirectSum()` for the top-hat, or a " *
-        "GaussianKernel / SharpSpectralKernel for spectral filtering.",
-    ))
-end
+# The filter is applied as a multiply by the kernel's spectral transfer function Ĝ(|k|, ℓ)
+# (`CGEF.spectral_transfer`, shared with the other spectral backends), normalized to 1 at k = 0 (so
+# the domain mean is preserved). Masking is NOT applied (FFT assumes a homogeneous periodic domain);
+# use the direct-sum method for masked/regional grids.
 
 """
     FFTWFilterPlan
@@ -61,7 +51,7 @@ function CGEF.Filtering.spectral_filter_plan(
     # Angular wavenumbers (rfft halves the first axis).
     kx = T(2π) .* FFTW.rfftfreq(Nlon, one(T) / dx)
     ky = T(2π) .* FFTW.fftfreq(Nlat, one(T) / dy)
-    transfer = T[_transfer(kernel, sqrt(kx[i]^2 + ky[j]^2), scale) for i in eachindex(kx), j in eachindex(ky)]
+    transfer = T[CGEF.spectral_transfer(kernel, sqrt(kx[i]^2 + ky[j]^2), scale) for i in eachindex(kx), j in eachindex(ky)]
 
     sample = zeros(T, Nlon, Nlat)
     fwd = FFTW.plan_rfft(sample)

@@ -27,9 +27,9 @@ export coords, area, iswet, grid_geometry, size_tuple, isperiodic
 
 # Re-export public components from Kernels
 using .Kernels: AbstractFilterKernel, TopHatKernel, GaussianKernel, SharpSpectralKernel
-using .Kernels: kernel_weight, kernel_radius
+using .Kernels: kernel_weight, kernel_radius, spectral_transfer
 export AbstractFilterKernel, TopHatKernel, GaussianKernel, SharpSpectralKernel
-export kernel_weight, kernel_radius
+export kernel_weight, kernel_radius, spectral_transfer
 
 # Re-export the execution-backend taxonomy from Backends (matches ScatteringTransforms.jl).
 using .Backends: AbstractExecutionBackend, SerialBackend, ThreadedBackend, GPUBackend, AutoBackend,
