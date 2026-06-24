@@ -23,10 +23,24 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         Test.@test (EI.check_no_stale_explicit_imports(CGEF); true)
     end
 
-    Test.@testset "JET (deferred)" begin
-        # TODO(Phase 3+): JET.@test_opt / @test_call on filter_field!, compute_Π!, filtering_spectrum
-        # once the type-stability rework lands.
-        Test.@test_skip JET.test_package
+    Test.@testset "JET type stability (hot path)" begin
+        geom = CGEF.CartesianGeometry(1000.0, 1000.0)
+        lon = collect(0.0:1000.0:20e3)
+        lat = collect(0.0:1000.0:20e3)
+        grid = CGEF.StructuredGrid(geom, lon, lat, trues(length(lon), length(lat)))
+        field = rand(length(lon), length(lat))
+        out = zeros(size(field))
+        kern = CGEF.TopHatKernel()
+        scale = 5000.0
+
+        # Footprint build + the convolution apply must be type-stable.
+        JET.@test_opt CGEF.Filtering.build_footprint(grid, kern, scale)
+        fp = CGEF.Filtering.build_footprint(grid, kern, scale)
+        JET.@test_opt CGEF.Filtering.apply_footprint!(out, field, grid, fp, CGEF.Deformable(), false)
+        JET.@test_opt CGEF.Filtering.apply_footprint!(out, field, grid, fp, CGEF.ZeroFill(), false)
+
+        # The serial public entry point is type-stable too.
+        JET.@test_opt CGEF.filter_field!(out, field, grid, kern, scale; backend = CGEF.SerialBackend())
     end
 
     # Coordinate system and distance tests
