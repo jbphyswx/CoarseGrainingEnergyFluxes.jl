@@ -47,23 +47,31 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
     end
 
     Test.@testset "JET type stability (hot path)" begin
-        geom = CGEF.CartesianGeometry(1000.0, 1000.0)
-        lon = collect(0.0:1000.0:20e3)
-        lat = collect(0.0:1000.0:20e3)
-        grid = CGEF.StructuredGrid(geom, lon, lat, trues(length(lon), length(lat)))
-        field = rand(length(lon), length(lat))
-        out = zeros(size(field))
-        kern = CGEF.TopHatKernel()
-        scale = 5000.0
+        # JET tracks compiler internals and explicitly refuses to run on pre-release Julia
+        # (`@test_opt` throws on nightly/rc — it loads as a no-op stub). Skip there; the type-stability
+        # gate runs on every released version in CI.
+        if !isempty(VERSION.prerelease)
+            @info "Skipping JET type-stability checks on pre-release Julia $(VERSION)"
+            Test.@test_skip true
+        else
+            geom = CGEF.CartesianGeometry(1000.0, 1000.0)
+            lon = collect(0.0:1000.0:20e3)
+            lat = collect(0.0:1000.0:20e3)
+            grid = CGEF.StructuredGrid(geom, lon, lat, trues(length(lon), length(lat)))
+            field = rand(length(lon), length(lat))
+            out = zeros(size(field))
+            kern = CGEF.TopHatKernel()
+            scale = 5000.0
 
-        # Footprint build + the convolution apply must be type-stable.
-        JET.@test_opt CGEF.Filtering.build_footprint(grid, kern, scale)
-        fp = CGEF.Filtering.build_footprint(grid, kern, scale)
-        JET.@test_opt CGEF.Filtering.apply_footprint!(out, field, grid, fp, CGEF.Deformable(), false)
-        JET.@test_opt CGEF.Filtering.apply_footprint!(out, field, grid, fp, CGEF.ZeroFill(), false)
+            # Footprint build + the convolution apply must be type-stable.
+            JET.@test_opt CGEF.Filtering.build_footprint(grid, kern, scale)
+            fp = CGEF.Filtering.build_footprint(grid, kern, scale)
+            JET.@test_opt CGEF.Filtering.apply_footprint!(out, field, grid, fp, CGEF.Deformable(), false)
+            JET.@test_opt CGEF.Filtering.apply_footprint!(out, field, grid, fp, CGEF.ZeroFill(), false)
 
-        # The serial public entry point is type-stable too.
-        JET.@test_opt CGEF.filter_field!(out, field, grid, kern, scale; backend = CGEF.SerialBackend())
+            # The serial public entry point is type-stable too.
+            JET.@test_opt CGEF.filter_field!(out, field, grid, kern, scale; backend = CGEF.SerialBackend())
+        end
     end
 
     # Coordinate system and distance tests
