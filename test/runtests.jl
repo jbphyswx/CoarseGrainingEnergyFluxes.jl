@@ -1021,6 +1021,31 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         Test.@test all(d.R.xx .+ d.R.yy .>= -1e-10)
     end
 
+    # Rotational/divergent (Helmholtz) decomposition of the energy flux.
+    Test.@testset "Helmholtz flux decomposition" begin
+        geom = CGEF.CartesianGeometry(1000.0, 1000.0)
+        x = collect(0.0:1000.0:30e3); y = collect(0.0:1000.0:30e3)
+        grid = CGEF.StructuredGrid(geom, x, y, trues(length(x), length(y)))
+        u = rand(length(x), length(y)) .- 0.5
+        v = rand(length(x), length(y)) .- 0.5
+        kern = CGEF.TopHatKernel(); scale = 5000.0
+
+        # An arbitrary split exercises the bilinear identity (algebra holds for any rotational part).
+        ur = 0.4 .* u; vr = 0.4 .* v
+        dec = CGEF.compute_Π_decomposed(u, v, ur, vr, grid, kern, scale)
+
+        # (1) channels sum EXACTLY to the total.
+        Test.@test dec.total ≈ dec.rotational .+ dec.cross .+ dec.divergent
+        # (2) the total equals the standard full-flux computation.
+        Πfull = zeros(size(u)); CGEF.compute_Π!(Πfull, u, v, nothing, grid, kern, scale)
+        Test.@test dec.total ≈ Πfull
+        # (3) pure-rotational input ⇒ divergent and cross channels vanish, total = rotational.
+        dec_r = CGEF.compute_Π_decomposed(u, v, u, v, grid, kern, scale)
+        Test.@test maximum(abs, dec_r.divergent) < 1e-10
+        Test.@test maximum(abs, dec_r.cross) < 1e-10
+        Test.@test dec_r.rotational ≈ Πfull
+    end
+
     # The CairoMakie viz functions are parent-owned stubs; without the extension loaded they must
     # raise a helpful error (the real methods are exercised when `using CairoMakie`).
     Test.@testset "Visualization stubs" begin

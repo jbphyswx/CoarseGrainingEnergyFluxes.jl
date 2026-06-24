@@ -52,8 +52,10 @@ export AbstractStencilOrder, SecondOrderStencil
 export ddx!, ddy!, ddz!
 
 # Re-export public components from Diagnostics
-using .Diagnostics: ΠWorkspace, compute_Π!, cumulative_energy, filtering_spectrum, spectral_density, tau_decomposition
-export ΠWorkspace, compute_Π!, cumulative_energy, filtering_spectrum, spectral_density, tau_decomposition
+using .Diagnostics: ΠWorkspace, compute_Π!, cumulative_energy, filtering_spectrum, spectral_density,
+    tau_decomposition, compute_Π_decomposed
+export ΠWorkspace, compute_Π!, cumulative_energy, filtering_spectrum, spectral_density,
+    tau_decomposition, compute_Π_decomposed
 
 # Re-export public components from Pipeline
 using .Pipeline: CoarseGrainResult, coarse_grain

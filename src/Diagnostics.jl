@@ -8,7 +8,7 @@ using ..Derivatives: Derivatives
 using ..Backends: Backends
 
 export ΠWorkspace, compute_Π!, cumulative_energy, filtering_spectrum
-export tau_decomposition
+export tau_decomposition, compute_Π_decomposed
 
 """
     ΠWorkspace{T, A}
@@ -736,6 +736,85 @@ function tau_decomposition(
         yy = flt(vp .* vp) .- vpb .* vpb,
     )
     return (; L = L, C = C, R = R)
+end
+
+# ---------------------------------------------------------------------------
+# Rotational / divergent (Helmholtz) decomposition of the energy flux
+# ---------------------------------------------------------------------------
+
+"""
+    compute_Π_decomposed(u, v, u_rot, v_rot, grid, kernel, scale; ρ₀=1025, backend=AutoBackend(), mask_strategy=Deformable())
+        -> (; total, rotational, cross, divergent)
+
+Split the 2D Cartesian cross-scale KE flux Π = -ρ₀ S̄_ij τ_ij by the **rotational vs divergent**
+character of the velocity in the subfilter stress (the carrier of scale interaction), contracted with
+the *full* filtered strain S̄(ū).
+
+The Helmholtz decomposition itself is NOT recomputed here — pass the rotational (solenoidal,
+divergence-free) part `(u_rot, v_rot)` from a Helmholtz solver (e.g. `HelmholtzDecomposition.jl`); the
+divergent (irrotational) part is taken as the complement `(u, v) - (u_rot, v_rot)`. Writing
+`u = uʳ + uᵈ`, the stress is bilinear, so
+
+    τ(u,u) = τ(uʳ,uʳ) + [τ(uʳ,uᵈ) + τ(uᵈ,uʳ)] + τ(uᵈ,uᵈ) = τʳʳ + τ_cross + τᵈᵈ,
+
+and the channels (each contracted with the same S̄) sum **exactly** to the total flux:
+
+    Π = Π_rotational + Π_cross + Π_divergent.
+
+`τ_cross` is formed as `τ(u,u) - τʳʳ - τᵈᵈ` so the identity holds to machine precision. The strain is
+left undecomposed (a single, commonly reported convention); split it separately via the velocity
+parts if a strain-resolved channel matrix is needed.
+
+Returns a named tuple of flux maps (W m⁻³).
+"""
+function compute_Π_decomposed(
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    u_rot::AbstractMatrix,
+    v_rot::AbstractMatrix,
+    grid::Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    ρ₀::T = T(1025.0),
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+    flt(f) = (o = zeros(T, size(f)); Filtering.filter_apply!(o, f, plan); o)
+
+    # Divergent (irrotational) part is the complement of the supplied rotational part.
+    u_div = u .- u_rot
+    v_div = v .- v_rot
+
+    # Symmetric subfilter stress (xx, xy, yy) of a velocity pair, τ_ij = ⟨a_i a_j⟩ - ā_i ā_j.
+    function stress(a, b)
+        ā = flt(a); b̄ = flt(b)
+        return (xx = flt(a .* a) .- ā .* ā,
+                xy = flt(a .* b) .- ā .* b̄,
+                yy = flt(b .* b) .- b̄ .* b̄)
+    end
+
+    τ  = stress(u, v)
+    τr = stress(u_rot, v_rot)
+    τd = stress(u_div, v_div)
+    # Cross channel via the exact complement (keeps the sum identity to machine precision).
+    τc = (xx = τ.xx .- τr.xx .- τd.xx,
+          xy = τ.xy .- τr.xy .- τd.xy,
+          yy = τ.yy .- τr.yy .- τd.yy)
+
+    # Full filtered strain S̄(ū): S_xx = ∂ū/∂x, S_yy = ∂v̄/∂y, S_xy = ½(∂ū/∂y + ∂v̄/∂x).
+    ū = flt(u); v̄ = flt(v)
+    Sxx = similar(ū); Derivatives.ddx!(Sxx, ū, grid)
+    Syy = similar(ū); Derivatives.ddy!(Syy, v̄, grid)
+    a = similar(ū); b = similar(ū)
+    Derivatives.ddy!(a, ū, grid); Derivatives.ddx!(b, v̄, grid)
+    Sxy = T(0.5) .* (a .+ b)
+
+    mask = grid.mask
+    contract(t) = ifelse.(mask, -ρ₀ .* (Sxx .* t.xx .+ T(2) .* Sxy .* t.xy .+ Syy .* t.yy), zero(T))
+
+    Πr = contract(τr); Πc = contract(τc); Πd = contract(τd)
+    return (; total = Πr .+ Πc .+ Πd, rotational = Πr, cross = Πc, divergent = Πd)
 end
 
 end # module
