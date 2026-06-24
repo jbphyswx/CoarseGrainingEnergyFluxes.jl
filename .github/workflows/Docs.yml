@@ -1,8 +1,9 @@
 name: Documentation
 on:
-  # NOTE: docs are mid-rewrite during the overhaul and still reference removed APIs
-  # (Helmholtz / IO / FastTransforms). Kept manual-only until the Phase 7 docs rewrite
-  # re-enables push/PR builds.
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

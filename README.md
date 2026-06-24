@@ -20,19 +20,19 @@ where τ_ℓ = (u ⊗ u)̄_ℓ − ū_ℓ ⊗ ū_ℓ
 
 ### Spatial Filtering at Multiple Scales
 
-![Filtering Scales](docs/assets/filtering_scales.png)
+![Filtering Scales](docs/src/assets/filtering_scales.png)
 
 ### Cross-Scale Energy Flux Π(x, ℓ)
 
-![Energy Flux](docs/assets/energy_flux_pi.png)
+![Energy Flux](docs/src/assets/energy_flux_pi.png)
 
 ### Filtering Energy Spectrum E(ℓ) and Mean |Π|
 
-![Spectrum](docs/assets/energy_spectrum.png)
+![Spectrum](docs/src/assets/energy_spectrum.png)
 
 ### Validation: Rigid-Body Rotation → Π = 0
 
-![Rigid Rotation Validation](docs/assets/rigid_rotation_validation.png)
+![Rigid Rotation Validation](docs/src/assets/rigid_rotation_validation.png)
 
 ## Quick Start
 

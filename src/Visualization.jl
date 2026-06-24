@@ -9,7 +9,7 @@ export plot_Π_map, plot_spectrum
 """
     plot_Π_map(res, scale_idx, grid; colormap=:balance, title=nothing) -> Figure
 
-Heatmap of the cross-scale energy-flux map `Π` from a [`CoarseGrainResult`](@ref) at scale index
+Heatmap of the cross-scale energy-flux map `Π` from a `CoarseGrainResult` at scale index
 `scale_idx`. Provided by the **CairoMakie** package extension — run `using CairoMakie` to enable it.
 """
 function plot_Π_map end
@@ -17,7 +17,7 @@ function plot_Π_map end
 """
     plot_spectrum(res; which=:density) -> Figure
 
-Plot the filtering spectrum from a [`CoarseGrainResult`](@ref). `which = :density` plots the filtering
+Plot the filtering spectrum from a `CoarseGrainResult`. `which = :density` plots the filtering
 spectral density `Ẽ(k_ℓ)` against filtering wavenumber `k_ℓ` (log x); `which = :cumulative` plots the
 cumulative coarse KE against scale `ℓ` (log–log). Provided by the **CairoMakie** package extension —
 run `using CairoMakie` to enable it.

@@ -12,7 +12,7 @@ using CairoMakie: CairoMakie
 using CoarseGrainingEnergyFluxes
 using Statistics: Statistics
 
-const ASSETS_DIR = joinpath(@__DIR__, "..", "assets")
+const ASSETS_DIR = joinpath(@__DIR__, "..", "src", "assets")  # Documenter serves docs/src/assets
 mkpath(ASSETS_DIR)
 
 # ─── Figure 1: Filtering at multiple scales ──────────────────────────────
