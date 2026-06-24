@@ -4,6 +4,7 @@ using Aqua: Aqua
 using ExplicitImports: ExplicitImports as EI
 using JET: JET
 using FFTW: FFTW  # triggers the spectral-filtering extension
+using OhMyThreads: OhMyThreads  # triggers the threaded-backend extension
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 
 Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
@@ -23,7 +24,7 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         Test.@test (EI.check_no_implicit_imports(CGEF); true)
         Test.@test (EI.check_no_stale_explicit_imports(CGEF); true)
         # Per-extension checks (each loaded backend extension must also be import-clean).
-        for extname in (:CoarseGrainingEnergyFluxesFFTWExt,)
+        for extname in (:CoarseGrainingEnergyFluxesFFTWExt, :CoarseGrainingEnergyFluxesOhMyThreadsExt)
             ext = Base.get_extension(CGEF, extname)
             ext === nothing && continue
             Test.@test (EI.check_no_implicit_imports(ext); true)
@@ -271,6 +272,42 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         # Non-periodic grid: spectral FFT must refuse.
         npgrid = CGEF.StructuredGrid(geom, x, y, trues(N, N))  # periodic = (false, false)
         Test.@test_throws ArgumentError CGEF.filter_field!(out, field, npgrid, g, ℓ; method = CGEF.Spectral())
+    end
+
+    # Threaded backend must agree with serial EXACTLY (shared footprint engine), including masking
+    # and periodic wrapping — the old hand-rolled threaded path silently disagreed on periodicity.
+    Test.@testset "Threaded backend (OhMyThreads)" begin
+        geom = CGEF.CartesianGeometry(1000.0, 1000.0)
+        lon = collect(0.0:1000.0:30e3)
+        lat = collect(0.0:1000.0:30e3)
+        u = rand(length(lon), length(lat))
+
+        grid = CGEF.StructuredGrid(geom, lon, lat, trues(length(lon), length(lat)))
+        for strat in (CGEF.Deformable(), CGEF.ZeroFill())
+            os = zeros(size(u)); ot = zeros(size(u))
+            CGEF.filter_field!(os, u, grid, CGEF.TopHatKernel(), 5000.0; backend = CGEF.SerialBackend(), mask_strategy = strat)
+            CGEF.filter_field!(ot, u, grid, CGEF.TopHatKernel(), 5000.0; backend = CGEF.ThreadedBackend(), mask_strategy = strat)
+            Test.@test ot ≈ os
+        end
+
+        # Masked Cartesian
+        mask = trues(length(lon), length(lat)); mask[5:8, 5:8] .= false
+        mgrid = CGEF.StructuredGrid(geom, lon, lat, mask)
+        os = zeros(size(u)); ot = zeros(size(u))
+        CGEF.filter_field!(os, u, mgrid, CGEF.GaussianKernel(), 4000.0; backend = CGEF.SerialBackend())
+        CGEF.filter_field!(ot, u, mgrid, CGEF.GaussianKernel(), 4000.0; backend = CGEF.ThreadedBackend())
+        Test.@test ot ≈ os
+
+        # Periodic global spherical grid (threaded must wrap exactly like serial)
+        sgeom = CGEF.SphericalGeometry(6371000.0)
+        slon = deg2rad.(collect(0.0:5.0:355.0))
+        slat = deg2rad.(collect(-40.0:5.0:40.0))
+        sgrid = CGEF.StructuredGrid(sgeom, slon, slat, trues(length(slon), length(slat)))
+        su = rand(length(slon), length(slat))
+        oss = zeros(size(su)); ost = zeros(size(su))
+        CGEF.filter_field!(oss, su, sgrid, CGEF.TopHatKernel(), deg2rad(15.0) * 6371000.0; backend = CGEF.SerialBackend())
+        CGEF.filter_field!(ost, su, sgrid, CGEF.TopHatKernel(), deg2rad(15.0) * 6371000.0; backend = CGEF.ThreadedBackend())
+        Test.@test ost ≈ oss
     end
 
     # spatial finite differences and boundary stencil fallbacks

@@ -1,92 +1,29 @@
 module CoarseGrainingEnergyFluxesOhMyThreadsExt
 
-using CoarseGrainingEnergyFluxes
-using OhMyThreads
-using StaticArrays
+using OhMyThreads: OhMyThreads
+using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 
-import CoarseGrainingEnergyFluxes.Filtering: threaded_filter_field!
-
-function threaded_filter_field!(
+# ThreadedBackend: build the footprint once, then fill output rows in parallel. Rows are
+# independent (each writes a disjoint column of the column-major output), so this is data-race-free
+# and produces results IDENTICAL to the serial backend (same shared footprint + per-row kernel),
+# including periodic wrapping and masking. Dynamic scheduling balances the uneven per-row cost from
+# land masks.
+function CGEF.Filtering.threaded_filter_field!(
     out::AbstractMatrix{T},
-    field::AbstractMatrix{T},
-    grid::StructuredGrid{G,T},
-    kernel::AbstractFilterKernel,
+    field::AbstractMatrix,
+    grid::CGEF.StructuredGrid{G,T},
+    kernel::CGEF.AbstractFilterKernel,
     scale::T,
-    mask_strategy::AbstractMaskStrategy,
-    workspace
-) where {T<:AbstractFloat, G<:AbstractGeometry{T}}
-    
-    Nlon, Nlat = size_tuple(grid)
-    rad = kernel_radius(kernel, scale)
-    
-    if G <: CartesianGeometry{T}
-        dx = grid.geometry.dx
-        dy = grid.geometry.dy
-        di_lim = ceil(Int, rad / dx)
-        dj_lim = ceil(Int, rad / dy)
-    else
-        R = grid.geometry.R
-        dλ = Nlon > 1 ? grid.lon[2] - grid.lon[1] : T(0)
-        dφ = Nlat > 1 ? grid.lat[2] - grid.lat[1] : T(0)
-    end
-    
+    mask_strategy::CGEF.AbstractMaskStrategy,
+    workspace,
+) where {T<:AbstractFloat, G<:CGEF.AbstractGeometry{T}}
+    fp = CGEF.Filtering.build_footprint(grid, kernel, scale)
+    periodic = CGEF.isperiodic(grid, 1)
+    _, Nlat = CGEF.size_tuple(grid)
     fill!(out, zero(T))
-    
-    # We use OhMyThreads.tforeach to parallelize the latitude loop (j) with dynamic load-balancing
-    # because land fractions vary across latitudes causing irregular computational cost per row.
-    tforeach(1:Nlat, scheduler=:dynamic) do j
-        φ_target = G <: SphericalGeometry{T} ? grid.lat[j] : zero(T)
-        dj_lim_loc = G <: SphericalGeometry{T} ? ceil(Int, rad / (R * dφ)) : dj_lim
-        
-        for i in 1:Nlon
-            iswet(grid, i, j) || continue
-            
-            target_pt = coords(grid, i, j)
-            
-            if G <: SphericalGeometry{T}
-                cosφ = cos(φ_target)
-                di_lim_loc = abs(cosφ) > T(1e-12) ? ceil(Int, rad / (R * cosφ * dλ)) : 0
-            else
-                di_lim_loc = di_lim
-            end
-            
-            weighted_sum = zero(T)
-            weight_norm  = zero(T)
-            
-            j_start = max(1, j - dj_lim_loc)
-            j_end   = min(Nlat, j + dj_lim_loc)
-            
-            for jj in j_start:j_end
-                i_start = max(1, i - di_lim_loc)
-                i_end   = min(Nlon, i + di_lim_loc)
-                
-                for ii in i_start:i_end
-                    if mask_strategy isa Deformable
-                        iswet(grid, ii, jj) || continue
-                    end
-                    
-                    neigh_pt = coords(grid, ii, jj)
-                    d = distance(grid.geometry, target_pt, neigh_pt)
-                    
-                    if d <= rad
-                        w = kernel_weight(kernel, d, scale) * area(grid, ii, jj)
-                        weight_norm += w
-                        
-                        if mask_strategy isa ZeroFill
-                            if iswet(grid, ii, jj)
-                                weighted_sum += w * field[ii, jj]
-                            end
-                        else
-                            weighted_sum += w * field[ii, jj]
-                        end
-                    end
-                end
-            end
-            
-            out[i, j] = weight_norm > T(1e-15) ? weighted_sum / weight_norm : zero(T)
-        end
+    OhMyThreads.tforeach(1:Nlat; scheduler = :dynamic) do j
+        CGEF.Filtering.apply_footprint_row!(out, field, grid, fp, mask_strategy, periodic, j)
     end
-    
     return out
 end
 

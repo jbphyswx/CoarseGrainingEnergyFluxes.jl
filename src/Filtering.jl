@@ -302,39 +302,60 @@ function apply_footprint!(
     strategy::AbstractMaskStrategy,
     periodic_lon::Bool,
 ) where {T<:AbstractFloat}
-    Nlon, Nlat = Grids.size_tuple(grid)
+    _, Nlat = Grids.size_tuple(grid)
     fill!(out, zero(T))
     for j in 1:Nlat
-        b = _band(fp, grid, j)
-        lo = fp.ptr[b]
-        hi = fp.ptr[b+1] - 1
-        for i in 1:Nlon
-            Grids.iswet(grid, i, j) || continue
-            weighted_sum = zero(T)
-            weight_norm = zero(T)
-            @inbounds for k in lo:hi
-                jj = j + fp.dj[k]
-                (1 <= jj <= Nlat) || continue
-                ii = i + fp.di[k]
-                if ii < 1 || ii > Nlon
-                    periodic_lon || continue
-                    ii = mod1(ii, Nlon)
-                end
-                wet = Grids.iswet(grid, ii, jj)
-                w = fp.w[k]
-                if strategy isa ZeroFill
-                    # Dry cells count in the denominator (as zero water).
-                    weight_norm += w
-                    wet && (weighted_sum += w * field[ii, jj])
-                else
-                    # Deformable: dry cells excluded from numerator AND denominator.
-                    wet || continue
-                    weight_norm += w
-                    weighted_sum += w * field[ii, jj]
-                end
+        apply_footprint_row!(out, field, grid, fp, strategy, periodic_lon, j)
+    end
+    return out
+end
+
+"""
+    apply_footprint_row!(out, field, grid, fp, strategy, periodic_lon, j)
+
+Fill output row `j` (`out[:, j]`) from a precomputed footprint. Rows are independent (each writes a
+disjoint column of the column-major output), so this is the unit of parallelism for the threaded /
+distributed backends. Callers must `fill!(out, 0)` first (dry cells are left untouched here).
+"""
+function apply_footprint_row!(
+    out::AbstractMatrix{T},
+    field::AbstractMatrix,
+    grid::Grids.StructuredGrid,
+    fp::FilterFootprint{T},
+    strategy::AbstractMaskStrategy,
+    periodic_lon::Bool,
+    j::Integer,
+) where {T<:AbstractFloat}
+    Nlon, Nlat = Grids.size_tuple(grid)
+    b = _band(fp, grid, j)
+    lo = fp.ptr[b]
+    hi = fp.ptr[b+1] - 1
+    for i in 1:Nlon
+        Grids.iswet(grid, i, j) || continue
+        weighted_sum = zero(T)
+        weight_norm = zero(T)
+        @inbounds for k in lo:hi
+            jj = j + fp.dj[k]
+            (1 <= jj <= Nlat) || continue
+            ii = i + fp.di[k]
+            if ii < 1 || ii > Nlon
+                periodic_lon || continue
+                ii = mod1(ii, Nlon)
             end
-            out[i, j] = weight_norm > T(1e-15) ? weighted_sum / weight_norm : zero(T)
+            wet = Grids.iswet(grid, ii, jj)
+            w = fp.w[k]
+            if strategy isa ZeroFill
+                # Dry cells count in the denominator (as zero water).
+                weight_norm += w
+                wet && (weighted_sum += w * field[ii, jj])
+            else
+                # Deformable: dry cells excluded from numerator AND denominator.
+                wet || continue
+                weight_norm += w
+                weighted_sum += w * field[ii, jj]
+            end
         end
+        out[i, j] = weight_norm > T(1e-15) ? weighted_sum / weight_norm : zero(T)
     end
     return out
 end
