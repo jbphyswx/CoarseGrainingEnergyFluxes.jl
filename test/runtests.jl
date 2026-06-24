@@ -5,6 +5,7 @@ using ExplicitImports: ExplicitImports as EI
 using JET: JET
 using FFTW: FFTW  # triggers the spectral-filtering extension
 using FINUFFT: FINUFFT  # triggers the scattered-Cartesian spectral extension
+using FastSphericalHarmonics: FastSphericalHarmonics as FSH  # triggers the uniform-spherical spectral extension
 using OhMyThreads: OhMyThreads  # triggers the threaded-backend extension
 using Distributed: Distributed  # with SharedArrays, triggers the distributed-backend extension
 using SharedArrays: SharedArrays
@@ -31,6 +32,7 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         for extname in (
             :CoarseGrainingEnergyFluxesFFTWExt,
             :CoarseGrainingEnergyFluxesFINUFFTExt,
+            :CoarseGrainingEnergyFluxesFastSphericalHarmonicsExt,
             :CoarseGrainingEnergyFluxesOhMyThreadsExt,
             :CoarseGrainingEnergyFluxesDistributedExt,
             :CoarseGrainingEnergyFluxesGPUExt,
@@ -316,6 +318,34 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
 
         # TopHat spectral still errors (shared transfer function).
         Test.@test_throws ArgumentError CGEF.filter_field!(outu, vec(u), ug, CGEF.TopHatKernel(), ℓ; method = CGEF.Spectral())
+    end
+
+    # Uniform-spherical spectral filtering (spherical harmonics): a single degree-l harmonic is an
+    # exact eigenfunction, scaled by Ĝ(k_l) with k_l = √(l(l+1))/R.
+    Test.@testset "Spectral spherical-harmonic filtering" begin
+        N = 24; M = 2N - 1
+        Θ, Φ = FSH.sph_points(N)
+        R = 1.0
+        geom = CGEF.SphericalGeometry(R)
+        grid = CGEF.StructuredGrid(geom, collect(Φ), π/2 .- collect(Θ), trues(M, N))
+        ker = CGEF.GaussianKernel(); ℓ = 1.0
+
+        l, m = 5, 2
+        C0 = zeros(N, M); C0[FSH.sph_mode(l, m)] = 1.0
+        field = permutedims(FSH.sph_evaluate(C0))    # CGEF [lon, lat]
+        out = zeros(M, N)
+        CGEF.filter_field!(out, field, grid, ker, ℓ; method = CGEF.Spectral())
+        Ghat = exp(-(l*(l+1)/R^2) * ℓ^2 / 24)        # Gaussian α=6
+        Test.@test out ≈ Ghat .* field atol = 1e-12
+
+        # l = 0 (mean) preserved.
+        cout = zeros(M, N)
+        CGEF.filter_field!(cout, fill(2.3, M, N), grid, ker, ℓ; method = CGEF.Spectral())
+        Test.@test all(≈(2.3; atol = 1e-10), cout)
+
+        # Grid that is not an FSH grid (M ≠ 2N-1) is rejected.
+        badgrid = CGEF.StructuredGrid(geom, collect(0.0:0.1:1.0), collect(0.0:0.1:1.0), trues(11, 11))
+        Test.@test_throws ArgumentError CGEF.filter_field!(zeros(11, 11), rand(11, 11), badgrid, ker, ℓ; method = CGEF.Spectral())
     end
 
     # Threaded backend must agree with serial EXACTLY (shared footprint engine), including masking
