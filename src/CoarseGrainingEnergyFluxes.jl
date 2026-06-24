@@ -39,8 +39,10 @@ export AbstractExecutionBackend, SerialBackend, ThreadedBackend, GPUBackend, Aut
 # Re-export public components from Filtering
 using .Filtering: filter_field!, filter_fields!, AbstractMaskStrategy, ZeroFill, Deformable
 using .Filtering: AbstractFilterPlan, plan_filter, filter_apply!
+using .Filtering: AbstractFilterMethod, DirectSum, Spectral
 export filter_field!, filter_fields!, AbstractMaskStrategy, ZeroFill, Deformable
 export AbstractFilterPlan, plan_filter, filter_apply!
+export AbstractFilterMethod, DirectSum, Spectral
 
 # Re-export public components from Derivatives
 using .Derivatives: AbstractStencilOrder, SecondOrderStencil

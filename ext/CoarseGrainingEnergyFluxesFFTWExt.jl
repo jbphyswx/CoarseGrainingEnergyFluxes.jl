@@ -1,117 +1,83 @@
 module CoarseGrainingEnergyFluxesFFTWExt
 
-using CoarseGrainingEnergyFluxes
-using FFTW
-using StaticArrays
+using FFTW: FFTW
+using LinearAlgebra: LinearAlgebra as LA
+using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 
-# Extend filtering module
-import CoarseGrainingEnergyFluxes.Filtering: filter_field!
+# Spectral (FFT) filtering for uniform, doubly-periodic Cartesian grids: ĝ·f̂ is a pointwise
+# multiply in Fourier space, so cost is O(N log N) and INDEPENDENT of the filter scale (vs the
+# direct sum's O(N · footprint)). Plans + the transfer-function array are built once and reused.
+#
+# The filter is applied as a multiply by the kernel's spectral transfer function Ĝ(|k|, ℓ),
+# normalized to 1 at k = 0 (so the domain mean is preserved). Masking is NOT applied (FFT assumes a
+# homogeneous periodic domain); use the direct-sum method for masked/regional grids.
 
-# Bessel function approximation for TopHat transfer function: 2 * J1(x)/x
-@inline function bessel_j1_over_x(x::T) where {T<:AbstractFloat}
-    if abs(x) < T(1e-5)
-        return T(0.5) - x^2 / T(16)
-    else
-        # Standard polynomial approximation or simple Bessel computation
-        # In FFTWExt, we can approximate J1(x) for efficiency
-        # J1(x) ≈ x/2 - x^3/16 + x^5/384 ...
-        # Standard Taylor expansion or simple recurrence:
-        ax = abs(x)
-        if ax < T(8.0)
-            y = x * x
-            ans1 = x * (T(0.5) + y * (T(-0.0625) + y * (T(0.0026041666666666665) + y * (T(-5.425347222222222e-5) + y * (T(6.781684027777778e-7))))))
-            return ans1 / x
-        else
-            # Asymptotic expansion for large x
-            z = T(0.8) / ax
-            y = z * z
-            xx = ax - T(2.35619449) # ax - 3π/4
-            ans2 = sqrt(T(0.636619772) / ax) * (cos(xx) + z * sin(xx))
-            return ans2 / x
-        end
-    end
+# Isotropic transfer functions Ĝ(|k|, ℓ).
+@inline _transfer(k::CGEF.GaussianKernel, kmag::T, ℓ::T) where {T} = exp(-kmag^2 * ℓ^2 / (T(4) * T(k.α)))
+@inline _transfer(::CGEF.SharpSpectralKernel, kmag::T, ℓ::T) where {T} = kmag <= T(π) / ℓ ? one(T) : zero(T)
+@inline function _transfer(::CGEF.TopHatKernel, kmag::T, ℓ::T) where {T}
+    throw(ArgumentError(
+        "Spectral filtering with TopHatKernel is not supported (its 2D transfer function is an " *
+        "oscillatory Airy pattern that rings). Use `method = DirectSum()` for the top-hat, or a " *
+        "GaussianKernel / SharpSpectralKernel for spectral filtering.",
+    ))
 end
 
 """
-    filter_field!(out, field, grid, kernel, scale; mask_strategy, workspace, backend)
+    FFTWFilterPlan
 
-FFT-accelerated spectral convolution for structured grids under `CartesianGeometry`.
-Extremely fast for large scales and large grids.
+Cached FFT filter plan: forward/inverse real-FFT plans, the precomputed transfer-function array,
+and a reusable complex spectrum buffer. Built by `plan_filter(...; method = Spectral())`.
 """
-function filter_field!(
-    out::AbstractMatrix{T},
-    field::AbstractMatrix{T},
-    grid::StructuredGrid{CartesianGeometry{T},T},
-    kernel::AbstractFilterKernel,
+struct FFTWFilterPlan{
+    T<:AbstractFloat,
+    FP,
+    IP,
+    A<:AbstractMatrix{T},
+    CA<:AbstractMatrix{Complex{T}},
+} <: CGEF.Filtering.AbstractFilterPlan
+    fwd::FP        # plan_rfft
+    inv::IP        # plan_irfft
+    transfer::A    # Ĝ(|k|, ℓ) on the rfft grid  (Nlon÷2+1, Nlat)
+    cbuf::CA       # reusable complex spectrum buffer
+end
+
+function CGEF.Filtering.spectral_filter_plan(
+    grid::CGEF.StructuredGrid{G,T},
+    kernel::CGEF.AbstractFilterKernel,
     scale::T;
-    mask_strategy::Symbol = :renormalize,
-    workspace = nothing,
-    backend::AbstractExecutionBackend = SerialBackend()
-) where {T<:AbstractFloat}
-    
-    Nlon, Nlat = size_tuple(grid)
+    mask_strategy = CGEF.Deformable(),
+    backend = CGEF.AutoBackend(),
+) where {T<:AbstractFloat, G<:CGEF.CartesianGeometry{T}}
+    (CGEF.isperiodic(grid, 1) && CGEF.isperiodic(grid, 2)) || throw(ArgumentError(
+        "Spectral FFT filtering requires a doubly-periodic Cartesian grid; build it with " *
+        "`StructuredGrid(geom, x, y, mask; periodic = (true, true))`.",
+    ))
+    all(grid.mask) || throw(ArgumentError("Spectral FFT filtering does not support land masks; use method = DirectSum()."))
+
+    Nlon, Nlat = size(grid.mask)
     dx = grid.geometry.dx
     dy = grid.geometry.dy
-    
-    # 1. Take FFT of input field
-    # (Note: FFTW operates on Complex fields, so we convert input to Complex)
-    field_c = Complex{T}.(field)
-    
-    # Pre-plan FFT for maximum speed
-    plan = plan_fft!(field_c; flags=FFTW.ESTIMATE)
-    plan * field_c # In-place forward FFT
-    
-    # 2. Get wave numbers kx, ky
-    # k_i = 2π * i / L
-    Lx = Nlon * dx
-    Ly = Nlat * dy
-    
-    kx = FFTW.fftfreq(Nlon, T(2π) / dx)
-    ky = FFTW.fftfreq(Nlat, T(2π) / dy)
-    
-    # 3. Apply transfer function in spectral space
-    for j in 1:Nlat
-        ky_val = ky[j]
-        for i in 1:Nlon
-            kx_val = kx[i]
-            k_mag = sqrt(kx_val^2 + ky_val^2)
-            
-            # Compute kernel transfer function G_hat(k)
-            if kernel isa TopHatKernel
-                # TopHat in 2D Fourier space is 2 * J1(k*R) / (k*R) where R = ℓ / 2
-                kR = k_mag * scale / T(2)
-                G_hat = T(2) * bessel_j1_over_x(kR)
-            elseif kernel isa GaussianKernel
-                # Gaussian transfer function: exp(-k² ℓ² / 24)
-                G_hat = exp(-k_mag^2 * scale^2 / T(24))
-            elseif kernel isa SharpSpectralKernel
-                # Sharp cut-off: 1 if k ≤ π/ℓ, 0 otherwise
-                k_cutoff = T(π) / scale
-                G_hat = k_mag <= k_cutoff ? one(T) : zero(T)
-            else
-                # Default fallback (Gaussian-like)
-                G_hat = exp(-k_mag^2 * scale^2 / T(24))
-            end
-            
-            field_c[i, j] *= G_hat
-        end
-    end
-    
-    # 4. In-place Inverse FFT
-    inv_plan = plan_ifft!(field_c; flags=FFTW.ESTIMATE)
-    inv_plan * field_c
-    
-    # 5. Extract real part and write back to out (respecting wet points)
-    for j in 1:Nlat
-        for i in 1:Nlon
-            if iswet(grid, i, j)
-                out[i, j] = real(field_c[i, j])
-            else
-                out[i, j] = zero(T)
-            end
-        end
-    end
-    
+    # Angular wavenumbers (rfft halves the first axis).
+    kx = T(2π) .* FFTW.rfftfreq(Nlon, one(T) / dx)
+    ky = T(2π) .* FFTW.fftfreq(Nlat, one(T) / dy)
+    transfer = T[_transfer(kernel, sqrt(kx[i]^2 + ky[j]^2), scale) for i in eachindex(kx), j in eachindex(ky)]
+
+    sample = zeros(T, Nlon, Nlat)
+    fwd = FFTW.plan_rfft(sample)
+    cbuf = fwd * sample                 # complex spectrum (Nlon÷2+1, Nlat)
+    inv = FFTW.plan_irfft(cbuf, Nlon)
+    return FFTWFilterPlan(fwd, inv, transfer, cbuf)
+end
+
+function CGEF.Filtering.filter_apply!(
+    out::AbstractMatrix{T},
+    field::AbstractMatrix{T},
+    plan::FFTWFilterPlan{T},
+) where {T<:AbstractFloat}
+    LA.mul!(plan.cbuf, plan.fwd, field)   # f̂ = rfft(field)
+    plan.cbuf .*= plan.transfer           # ĝ · f̂
+    LA.mul!(out, plan.inv, plan.cbuf)     # irfft  (consumes cbuf, rebuilt next call)
     return out
 end
 

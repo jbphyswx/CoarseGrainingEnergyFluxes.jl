@@ -7,6 +7,7 @@ using ..Backends: Backends
 using StaticArrays: StaticArrays as SA
 
 export AbstractMaskStrategy, ZeroFill, Deformable
+export AbstractFilterMethod, DirectSum, Spectral
 export filter_field!, filter_fields!
 export AbstractFilterPlan, plan_filter, filter_apply!
 
@@ -40,6 +41,30 @@ inhomogeneous near coasts (breaks the strict commutation theorems).
 struct Deformable <: AbstractMaskStrategy end
 
 # ---------------------------------------------------------------------------
+# Filtering method: physical direct-sum (default) vs spectral (FFT/SHT/NUFFT via extensions)
+# ---------------------------------------------------------------------------
+
+"""
+    AbstractFilterMethod
+
+How the convolution is evaluated: [`DirectSum`](@ref) (physical-space footprint, any grid/mask) or
+[`Spectral`](@ref) (transform-space multiply — FFT for uniform periodic Cartesian, spherical
+harmonics for the uniform sphere, NUFFT/NUFSHT for scattered points; provided by extensions).
+"""
+abstract type AbstractFilterMethod end
+
+"Physical-space direct-sum convolution (works on any grid, mask, and geometry)."
+struct DirectSum <: AbstractFilterMethod end
+
+"""
+    Spectral <: AbstractFilterMethod
+
+Transform-space filtering (kernel applied as a multiply on the transformed field). Requires a
+spectral extension and a compatible grid (e.g. `using FFTW` for a uniform, periodic Cartesian grid).
+"""
+struct Spectral <: AbstractFilterMethod end
+
+# ---------------------------------------------------------------------------
 # Extension hook points
 # ---------------------------------------------------------------------------
 # Fallbacks that error until the relevant backend extension is loaded. Each execution-backend
@@ -64,6 +89,15 @@ end
 
 function finufft_filter_field!(args...; kwargs...)
     throw(ArgumentError("FINUFFT filtering is unavailable — run `using FINUFFT`."))
+end
+
+# Build a spectral filter plan (overridden by FFTW / FastSphericalHarmonics / FINUFFT / NUFSHT
+# extensions, dispatched on the grid geometry). Errors until a compatible extension is loaded.
+function spectral_filter_plan(grid, kernel, scale; kwargs...)
+    throw(ArgumentError(
+        "Spectral filtering is unavailable for $(typeof(grid)) — load a spectral backend " *
+        "(e.g. `using FFTW` for a uniform periodic Cartesian grid).",
+    ))
 end
 
 # ---------------------------------------------------------------------------
@@ -104,7 +138,13 @@ function filter_field!(
     mask_strategy::AbstractMaskStrategy = Deformable(),
     workspace = nothing,
     backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    method::AbstractFilterMethod = DirectSum(),
 ) where {T<:AbstractFloat}
+
+    # Spectral methods route through a (cached) transform plan provided by an extension.
+    if method isa Spectral
+        return filter_apply!(out, field, plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend, method = method))
+    end
 
     # 1. Resolve AutoBackend to a concrete backend instance.
     resolved = Backends.resolve_backend(backend)
@@ -356,7 +396,11 @@ function plan_filter(
     scale::T;
     mask_strategy::AbstractMaskStrategy = Deformable(),
     backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    method::AbstractFilterMethod = DirectSum(),
 ) where {G<:Geometry.AbstractGeometry{T}} where {T<:AbstractFloat}
+    if method isa Spectral
+        return spectral_filter_plan(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
+    end
     resolved = Backends.resolve_backend(backend)
     if resolved isa Backends.SerialBackend
         fp = build_footprint(grid, kernel, scale)

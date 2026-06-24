@@ -3,6 +3,7 @@ using StaticArrays: StaticArrays as SA
 using Aqua: Aqua
 using ExplicitImports: ExplicitImports as EI
 using JET: JET
+using FFTW: FFTW  # triggers the spectral-filtering extension
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 
 Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
@@ -21,6 +22,13 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         # backend extension is rewritten and pulled into the test environment.
         Test.@test (EI.check_no_implicit_imports(CGEF); true)
         Test.@test (EI.check_no_stale_explicit_imports(CGEF); true)
+        # Per-extension checks (each loaded backend extension must also be import-clean).
+        for extname in (:CoarseGrainingEnergyFluxesFFTWExt,)
+            ext = Base.get_extension(CGEF, extname)
+            ext === nothing && continue
+            Test.@test (EI.check_no_implicit_imports(ext); true)
+            Test.@test (EI.check_no_stale_explicit_imports(ext); true)
+        end
     end
 
     Test.@testset "JET type stability (hot path)" begin
@@ -221,6 +229,48 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         # offset/weight vectors, ~kBs); a reused plan allocates essentially nothing.
         CGEF.filter_apply!(out_plan, u, plan)  # warm up
         Test.@test (@allocated CGEF.filter_apply!(out_plan, u, plan)) < 256
+    end
+
+    # Spectral (FFT) filtering on a uniform doubly-periodic Cartesian grid
+    Test.@testset "Spectral FFTW filtering" begin
+        N = 32
+        dx = 1.0
+        geom = CGEF.CartesianGeometry(dx, dx)
+        x = collect(0.0:dx:dx*(N - 1))
+        y = collect(0.0:dx:dx*(N - 1))
+        grid = CGEF.StructuredGrid(geom, x, y, trues(N, N); periodic = (true, true))
+        L = N * dx
+        g = CGEF.GaussianKernel()  # α = 6
+        ℓ = 4.0
+
+        # A pure Fourier mode is an eigenfunction of the filter: out = Ĝ(k)·field, exactly.
+        m = 3
+        kx0 = 2π * m / L
+        field = Float64[cos(kx0 * xi) for xi in x, _ in y]
+        out = zeros(N, N)
+        CGEF.filter_field!(out, field, grid, g, ℓ; method = CGEF.Spectral())
+        Test.@test out ≈ exp(-kx0^2 * ℓ^2 / 24) .* field rtol = 1e-10  # Gaussian α=6 transfer
+
+        # DC (constant field) is preserved, Ĝ(0) = 1.
+        cfield = fill(2.5, N, N)
+        cout = zeros(N, N)
+        CGEF.filter_field!(cout, cfield, grid, g, ℓ; method = CGEF.Spectral())
+        Test.@test cout ≈ cfield
+
+        # Sharp spectral cutoff: a mode below k_c passes, above k_c is removed.
+        ss = CGEF.SharpSpectralKernel()
+        sout = zeros(N, N)
+        CGEF.filter_field!(sout, field, grid, ss, L / 8; method = CGEF.Spectral())  # k_c = 8π/L > 6π/L
+        Test.@test sout ≈ field rtol = 1e-10
+        CGEF.filter_field!(sout, field, grid, ss, L; method = CGEF.Spectral())       # k_c = π/L < 6π/L
+        Test.@test maximum(abs, sout) < 1e-10
+
+        # TopHat spectral is unsupported (Airy ringing) and errors with guidance.
+        Test.@test_throws ArgumentError CGEF.filter_field!(out, field, grid, CGEF.TopHatKernel(), ℓ; method = CGEF.Spectral())
+
+        # Non-periodic grid: spectral FFT must refuse.
+        npgrid = CGEF.StructuredGrid(geom, x, y, trues(N, N))  # periodic = (false, false)
+        Test.@test_throws ArgumentError CGEF.filter_field!(out, field, npgrid, g, ℓ; method = CGEF.Spectral())
     end
 
     # spatial finite differences and boundary stencil fallbacks
