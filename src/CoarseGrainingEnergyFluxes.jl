@@ -8,7 +8,6 @@ using PrecompileTools
 include("Geometry.jl")
 include("Grids.jl")
 include("Kernels.jl")
-include("Helmholtz.jl")
 include("Filtering.jl")
 include("Derivatives.jl")
 include("Diagnostics.jl")
@@ -31,10 +30,6 @@ using .Kernels: AbstractFilterKernel, TopHatKernel, GaussianKernel, SharpSpectra
 using .Kernels: kernel_weight, kernel_radius
 export AbstractFilterKernel, TopHatKernel, GaussianKernel, SharpSpectralKernel
 export kernel_weight, kernel_radius
-
-# Re-export public components from Helmholtz
-using .Helmholtz: helmholtz_decompose!, solve_poisson!
-export helmholtz_decompose!, solve_poisson!
 
 # Re-export public components from Filtering
 using .Filtering: AbstractExecutionBackend, SerialBackend, ThreadedBackend, DistributedBackend, GPUBackend, FINUFFTBackend, AutoBackend
