@@ -1,10 +1,12 @@
 [deps]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 CoarseGrainingEnergyFluxes = "a8c2fbc6-778a-4d2b-8a8c-9c98efc7e8cf"
+Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 ExplicitImports = "7d51a73a-1435-4ff3-83d9-f097790105c7"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
+SharedArrays = "1a1011a3-84de-559e-8e89-a11a2f7dc383"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 

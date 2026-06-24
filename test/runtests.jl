@@ -5,6 +5,8 @@ using ExplicitImports: ExplicitImports as EI
 using JET: JET
 using FFTW: FFTW  # triggers the spectral-filtering extension
 using OhMyThreads: OhMyThreads  # triggers the threaded-backend extension
+using Distributed: Distributed  # with SharedArrays, triggers the distributed-backend extension
+using SharedArrays: SharedArrays
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 
 Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
@@ -24,7 +26,11 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         Test.@test (EI.check_no_implicit_imports(CGEF); true)
         Test.@test (EI.check_no_stale_explicit_imports(CGEF); true)
         # Per-extension checks (each loaded backend extension must also be import-clean).
-        for extname in (:CoarseGrainingEnergyFluxesFFTWExt, :CoarseGrainingEnergyFluxesOhMyThreadsExt)
+        for extname in (
+            :CoarseGrainingEnergyFluxesFFTWExt,
+            :CoarseGrainingEnergyFluxesOhMyThreadsExt,
+            :CoarseGrainingEnergyFluxesDistributedExt,
+        )
             ext = Base.get_extension(CGEF, extname)
             ext === nothing && continue
             Test.@test (EI.check_no_implicit_imports(ext); true)
@@ -308,6 +314,21 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         CGEF.filter_field!(oss, su, sgrid, CGEF.TopHatKernel(), deg2rad(15.0) * 6371000.0; backend = CGEF.SerialBackend())
         CGEF.filter_field!(ost, su, sgrid, CGEF.TopHatKernel(), deg2rad(15.0) * 6371000.0; backend = CGEF.ThreadedBackend())
         Test.@test ost ≈ oss
+    end
+
+    # Distributed backend must also agree with serial (footprint engine + SharedArray fill). With no
+    # extra worker processes the @distributed loop runs serially on the caller — still exact.
+    Test.@testset "Distributed backend" begin
+        geom = CGEF.CartesianGeometry(1000.0, 1000.0)
+        lon = collect(0.0:1000.0:30e3)
+        lat = collect(0.0:1000.0:30e3)
+        mask = trues(length(lon), length(lat)); mask[6:9, 6:9] .= false
+        grid = CGEF.StructuredGrid(geom, lon, lat, mask)
+        u = rand(length(lon), length(lat))
+        os = zeros(size(u)); od = zeros(size(u))
+        CGEF.filter_field!(os, u, grid, CGEF.TopHatKernel(), 5000.0; backend = CGEF.SerialBackend())
+        CGEF.filter_field!(od, u, grid, CGEF.TopHatKernel(), 5000.0; backend = CGEF.DistributedBackend())
+        Test.@test od ≈ os
     end
 
     # spatial finite differences and boundary stencil fallbacks
