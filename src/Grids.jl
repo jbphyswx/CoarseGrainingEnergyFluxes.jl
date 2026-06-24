@@ -29,34 +29,54 @@ isperiodic(::AbstractGrid, ::Integer) = false
 # ---------------------------------------------------------------------------
 
 """
-    StructuredGrid{G, T, V, M, B}
+    StructuredGrid{G, T, N, V, AT, BT}
 
-Structured grid where coordinates are 1D vectors along each axis (e.g. regular latitude-longitude).
+Structured (rectilinear) `N`-dimensional grid: one coordinate vector per axis (`axes`), an N-D cell
+`measure` (length in 1D, area in 2D, volume in 3D), an N-D active `mask`, and per-axis `periodic`
+flags. `N = 1, 2, 3`.
+
+The first two axes carry the convenience aliases `grid.lon` / `grid.lat` (= `axes[1]` / `axes[2]`),
+and `grid.areas` aliases `grid.measure`, so 2D code reads naturally.
 """
 struct StructuredGrid{
     G<:Geometry.AbstractGeometry,
     T<:AbstractFloat,
+    N,
     V<:AbstractVector{T},
-    M<:AbstractMatrix{T},
-    B<:AbstractMatrix{Bool}
+    AT<:AbstractArray{T,N},
+    BT<:AbstractArray{Bool,N},
 } <: AbstractGrid{G, T}
     geometry::G
-    lon::V                  # 1D coordinate vector along X/λ
-    lat::V                  # 1D coordinate vector along Y/φ
-    areas::M                # 2D cell areas (Nlon × Nlat)
-    mask::B                 # 2D active mask (true=water, false=land)
-    periodic::NTuple{2,Bool} # per-axis periodicity (lon/x, lat/y) for footprint wrapping
+    axes::NTuple{N,V}        # coordinate vector per axis (axes[1]=lon/x, axes[2]=lat/y, axes[3]=z)
+    measure::AT             # N-D cell measure (area in 2D, volume in 3D)
+    mask::BT                # N-D active mask (true=water, false=land)
+    periodic::NTuple{N,Bool} # per-axis periodicity for footprint wrapping
+end
+
+# Convenience field aliases: lon/lat for the first two axes, areas ≡ measure (keeps 2D code/users
+# working). `getfield` is used internally to avoid recursion.
+@inline function Base.getproperty(grid::StructuredGrid, name::Symbol)
+    if name === :lon
+        return @inbounds getfield(grid, :axes)[1]
+    elseif name === :lat
+        return @inbounds getfield(grid, :axes)[2]
+    elseif name === :areas
+        return getfield(grid, :measure)
+    else
+        return getfield(grid, name)
+    end
 end
 
 size_tuple(grid::StructuredGrid) = size(grid.mask)
 
-@inline function coords(grid::StructuredGrid{G,T}, i::Integer, j::Integer) where {G,T}
-    return SA.SVector{2,T}(grid.lon[i], grid.lat[j])
-end
-
-@inline area(grid::StructuredGrid, i::Integer, j::Integer) = grid.areas[i, j]
-@inline iswet(grid::StructuredGrid, i::Integer, j::Integer) = grid.mask[i, j]
 @inline isperiodic(grid::StructuredGrid, dim::Integer) = grid.periodic[dim]
+
+# N-D accessors (a 2-index call on a 2D grid is the common case).
+@inline function coords(grid::StructuredGrid{G,T,N}, I::Vararg{Integer,N}) where {G,T,N}
+    return SA.SVector{N,T}(ntuple(d -> @inbounds(grid.axes[d][I[d]]), N))
+end
+@inline area(grid::StructuredGrid{G,T,N}, I::Vararg{Integer,N}) where {G,T,N} = grid.measure[I...]
+@inline iswet(grid::StructuredGrid{G,T,N}, I::Vararg{Integer,N}) where {G,T,N} = grid.mask[I...]
 
 # Auto-detect longitude periodicity: a spherical lon axis that closes the full 2π circle (to
 # within one cell) is periodic; a regional lon span is NOT. Cartesian axes are opt-in only.
@@ -124,8 +144,8 @@ function StructuredGrid(
 
     per = periodic === nothing ? (_auto_periodic_lon(geometry, lon_T), false) : _periodic_tuple(periodic)
 
-    return StructuredGrid{G, T, typeof(lon_T), typeof(areas), typeof(mask)}(
-        geometry, lon_T, lat_T, areas, mask, per,
+    return StructuredGrid{G, T, 2, typeof(lon_T), typeof(areas), typeof(mask)}(
+        geometry, (lon_T, lat_T), areas, mask, per,
     )
 end
 
