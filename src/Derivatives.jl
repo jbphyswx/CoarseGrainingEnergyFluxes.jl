@@ -1,8 +1,7 @@
 module Derivatives
 
-using ..Geometry
-using ..Grids
-using StaticArrays
+using ..Geometry: Geometry
+using ..Grids: Grids
 
 export AbstractStencilOrder, SecondOrderStencil
 export ddx!, ddy!, ddz!
@@ -34,21 +33,21 @@ Calculate spatial derivative of `f` in the horizontal x (Eastward/λ) direction,
 function ddx!(
     ∂f∂x::AbstractMatrix{T},
     f::AbstractMatrix{T},
-    grid::StructuredGrid{CartesianGeometry{T},T}
+    grid::Grids.StructuredGrid{Geometry.CartesianGeometry{T},T}
 ) where {T<:AbstractFloat}
-    Nlon, Nlat = size_tuple(grid)
+    Nlon, Nlat = Grids.size_tuple(grid)
     dx = grid.geometry.dx
     
     for j in 1:Nlat
         for i in 1:Nlon
-            if !iswet(grid, i, j)
+            if !Grids.iswet(grid, i, j)
                 ∂f∂x[i, j] = zero(T)
                 continue
             end
             
             # Check neighbors
-            has_p = i < Nlon && iswet(grid, i+1, j)
-            has_m = i > 1    && iswet(grid, i-1, j)
+            has_p = i < Nlon && Grids.iswet(grid, i+1, j)
+            has_m = i > 1    && Grids.iswet(grid, i-1, j)
             
             if has_p && has_m
                 # Standard 2nd-order centered difference
@@ -71,9 +70,9 @@ end
 function ddx!(
     ∂f∂x::AbstractMatrix{T},
     f::AbstractMatrix{T},
-    grid::StructuredGrid{SphericalGeometry{T},T}
+    grid::Grids.StructuredGrid{Geometry.SphericalGeometry{T},T}
 ) where {T<:AbstractFloat}
-    Nlon, Nlat = size_tuple(grid)
+    Nlon, Nlat = Grids.size_tuple(grid)
     R = grid.geometry.R
     dλ = Nlon > 1 ? grid.lon[2] - grid.lon[1] : T(0)
     
@@ -85,7 +84,7 @@ function ddx!(
         inv_denom = abs(cosφ) > T(1e-12) ? one(T) / (R * cosφ * dλ) : zero(T)
         
         for i in 1:Nlon
-            if !iswet(grid, i, j)
+            if !Grids.iswet(grid, i, j)
                 ∂f∂x[i, j] = zero(T)
                 continue
             end
@@ -94,8 +93,8 @@ function ddx!(
             i_p = i < Nlon ? i + 1 : 1      # wrap to first point
             i_m = i > 1 ? i - 1 : Nlon      # wrap to last point
             
-            has_p = iswet(grid, i_p, j)
-            has_m = iswet(grid, i_m, j)
+            has_p = Grids.iswet(grid, i_p, j)
+            has_m = Grids.iswet(grid, i_m, j)
             
             if has_p && has_m
                 ∂f∂x[i, j] = (f[i_p, j] - f[i_m, j]) / T(2) * inv_denom
@@ -123,21 +122,21 @@ Calculate spatial derivative of `f` in the vertical y (Northward/φ) direction, 
 function ddy!(
     ∂f∂y::AbstractMatrix{T},
     f::AbstractMatrix{T},
-    grid::StructuredGrid{CartesianGeometry{T},T}
+    grid::Grids.StructuredGrid{Geometry.CartesianGeometry{T},T}
 ) where {T<:AbstractFloat}
-    Nlon, Nlat = size_tuple(grid)
+    Nlon, Nlat = Grids.size_tuple(grid)
     dy = grid.geometry.dy
     
     for j in 1:Nlat
         for i in 1:Nlon
-            if !iswet(grid, i, j)
+            if !Grids.iswet(grid, i, j)
                 ∂f∂y[i, j] = zero(T)
                 continue
             end
             
             # Check neighbors
-            has_p = j < Nlat && iswet(grid, i, j+1)
-            has_m = j > 1    && iswet(grid, i, j-1)
+            has_p = j < Nlat && Grids.iswet(grid, i, j+1)
+            has_m = j > 1    && Grids.iswet(grid, i, j-1)
             
             if has_p && has_m
                 # Standard 2nd-order centered difference
@@ -160,22 +159,22 @@ end
 function ddy!(
     ∂f∂y::AbstractMatrix{T},
     f::AbstractMatrix{T},
-    grid::StructuredGrid{SphericalGeometry{T},T}
+    grid::Grids.StructuredGrid{Geometry.SphericalGeometry{T},T}
 ) where {T<:AbstractFloat}
-    Nlon, Nlat = size_tuple(grid)
+    Nlon, Nlat = Grids.size_tuple(grid)
     R = grid.geometry.R
     dφ = Nlat > 1 ? grid.lat[2] - grid.lat[1] : T(0)
     inv_denom = one(T) / (R * dφ)
     
     for j in 1:Nlat
         for i in 1:Nlon
-            if !iswet(grid, i, j)
+            if !Grids.iswet(grid, i, j)
                 ∂f∂y[i, j] = zero(T)
                 continue
             end
             
-            has_p = j < Nlat && iswet(grid, i, j+1)
-            has_m = j > 1    && iswet(grid, i, j-1)
+            has_p = j < Nlat && Grids.iswet(grid, i, j+1)
+            has_m = j > 1    && Grids.iswet(grid, i, j-1)
             
             if has_p && has_m
                 ∂f∂y[i, j] = (f[i, j+1] - f[i, j-1]) / T(2) * inv_denom
@@ -203,7 +202,7 @@ Calculate spatial derivative of `f` in the vertical coordinate z, writing to `�
 function ddz!(
     ∂f∂z::AbstractArray{T,3},
     f::AbstractArray{T,3},
-    grid::StructuredGrid{CartesianGeometry{T},T}
+    grid::Grids.StructuredGrid{Geometry.CartesianGeometry{T},T}
 ) where {T<:AbstractFloat}
     Nlon, Nlat, Ndepth = size(f)
     dz = grid.geometry.dz
@@ -212,7 +211,7 @@ function ddz!(
     for k in 1:Ndepth
         for j in 1:Nlat
             for i in 1:Nlon
-                if !iswet(grid, i, j)
+                if !Grids.iswet(grid, i, j)
                     ∂f∂z[i, j, k] = zero(T)
                     continue
                 end

@@ -1,7 +1,7 @@
 module Geometry
 
-using LinearAlgebra
-using StaticArrays
+using LinearAlgebra: LinearAlgebra as LA
+using StaticArrays: StaticArrays as SA
 
 export AbstractGeometry, CartesianGeometry, SphericalGeometry
 export distance, area_element, to_planetary_cartesian, from_planetary_cartesian
@@ -103,11 +103,11 @@ Calculate the distance between two points in the given geometry.
 - For `CartesianGeometry`, this is the Euclidean norm.
 - For `SphericalGeometry`, this is the great-circle distance.
 """
-@inline function distance(::CartesianGeometry{T}, pt1::SVector{N,T}, pt2::SVector{N,T}) where {N,T}
-    return norm(pt1 - pt2)
+@inline function distance(::CartesianGeometry{T}, pt1::SA.SVector{N,T}, pt2::SA.SVector{N,T}) where {N,T}
+    return LA.norm(pt1 - pt2)
 end
 
-@inline function distance(geo::SphericalGeometry{T}, coords1::SVector{2,T}, coords2::SVector{2,T}) where {T}
+@inline function distance(geo::SphericalGeometry{T}, coords1::SA.SVector{2,T}, coords2::SA.SVector{2,T}) where {T}
     # Haversine formula for great-circle distance (robust for both small and large distances)
     λ1, φ1 = coords1[1], coords1[2]
     λ2, φ2 = coords2[1], coords2[2]
@@ -121,29 +121,29 @@ end
 end
 
 # 3D spherical distance (with radial component)
-@inline function distance(geo::SphericalGeometry{T}, coords1::SVector{3,T}, coords2::SVector{3,T}) where {T}
+@inline function distance(geo::SphericalGeometry{T}, coords1::SA.SVector{3,T}, coords2::SA.SVector{3,T}) where {T}
     # Transform spherical coords (λ, φ, r) to 3D planetary Cartesian first, then compute Euclidean distance
     p1 = spherical_to_planetary_position(geo, coords1)
     p2 = spherical_to_planetary_position(geo, coords2)
-    return norm(p1 - p2)
+    return LA.norm(p1 - p2)
 end
 
 # Helper to transform position coords (λ, φ, r) to Cartesian X, Y, Z
-@inline function spherical_to_planetary_position(geo::SphericalGeometry{T}, coords::SVector{3,T}) where {T}
+@inline function spherical_to_planetary_position(geo::SphericalGeometry{T}, coords::SA.SVector{3,T}) where {T}
     λ, φ, r = coords[1], coords[2], coords[3]
     rad = geo.R + r
     X = rad * cos(φ) * cos(λ)
     Y = rad * cos(φ) * sin(λ)
     Z = rad * sin(φ)
-    return SVector{3,T}(X, Y, Z)
+    return SA.SVector{3,T}(X, Y, Z)
 end
 
-@inline function spherical_to_planetary_position(geo::SphericalGeometry{T}, coords::SVector{2,T}) where {T}
+@inline function spherical_to_planetary_position(geo::SphericalGeometry{T}, coords::SA.SVector{2,T}) where {T}
     λ, φ = coords[1], coords[2]
     X = geo.R * cos(φ) * cos(λ)
     Y = geo.R * cos(φ) * sin(λ)
     Z = geo.R * sin(φ)
-    return SVector{3,T}(X, Y, Z)
+    return SA.SVector{3,T}(X, Y, Z)
 end
 
 # ---------------------------------------------------------------------------
@@ -192,8 +192,8 @@ This is essential for spherical filtering to ensure commutativity with spatial d
     ux = u_east_T * (-sinλ) + u_north_T * (-sinφ * cosλ) + u_vertical_T * (cosφ * cosλ)
     uy = u_east_T * (cosλ)  + u_north_T * (-sinφ * sinλ) + u_vertical_T * (cosφ * sinλ)
     uz =                      u_north_T * cosφ           + u_vertical_T * sinφ
-    
-    return SVector{3,T}(ux, uy, uz)
+
+    return SA.SVector{3,T}(ux, uy, uz)
 end
 
 # 2D spherical version (assumes zero vertical velocity)
@@ -232,8 +232,8 @@ Convert global planetary Cartesian velocity components back to local East, North
     u_east     = ux_T * (-sinλ) + uy_T * cosλ
     u_north    = ux_T * (-sinφ * cosλ) + uy_T * (-sinφ * sinλ) + uz_T * cosφ
     u_vertical = ux_T * (cosφ * cosλ)  + uy_T * (cosφ * sinλ)  + uz_T * sinφ
-    
-    return SVector{3,T}(u_east, u_north, u_vertical)
+
+    return SA.SVector{3,T}(u_east, u_north, u_vertical)
 end
 
 end # module

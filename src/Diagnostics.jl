@@ -1,12 +1,10 @@
 module Diagnostics
 
-using ..Geometry
-using ..Grids
-using ..Kernels
-using ..Filtering
-using ..Derivatives
-using StaticArrays
-using LinearAlgebra
+using ..Geometry: Geometry
+using ..Grids: Grids
+using ..Kernels: Kernels
+using ..Filtering: Filtering
+using ..Derivatives: Derivatives
 
 export ΠWorkspace, compute_Π!, compute_filtering_spectrum
 
@@ -58,8 +56,8 @@ struct ΠWorkspace{T<:AbstractFloat, A<:AbstractArray{T}}
 end
 
 # Workspace constructor based on grid structure and float type
-function ΠWorkspace(grid::AbstractGrid{G,T}; dims::Integer = 2) where {G, T<:AbstractFloat}
-    sz = size_tuple(grid)
+function ΠWorkspace(grid::Grids.AbstractGrid{G,T}; dims::Integer = 2) where {G, T<:AbstractFloat}
+    sz = Grids.size_tuple(grid)
     A = Matrix{T}
     
     u_filt  = zeros(T, sz...)
@@ -166,50 +164,50 @@ function compute_Π!(
     u::AbstractMatrix,
     v::AbstractMatrix,
     w::Union{Nothing, AbstractMatrix}, # nothing or zeros for 2D
-    grid::StructuredGrid{G,T},
-    kernel::AbstractFilterKernel,
+    grid::Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
     scale::T;
     ρ₀::T = T(1025.0),
     workspace::Union{Nothing, ΠWorkspace} = nothing,
-    backend::AbstractExecutionBackend = AutoBackend(),
+    backend::Filtering.AbstractExecutionBackend = Filtering.AutoBackend(),
     mask_strategy::Symbol = :renormalize
-) where {T<:AbstractFloat, G<:AbstractGeometry{T}}
+) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
     
     # 1. Fetch or create pre-allocated workspace
     ws = workspace === nothing ? ΠWorkspace(grid) : workspace
-    Nlon, Nlat = size_tuple(grid)
+    Nlon, Nlat = Grids.size_tuple(grid)
     
     has_w = w !== nothing
     
-    if G <: CartesianGeometry{T}
+    if G <: Geometry.CartesianGeometry{T}
         # -------------------------------------------------------------------
         # Cartesian Case
         # -------------------------------------------------------------------
         # Filter velocity components
-        filter_field!(ws.u_filt, u, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
-        filter_field!(ws.v_filt, v, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.u_filt, u, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.v_filt, v, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         if has_w
-            filter_field!(ws.w_filt, w, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+            Filtering.filter_field!(ws.w_filt, w, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         end
         
         # Filter products: u², uv, vv, etc.
         # uu
         @. ws.scratch = u * u
-        filter_field!(ws.uu_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.uu_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         # uv
         @. ws.scratch = u * v
-        filter_field!(ws.uv_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.uv_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         # vv
         @. ws.scratch = v * v
-        filter_field!(ws.vv_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.vv_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         
         if has_w
             @. ws.scratch = u * w
-            filter_field!(ws.uw_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+            Filtering.filter_field!(ws.uw_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
             @. ws.scratch = v * w
-            filter_field!(ws.vw_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+            Filtering.filter_field!(ws.vw_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
             @. ws.scratch = w * w
-            filter_field!(ws.ww_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+            Filtering.filter_field!(ws.ww_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         end
         
         # Compute subfilter stresses: τ_ij = [u_i u_j]̄ - ū_i ū_j
@@ -224,21 +222,21 @@ function compute_Π!(
         
         # Compute strain rate tensor components: S̄_ij = 0.5 * (∂ū_i/∂x_j + ∂ū_j/∂x_i)
         # S_xx = ∂ū/∂x
-        ddx!(ws.S_xx, ws.u_filt, grid)
+        Derivatives.ddx!(ws.S_xx, ws.u_filt, grid)
         # S_yy = ∂v̄/∂y
-        ddy!(ws.S_yy, ws.v_filt, grid)
+        Derivatives.ddy!(ws.S_yy, ws.v_filt, grid)
         # S_xy = 0.5 * (∂ū/∂y + ∂v̄/∂x)
-        ddy!(ws.S_xy, ws.u_filt, grid)
-        ddx!(ws.scratch, ws.v_filt, grid)
+        Derivatives.ddy!(ws.S_xy, ws.u_filt, grid)
+        Derivatives.ddx!(ws.scratch, ws.v_filt, grid)
         @. ws.S_xy = T(0.5) * (ws.S_xy + ws.scratch)
         
         if has_w
             # S_xz = 0.5 * (∂ū/∂z + ∂w̄/∂x) (assumes ∂/∂z is zero or handles vertical layers)
-            ddx!(ws.S_xz, ws.w_filt, grid)
+            Derivatives.ddx!(ws.S_xz, ws.w_filt, grid)
             @. ws.S_xz = T(0.5) * ws.S_xz
             
             # S_yz = 0.5 * (∂v̄/∂z + ∂w̄/∂y)
-            ddy!(ws.S_yz, ws.w_filt, grid)
+            Derivatives.ddy!(ws.S_yz, ws.w_filt, grid)
             @. ws.S_yz = T(0.5) * ws.S_yz
             
             # S_zz = ∂w̄/∂z = 0 (for standard 2.5D datasets)
@@ -253,13 +251,13 @@ function compute_Π!(
         for j in 1:Nlat
             φ = grid.lat[j]
             for i in 1:Nlon
-                if iswet(grid, i, j)
+                if Grids.iswet(grid, i, j)
                     λ = grid.lon[i]
                     u_val = u[i, j]
                     v_val = v[i, j]
                     w_val = has_w ? w[i, j] : zero(T)
                     
-                    p_vel = to_planetary_cartesian(grid.geometry, u_val, v_val, w_val, λ, φ)
+                    p_vel = Geometry.to_planetary_cartesian(grid.geometry, u_val, v_val, w_val, λ, φ)
                     ws.ux[i, j] = p_vel[1]
                     ws.uy[i, j] = p_vel[2]
                     ws.uz[i, j] = p_vel[3]
@@ -272,31 +270,31 @@ function compute_Π!(
         end
         
         # Filter planetary Cartesian components
-        filter_field!(ws.ux_filt, ws.ux, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
-        filter_field!(ws.uy_filt, ws.uy, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
-        filter_field!(ws.uz_filt, ws.uz, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.ux_filt, ws.ux, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.uy_filt, ws.uy, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.uz_filt, ws.uz, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         
         # Filter planetary products: X-X, X-Y, X-Z, Y-Y, Y-Z, Z-Z
         @. ws.scratch = ws.ux * ws.ux
-        filter_field!(ws.uu_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.uu_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         @. ws.scratch = ws.ux * ws.uy
-        filter_field!(ws.uv_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.uv_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         @. ws.scratch = ws.ux * ws.uz
-        filter_field!(ws.uw_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.uw_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         @. ws.scratch = ws.uy * ws.uy
-        filter_field!(ws.vv_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.vv_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         @. ws.scratch = ws.uy * ws.uz
-        filter_field!(ws.vw_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.vw_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         @. ws.scratch = ws.uz * ws.uz
-        filter_field!(ws.ww_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(ws.ww_filt, ws.scratch, grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         
         # Transform filtered planetary velocities back to local coordinates (u_filt, v_filt, w_filt)
         for j in 1:Nlat
             φ = grid.lat[j]
             for i in 1:Nlon
-                if iswet(grid, i, j)
+                if Grids.iswet(grid, i, j)
                     λ = grid.lon[i]
-                    l_vel = from_planetary_cartesian(grid.geometry, ws.ux_filt[i, j], ws.uy_filt[i, j], ws.uz_filt[i, j], λ, φ)
+                    l_vel = Geometry.from_planetary_cartesian(grid.geometry, ws.ux_filt[i, j], ws.uy_filt[i, j], ws.uz_filt[i, j], λ, φ)
                     ws.u_filt[i, j] = l_vel[1]
                     ws.v_filt[i, j] = l_vel[2]
                     ws.w_filt[i, j] = l_vel[3]
@@ -314,7 +312,7 @@ function compute_Π!(
             φ = grid.lat[j]
             sinφ, cosφ = sin(φ), cos(φ)
             for i in 1:Nlon
-                if iswet(grid, i, j)
+                if Grids.iswet(grid, i, j)
                     λ = grid.lon[i]
                     sinλ, cosλ = sin(λ), cos(λ)
                     
@@ -376,12 +374,12 @@ function compute_Π!(
         
         # Compute Spherical Strain Rates (with geometry curvature correction terms)
         # S_ee = 1/(R cosφ) * ∂ū_e/∂λ - v̄_n * sinφ / (R cosφ)
-        ddx!(ws.S_xx, ws.u_filt, grid)
+        Derivatives.ddx!(ws.S_xx, ws.u_filt, grid)
         # S_nn = 1/R * ∂v̄_n/∂φ
-        ddy!(ws.S_yy, ws.v_filt, grid)
+        Derivatives.ddy!(ws.S_yy, ws.v_filt, grid)
         # S_en = 0.5 * ( 1/(R cosφ) ∂v̄_n/∂λ + 1/R ∂ū_e/∂φ + ū_e * sinφ / (R cosφ) )
-        ddy!(ws.S_xy, ws.u_filt, grid)
-        ddx!(ws.scratch, ws.v_filt, grid)
+        Derivatives.ddy!(ws.S_xy, ws.u_filt, grid)
+        Derivatives.ddx!(ws.scratch, ws.v_filt, grid)
         
         R = grid.geometry.R
         for j in 1:Nlat
@@ -391,7 +389,7 @@ function compute_Π!(
             tan_fact = abs(cosφ) > T(1e-12) ? sinφ / (R * cosφ) : zero(T)
             
             for i in 1:Nlon
-                if iswet(grid, i, j)
+                if Grids.iswet(grid, i, j)
                     # S_ee correction
                     ws.S_xx[i, j] -= ws.v_filt[i, j] * tan_fact
                     
@@ -403,11 +401,11 @@ function compute_Π!(
         
         if has_w
             # S_er = 0.5 * (∂ū_e/∂r + 1/(R cosφ) ∂w̄/∂λ) = 0.5 * 1/(R cosφ) ∂w̄/∂λ (if vertically flat layers)
-            ddx!(ws.S_xz, ws.w_filt, grid)
+            Derivatives.ddx!(ws.S_xz, ws.w_filt, grid)
             @. ws.S_xz = T(0.5) * ws.S_xz
             
             # S_nr = 0.5 * (∂v̄_n/∂r + 1/R ∂w̄/∂φ) = 0.5 * 1/R ∂w̄/∂φ
-            ddy!(ws.S_yz, ws.w_filt, grid)
+            Derivatives.ddy!(ws.S_yz, ws.w_filt, grid)
             @. ws.S_yz = T(0.5) * ws.S_yz
             
             # S_rr = ∂w̄/∂r = 0
@@ -424,7 +422,7 @@ function compute_Π!(
     if has_w
         for j in 1:Nlat
             for i in 1:Nlon
-                if iswet(grid, i, j)
+                if Grids.iswet(grid, i, j)
                     sfs_sum = ws.S_xx[i, j] * ws.τ_xx[i, j] +
                               T(2) * ws.S_xy[i, j] * ws.τ_xy[i, j] +
                               ws.S_yy[i, j] * ws.τ_yy[i, j] +
@@ -440,7 +438,7 @@ function compute_Π!(
     else
         for j in 1:Nlat
             for i in 1:Nlon
-                if iswet(grid, i, j)
+                if Grids.iswet(grid, i, j)
                     sfs_sum = ws.S_xx[i, j] * ws.τ_xx[i, j] +
                               T(2) * ws.S_xy[i, j] * ws.τ_xy[i, j] +
                               ws.S_yy[i, j] * ws.τ_yy[i, j]
@@ -501,19 +499,19 @@ function compute_filtering_spectrum(
     u::AbstractMatrix,
     v::AbstractMatrix,
     w::Union{Nothing, AbstractMatrix},
-    grid::StructuredGrid{G,T},
-    kernel::AbstractFilterKernel,
+    grid::Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
     scales::AbstractVector;
     ρ₀::T = T(1025.0),
-    backend::AbstractExecutionBackend = AutoBackend(),
+    backend::Filtering.AbstractExecutionBackend = Filtering.AutoBackend(),
     mask_strategy::Symbol = :renormalize
-) where {T<:AbstractFloat, G<:AbstractGeometry{T}}
+) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
     
     Nscales = length(scales)
     spectrum = zeros(T, Nscales)
     
     # Pre-allocate temporary workspace arrays
-    Nlon, Nlat = size_tuple(grid)
+    Nlon, Nlat = Grids.size_tuple(grid)
     u_filt = zeros(T, Nlon, Nlat)
     v_filt = zeros(T, Nlon, Nlat)
     w_filt = w !== nothing ? zeros(T, Nlon, Nlat) : nothing
@@ -522,8 +520,8 @@ function compute_filtering_spectrum(
     total_area = zero(T)
     for j in 1:Nlat
         for i in 1:Nlon
-            if iswet(grid, i, j)
-                total_area += area(grid, i, j)
+            if Grids.iswet(grid, i, j)
+                total_area += Grids.area(grid, i, j)
             end
         end
     end
@@ -533,22 +531,22 @@ function compute_filtering_spectrum(
         ℓ = T(scales[s_idx])
         
         # Filter velocity fields at this scale
-        filter_field!(u_filt, u, grid, kernel, ℓ; mask_strategy=mask_strategy, backend=backend)
-        filter_field!(v_filt, v, grid, kernel, ℓ; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(u_filt, u, grid, kernel, ℓ; mask_strategy=mask_strategy, backend=backend)
+        Filtering.filter_field!(v_filt, v, grid, kernel, ℓ; mask_strategy=mask_strategy, backend=backend)
         if w !== nothing
-            filter_field!(w_filt, w, grid, kernel, ℓ; mask_strategy=mask_strategy, backend=backend)
+            Filtering.filter_field!(w_filt, w, grid, kernel, ℓ; mask_strategy=mask_strategy, backend=backend)
         end
         
         # Compute spatial average energy: E(ℓ) = 0.5 * ρ₀ * ∫ |ū_ℓ|² dA / ∫ dA
         integrated_energy = zero(T)
         for j in 1:Nlat
             for i in 1:Nlon
-                if iswet(grid, i, j)
+                if Grids.iswet(grid, i, j)
                     vel2 = u_filt[i, j]^2 + v_filt[i, j]^2
                     if w !== nothing
                         vel2 += w_filt[i, j]^2
                     end
-                    integrated_energy += vel2 * area(grid, i, j)
+                    integrated_energy += vel2 * Grids.area(grid, i, j)
                 end
             end
         end

@@ -1,8 +1,6 @@
 module CoarseGrainingEnergyFluxes
 
-using LinearAlgebra
-using StaticArrays
-using PrecompileTools
+using PrecompileTools: @setup_workload, @compile_workload
 
 # Submodules inclusion
 include("Geometry.jl")

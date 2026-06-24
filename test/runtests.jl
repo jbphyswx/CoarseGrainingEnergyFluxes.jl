@@ -15,10 +15,11 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
     end
 
     Test.@testset "Explicit imports (core)" begin
-        # TODO(Phase 1): the package still uses bare `using` (implicit re-exports). Once converted to
-        # `using X: X` + qualified calls, flip the implicit-imports check from @test_broken to @test
-        # (and add per-ext checks). The stale-imports check already passes (no explicit imports yet).
-        Test.@test_broken (EI.check_no_implicit_imports(CGEF); true)
+        # Core module + submodules: no bare `using` (no implicit imports) and no stale explicit
+        # imports — the strict qualified-import policy.
+        # TODO(Phase 5+): add per-extension checks (EI.check_no_implicit_imports(ext)) as each
+        # backend extension is rewritten and pulled into the test environment.
+        Test.@test (EI.check_no_implicit_imports(CGEF); true)
         Test.@test (EI.check_no_stale_explicit_imports(CGEF); true)
     end
 

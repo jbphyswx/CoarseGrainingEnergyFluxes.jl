@@ -1,12 +1,11 @@
 module Pipeline
 
-using ..Geometry
-using ..Grids
-using ..Kernels
-using ..Filtering
-using ..Derivatives
-using ..Diagnostics
-using StaticArrays
+using ..Geometry: Geometry
+using ..Grids: Grids
+using ..Kernels: Kernels
+using ..Filtering: Filtering
+using ..Derivatives: Derivatives
+using ..Diagnostics: Diagnostics
 
 export CoarseGrainResult, coarse_grain
 
@@ -92,27 +91,27 @@ function coarse_grain(
     u::AbstractMatrix,
     v::AbstractMatrix,
     w::Union{Nothing, AbstractMatrix},
-    grid::StructuredGrid{G,T};
+    grid::Grids.StructuredGrid{G,T};
     scales::AbstractVector,
-    kernel::AbstractFilterKernel = TopHatKernel(),
+    kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     ρ₀::T = T(1025.0),
-    backend::AbstractExecutionBackend = AutoBackend(),
+    backend::Filtering.AbstractExecutionBackend = Filtering.AutoBackend(),
     mask_strategy::Symbol = :renormalize
-) where {T<:AbstractFloat, G<:AbstractGeometry{T}}
+) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
     
     Nscales = length(scales)
-    Nlon, Nlat = size_tuple(grid)
+    Nlon, Nlat = Grids.size_tuple(grid)
     
     # 1. Pre-allocate results vectors
     Π_maps = [zeros(T, Nlon, Nlat) for _ in 1:Nscales]
     
     # 2. Pre-allocate a single, reusable workspace for the entire scale sweep
-    workspace = ΠWorkspace(grid)
+    workspace = Diagnostics.ΠWorkspace(grid)
     
     # 3. Sweep through scales and compute the cross-scale energy transfer Π maps
     for s_idx in 1:Nscales
         scale = T(scales[s_idx])
-        compute_Π!(
+        Diagnostics.compute_Π!(
             Π_maps[s_idx],
             u, v, w,
             grid,
@@ -126,7 +125,7 @@ function coarse_grain(
     end
     
     # 4. Sweep through scales to compute the spatial filtering energy spectrum E(ℓ)
-    spectrum = compute_filtering_spectrum(
+    spectrum = Diagnostics.compute_filtering_spectrum(
         u, v, w,
         grid,
         kernel,
@@ -147,13 +146,13 @@ end
 function coarse_grain(
     u::AbstractMatrix,
     v::AbstractMatrix,
-    grid::StructuredGrid{G,T};
+    grid::Grids.StructuredGrid{G,T};
     scales::AbstractVector,
-    kernel::AbstractFilterKernel = TopHatKernel(),
+    kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     ρ₀::T = T(1025.0),
-    backend::AbstractExecutionBackend = AutoBackend(),
+    backend::Filtering.AbstractExecutionBackend = Filtering.AutoBackend(),
     mask_strategy::Symbol = :renormalize
-) where {T<:AbstractFloat, G<:AbstractGeometry{T}}
+) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
     return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, ρ₀=ρ₀, backend=backend, mask_strategy=mask_strategy)
 end
 

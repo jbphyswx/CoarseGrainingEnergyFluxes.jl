@@ -1,7 +1,7 @@
 module Grids
 
-using ..Geometry
-using StaticArrays
+using ..Geometry: Geometry
+using StaticArrays: StaticArrays as SA
 
 export AbstractGrid, StructuredGrid, CurvilinearGrid, UnstructuredGrid
 export coords, area, iswet, grid_geometry, size_tuple
@@ -11,7 +11,7 @@ export coords, area, iswet, grid_geometry, size_tuple
 
 Abstract supertype for all grid architectures (structured, curvilinear, unstructured).
 """
-abstract type AbstractGrid{G<:AbstractGeometry, T<:AbstractFloat} end
+abstract type AbstractGrid{G<:Geometry.AbstractGeometry, T<:AbstractFloat} end
 
 # Common interface queries
 grid_geometry(grid::AbstractGrid) = grid.geometry
@@ -26,10 +26,10 @@ grid_geometry(grid::AbstractGrid) = grid.geometry
 Structured grid where coordinates are 1D vectors along each axis (e.g. regular latitude-longitude).
 """
 struct StructuredGrid{
-    G<:AbstractGeometry, 
-    T<:AbstractFloat, 
-    V<:AbstractVector{T}, 
-    M<:AbstractMatrix{T}, 
+    G<:Geometry.AbstractGeometry,
+    T<:AbstractFloat,
+    V<:AbstractVector{T},
+    M<:AbstractMatrix{T},
     B<:AbstractMatrix{Bool}
 } <: AbstractGrid{G, T}
     geometry::G
@@ -42,7 +42,7 @@ end
 size_tuple(grid::StructuredGrid) = size(grid.mask)
 
 @inline function coords(grid::StructuredGrid{G,T}, i::Integer, j::Integer) where {G,T}
-    return SVector{2,T}(grid.lon[i], grid.lat[j])
+    return SA.SVector{2,T}(grid.lon[i], grid.lat[j])
 end
 
 @inline area(grid::StructuredGrid, i::Integer, j::Integer) = grid.areas[i, j]
@@ -56,7 +56,7 @@ function StructuredGrid(
     mask::AbstractMatrix{Bool}
 ) where {
     T<:AbstractFloat,
-    G<:AbstractGeometry{T}
+    G<:Geometry.AbstractGeometry{T}
 }
     # Convert lon and lat vectors to the geometry float type T
     lon_T = convert(Vector{T}, lon)
@@ -69,9 +69,9 @@ function StructuredGrid(
     areas = Matrix{T}(undef, Nlon, Nlat)
     
     # Populate cell areas
-    if G <: CartesianGeometry{T}
+    if G <: Geometry.CartesianGeometry{T}
         # Cartesian cells are uniform
-        A = area_element(geometry)
+        A = Geometry.area_element(geometry)
         fill!(areas, A)
     else
         # Spherical cell area varies with latitude
@@ -81,7 +81,7 @@ function StructuredGrid(
         dφ = Nlat > 1 ? lat_T[2] - lat_T[1] : T(0)
         
         for j in 1:Nlat
-            A_lat = area_element(geometry, lat_T[j], dλ, dφ)
+            A_lat = Geometry.area_element(geometry, lat_T[j], dλ, dφ)
             for i in 1:Nlon
                 areas[i, j] = A_lat
             end
@@ -101,7 +101,7 @@ end
 Curvilinear grid where coordinates are 2D arrays (e.g. ROMS / WCOFS / Orthogonal Curvilinear).
 """
 struct CurvilinearGrid{
-    G<:AbstractGeometry,
+    G<:Geometry.AbstractGeometry,
     T<:AbstractFloat,
     M<:AbstractMatrix{T},
     B<:AbstractMatrix{Bool}
@@ -116,7 +116,7 @@ end
 size_tuple(grid::CurvilinearGrid) = size(grid.mask)
 
 @inline function coords(grid::CurvilinearGrid{G,T}, i::Integer, j::Integer) where {G,T}
-    return SVector{2,T}(grid.lon[i, j], grid.lat[i, j])
+    return SA.SVector{2,T}(grid.lon[i, j], grid.lat[i, j])
 end
 
 @inline area(grid::CurvilinearGrid, i::Integer, j::Integer) = grid.areas[i, j]
@@ -132,7 +132,7 @@ end
 Unstructured mesh (e.g. radial data, finite volume, or triangular mesh) where coords are 1D vectors.
 """
 struct UnstructuredGrid{
-    G<:AbstractGeometry,
+    G<:Geometry.AbstractGeometry,
     T<:AbstractFloat,
     V<:AbstractVector{T},
     B<:AbstractVector{Bool}
@@ -148,7 +148,7 @@ end
 size_tuple(grid::UnstructuredGrid) = (length(grid.mask),)
 
 @inline function coords(grid::UnstructuredGrid{G,T}, idx::Integer) where {G,T}
-    return SVector{2,T}(grid.lon[idx], grid.lat[idx])
+    return SA.SVector{2,T}(grid.lon[idx], grid.lat[idx])
 end
 
 @inline area(grid::UnstructuredGrid, idx::Integer) = grid.areas[idx]
