@@ -12,7 +12,7 @@ function threaded_filter_field!(
     grid::StructuredGrid{G,T},
     kernel::AbstractFilterKernel,
     scale::T,
-    mask_strategy::Symbol,
+    mask_strategy::AbstractMaskStrategy,
     workspace
 ) where {T<:AbstractFloat, G<:AbstractGeometry{T}}
     
@@ -61,7 +61,7 @@ function threaded_filter_field!(
                 i_end   = min(Nlon, i + di_lim_loc)
                 
                 for ii in i_start:i_end
-                    if mask_strategy == :renormalize || mask_strategy == :deformable
+                    if mask_strategy isa Deformable
                         iswet(grid, ii, jj) || continue
                     end
                     
@@ -72,7 +72,7 @@ function threaded_filter_field!(
                         w = kernel_weight(kernel, d, scale) * area(grid, ii, jj)
                         weight_norm += w
                         
-                        if mask_strategy == :zero
+                        if mask_strategy isa ZeroFill
                             if iswet(grid, ii, jj)
                                 weighted_sum += w * field[ii, jj]
                             end

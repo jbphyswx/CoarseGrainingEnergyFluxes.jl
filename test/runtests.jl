@@ -352,8 +352,8 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         out_renorm = zeros(length(lon_deg), length(lat_deg))
 
         # Filter with both masking strategies
-        CGEF.filter_field!(out_zero, field, grid, CGEF.TopHatKernel(), 100000.0; mask_strategy=:zero)
-        CGEF.filter_field!(out_renorm, field, grid, CGEF.TopHatKernel(), 100000.0; mask_strategy=:renormalize)
+        CGEF.filter_field!(out_zero, field, grid, CGEF.TopHatKernel(), 100000.0; mask_strategy=CGEF.ZeroFill())
+        CGEF.filter_field!(out_renorm, field, grid, CGEF.TopHatKernel(), 100000.0; mask_strategy=CGEF.Deformable())
 
         # For a constant field of ones, output should be exactly 1.0 everywhere
         # (or very close, allowing for small numerical errors)
@@ -678,8 +678,8 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
                 out_zero = zeros(length(lon), length(lat))
                 out_renorm = zeros(length(lon), length(lat))
 
-                CGEF.filter_field!(out_zero, field, grid, kernel, scale; mask_strategy=:zero)
-                CGEF.filter_field!(out_renorm, field, grid, kernel, scale; mask_strategy=:renormalize)
+                CGEF.filter_field!(out_zero, field, grid, kernel, scale; mask_strategy=CGEF.ZeroFill())
+                CGEF.filter_field!(out_renorm, field, grid, kernel, scale; mask_strategy=CGEF.Deformable())
 
                 # Interior points should be exactly C
                 for j in 20:length(lat)-20, i in 20:length(lon)-20

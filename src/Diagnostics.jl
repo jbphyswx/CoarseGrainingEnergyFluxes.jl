@@ -110,7 +110,7 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    compute_Π!(Π, u, v, w, grid, kernel, scale; ρ₀=1025.0, workspace=nothing, backend=AutoBackend(), mask_strategy=:renormalize)
+    compute_Π!(Π, u, v, w, grid, kernel, scale; ρ₀=1025.0, workspace=nothing, backend=AutoBackend(), mask_strategy=Deformable())
 
 Compute the cross-scale kinetic energy flux Π = -ρ₀ S̄_ij τ_ij at filter scale ℓ.
 
@@ -131,7 +131,7 @@ energy transfer across scales in turbulent flows. Positive Π indicates forward 
 - `ρ₀::T=1025.0`: Reference density (kg/m³), default seawater value
 - `workspace=nothing`: Pre-allocated ΠWorkspace for intermediate arrays
 - `backend::AbstractExecutionBackend=AutoBackend()`: Execution backend
-- `mask_strategy::Symbol=:renormalize`: Land masking strategy
+- `mask_strategy::AbstractMaskStrategy=Deformable()`: Land masking strategy (`ZeroFill()` or `Deformable()`)
 
 # Physics
 The cross-scale energy flux is computed as:
@@ -171,7 +171,7 @@ function compute_Π!(
     ρ₀::T = T(1025.0),
     workspace::Union{Nothing, ΠWorkspace} = nothing,
     backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
-    mask_strategy::Symbol = :renormalize
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable()
 ) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
     
     # 1. Fetch or create pre-allocated workspace
@@ -459,7 +459,7 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    compute_filtering_spectrum(u, v, w, grid, kernel, scales; ρ₀=1025.0, backend=AutoBackend(), mask_strategy=:renormalize)
+    compute_filtering_spectrum(u, v, w, grid, kernel, scales; ρ₀=1025.0, backend=AutoBackend(), mask_strategy=Deformable())
 
 Compute the filtering kinetic energy spectrum E(ℓ) = 0.5 * ρ₀ * ⟨|ū_ℓ|²⟩.
 
@@ -477,7 +477,7 @@ scales through coarse-grained (filtered) velocities.
 # Keyword Arguments
 - `ρ₀::T=1025.0`: Reference density (kg/m³)
 - `backend::AbstractExecutionBackend=AutoBackend()`: Execution backend
-- `mask_strategy::Symbol=:renormalize`: Land masking strategy
+- `mask_strategy::AbstractMaskStrategy=Deformable()`: Land masking strategy (`ZeroFill()` or `Deformable()`)
 
 # Returns
 - `spectrum::Vector{T}`: Energy spectrum values at each scale (m²/s²)
@@ -505,7 +505,7 @@ function compute_filtering_spectrum(
     scales::AbstractVector;
     ρ₀::T = T(1025.0),
     backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
-    mask_strategy::Symbol = :renormalize
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable()
 ) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
     
     Nscales = length(scales)

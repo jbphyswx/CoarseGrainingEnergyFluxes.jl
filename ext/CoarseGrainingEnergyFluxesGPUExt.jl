@@ -75,7 +75,7 @@ end
             i_end   = min(Nlon, i + di_lim)
             
             for ii in i_start:i_end
-                if mask_strategy == :renormalize || mask_strategy == :deformable
+                if mask_strategy isa Deformable
                     mask[ii, jj] || continue
                 end
                 
@@ -103,7 +103,7 @@ end
                     
                     weight_norm += w
                     
-                    if mask_strategy == :zero
+                    if mask_strategy isa ZeroFill
                         if mask[ii, jj]
                             weighted_sum += w * field[ii, jj]
                         end
@@ -125,7 +125,7 @@ function gpu_filter_field!(
     grid::StructuredGrid{G,T},
     kernel::AbstractFilterKernel,
     scale::T,
-    mask_strategy::Symbol,
+    mask_strategy::AbstractMaskStrategy,
     workspace
 ) where {T<:AbstractFloat, G<:AbstractGeometry{T}}
     

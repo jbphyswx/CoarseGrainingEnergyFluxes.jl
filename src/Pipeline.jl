@@ -36,7 +36,7 @@ struct CoarseGrainResult{T<:AbstractFloat, A<:AbstractArray{T}}
 end
 
 """
-    coarse_grain(u, v, w, grid; scales, kernel=TopHatKernel(), ρ₀=1025.0, backend=AutoBackend(), mask_strategy=:renormalize)
+    coarse_grain(u, v, w, grid; scales, kernel=TopHatKernel(), ρ₀=1025.0, backend=AutoBackend(), mask_strategy=Deformable())
     coarse_grain(u, v, grid; scales, ...)  # 2D convenience wrapper
 
 Perform complete coarse-graining analysis across multiple filter scales.
@@ -58,7 +58,7 @@ This is the high-level orchestration function that runs the full pipeline:
 - `kernel::AbstractFilterKernel=TopHatKernel()`: Filter kernel
 - `ρ₀::T=1025.0`: Reference density (kg/m³)
 - `backend::AbstractExecutionBackend=AutoBackend()`: Execution backend
-- `mask_strategy::Symbol=:renormalize`: Land masking strategy
+- `mask_strategy::AbstractMaskStrategy=Deformable()`: Land masking strategy (`ZeroFill()` or `Deformable()`)
 
 # Returns
 - `CoarseGrainResult`: Container with scales, Π maps, and spectrum
@@ -97,7 +97,7 @@ function coarse_grain(
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     ρ₀::T = T(1025.0),
     backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
-    mask_strategy::Symbol = :renormalize
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable()
 ) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
     
     Nscales = length(scales)
@@ -152,7 +152,7 @@ function coarse_grain(
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     ρ₀::T = T(1025.0),
     backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
-    mask_strategy::Symbol = :renormalize
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable()
 ) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
     return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, ρ₀=ρ₀, backend=backend, mask_strategy=mask_strategy)
 end
