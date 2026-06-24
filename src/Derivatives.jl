@@ -234,4 +234,53 @@ function ddz!(
     return ∂f∂z
 end
 
+# ---------------------------------------------------------------------------
+# True 3D Cartesian derivatives (3D grid + 3D mask)
+#
+# These dispatch on `StructuredGrid{Cartesian,T,3}` (N = 3), which is strictly more specific than the
+# N-free 2.5D methods above, so a genuine 3D grid routes here while a 2D grid carrying a 3D field
+# (layer-by-layer) keeps using the 2.5D methods. Each direction uses a 2nd-order centered difference
+# that falls back to a one-sided difference at the domain edge or against a land cell, mirroring the
+# 2D engine. Dry cells are written as exactly zero.
+# ---------------------------------------------------------------------------
+
+for (fn, dim, spacing) in (
+    (:ddx!, 1, :(grid.geometry.dx)),
+    (:ddy!, 2, :(grid.geometry.dy)),
+    (:ddz!, 3, :(grid.geometry.dz)),
+)
+    @eval function $fn(
+        ∂f::AbstractArray{T,3},
+        f::AbstractArray{T,3},
+        grid::Grids.StructuredGrid{Geometry.CartesianGeometry{T},T,3},
+    ) where {T<:AbstractFloat}
+        Nx, Ny, Nz = Grids.size_tuple(grid)
+        h = $spacing
+        mask = grid.mask
+        d = $dim
+        @inbounds for k in 1:Nz, j in 1:Ny, i in 1:Nx
+            if !mask[i, j, k]
+                ∂f[i, j, k] = zero(T)
+                continue
+            end
+            ip = d == 1 ? i + 1 : i; jp = d == 2 ? j + 1 : j; kp = d == 3 ? k + 1 : k
+            im = d == 1 ? i - 1 : i; jm = d == 2 ? j - 1 : j; km = d == 3 ? k - 1 : k
+            lim = d == 1 ? Nx : d == 2 ? Ny : Nz
+            idx = d == 1 ? i : d == 2 ? j : k
+            has_p = idx < lim && mask[ip, jp, kp]
+            has_m = idx > 1 && mask[im, jm, km]
+            if has_p && has_m
+                ∂f[i, j, k] = (f[ip, jp, kp] - f[im, jm, km]) / (T(2) * h)
+            elseif has_p
+                ∂f[i, j, k] = (f[ip, jp, kp] - f[i, j, k]) / h
+            elseif has_m
+                ∂f[i, j, k] = (f[i, j, k] - f[im, jm, km]) / h
+            else
+                ∂f[i, j, k] = zero(T)
+            end
+        end
+        return ∂f
+    end
+end
+
 end # module

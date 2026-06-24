@@ -459,6 +459,64 @@ function compute_Π!(
     return Π
 end
 
+"""
+    compute_Π!(Π::AbstractArray{T,3}, u, v, w, grid::StructuredGrid{Cartesian,T,3}, kernel, scale; ρ₀=1025, mask_strategy=Deformable(), backend=AutoBackend())
+
+Full **three-dimensional** Cartesian cross-scale energy flux Π = -ρ₀ S̄_ij τ_ij with all nine strain
+components (the diagonal `S_zz = ∂w̄/∂z` and the off-diagonals `S_xz, S_yz` carry genuine vertical
+derivatives, unlike the 2.5D layer-by-layer path). The 3D grid carries a 3D mask, so dry cells are
+handled per-cell in all three directions.
+
+The contraction is the symmetric six-term sum
+`S̄:τ = S_xx τ_xx + S_yy τ_yy + S_zz τ_zz + 2(S_xy τ_xy + S_xz τ_xz + S_yz τ_yz)`.
+
+Dispatched on a 3D output array + 3D Cartesian grid (the 2D method takes an `AbstractMatrix`).
+Spherical 3D (volumetric curvature terms) is not yet implemented. This diagnostic allocates its
+temporaries; pass a reusable plan-driven path if it ever lands on a hot loop.
+"""
+function compute_Π!(
+    Π::AbstractArray{T,3},
+    u::AbstractArray{<:Any,3},
+    v::AbstractArray{<:Any,3},
+    w::AbstractArray{<:Any,3},
+    grid::Grids.StructuredGrid{G,T,3},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    ρ₀::T = T(1025.0),
+    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+    flt(f) = (o = zeros(T, size(f)); Filtering.filter_apply!(o, f, plan); o)
+
+    # Filtered velocities and the six independent filtered quadratic products.
+    ū = flt(u); v̄ = flt(v); w̄ = flt(w)
+    uu = flt(u .* u); uv = flt(u .* v); uw = flt(u .* w)
+    vv = flt(v .* v); vw = flt(v .* w); ww = flt(w .* w)
+
+    # Subfilter stress τ_ij = ⟨u_i u_j⟩ - ū_i ū_j (symmetric, six components).
+    τxx = uu .- ū .* ū; τxy = uv .- ū .* v̄; τxz = uw .- ū .* w̄
+    τyy = vv .- v̄ .* v̄; τyz = vw .- v̄ .* w̄; τzz = ww .- w̄ .* w̄
+
+    # Strain S̄_ij = ½(∂ū_i/∂x_j + ∂ū_j/∂x_i): three diagonals + three off-diagonals.
+    Sxx = similar(ū); Derivatives.ddx!(Sxx, ū, grid)
+    Syy = similar(ū); Derivatives.ddy!(Syy, v̄, grid)
+    Szz = similar(ū); Derivatives.ddz!(Szz, w̄, grid)
+    a = similar(ū); b = similar(ū)
+    Derivatives.ddy!(a, ū, grid); Derivatives.ddx!(b, v̄, grid); Sxy = T(0.5) .* (a .+ b)
+    Derivatives.ddz!(a, ū, grid); Derivatives.ddx!(b, w̄, grid); Sxz = T(0.5) .* (a .+ b)
+    Derivatives.ddz!(a, v̄, grid); Derivatives.ddy!(b, w̄, grid); Syz = T(0.5) .* (a .+ b)
+
+    mask = grid.mask
+    @inbounds @. Π = ifelse(
+        mask,
+        -ρ₀ * (Sxx * τxx + Syy * τyy + Szz * τzz +
+               T(2) * (Sxy * τxy + Sxz * τxz + Syz * τyz)),
+        zero(T),
+    )
+    return Π
+end
+
 # ---------------------------------------------------------------------------
 # Filtering Energy Spectrum E(ℓ)
 # ---------------------------------------------------------------------------

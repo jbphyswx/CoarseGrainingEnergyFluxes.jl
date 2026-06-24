@@ -218,8 +218,10 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         kern = CGEF.TopHatKernel()
         scale = 5000.0
 
-        # A prebuilt plan applied to a field matches a direct filter_field! call.
-        plan = CGEF.plan_filter(grid, kern, scale)
+        # A prebuilt plan applied to a field matches a direct filter_field! call. Pin SerialBackend so
+        # the footprint-based PhysicalFilterPlan (whose reuse/allocation we assert below) is built
+        # regardless of how many threads the suite happens to run with.
+        plan = CGEF.plan_filter(grid, kern, scale; backend = CGEF.SerialBackend())
         out_plan = zeros(size(u))
         out_direct = zeros(size(u))
         CGEF.filter_apply!(out_plan, u, plan)
@@ -402,6 +404,38 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         CGEF.filter_field!(o2, f2d, grid2, CGEF.TopHatKernel(), 6.0)
         for k in 1:nz
             Test.@test o3z[:, :, k] ≈ o2
+        end
+    end
+
+    # True 3D Cartesian energy flux Π = -ρ₀ S̄_ij τ_ij (all nine strain components).
+    Test.@testset "3D Cartesian energy flux" begin
+        geom3 = CGEF.CartesianGeometry(1.0, 1.0, 50.0)
+        x = collect(0.0:1.0:24.0); y = collect(0.0:1.0:24.0); z = collect(0.0:50.0:150.0)
+        nx, ny, nz = length(x), length(y), length(z)
+        grid3 = CGEF.StructuredGrid(geom3, x, y, z, trues(nx, ny, nz))
+        ker = CGEF.TopHatKernel(); ℓ = 5.0
+
+        # (1) Constant velocity ⇒ zero strain ⇒ Π ≡ 0.
+        Πc = zeros(nx, ny, nz)
+        CGEF.compute_Π!(Πc, fill(2.0, nx, ny, nz), fill(-3.0, nx, ny, nz),
+                        fill(0.5, nx, ny, nz), grid3, ker, ℓ)
+        Test.@test maximum(abs, Πc) < 1e-9
+
+        # (2) z-invariant (u, v) with w = 0: the 3D six-term contraction must collapse EXACTLY to the
+        # 2D three-term flux on every layer (Szz = Sxz = Syz = τxz = τyz = τzz = 0), validating the 3D
+        # assembly + 3D derivatives against the established 2D path.
+        u2 = rand(nx, ny) .- 0.5; v2 = rand(nx, ny) .- 0.5
+        u3 = repeat(reshape(u2, nx, ny, 1), 1, 1, nz)
+        v3 = repeat(reshape(v2, nx, ny, 1), 1, 1, nz)
+        w3 = zeros(nx, ny, nz)
+        Π3 = zeros(nx, ny, nz)
+        CGEF.compute_Π!(Π3, u3, v3, w3, grid3, ker, ℓ)
+
+        grid2 = CGEF.StructuredGrid(CGEF.CartesianGeometry(1.0, 1.0), x, y, trues(nx, ny))
+        Π2 = zeros(nx, ny)
+        CGEF.compute_Π!(Π2, u2, v2, nothing, grid2, ker, ℓ)
+        for k in 1:nz
+            Test.@test Π3[:, :, k] ≈ Π2
         end
     end
 

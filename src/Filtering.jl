@@ -150,7 +150,10 @@ function filter_field!(
     resolved = Backends.resolve_backend(backend)
 
     # 2. Dispatch to the appropriate execution backend (extensions override the hook functions).
-    if resolved isa Backends.SerialBackend
+    #    The parallel hooks (threaded/distributed/GPU/MPI) are latitude-row decomposed and thus 2D
+    #    only; a non-2D grid carries an n-D footprint with no row structure, so it always uses the
+    #    serial n-D engine regardless of the requested backend (parallel n-D is a future refinement).
+    if resolved isa Backends.SerialBackend || !_row_parallelizable(grid)
         serial_filter_field!(out, field, grid, kernel, scale, mask_strategy, workspace)
     elseif resolved isa Backends.ThreadedBackend
         threaded_filter_field!(out, field, grid, kernel, scale, mask_strategy, workspace)
@@ -521,13 +524,19 @@ function plan_filter(
         return spectral_filter_plan(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
     end
     resolved = Backends.resolve_backend(backend)
-    if resolved isa Backends.SerialBackend
+    # n-D (non-2D) grids have no row-parallel hook, so they precompute the serial footprint plan.
+    if resolved isa Backends.SerialBackend || !_row_parallelizable(grid)
         fp = build_footprint(grid, kernel, scale)
         return PhysicalFilterPlan(fp, grid, mask_strategy)
     else
         return FallbackFilterPlan(grid, kernel, scale, mask_strategy, resolved)
     end
 end
+
+# The parallel backends decompose over latitude rows, which only exists for 2D structured grids;
+# every other grid (1D, true 3D, and the curvilinear/unstructured stubs) uses the serial engine.
+_row_parallelizable(::Grids.StructuredGrid{G,T,2}) where {G,T} = true
+_row_parallelizable(::Grids.AbstractGrid) = false
 
 """
     filter_apply!(out, field, plan) -> out
