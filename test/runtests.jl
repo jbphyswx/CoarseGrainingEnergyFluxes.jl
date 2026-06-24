@@ -7,6 +7,7 @@ using FFTW: FFTW  # triggers the spectral-filtering extension
 using OhMyThreads: OhMyThreads  # triggers the threaded-backend extension
 using Distributed: Distributed  # with SharedArrays, triggers the distributed-backend extension
 using SharedArrays: SharedArrays
+using KernelAbstractions: KernelAbstractions as KA  # triggers the GPU backend extension (CPU device here)
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 
 Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
@@ -30,6 +31,7 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
             :CoarseGrainingEnergyFluxesFFTWExt,
             :CoarseGrainingEnergyFluxesOhMyThreadsExt,
             :CoarseGrainingEnergyFluxesDistributedExt,
+            :CoarseGrainingEnergyFluxesGPUExt,
         )
             ext = Base.get_extension(CGEF, extname)
             ext === nothing && continue
@@ -198,9 +200,10 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         CGEF.filter_field!(out_default, field, grid, CGEF.TopHatKernel(), 5000.0)  # AutoBackend
         Test.@test out_serial ≈ out_default
 
-        # An unloaded backend errors helpfully rather than silently mis-dispatching
+        # A backend whose extension is not loaded errors helpfully (MPI is intentionally not loaded
+        # in the test env — it isn't runnable here — so its hook is still the informative stub).
         Test.@test_throws ArgumentError CGEF.filter_field!(
-            out_serial, field, grid, CGEF.TopHatKernel(), 5000.0; backend = CGEF.GPUBackend(:fake_device),
+            out_serial, field, grid, CGEF.TopHatKernel(), 5000.0; backend = CGEF.MPIBackend(),
         )
     end
 
@@ -329,6 +332,36 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         CGEF.filter_field!(os, u, grid, CGEF.TopHatKernel(), 5000.0; backend = CGEF.SerialBackend())
         CGEF.filter_field!(od, u, grid, CGEF.TopHatKernel(), 5000.0; backend = CGEF.DistributedBackend())
         Test.@test od ≈ os
+    end
+
+    # GPU backend on the KernelAbstractions CPU device must match serial (validates the GPU kernel
+    # logic here; actual GPU hardware is exercised separately). Same engine ⇒ masking + periodicity
+    # consistent.
+    Test.@testset "GPU backend (KernelAbstractions CPU)" begin
+        gpu = CGEF.GPUBackend(KA.CPU())
+        geom = CGEF.CartesianGeometry(1000.0, 1000.0)
+        lon = collect(0.0:1000.0:20e3)
+        lat = collect(0.0:1000.0:20e3)
+        mask = trues(length(lon), length(lat)); mask[5:7, 5:7] .= false
+        grid = CGEF.StructuredGrid(geom, lon, lat, mask)
+        u = rand(length(lon), length(lat))
+        for strat in (CGEF.Deformable(), CGEF.ZeroFill())
+            os = zeros(size(u)); og = zeros(size(u))
+            CGEF.filter_field!(os, u, grid, CGEF.TopHatKernel(), 5000.0; backend = CGEF.SerialBackend(), mask_strategy = strat)
+            CGEF.filter_field!(og, u, grid, CGEF.TopHatKernel(), 5000.0; backend = gpu, mask_strategy = strat)
+            Test.@test og ≈ os
+        end
+
+        # Periodic global spherical grid
+        sgeom = CGEF.SphericalGeometry(6371000.0)
+        slon = deg2rad.(collect(0.0:5.0:355.0))
+        slat = deg2rad.(collect(-30.0:5.0:30.0))
+        sgrid = CGEF.StructuredGrid(sgeom, slon, slat, trues(length(slon), length(slat)))
+        su = rand(length(slon), length(slat))
+        oss = zeros(size(su)); osg = zeros(size(su))
+        CGEF.filter_field!(oss, su, sgrid, CGEF.TopHatKernel(), deg2rad(15.0) * 6371000.0; backend = CGEF.SerialBackend())
+        CGEF.filter_field!(osg, su, sgrid, CGEF.TopHatKernel(), deg2rad(15.0) * 6371000.0; backend = gpu)
+        Test.@test osg ≈ oss
     end
 
     # spatial finite differences and boundary stencil fallbacks
