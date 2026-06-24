@@ -7,7 +7,7 @@ Spatial coarse-graining analysis of energy fluxes in geophysical fluid dynamics.
 This package implements the coarse-graining (spatial filtering) framework for computing:
 
 - **Cross-scale energy flux** Π(x, ℓ) — the local rate of kinetic energy transfer across scale ℓ
-- **Filtering energy spectrum** E(ℓ) — domain-averaged kinetic energy at each scale
+- **Cumulative coarse-grained energy** ½⟨|ū_ℓ|²⟩ (`cumulative_energy`) and the **filtering spectral density** Ẽ(k_ℓ) (`filtering_spectrum`) — the spectrum extracted by filtering (Sadek & Aluie 2018)
 
 The approach follows Aluie (2011, 2019) and Aluie, Hecht, & Vallis (2018), using real-space convolution kernels (top-hat, Gaussian) to separate large-scale (ū) and sub-scale (u') motions at each point in space.
 
@@ -48,10 +48,22 @@ where:
 When Π > 0, energy flows from large to small scales (forward cascade).
 When Π < 0, energy flows from small to large scales (inverse cascade).
 
-### The Filtering Energy Spectrum
+### The Filtering Spectrum
+
+The **cumulative** coarse-grained kinetic energy (`cumulative_energy`; Sadek & Aluie 2018, Eq. 15)
+is the domain average of the filtered KE:
 
 ```
 E(ℓ) = ½ ⟨|ū_ℓ|²⟩
 ```
 
-where ⟨·⟩ denotes domain average. The spectral slope of E(ℓ) vs ℓ reveals the energy distribution across scales.
+This is a *cumulative* quantity, **not** a spectral density. The **filtering spectral density**
+(`filtering_spectrum`; their Eq. 14 — comparable to a Fourier energy spectrum) is its derivative
+with respect to the filtering wavenumber `k_ℓ = L/ℓ`:
+
+```
+Ẽ(k_ℓ) = d/dk_ℓ [ ½ ⟨|ū_ℓ|²⟩ ]
+```
+
+`coarse_grain` returns both (`result.cumulative_energy`, `result.filtering_spectrum`,
+`result.wavenumber`).
