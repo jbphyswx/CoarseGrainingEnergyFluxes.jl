@@ -9,7 +9,7 @@ using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 # direct sum's O(N · footprint)). Plans + the transfer-function array are built once and reused.
 #
 # The filter is applied as a multiply by the kernel's spectral transfer function Ĝ(|k|, ℓ)
-# (`CGEF.spectral_transfer`, shared with the other spectral backends), normalized to 1 at k = 0 (so
+# (`CGEF.Kernels.spectral_transfer`, shared with the other spectral backends), normalized to 1 at k = 0 (so
 # the domain mean is preserved). Masking is NOT applied (FFT assumes a homogeneous periodic domain);
 # use the direct-sum method for masked/regional grids.
 
@@ -34,16 +34,16 @@ end
 
 function CGEF.Filtering.spectral_filter_plan(
     grid::CGEF.StructuredGrid{G,T},
-    kernel::CGEF.AbstractFilterKernel,
+    kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy = CGEF.Deformable(),
-    backend = CGEF.AutoBackend(),
+    mask_strategy = CGEF.Filtering.Deformable(),
+    backend = CGEF.Backends.AutoBackend(),
 ) where {T<:AbstractFloat, G<:CGEF.CartesianGeometry{T}}
-    (CGEF.isperiodic(grid, 1) && CGEF.isperiodic(grid, 2)) || throw(ArgumentError(
+    (CGEF.Grids.isperiodic(grid, 1) && CGEF.Grids.isperiodic(grid, 2)) || throw(ArgumentError(
         "Spectral FFT filtering requires a doubly-periodic Cartesian grid; build it with " *
         "`StructuredGrid(geom, x, y, mask; periodic = (true, true))`.",
     ))
-    all(grid.mask) || throw(ArgumentError("Spectral FFT filtering does not support land masks; use method = DirectSum()."))
+    all(grid.mask) || throw(ArgumentError("Spectral FFT filtering does not support a partial mask; use method = DirectSum()."))
 
     Nlon, Nlat = size(grid.mask)
     dx = grid.geometry.dx
@@ -51,7 +51,7 @@ function CGEF.Filtering.spectral_filter_plan(
     # Angular wavenumbers (rfft halves the first axis).
     kx = T(2π) .* FFTW.rfftfreq(Nlon, one(T) / dx)
     ky = T(2π) .* FFTW.fftfreq(Nlat, one(T) / dy)
-    transfer = T[CGEF.spectral_transfer(kernel, sqrt(kx[i]^2 + ky[j]^2), scale) for i in eachindex(kx), j in eachindex(ky)]
+    transfer = T[CGEF.Kernels.spectral_transfer(kernel, sqrt(kx[i]^2 + ky[j]^2), scale) for i in eachindex(kx), j in eachindex(ky)]
 
     sample = zeros(T, Nlon, Nlat)
     fwd = FFTW.plan_rfft(sample)
