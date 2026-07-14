@@ -1,11 +1,10 @@
 # Minimal Cartesian coarse-graining demo: cross-scale kinetic-energy flux Π(x, ℓ) and the
 # coarse-grained kinetic energy across scales on a synthetic two-scale 2D velocity field.
 #
-# NOTE: this is a smoke/placeholder example to keep the package runnable end-to-end. A fuller set
-# of scientifically-motivated examples (forced-2D-turbulence forward/inverse cascade, 3D isotropic
-# turbulence, spherical ocean SSH submesoscale flux with land masks, the corrected filtering
-# spectrum recovering a known slope, batched/threaded/GPU/MPI demos) lands in the docs/examples
-# phase of the overhaul.
+# See also in this directory: spherical_coarse_grain.jl (spherical + land mask),
+# curvilinear_coarse_grain.jl (model-native curvilinear mesh), unstructured_coarse_grain.jl
+# (scattered points via k-d tree + Voronoi + spectral filtering), true_3d_coarse_grain.jl (coupled
+# 3D Cartesian + spherical-volumetric flux), depth_profile.jl (2.5D-per-level vertical structure).
 
 using Random: Random
 using Statistics: Statistics
@@ -35,6 +34,6 @@ for (i, ℓ) in enumerate(scales)
     println(
         rpad(round(ℓ / 1e3; digits = 1), 13),
         rpad(round(result.cumulative_energy[i]; sigdigits = 4), 18),
-        round(Statistics.mean(abs, result.Π[i]); sigdigits = 4),
+        round(Statistics.mean(abs, @view result.Π[:, :, i]); sigdigits = 4),
     )
 end
