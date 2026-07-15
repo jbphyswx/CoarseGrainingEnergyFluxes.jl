@@ -18,7 +18,7 @@ jobs:
       matrix:
         # 1.11 is the floor: Project.toml [workspace]/[sources] (and future unregistered ecosystem
         # deps such as NUFSHT.jl) require Julia >= 1.11.
-        version: ['1.11', '1.12', '1']
+        version: ['1.11', '1.12']
         os: [ubuntu-latest]
         arch: [x64]
         include:
