@@ -11,25 +11,29 @@ using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 # refinement. The caller is responsible for `MPI.Init()`.
 #
 # NOTE: built but not exercised in CI (no MPI runtime here); validate under `mpiexec -n P`.
+# Grid-generic (see the OhMyThreadsExt comment): `apply_footprint_row!` already works for any
+# row-decomposable 2D grid, StructuredGrid or CurvilinearGrid.
 function CGEF.Filtering.mpi_filter_field!(
     out::AbstractMatrix{T},
     field::AbstractMatrix,
-    grid::CGEF.StructuredGrid{G,T},
-    kernel::CGEF.AbstractFilterKernel,
+    grid::Union{CGEF.StructuredGrid{G,T,2}, CGEF.CurvilinearGrid{T,G}},
+    kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T,
-    mask_strategy::CGEF.AbstractMaskStrategy,
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
     workspace,
-) where {T<:AbstractFloat, G<:CGEF.AbstractGeometry{T}}
+) where {T<:AbstractFloat, G<:CGEF.Geometry.AbstractGeometry{T}}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nproc = MPI.Comm_size(comm)
 
-    fp = CGEF.Filtering.build_footprint(grid, kernel, scale)
-    periodic = CGEF.isperiodic(grid, 1)
-    _, Nlat = CGEF.size_tuple(grid)
+    # `workspace`, when supplied by a cached `PhysicalFilterPlan`, IS the already-built footprint —
+    # reused instead of rebuilding it on every call (and every rank, in this backend's case).
+    fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale) : workspace
+    periodic = CGEF.Grids.isperiodic(grid, 1)
+    _, Nlat = CGEF.Grids.size_tuple(grid)
 
     fill!(out, zero(T))
-    # Round-robin row partition across ranks (balances land-mask cost like dynamic scheduling).
+    # Round-robin row partition across ranks (balances per-row masking cost like dynamic scheduling).
     for j in (rank + 1):nproc:Nlat
         CGEF.Filtering.apply_footprint_row!(out, field, grid, fp, mask_strategy, periodic, j)
     end

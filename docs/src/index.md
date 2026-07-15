@@ -11,6 +11,11 @@ This package implements the coarse-graining (spatial filtering) framework for co
 
 The approach follows Aluie (2011, 2019) and Aluie, Hecht, & Vallis (2018), using real-space convolution kernels (top-hat, Gaussian) to separate large-scale (ū) and sub-scale (u') motions at each point in space.
 
+Every diagnostic works across the full grid×dimensionality matrix — `StructuredGrid` (1D, 2D, and
+true 3D Cartesian or spherical-volumetric), `CurvilinearGrid` (model-native meshes, e.g. ROMS), and
+`UnstructuredGrid` (scattered points, via k-d tree neighbors, Voronoi cell areas, and non-uniform
+spectral transforms) — see [Architecture](architecture.md) for the full capability matrix.
+
 ## Installation
 
 ```julia

@@ -49,7 +49,7 @@ for (i, ℓ) in enumerate(scales)
     println(
         rpad(round(ℓ / 1e3; digits = 1), 13),
         rpad(round(result.cumulative_energy[i]; sigdigits = 4), 18),
-        round(Statistics.mean(abs, result.Π[i]); sigdigits = 4),
+        round(Statistics.mean(abs, @view result.Π[:, :, i]); sigdigits = 4),
     )
 end
 
