@@ -1,6 +1,6 @@
 # UnstructuredGrid demo: genuinely scattered observations (e.g. moorings, drifters, along-track
-# altimetry) — this is the original motivating case for issue #1 (nonuniform grid-matrix support).
-# k-d tree neighbor search (NearestNeighbors) and exact Voronoi cell areas (DelaunayTriangulation)
+# altimetry), where no rectilinear or curvilinear grid structure exists at all. k-d tree neighbor
+# search (NearestNeighbors) and exact Voronoi cell areas (DelaunayTriangulation)
 # are built at construction time; ddx!/ddy! use weighted-least-squares gradients over that
 # adjacency; filtering is necessarily spectral (FINUFFT) since a scattered point cloud has no
 # translation-invariant real-space footprint.

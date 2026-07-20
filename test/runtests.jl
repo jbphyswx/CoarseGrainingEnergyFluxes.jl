@@ -1401,10 +1401,11 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         # a wrapped neighbor's distance must be computed from its coordinate SHIFTED by one period,
         # not its raw stored coordinate (which sits a full domain-width away) — otherwise every
         # periodic wrap is silently rejected by the `d <= rad` gate and boundary cells behave as if
-        # non-periodic, with no error (found via a direct fast-vs-scattered cross-check; the existing
-        # "no boundary weight corruption" test above did not catch this — its eigenmode is too smooth
-        # and its tolerance too loose to distinguish a correctly-wrapped boundary from a silently
-        # truncated one).
+        # non-periodic, with no error. The existing "no boundary weight corruption" test above does
+        # not catch this on its own — its eigenmode is too smooth and its tolerance too loose to
+        # distinguish a correctly-wrapped boundary from a silently truncated one — so this test
+        # cross-checks the general/scattered path directly against the independently-trusted fast
+        # path instead.
         dx = 1_000.0
         N = 40
         geom = CGEF.CartesianGeometry(dx, dx)

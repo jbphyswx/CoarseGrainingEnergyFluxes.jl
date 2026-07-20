@@ -40,9 +40,8 @@ Test.@testset "MPI backend (rank $rank of $nproc)" begin
     # Each rank is a SEPARATE OS process (mpiexec launches independent `julia` instances), so an
     # unseeded `rand()` gives every rank a DIFFERENT field — silently violating the MPIBackend's
     # documented "field replicated across ranks" assumption and making the Allreduce-combined result
-    # meaningless (found by actually running this file under `mpiexec`, not assuming it worked: every
-    # rank failed all 3 tests before this fix). Seed identically on every rank so the field truly is
-    # replicated, matching the assumption under test.
+    # meaningless. Seed identically on every rank so the field truly is replicated, matching the
+    # assumption under test.
     Random.seed!(1234)
     field = rand(length(lon), length(lat))
     serial, mpi_out = _serial_vs_mpi(grid, field, CGEF.TopHatKernel(), 5000.0)

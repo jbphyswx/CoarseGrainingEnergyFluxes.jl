@@ -29,8 +29,8 @@ Two genuinely different classes of assertion appear here, and the comment on eac
 
 `filter_plan`/`filter_plans`/`deriv_plan`/`workspace` reuse is exactly what makes a caller's REPEATED
 sweep (many timesteps over the same grid/scales) genuinely zero-(re)allocation — the whole point of
-these tests is to catch a regression back to a per-call footprint/plan rebuild, which is real,
-previously-shipped, silently-wasteful behavior this session found and fixed (see CHANGELOG.md).
+these tests is to catch a regression back to a per-call footprint/plan rebuild (see CHANGELOG.md for
+the concrete cost of that regression).
 =#
 
 using Test: Test
@@ -292,9 +292,9 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
     # -----------------------------------------------------------------------
     # compute_Π_profile! / coarse_grain! / coarse_grain_profile / cumulative_energy! — a repeated
     # sweep over the SAME grid/kernel/scales, with workspace + prebuilt per-scale filter_plan(s)
-    # supplied, must not rebuild the footprint (the real, previously-shipped bug this session found:
-    # `compute_Π_profile!` rebuilt the same footprint once per depth level; `coarse_grain!` and
-    # `cumulative_energy!` each independently rebuilt the same per-scale footprint a second time).
+    # supplied, must not rebuild the footprint: `compute_Π_profile!` must not rebuild it once per
+    # depth level, and `coarse_grain!`/`cumulative_energy!` must not each independently rebuild the
+    # same per-scale footprint a second time.
     # -----------------------------------------------------------------------
     Test.@testset "Repeated-sweep pipeline entry points: no redundant footprint rebuild" begin
         ker = CGEF.TopHatKernel()

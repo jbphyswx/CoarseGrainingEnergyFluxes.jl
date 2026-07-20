@@ -1125,9 +1125,8 @@ function cumulative_energy!(
 
     # Sweep through scales. When the caller (typically `coarse_grain!`, which already builds one
     # plan per scale for its own `compute_Π!` loop) supplies `filter_plans`, reuse those instead of
-    # rebuilding the same footprint a second time — this was the dominant redundant allocation in a
-    # `coarse_grain!` sweep (confirmed by measurement: a 3-scale sweep dropped from ~60KB to within a
-    # few hundred bytes of the sum of the three `compute_Π!` calls' own footprint builds).
+    # rebuilding the same footprint a second time — otherwise this becomes the dominant allocation in
+    # a `coarse_grain!` sweep, since each footprint build costs far more than the rest of the loop body.
     for s_idx in 1:Nscales
         ℓ = T(scales[s_idx])
         plan = filter_plans === nothing ?
