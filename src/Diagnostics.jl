@@ -826,7 +826,7 @@ end
 
 Full **three-dimensional** Cartesian cross-scale energy flux Π = -S̄_ij τ_ij with all nine strain
 components (the diagonal `S_zz = ∂w̄/∂z` and the off-diagonals `S_xz, S_yz` carry genuine vertical
-derivatives, unlike the 2.5D layer-by-layer path). The 3D grid carries a 3D mask, so dry cells are
+derivatives, unlike the 2.5D layer-by-layer path). The 3D grid carries a 3D mask, so masked cells are
 handled per-cell in all three directions.
 
 The contraction is the symmetric six-term sum

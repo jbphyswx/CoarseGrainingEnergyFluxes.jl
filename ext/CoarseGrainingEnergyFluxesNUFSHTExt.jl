@@ -36,7 +36,7 @@ adapter, and the (optional) mask for renormalization. Built by
 struct NUFSHTFilterPlan{P, F, T<:AbstractFloat, M} <: CGEF.Filtering.AbstractFilterPlan
     plan::P
     filter::F
-    mask::M        # Vector{T} of 0/1, or nothing when fully wet
+    mask::M        # Vector{T} of 0/1, or nothing when fully active (unmasked)
 end
 
 function CGEF.Filtering.spectral_filter_plan(
@@ -79,7 +79,7 @@ function CGEF.Filtering.filter_apply!(
     if plan.mask === nothing
         NUFSHT.nusht_filter!(out, f, plan.filter, plan.plan)
     else
-        # Zero land, filter, then divide by the filtered mass over wet points (deformable masking).
+        # Zero masked points, filter, then divide by the filtered mass over active points (deformable masking).
         NUFSHT.nusht_filter!(out, f .* plan.mask, plan.filter, plan.plan)
         NUFSHT.nusht_filter_renorm!(out, plan.mask, plan.filter, plan.plan)
     end

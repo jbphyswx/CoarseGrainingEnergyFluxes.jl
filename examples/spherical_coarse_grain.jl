@@ -1,9 +1,9 @@
 # Spherical regional coarse-graining demo: cross-scale kinetic-energy flux Π(x, ℓ) and the filtering
-# spectrum on a synthetic non-divergent velocity field over a lon/lat patch with a land mask.
+# spectrum on a synthetic non-divergent velocity field over a masked lon/lat patch.
 #
 # The velocity is built as u = ∇⊥ψ (a streamfunction), so it is non-divergent — the regime in which
-# the planetary-Cartesian filtering of Aluie (2019) / Storer et al. (2022) is exact. Land cells are
-# masked and handled by the default deformable kernel renormalization.
+# the planetary-Cartesian filtering of Aluie (2019) / Storer et al. (2022) is exact. Masked cells are
+# handled by the default deformable kernel renormalization.
 
 using Random: Random
 using Statistics: Statistics
@@ -11,14 +11,14 @@ using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 
 Random.seed!(2024)
 
-# Regional spherical patch: 20°×20° box near the Gulf Stream latitude, 0.1° resolution.
+# Regional spherical patch: 20°×20° box at mid-latitude, 0.1° resolution.
 R = 6.371e6
 geom = CGEF.SphericalGeometry(R)
 lon = deg2rad.(collect(-70.0:0.1:-50.0))
 lat = deg2rad.(collect(30.0:0.1:50.0))
 Nlon, Nlat = length(lon), length(lat)
 
-# A simple round "island" land mask in the middle of the domain.
+# A simple circular excluded region in the middle of the domain.
 mask = trues(Nlon, Nlat)
 ci, cj = Nlon ÷ 2, Nlat ÷ 2
 for j in 1:Nlat, i in 1:Nlon

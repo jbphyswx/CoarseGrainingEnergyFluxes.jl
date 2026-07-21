@@ -12,8 +12,8 @@ The coarse-grained (filtered) field at scale ℓ is a convolution with a normali
 ū_ℓ(x) = ∫ G_ℓ(x, x') u(x') dA(x')
 ```
 
-Over a wet (unmasked) domain the kernel is renormalized by its running mass, so a constant field
-filters to itself even next to coastlines (the `Deformable` mask strategy).
+Over an unmasked domain the kernel is renormalized by its running mass, so a constant field filters
+to itself even next to a mask boundary (the `Deformable` mask strategy).
 
 ### Sub-Scale Stress Tensor
 

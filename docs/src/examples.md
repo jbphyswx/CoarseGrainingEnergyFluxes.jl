@@ -79,7 +79,7 @@ result.wavenumber            # k_ℓ = L/ℓ
 result.filtering_spectrum    # Ẽ(k_ℓ) density (Eq. 14)
 ```
 
-## Spherical ocean domain with a land mask
+## Spherical domain with a mask
 
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
@@ -87,7 +87,7 @@ using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 geom = CGEF.SphericalGeometry(6.371e6)
 lon = deg2rad.(collect(0.0:0.25:359.75))
 lat = deg2rad.(collect(-80.0:0.25:80.0))
-mask = trues(length(lon), length(lat))      # or load a real land/sea mask
+mask = trues(length(lon), length(lat))      # or load a real mask of active/excluded cells
 
 grid = CGEF.StructuredGrid(geom, lon, lat, mask)   # full-circle lon ⇒ periodic auto-detected
 # u, v = load_velocity(...)
@@ -96,15 +96,16 @@ scales = collect(10e3:10e3:300e3)
 result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel())
 ```
 
-The `Deformable` mask strategy (default) renormalizes the kernel over wet points near coastlines;
-pass `mask_strategy = CGEF.Filtering.ZeroFill()` to treat land as zeros instead.
+The `Deformable` mask strategy (default) renormalizes the kernel over active points near the mask
+boundary; pass `mask_strategy = CGEF.Filtering.ZeroFill()` to treat excluded cells as zeros instead.
 
 ## Curvilinear (model-native) grids
 
 `CurvilinearGrid` needs no rectilinear axis assumption at all — every point carries its own
 `(lon, lat)`, and derivatives/filtering/`Π` all work directly off the 2D coordinate arrays via a
-per-point footprint and weighted-least-squares (WLSQ) gradients. A common source is a ROMS-style
-ocean model's curvilinear rho-points grid; here's a synthetic sheared/rotated example:
+per-point footprint and weighted-least-squares (WLSQ) gradients. A common source is a
+structured-grid ocean/atmosphere model's curvilinear cell-center grid; here's a synthetic
+sheared/rotated example:
 
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
@@ -227,7 +228,7 @@ meaningfully exercised under `mpiexec -n P`; see `test/mpi_runtests.jl` for a ru
 ## Spectral filtering (`method = Spectral()`)
 
 Spectral filtering multiplies by Ĝ(k) and is selected by the grid type (FFTW / FINUFFT /
-FastSphericalHarmonics / NUFSHT). It assumes a homogeneous domain (no land mask). Use a Gaussian or
+FastSphericalHarmonics / NUFSHT). It assumes a homogeneous domain (no mask). Use a Gaussian or
 sharp-spectral kernel — the top-hat is unsupported spectrally.
 
 ```julia

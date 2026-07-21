@@ -142,7 +142,7 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         geom = CGEF.CartesianGeometry(2000.0, 2000.0)
         lon = collect(0.0:2000.0:20000.0) # 11 points
         lat = collect(0.0:2000.0:10000.0) # 6 points
-        mask = trues(11, 6) # active water grid
+        mask = trues(11, 6) # fully active grid
 
         grid = CGEF.StructuredGrid(geom, lon, lat, mask)
         Test.@test CGEF.Grids.size_tuple(grid) == (11, 6)
@@ -181,7 +181,7 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         out = zeros(11, 11)
         CGEF.Filtering.filter_field!(out, field, grid, CGEF.TopHatKernel(), 300.0)
 
-        # Wet cells must have the exact filtered value (42.0)
+        # Active (unmasked) cells must have the exact filtered value (42.0)
         Test.@test out[5, 5] ≈ 42.0
 
         # Test division by zero protection with single-latitude grid
@@ -655,7 +655,7 @@ Test.@testset "CoarseGrainingEnergyFluxes.jl" begin
         grid = CGEF.StructuredGrid(geom, lon, lat, mask)
 
         # Test horizontal derivatives of f(x) = 3x + 1
-        # ∂f/∂x should be exactly 3.0 at all wet cells
+        # ∂f/∂x should be exactly 3.0 at all active (unmasked) cells
         f = zeros(6, 6)
         for j in 1:6, i in 1:6
             f[i, j] = 3.0 * grid.lon[i] + 1.0

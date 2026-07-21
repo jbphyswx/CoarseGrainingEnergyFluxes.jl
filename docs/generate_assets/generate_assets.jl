@@ -424,10 +424,10 @@ function fig_tracer_flux()
     save_fig("tracer_flux.png", fig)
 end
 
-# ─── Land masking: deformable vs zero-fill near coastlines ───────────────────
+# ─── Masking: deformable vs zero-fill near a mask boundary ───────────────────
 function fig_masking()
     fr = fractal_field(); xs = fr.xs; km = xs ./ 1e3; N = length(xs)
-    # a curved "coastline": mask out a disk (island) + a corner (continent)
+    # an irregular mask boundary: exclude a disk + a corner region
     cx, cy = N ÷ 2, Int(round(0.62N))
     mask = trues(N, N)
     for j in 1:N, i in 1:N
@@ -439,28 +439,28 @@ function fig_masking()
     ℓ = 16e3; ker = CGEF.GaussianKernel()
     od = zero(fr.f); CGEF.Filtering.filter_field!(od, fr.f, grid, ker, ℓ; mask_strategy = CGEF.Filtering.Deformable())
     oz = zero(fr.f); CGEF.Filtering.filter_field!(oz, fr.f, grid, ker, ℓ; mask_strategy = CGEF.Filtering.ZeroFill())
-    # show land as NaN (rendered transparent/blank)
-    land(A) = [mask[i, j] ? A[i, j] : NaN for i in 1:N, j in 1:N]
-    landmask = [mask[i, j] ? NaN : 1.0 for i in 1:N, j in 1:N]
+    # show masked cells as NaN (rendered transparent/blank)
+    showmasked(A) = [mask[i, j] ? A[i, j] : NaN for i in 1:N, j in 1:N]
+    maskoverlay = [mask[i, j] ? NaN : 1.0 for i in 1:N, j in 1:N]
     cl = symclim(fr.f)
-    diff = land(od .- oz)
+    diff = showmasked(od .- oz)
     cld = symclim(filter(!isnan, diff) |> collect)
 
     fig = MK.Figure(; size = (1760, 430))
-    MK.Label(fig[0, 1:4], "Land masks: the deformable kernel renormalizes over water (no bleed) — the difference is concentrated at coasts";
+    MK.Label(fig[0, 1:4], "Masking: the deformable kernel renormalizes over active cells (no bleed) — the difference is concentrated at the mask boundary";
         fontsize = 18, font = :bold)
-    for (k, (ttl, A)) in enumerate((("field + land mask", fr.f), ("Deformable (renormalized)", od),
-            ("ZeroFill (land = 0)", oz)))
+    for (k, (ttl, A)) in enumerate((("field + mask", fr.f), ("Deformable (renormalized)", od),
+            ("ZeroFill (masked = 0)", oz)))
         ax = MK.Axis(fig[1, k]; title = ttl, aspect = MK.DataAspect(),
             xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
-        hm = MK.heatmap!(ax, km, km, land(A); colormap = FIELDMAP, colorrange = (-cl, cl))
-        MK.heatmap!(ax, km, km, landmask; colormap = [:gray75, :gray75])
+        hm = MK.heatmap!(ax, km, km, showmasked(A); colormap = FIELDMAP, colorrange = (-cl, cl))
+        MK.heatmap!(ax, km, km, maskoverlay; colormap = [:gray75, :gray75])
         k == 3 && MK.Colorbar(fig[1, k, MK.Right()], hm; width = 10)
     end
     ax4 = MK.Axis(fig[1, 4]; title = "Deformable − ZeroFill", aspect = MK.DataAspect(),
         xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
     hmd = MK.heatmap!(ax4, km, km, diff; colormap = :PuOr, colorrange = (-cld, cld))
-    MK.heatmap!(ax4, km, km, landmask; colormap = [:gray75, :gray75])
+    MK.heatmap!(ax4, km, km, maskoverlay; colormap = [:gray75, :gray75])
     MK.Colorbar(fig[1, 4, MK.Right()], hmd; width = 10)
     MK.colgap!(fig.layout, 12)
     save_fig("masking.png", fig)

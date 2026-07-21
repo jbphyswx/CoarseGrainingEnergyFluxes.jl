@@ -1,7 +1,7 @@
 # Minimal Cartesian coarse-graining demo: cross-scale kinetic-energy flux Π(x, ℓ) and the
 # coarse-grained kinetic energy across scales on a synthetic two-scale 2D velocity field.
 #
-# See also in this directory: spherical_coarse_grain.jl (spherical + land mask),
+# See also in this directory: spherical_coarse_grain.jl (spherical + mask),
 # curvilinear_coarse_grain.jl (model-native curvilinear mesh), unstructured_coarse_grain.jl
 # (scattered points via k-d tree + Voronoi + spectral filtering), true_3d_coarse_grain.jl (coupled
 # 3D Cartesian + spherical-volumetric flux), depth_profile.jl (2.5D-per-level vertical structure).

@@ -18,7 +18,7 @@ export AbstractFilterPlan, plan_filter, filter_apply!
 """
     AbstractMaskStrategy
 
-How land/dry cells enter the filter normalization.
+How masked (inactive) cells enter the filter normalization.
 """
 abstract type AbstractMaskStrategy end
 
@@ -34,9 +34,9 @@ struct ZeroFill <: AbstractMaskStrategy end
 """
     Deformable <: AbstractMaskStrategy
 
-Dry cells are excluded from BOTH numerator and denominator, so the kernel is renormalized over the
+Masked cells are excluded from BOTH numerator and denominator, so the kernel is renormalized over the
 the locally-included area only ("deformable kernel"). Excluded cells are genuinely dropped, but the kernel becomes
-inhomogeneous near coasts (breaks the strict commutation theorems).
+inhomogeneous near a mask boundary (breaks the strict commutation theorems).
 """
 struct Deformable <: AbstractMaskStrategy end
 
@@ -549,7 +549,7 @@ end
 
 Fill output row `j` (`out[:, j]`) from a precomputed footprint. Rows are independent (each writes a
 disjoint column of the column-major output), so this is the unit of parallelism for the threaded /
-distributed backends. Callers must `fill!(out, 0)` first (dry cells are left untouched here).
+distributed backends. Callers must `fill!(out, 0)` first (masked cells are left untouched here).
 """
 function apply_footprint_row!(
     out::AbstractMatrix{T},
@@ -576,15 +576,15 @@ function apply_footprint_row!(
                 periodic_lon || continue
                 ii = mod1(ii, Nlon)
             end
-            wet = Grids.isactive(grid, ii, jj)
+            active = Grids.isactive(grid, ii, jj)
             w = fp.w[k]
             if strategy isa ZeroFill
                 # Excluded cells count in the denominator (as zero).
                 weight_norm += w
-                wet && (weighted_sum += w * field[ii, jj])
+                active && (weighted_sum += w * field[ii, jj])
             else
-                # Deformable: dry cells excluded from numerator AND denominator.
-                wet || continue
+                # Deformable: masked cells excluded from numerator AND denominator.
+                active || continue
                 weight_norm += w
                 weighted_sum += w * field[ii, jj]
             end
@@ -643,13 +643,13 @@ function apply_footprint_row!(
         @inbounds for k in lo:hi
             ii = fp.ii[k]
             jj = fp.jj[k]
-            wet = Grids.isactive(grid, ii, jj)
+            active = Grids.isactive(grid, ii, jj)
             w = fp.w[k]
             if strategy isa ZeroFill
                 weight_norm += w
-                wet && (weighted_sum += w * field[ii, jj])
+                active && (weighted_sum += w * field[ii, jj])
             else
-                wet || continue
+                active || continue
                 weight_norm += w
                 weighted_sum += w * field[ii, jj]
             end
@@ -842,12 +842,12 @@ end
     @inbounds for k in eachindex(fp.offsets)
         J, valid = _shift_index(Ti, fp.offsets[k], dims, periodic)
         valid || continue
-        wet = mask[J...]
+        active = mask[J...]
         wk = fp.w[k]
         if strategy isa ZeroFill
             wn += wk
-            wet && (ws += wk * field[J...])
-        elseif wet
+            active && (ws += wk * field[J...])
+        elseif active
             wn += wk
             ws += wk * field[J...]
         end
@@ -884,12 +884,12 @@ end
     wn = zero(T)
     @inbounds for k in lo:hi
         J = fp.nbrs[k]
-        wet = mask[J...]
+        active = mask[J...]
         wk = fp.w[k]
         if strategy isa ZeroFill
             wn += wk
-            wet && (ws += wk * field[J...])
-        elseif wet
+            active && (ws += wk * field[J...])
+        elseif active
             wn += wk
             ws += wk * field[J...]
         end

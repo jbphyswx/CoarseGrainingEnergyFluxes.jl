@@ -1,7 +1,7 @@
-# CurvilinearGrid demo: a sheared/rotated model-native mesh (the kind a ROMS-style ocean model
-# stores at its rho-points) — no rectilinear axis anywhere. Filtering, derivatives, and Π all work
-# directly off the 2D (lon, lat) coordinate arrays via a per-point footprint and weighted-least-
-# squares (WLSQ) gradients, not a fast-path that assumes uniform spacing.
+# CurvilinearGrid demo: a sheared/rotated model-native mesh (the kind a structured-grid ocean or
+# atmosphere model stores at its cell centers) — no rectilinear axis anywhere. Filtering,
+# derivatives, and Π all work directly off the 2D (lon, lat) coordinate arrays via a per-point
+# footprint and weighted-least-squares (WLSQ) gradients, not a fast-path that assumes uniform spacing.
 
 using Random: Random
 using Statistics: Statistics

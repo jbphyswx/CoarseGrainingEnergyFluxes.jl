@@ -17,7 +17,7 @@ abstract type AbstractStencilOrder end
 """
     SecondOrderStencil <: AbstractStencilOrder
 
-Standard 2nd-order centered difference stencil. Near boundaries and land,
+Standard 2nd-order centered difference stencil. Near boundaries and masked cells,
 it falls back dynamically to 1st-order one-sided differences to avoid contamination.
 """
 struct SecondOrderStencil <: AbstractStencilOrder end
@@ -95,10 +95,10 @@ function ddx!(
                 # Nonuniform-aware 2nd-order centered difference
                 ∂f∂x[i, j] = Geometry.nonuniform_first_derivative(f[i-1, j], f[i, j], f[i+1, j], h_m, h_p)
             elseif has_p
-                # Forward difference (at boundary or near land)
+                # Forward difference (at boundary or near a masked cell)
                 ∂f∂x[i, j] = (f[i+1, j] - f[i, j]) / h_p
             elseif has_m
-                # Backward difference (at boundary or near land)
+                # Backward difference (at boundary or near a masked cell)
                 ∂f∂x[i, j] = (f[i, j] - f[i-1, j]) / h_m
             else
                 # Completely isolated point
@@ -204,10 +204,10 @@ function ddy!(
                 # Nonuniform-aware 2nd-order centered difference
                 ∂f∂y[i, j] = Geometry.nonuniform_first_derivative(f[i, j-1], f[i, j], f[i, j+1], h_m, h_p)
             elseif has_p
-                # Forward difference (at boundary or near land)
+                # Forward difference (at boundary or near a masked cell)
                 ∂f∂y[i, j] = (f[i, j+1] - f[i, j]) / h_p
             elseif has_m
-                # Backward difference (at boundary or near land)
+                # Backward difference (at boundary or near a masked cell)
                 ∂f∂y[i, j] = (f[i, j] - f[i, j-1]) / h_m
             else
                 # Completely isolated point
@@ -306,8 +306,8 @@ end
 # These dispatch on `StructuredGrid{Cartesian,T,3}` (N = 3), which is strictly more specific than the
 # N-free 2.5D methods above, so a genuine 3D grid routes here while a 2D grid carrying a 3D field
 # (layer-by-layer) keeps using the 2.5D methods. Each direction uses a 2nd-order centered difference
-# that falls back to a one-sided difference at the domain edge or against a land cell, mirroring the
-# 2D engine. Dry cells are written as exactly zero.
+# that falls back to a one-sided difference at the domain edge or against a masked cell, mirroring
+# the 2D engine. Masked cells are written as exactly zero.
 # ---------------------------------------------------------------------------
 
 for (fn, dim) in ((:ddx!, 1), (:ddy!, 2), (:ddz!, 3))
@@ -520,10 +520,11 @@ end
 # difference the `StructuredGrid` engine uses.
 #
 # The stencil reuses the `isactive`-based one-sided fallback of the `StructuredGrid` methods: a
-# neighbour enters only if in-bounds and wet, so boundary/coastal nodes silently use fewer points.
-# If a whole tangent direction has no data (`A` rank-deficient), that undetermined gradient component
-# is set to zero (matching the `StructuredGrid` "isolated point ⇒ 0" convention); a node with no wet
-# neighbours has a zero gradient. `CurvilinearGrid` is treated as non-periodic (no seam wrap).
+# neighbour enters only if in-bounds and active, so boundary/masked-adjacent nodes silently use fewer
+# points. If a whole tangent direction has no data (`A` rank-deficient), that undetermined gradient
+# component is set to zero (matching the `StructuredGrid` "isolated point ⇒ 0" convention); a node
+# with no active neighbours has a zero gradient. `CurvilinearGrid` is treated as non-periodic (no
+# seam wrap).
 
 """
     WLSQGradientPlan{T, VI, VT}
@@ -576,7 +577,7 @@ function WLSQGradientPlan(grid::Grids.CurvilinearGrid{T,G}) where {T<:AbstractFl
             continue
         end
         c0 = Grids.coords(grid, i, j)
-        # Pass 1: assemble the weighted normal (Gram) matrix A over the valid wet neighbours.
+        # Pass 1: assemble the weighted normal (Gram) matrix A over the valid active neighbours.
         Axx = zero(T); Ayy = zero(T); Axy = zero(T)
         for (ddi, ddj) in _WLSQ_OFFSETS
             in_ = i + ddi; jn = j + ddj
@@ -702,7 +703,7 @@ index space to offset from on a scattered mesh) and its precomputed gradient coe
 
 Since each node's neighbour COUNT is already known exactly in advance from the grid's own
 `neighbor_ptr` (no fixed stencil-size upper bound needed, unlike `CurvilinearGrid`'s fixed 4-point
-stencil), storage is preallocated to that EXACT total, then trimmed only for skipped dry
+stencil), storage is preallocated to that EXACT total, then trimmed only for skipped masked
 nodes/neighbours or degenerate (zero-displacement) pairs.
 """
 struct UnstructuredWLSQGradientPlan{T<:AbstractFloat, VI<:AbstractVector{Int}, VT<:AbstractVector{T}}
@@ -724,7 +725,7 @@ function WLSQGradientPlan(grid::Grids.UnstructuredGrid{T}) where {T<:AbstractFlo
     geo = grid.geometry
     # Exact upper bound: every retained entry corresponds to one flat adjacency-array slot, so the
     # true count over the whole grid can never exceed `length(grid.neighbor_nbrs)` — preallocate to
-    # that (not a conservative sizehint!) and trim only for skipped dry/degenerate pairs.
+    # that (not a conservative sizehint!) and trim only for skipped masked/degenerate pairs.
     maxentries = length(grid.neighbor_nbrs)
     nbr = Vector{Int}(undef, maxentries)
     cx = Vector{T}(undef, maxentries)
@@ -738,7 +739,7 @@ function WLSQGradientPlan(grid::Grids.UnstructuredGrid{T}) where {T<:AbstractFlo
             continue
         end
         c0 = Grids.coords(grid, i)
-        # Pass 1: assemble the weighted normal (Gram) matrix A over the valid wet neighbours.
+        # Pass 1: assemble the weighted normal (Gram) matrix A over the valid active neighbours.
         Axx = zero(T); Ayy = zero(T); Axy = zero(T)
         for j in Grids.neighbors(grid, i)
             Grids.isactive(grid, j) || continue

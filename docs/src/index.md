@@ -12,7 +12,7 @@ This package implements the coarse-graining (spatial filtering) framework for co
 The approach follows Aluie (2011, 2019) and Aluie, Hecht, & Vallis (2018), using real-space convolution kernels (top-hat, Gaussian) to separate large-scale (ū) and sub-scale (u') motions at each point in space.
 
 Every diagnostic works across the full grid×dimensionality matrix — `StructuredGrid` (1D, 2D, and
-true 3D Cartesian or spherical-volumetric), `CurvilinearGrid` (model-native meshes, e.g. ROMS), and
+true 3D Cartesian or spherical-volumetric), `CurvilinearGrid` (model-native orthogonal curvilinear meshes), and
 `UnstructuredGrid` (scattered points, via k-d tree neighbors, Voronoi cell areas, and non-uniform
 spectral transforms) — see [Architecture](architecture.md) for the full capability matrix.
 
@@ -30,11 +30,11 @@ Pkg.add(url="https://github.com/jbphyswx/CoarseGrainingEnergyFluxes.jl")
 Traditional Fourier spectral analysis provides wavenumber spectra E(k) but:
 - Requires periodicity or windowing
 - Cannot localize energy transfer in physical space
-- Poorly suited to irregular domains and coastlines
+- Poorly suited to irregular domains and boundaries
 
 Coarse-graining provides:
 - **Local** energy flux Π(x, ℓ) at every grid point
-- Works on arbitrary domains with land masks
+- Works on arbitrary domains with masked (excluded) regions
 - No periodicity assumption
 - Direct physical-space interpretation
 

@@ -39,14 +39,14 @@ using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
                         end
                     end
                     if inbounds
-                        wet = mask[ii, jj]
+                        active = mask[ii, jj]
                         wk = w[k]
                         if is_zerofill
                             wn += wk
-                            if wet
+                            if active
                                 ws += wk * field[ii, jj]
                             end
-                        elseif wet
+                        elseif active
                             wn += wk
                             ws += wk * field[ii, jj]
                         end
@@ -80,14 +80,14 @@ end
             for k in lo:hi
                 ii = ii_arr[k]
                 jj = jj_arr[k]
-                wet = mask[ii, jj]
+                active = mask[ii, jj]
                 wk = w[k]
                 if is_zerofill
                     wn += wk
-                    if wet
+                    if active
                         ws += wk * field[ii, jj]
                     end
-                elseif wet
+                elseif active
                     wn += wk
                     ws += wk * field[ii, jj]
                 end

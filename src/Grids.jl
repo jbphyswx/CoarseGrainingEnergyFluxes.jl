@@ -398,11 +398,11 @@ end
 """
     CurvilinearGrid{T, G, ML, MA, B}
 
-Curvilinear grid where the cell-center coordinates are 2D arrays (e.g. ROMS / WCOFS / orthogonal
-curvilinear meshes). `lon`/`lat` are the `Nlon × Nlat` cell-center (rho-point) coordinates;
-`lon_corner`/`lat_corner` are the `(Nlon+1) × (Nlat+1)` cell-vertex (psi-point) coordinates from
-which the exact quadrilateral cell `areas` are computed (matching how ROMS stores rho/psi points),
-rather than a cell-center spacing approximation.
+Curvilinear grid where the cell-center coordinates are 2D arrays (e.g. an orthogonal curvilinear
+mesh from a structured-grid ocean/atmosphere model). `lon`/`lat` are the `Nlon × Nlat` cell-center
+coordinates; `lon_corner`/`lat_corner` are the `(Nlon+1) × (Nlat+1)` cell-vertex coordinates from
+which the exact quadrilateral cell `areas` are computed directly, rather than a cell-center spacing
+approximation.
 
 # Type parameters
 - `T`: coordinate float type. `G<:AbstractGeometry{T}` is tied to it (a mismatched-eltype geometry is
@@ -546,7 +546,8 @@ end
 
 Build a curvilinear grid from `Nlon × Nlat` cell-center coordinate arrays `lon`/`lat`, computing
 exact quadrilateral cell areas from the `(Nlon+1) × (Nlat+1)` cell-vertex arrays. Supply
-`lon_corner`/`lat_corner` for exact corners (e.g. ROMS psi points); otherwise they are reconstructed
+`lon_corner`/`lat_corner` for exact corners (e.g. from the source model's own cell-vertex grid);
+otherwise they are reconstructed
 from the centers (see [`_centers_to_corners`](@ref)), which requires at least a 2×2 grid.
 
 Spherical cell areas use the exact spherical-quadrilateral (L'Huilier excess) area; Cartesian cells

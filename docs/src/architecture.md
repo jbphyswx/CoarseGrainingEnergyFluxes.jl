@@ -67,7 +67,7 @@ Given 3D `(lon, lat, depth)` velocity, there are two distinct, non-interchangeab
 Two orthogonal choices control *how* a filter is evaluated:
 
 1. **Filter method** (`method = DirectSum()` default, or `Spectral()`):
-   - `DirectSum()` — real-space footprint convolution. Supports land masks, regional/non-periodic
+   - `DirectSum()` — real-space footprint convolution. Supports masks, regional/non-periodic
      domains, and arbitrary scales. The only method for masked or bounded fields.
    - `Spectral()` — transform → multiply by Ĝ(|k|, ℓ) → inverse transform. `O(N log N)`,
      scale-independent cost, but assumes a homogeneous (periodic / global) domain with no mask.
@@ -110,7 +110,7 @@ AbstractGeometry{T}                 AbstractFilterKernel
 AbstractGrid{G,T}
 ├── StructuredGrid{G,T,N}      N = 1, 2, 3   (rectilinear; N-D cell measure + mask; N=3 spherical
 │                              is a genuine volumetric shell — lon,lat,radius axes, r²cosφ volume)
-├── CurvilinearGrid{T,G,...}   2D, model-native (e.g. ROMS rho/u/v/psi points); exact corner-based
+├── CurvilinearGrid{T,G,...}   2D, model-native (orthogonal curvilinear meshes); exact corner-based
 │                              quadrilateral cell areas; independent type params for lon/lat vs.
 │                              the derived areas array (no shared-eltype over-constraint)
 └── UnstructuredGrid{T,G,...}  1D, scattered points; k-d tree adjacency (CSR) + Voronoi cell areas;

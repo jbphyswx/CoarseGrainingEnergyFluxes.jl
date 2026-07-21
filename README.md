@@ -28,7 +28,7 @@ execution.
 Every diagnostic works across the full grid×dimensionality matrix: 1D transects, 2D (Cartesian or
 spherical, single-level or the standard literature "vertical structure" depth-profile method), true
 3D (Cartesian and spherical-volumetric, genuinely coupled vertical derivatives), model-native
-curvilinear grids (ROMS-style, via weighted-least-squares gradients), and scattered/unstructured
+curvilinear grids (orthogonal curvilinear meshes, via weighted-least-squares gradients), and scattered/unstructured
 point clouds (via k-d tree neighbor search, Voronoi cell areas, and non-uniform spectral transforms).
 
 ## Results
@@ -58,8 +58,8 @@ The scalar analogue of Π (buoyancy ⇒ available-potential-energy transfer).
 
 ![Tracer flux](docs/src/assets/tracer_flux.png)
 
-### Land masks: deformable vs zero-fill
-The deformable kernel renormalizes over water; the difference between strategies is concentrated at coastlines.
+### Masking: deformable vs zero-fill
+The deformable kernel renormalizes over active cells; the difference between strategies is concentrated at the mask boundary.
 
 ![Masking](docs/src/assets/masking.png)
 
@@ -74,8 +74,8 @@ Pure rotation has no deformation, so the flux must vanish (to machine precision)
 ![Rigid Rotation Validation](docs/src/assets/rigid_rotation_validation.png)
 
 ### Curvilinear (model-native) grids
-A sheared/rotated curvilinear mesh (e.g. a ROMS-style ocean grid) filtered via weighted-least-squares
-gradients — no rectilinear assumption anywhere in the pipeline.
+A sheared/rotated curvilinear mesh filtered via weighted-least-squares gradients — no rectilinear
+assumption anywhere in the pipeline.
 
 ![Curvilinear grid](docs/src/assets/curvilinear.png)
 
@@ -104,7 +104,7 @@ using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 
 # Create grid
 geom = CGEF.SphericalGeometry(6.371e6)  # Earth radius in meters
-grid = CGEF.StructuredGrid(geom, lon_rad, lat_rad, land_mask)
+grid = CGEF.StructuredGrid(geom, lon_rad, lat_rad, mask)
 
 # Run multi-scale analysis
 scales = collect(10e3:10e3:300e3)  # 10 km to 300 km
@@ -163,7 +163,7 @@ Backend implementations and all spectral/spatial-indexing transforms live in **p
 | Grid | Dimensionality | Real-space filter | Spectral filter | Derivatives | `compute_Π!` |
 |------|-----------------|--------------------|-----------------|--------------|--------------|
 | `StructuredGrid` | 1D, 2D, true 3D (Cartesian or spherical-volumetric) | Yes | Yes (FFTW 2D Cartesian; FastSphericalHarmonics 2D spherical) | `ddx!`/`ddy!`/`ddz!` | Yes, all dimensionalities + a 2.5D depth-profile wrapper (`compute_Π_profile!`) |
-| `CurvilinearGrid` | 2D (model-native, e.g. ROMS rho/u/v/psi points) | Yes (per-point footprint, no translation invariance assumed) | Not yet (no spectral extension targets it — real-space only) | `ddx!`/`ddy!` via weighted-least-squares (WLSQ) | Yes |
+| `CurvilinearGrid` | 2D (model-native, orthogonal curvilinear meshes) | Yes (per-point footprint, no translation invariance assumed) | Not yet (no spectral extension targets it — real-space only) | `ddx!`/`ddy!` via weighted-least-squares (WLSQ) | Yes |
 | `UnstructuredGrid` | 1D (scattered points) | Not applicable — spectral only | Yes (FINUFFT Cartesian; NUFSHT spherical) | `ddx!`/`ddy!` via WLSQ over k-d tree adjacency | Yes |
 
 `CurvilinearGrid` and `UnstructuredGrid` are built genuinely from scratch, not thin wrappers: exact
