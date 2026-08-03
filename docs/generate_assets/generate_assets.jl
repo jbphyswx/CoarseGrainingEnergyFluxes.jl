@@ -10,12 +10,13 @@ built from the package's public API under the qualified-import policy.
 
 using CairoMakie: CairoMakie as MK
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
-using DelaunayTriangulation: DelaunayTriangulation   # triggers CGEF's planar Voronoi-area extension
+using FlowGeometries: FlowGeometries as FG
+using DelaunayTriangulation: DelaunayTriangulation   # triggers FlowGeometries' planar Voronoi-area extension
 using FFTW: FFTW
 using FINUFFT: FINUFFT        # triggers CGEF's scattered-Cartesian (FINUFFT) extension
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 using NUFSHT: NUFSHT          # triggers CGEF's scattered-spherical (NUFSHT) extension
-using NearestNeighbors: NearestNeighbors   # triggers CGEF's k-d tree neighbor-search extension
+using NearestNeighbors: NearestNeighbors   # triggers FlowGeometries' k-d tree neighbor-search extension
 using Random: Random
 using Statistics: Statistics
 
@@ -25,7 +26,9 @@ mkpath(ASSETS)
 MK.set_theme!(
     MK.Theme(;
         fontsize = 15,
-        figure_padding = (12, 34, 12, 12),   # extra right margin so colorbar ticklabels aren't clipped
+        # Right margin sized for a rightmost colorbar carrying BOTH scientific-notation ticks
+        # (`2×10⁻⁶`) and a rotated label; anything narrower clips one or the other.
+        figure_padding = (12, 100, 12, 12),
         Axis = (; titlesize = 16, titlefont = :bold, xgridvisible = false, ygridvisible = false),
         Colorbar = (; ticklabelsize = 11, labelsize = 13),
     ),
@@ -58,8 +61,8 @@ end
 step_of(xs) = xs[2] - xs[1]
 # The synthetic fields are periodic, so filter on a periodic grid — the footprint wraps and there are
 # no domain-edge artifacts in the filtered fields or in Π.
-cartgrid(xs) = CGEF.StructuredGrid(CGEF.CartesianGeometry(step_of(xs), step_of(xs)), xs, xs,
-    trues(length(xs), length(xs)); periodic = (true, true))
+cartgrid(xs) = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs;
+    periodic = (true, true))
 
 function eddy_noise_flow(; N = 192, dx = 1000.0, seed = 7, λ_eddy_km = 18.0, λ_large_km = 55.0,
         width = 2.6, amp_large = 0.8, noise = 0.14, n_noise_max = 60.0)
@@ -87,11 +90,11 @@ function eddy_noise_flow(; N = 192, dx = 1000.0, seed = 7, λ_eddy_km = 18.0, λ
     v = real(FFTW.ifft(-im .* KX .* ψh))
     ω = real(FFTW.ifft(ωh))
     s = 1.0 / Statistics.std(u)
-    return (; xs = collect(0.0:dx:(N - 1) * dx), u = u .* s, v = v .* s, ω = ω .* s)
+    return (; xs = 0.0:dx:(N - 1) * dx, u = u .* s, v = v .* s, ω = ω .* s)
 end
 
 function fractal_field(; N = 192, dx = 1000.0)
-    xs = collect(0.0:dx:(N - 1) * dx)
+    xs = 0.0:dx:(N - 1) * dx
     L = N * dx          # period = N·dx so the integer-cycle pattern is exactly periodic on the grid
     f = [1.0 * sin(2π * 2 * x / L) * cos(2π * 2 * y / L) +
          0.6 * sin(2π * 6 * x / L) * cos(2π * 6 * y / L) +
@@ -135,17 +138,19 @@ function powerlaw_flow(; N = 320, dx = 1000.0, seed = 11, slope = -3.0, nmin = 3
     v = real(FFTW.ifft(-im .* KX .* ψh))
     ω = real(FFTW.ifft((KX .^ 2 .+ KY .^ 2) .* ψh))
     s = 1.0 / Statistics.std(u)
-    return (; xs = collect(0.0:dx:(N - 1) * dx), u = u .* s, v = v .* s, ω = ω .* s)
+    return (; xs = 0.0:dx:(N - 1) * dx, u = u .* s, v = v .* s, ω = ω .* s)
 end
 
 blankaxis!(ax) = (MK.hidedecorations!(ax); MK.hidespines!(ax))
 
 # A heatmap panel with no ticks (clean image tiles).
-function tile!(fig, r, c, km, A, cmap, cl; title = "")
+# `lo` defaults to `-cl`, which is what a signed field wants. A magnitude has to pass `lo = 0`, or half
+# the colour range is unreachable and the panel washes out.
+function tile!(fig, r, c, km, A, cmap, cl; title = "", lo = -cl)
     ax = MK.Axis(fig[r, c]; title = title, aspect = MK.DataAspect(),
         xticksvisible = false, yticksvisible = false,
         xticklabelsvisible = false, yticklabelsvisible = false)
-    hm = MK.heatmap!(ax, km, km, A; colormap = cmap, colorrange = (-cl, cl))
+    hm = MK.heatmap!(ax, km, km, A; colormap = cmap, colorrange = (lo, cl))
     return hm
 end
 
@@ -314,16 +319,16 @@ end
 # ─── Rigid-body rotation: Π must vanish — square vs circular domain ──────────
 function fig_rigid_rotation()
     N = 161; dx = 1000.0
-    geom = CGEF.CartesianGeometry(dx, dx)
-    xs = collect(-80e3:dx:80e3); km = xs ./ 1e3
+    geom = FG.Geometry.CartesianGeometry()
+    xs = -80e3:dx:80e3; km = xs ./ 1e3
     Ω = 1e-4
     u = [-Ω * y for x in xs, y in xs]
     v = [Ω * x for x in xs, y in xs]
     R0 = maximum(xs)                                    # inscribed-circle radius (half the box)
     cmask = [hypot(x, y) <= R0 for x in xs, y in xs]    # circular domain via a Bool mask
 
-    gsq = CGEF.StructuredGrid(geom, xs, xs, trues(N, N))
-    gci = CGEF.StructuredGrid(geom, xs, xs, cmask)
+    gsq = FG.Grids.StructuredGrid(geom, xs, xs)
+    gci = FG.Grids.StructuredGrid(geom, xs, xs, cmask)
     ker = CGEF.GaussianKernel()
     Πsq = zero(u); CGEF.Diagnostics.compute_Π!(Πsq, u, v, nothing, gsq, ker, 20e3)
     Πci = zero(u); CGEF.Diagnostics.compute_Π!(Πci, u, v, nothing, gci, ker, 20e3)
@@ -374,7 +379,7 @@ function rot_div_flow(; N = 192, dx = 1000.0, seed = 3)
     ur = real(FFTW.ifft(im .* KY .* ψh)); vr = real(FFTW.ifft(-im .* KX .* ψh))   # rotational
     ud = real(FFTW.ifft(im .* KX .* φh)); vd = real(FFTW.ifft(im .* KY .* φh))     # divergent
     s = 1.0 / Statistics.std(ur .+ ud)
-    return (; xs = collect(0.0:dx:(N - 1) * dx), ur = ur .* s, vr = vr .* s, ud = ud .* s, vd = vd .* s)
+    return (; xs = 0.0:dx:(N - 1) * dx, ur = ur .* s, vr = vr .* s, ud = ud .* s, vd = vd .* s)
 end
 
 # ─── Rotational / divergent (Helmholtz) decomposition of Π ───────────────────
@@ -434,8 +439,8 @@ function fig_masking()
         ((i - cx)^2 + (j - cy)^2 <= (0.16N)^2) && (mask[i, j] = false)
         (i + j <= Int(round(0.5N))) && (mask[i, j] = false)
     end
-    geom = CGEF.CartesianGeometry(step_of(xs), step_of(xs))
-    grid = CGEF.StructuredGrid(geom, xs, xs, mask)
+    geom = FG.Geometry.CartesianGeometry()
+    grid = FG.Grids.StructuredGrid(geom, xs, xs, mask)
     ℓ = 16e3; ker = CGEF.GaussianKernel()
     od = zero(fr.f); CGEF.Filtering.filter_field!(od, fr.f, grid, ker, ℓ; mask_strategy = CGEF.Filtering.Deformable())
     oz = zero(fr.f); CGEF.Filtering.filter_field!(oz, fr.f, grid, ker, ℓ; mask_strategy = CGEF.Filtering.ZeroFill())
@@ -471,7 +476,7 @@ function fig_spherical()
     Ndeg = 48; N = Ndeg + 1; M = 2N - 1
     Θ, Φ = FSH.sph_points(N)
     R = 6.371e6
-    sgrid = CGEF.StructuredGrid(CGEF.SphericalGeometry(R), collect(Φ), π / 2 .- collect(Θ), trues(M, N))
+    sgrid = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), collect(Φ), π / 2 .- collect(Θ))
     Random.seed!(9)
     C = zeros(N, M)
     for l in 1:30, m in (-l):l
@@ -492,7 +497,9 @@ function fig_spherical()
     sφ = [mod(ga * k, 2π) for k in 0:(Mpts - 1)]
     slat = π / 2 .- sθ
     obs = [field[argmin(abs.(Φv .- sφ[q])), argmin(abs.(latgrid .- slat[q]))] for q in 1:Mpts]
-    ug = CGEF.UnstructuredGrid(CGEF.SphericalGeometry(R), sφ, slat, ones(Mpts), trues(Mpts))   # no adjacency needed for spectral-only filtering
+    # Supplying the measure explicitly means the mask is positional too — `(x, y, measure)` alone would
+    # be ambiguous with `(x, y, mask)`.
+    ug = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(R), sφ, slat, ones(Mpts), trues(Mpts))   # no adjacency needed for spectral-only filtering
     fobs = zero(obs); CGEF.Filtering.filter_field!(fobs, obs, ug, CGEF.GaussianKernel(), ℓ; method = CGEF.Filtering.Spectral())
 
     fig = MK.Figure(; size = (1660, 440))
@@ -516,20 +523,19 @@ end
 # ─── CurvilinearGrid: a sheared/rotated model-native mesh ────────────────────
 function fig_curvilinear()
     N = 55; dx = 2_000.0
-    geom = CGEF.CartesianGeometry(dx, dx)
+    geom = FG.Geometry.CartesianGeometry()
     i = collect(0.0:(N - 1)); j = collect(0.0:(N - 1))
     θ = deg2rad(18.0); shear = 0.35
-    lon = [dx * (ii * cos(θ) - jj * shear * sin(θ)) for ii in i, jj in j]
-    lat = [dx * (ii * sin(θ) + jj * (1 + shear * cos(θ))) for ii in i, jj in j]
-    mask = trues(N, N)
-    grid = CGEF.CurvilinearGrid(geom, lon, lat, mask)
-    km_lon = lon ./ 1e3; km_lat = lat ./ 1e3
+    x = [dx * (ii * cos(θ) - jj * shear * sin(θ)) for ii in i, jj in j]
+    y = [dx * (ii * sin(θ) + jj * (1 + shear * cos(θ))) for ii in i, jj in j]
+    grid = FG.Grids.CurvilinearGrid(geom, x, y)
+    km_x = x ./ 1e3; km_y = y ./ 1e3
 
     L = N * dx
-    f = [1.0 * sin(2π * 2 * lon[ii, jj] / L) * cos(2π * 2 * lat[ii, jj] / L) +
-         0.5 * sin(2π * 6 * lon[ii, jj] / L) * cos(2π * 6 * lat[ii, jj] / L) for ii in 1:N, jj in 1:N]
-    u = [ 0.6 * sin(2π * 2 * lon[ii, jj] / L) * cos(2π * 5 * lat[ii, jj] / L) for ii in 1:N, jj in 1:N]
-    v = [-0.6 * cos(2π * 5 * lon[ii, jj] / L) * sin(2π * 2 * lat[ii, jj] / L) for ii in 1:N, jj in 1:N]
+    f = [1.0 * sin(2π * 2 * x[ii, jj] / L) * cos(2π * 2 * y[ii, jj] / L) +
+         0.5 * sin(2π * 6 * x[ii, jj] / L) * cos(2π * 6 * y[ii, jj] / L) for ii in 1:N, jj in 1:N]
+    u = [ 0.6 * sin(2π * 2 * x[ii, jj] / L) * cos(2π * 5 * y[ii, jj] / L) for ii in 1:N, jj in 1:N]
+    v = [-0.6 * cos(2π * 5 * x[ii, jj] / L) * sin(2π * 2 * y[ii, jj] / L) for ii in 1:N, jj in 1:N]
 
     ℓ = 18e3; ker = CGEF.GaussianKernel()
     f̄ = zero(f); CGEF.Filtering.filter_field!(f̄, f, grid, ker, ℓ)
@@ -541,20 +547,20 @@ function fig_curvilinear()
 
     ax0 = MK.Axis(fig[1, 1]; title = "mesh (every 4th grid line)", aspect = MK.DataAspect(),
         xlabel = "x (km)", ylabel = "y (km)")
-    for ii in 1:4:N; MK.lines!(ax0, km_lon[ii, :], km_lat[ii, :]; color = :gray55, linewidth = 0.8); end
-    for jj in 1:4:N; MK.lines!(ax0, km_lon[:, jj], km_lat[:, jj]; color = :gray55, linewidth = 0.8); end
+    for ii in 1:4:N; MK.lines!(ax0, km_x[ii, :], km_y[ii, :]; color = :gray55, linewidth = 0.8); end
+    for jj in 1:4:N; MK.lines!(ax0, km_x[:, jj], km_y[:, jj]; color = :gray55, linewidth = 0.8); end
 
     clf = maximum(abs, f)
     ax1 = MK.Axis(fig[1, 2]; title = "field f", aspect = MK.DataAspect(), xlabel = "x (km)")
-    MK.scatter!(ax1, vec(km_lon), vec(km_lat); color = vec(f), colormap = FIELDMAP, colorrange = (-clf, clf), markersize = 5)
+    MK.scatter!(ax1, vec(km_x), vec(km_y); color = vec(f), colormap = FIELDMAP, colorrange = (-clf, clf), markersize = 5)
 
     ax2 = MK.Axis(fig[1, 3]; title = "filtered f̄  (ℓ = 18 km)", aspect = MK.DataAspect(), xlabel = "x (km)")
-    MK.scatter!(ax2, vec(km_lon), vec(km_lat); color = vec(f̄), colormap = FIELDMAP, colorrange = (-clf, clf), markersize = 5)
+    MK.scatter!(ax2, vec(km_x), vec(km_y); color = vec(f̄), colormap = FIELDMAP, colorrange = (-clf, clf), markersize = 5)
     MK.Colorbar(fig[1, 3, MK.Right()], colormap = FIELDMAP, colorrange = (-clf, clf), width = 10)
 
     clΠ = symclim(Π; interior = 6, q = 0.98)
     ax3 = MK.Axis(fig[1, 4]; title = "flux Π", aspect = MK.DataAspect(), xlabel = "x (km)")
-    hm3 = MK.scatter!(ax3, vec(km_lon), vec(km_lat); color = vec(Π), colormap = CASCADE, colorrange = (-clΠ, clΠ), markersize = 5)
+    hm3 = MK.scatter!(ax3, vec(km_x), vec(km_y); color = vec(Π), colormap = CASCADE, colorrange = (-clΠ, clΠ), markersize = 5)
     MK.Colorbar(fig[1, 4, MK.Right()], hm3; width = 10)
     MK.colgap!(fig.layout, 20)
     save_fig("curvilinear.png", fig)
@@ -564,36 +570,35 @@ end
 function fig_unstructured()
     Random.seed!(21)
     npts = 1_500; L = 100e3
-    geom = CGEF.CartesianGeometry(1.0, 1.0)   # placeholder — no fixed spacing for scattered data
-    lon = L .* rand(npts); lat = L .* rand(npts)
-    mask = trues(npts)
-    grid = CGEF.UnstructuredGrid(geom, lon, lat, mask; k = 8)   # k-d tree adjacency + Voronoi areas
+    geom = FG.Geometry.CartesianGeometry()   # placeholder — no fixed spacing for scattered data
+    x = L .* rand(npts); y = L .* rand(npts)
+    grid = FG.Grids.UnstructuredGrid(geom, x, y; k = 8)   # k-d tree adjacency + Voronoi areas
 
-    f = [1.0 * sin(2π * 2 * lon[q] / L) * cos(2π * 2 * lat[q] / L) +
-         0.5 * sin(2π * 7 * lon[q] / L) * cos(2π * 7 * lat[q] / L) for q in 1:npts]
-    u = [ 0.6 * sin(2π * 2 * lon[q] / L) * cos(2π * 5 * lat[q] / L) for q in 1:npts]
-    v = [-0.6 * cos(2π * 5 * lon[q] / L) * sin(2π * 2 * lat[q] / L) for q in 1:npts]
+    f = [1.0 * sin(2π * 2 * x[q] / L) * cos(2π * 2 * y[q] / L) +
+         0.5 * sin(2π * 7 * x[q] / L) * cos(2π * 7 * y[q] / L) for q in 1:npts]
+    u = [ 0.6 * sin(2π * 2 * x[q] / L) * cos(2π * 5 * y[q] / L) for q in 1:npts]
+    v = [-0.6 * cos(2π * 5 * x[q] / L) * sin(2π * 2 * y[q] / L) for q in 1:npts]
 
     ℓ = 12e3; ker = CGEF.GaussianKernel()
     f̄ = zero(f); CGEF.Filtering.filter_field!(f̄, f, grid, ker, ℓ; method = CGEF.Filtering.Spectral())
     Π = zero(f); CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, grid, ker, ℓ)
 
-    km_lon = lon ./ 1e3; km_lat = lat ./ 1e3
+    km_x = x ./ 1e3; km_y = y ./ 1e3
     fig = MK.Figure(; size = (1260, 430))
     MK.Label(fig[0, 1:3], "UnstructuredGrid: scattered points — k-d tree neighbors, Voronoi cell areas, FINUFFT spectral filtering";
         fontsize = 17, font = :bold)
 
     clf = maximum(abs, f)
     ax1 = MK.Axis(fig[1, 1]; title = "field f (scattered samples)", aspect = MK.DataAspect(), xlabel = "x (km)", ylabel = "y (km)")
-    MK.scatter!(ax1, km_lon, km_lat; color = f, colormap = FIELDMAP, colorrange = (-clf, clf), markersize = 6)
+    MK.scatter!(ax1, km_x, km_y; color = f, colormap = FIELDMAP, colorrange = (-clf, clf), markersize = 6)
 
     ax2 = MK.Axis(fig[1, 2]; title = "spectrally filtered f̄  (ℓ = 12 km)", aspect = MK.DataAspect(), xlabel = "x (km)")
-    MK.scatter!(ax2, km_lon, km_lat; color = f̄, colormap = FIELDMAP, colorrange = (-clf, clf), markersize = 6)
+    MK.scatter!(ax2, km_x, km_y; color = f̄, colormap = FIELDMAP, colorrange = (-clf, clf), markersize = 6)
     MK.Colorbar(fig[1, 2, MK.Right()], colormap = FIELDMAP, colorrange = (-clf, clf), width = 10)
 
     clΠ = symclim(Π; q = 0.98)
     ax3 = MK.Axis(fig[1, 3]; title = "flux Π", aspect = MK.DataAspect(), xlabel = "x (km)")
-    hm3 = MK.scatter!(ax3, km_lon, km_lat; color = Π, colormap = CASCADE, colorrange = (-clΠ, clΠ), markersize = 6)
+    hm3 = MK.scatter!(ax3, km_x, km_y; color = Π, colormap = CASCADE, colorrange = (-clΠ, clΠ), markersize = 6)
     MK.Colorbar(fig[1, 3, MK.Right()], hm3; width = 10)
     MK.colgap!(fig.layout, 20)
     save_fig("unstructured.png", fig)
@@ -603,10 +608,9 @@ end
 function fig_volumetric_3d()
     Random.seed!(31)
     N = 22; dx = 500.0
-    geom = CGEF.CartesianGeometry(dx, dx, dx)
-    x = collect(0.0:dx:(N - 1) * dx); km = x ./ 1e3
-    mask = trues(N, N, N)
-    grid = CGEF.StructuredGrid(geom, x, x, x, mask)
+    geom = FG.Geometry.CartesianGeometry()
+    x = 0.0:dx:(N - 1) * dx; km = x ./ 1e3
+    grid = FG.Grids.StructuredGrid(geom, x, x, x)
 
     L = N * dx
     u = [sin(2π * 2 * x[a] / L) * cos(2π * 2 * x[b] / L) * cos(2π * 2 * x[c] / L) for a in 1:N, b in 1:N, c in 1:N]
@@ -626,7 +630,8 @@ function fig_volumetric_3d()
         fontsize = 18, font = :bold)
     local hmsp, hmΠ
     for (col, k) in enumerate(zlevels)
-        hmsp = tile!(fig, 1, col, km, speed[:, :, k], SPEEDMAP, clsp; title = "speed |u|  (z = $(round(x[k]/1e3; digits=1)) km)")
+        hmsp = tile!(fig, 1, col, km, speed[:, :, k], SPEEDMAP, clsp;
+                     lo = zero(clsp), title = "speed |u|  (z = $(round(x[k]/1e3; digits=1)) km)")
         hmΠ = tile!(fig, 2, col, km, Π[:, :, k], CASCADE, clΠ; title = "flux Π  (z = $(round(x[k]/1e3; digits=1)) km)")
     end
     MK.Colorbar(fig[1, 4], hmsp; width = 11, label = "|u|")
@@ -635,11 +640,11 @@ function fig_volumetric_3d()
     save_fig("volumetric_3d.png", fig)
 end
 
-# ─── Depth-profile (2.5D-per-level) vertical structure ───────────────────────
-function fig_depth_profile()
+# ─── Vertical profile (2.5D-per-level) vertical structure ────────────────────
+function fig_profile()
     Random.seed!(41)
     N = 70; Nz = 8; dx = 1_000.0
-    xs = collect(0.0:dx:(N - 1) * dx); km = xs ./ 1e3
+    xs = 0.0:dx:(N - 1) * dx; km = xs ./ 1e3
     grid = cartgrid(xs)   # periodic — the synthetic field below is exactly periodic, so this avoids
                           # domain-edge footprint-truncation artifacts swamping the color scale
 
@@ -653,31 +658,31 @@ function fig_depth_profile()
 
     scales = collect(6e3:6e3:30e3)
     result = CGEF.coarse_grain_profile(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel())
-    depth_km = collect(0:(Nz - 1)) .* 0.5      # nominal 0.5 km level spacing, cosmetic only
+    level_km = collect(0:(Nz - 1)) .* 0.5      # nominal 0.5 km level spacing, cosmetic only
 
-    j0 = N ÷ 2   # a fixed y-row for the x–depth cross-section
+    j0 = N ÷ 2   # a fixed y-row for the x–level cross-section
     Πxz = [result.Π[a, j0, k, 2] for a in 1:N, k in 1:Nz]   # scale index 2 = 12 km
     clΠ = symclim(Πxz; q = 0.98)   # no `interior` crop here — Nz is small, an 8-deep symmetric crop leaves nothing
 
     fig = MK.Figure(; size = (1360, 440))
-    MK.Label(fig[0, 1:2], "Depth-profile (2.5D-per-level) vertical structure — the literature-standard method (Aluie, Hecht & Vallis 2018)";
+    MK.Label(fig[0, 1:2], "Vertical profile (2.5D-per-level) vertical structure — the literature-standard method (Aluie, Hecht & Vallis 2018)";
         fontsize = 16, font = :bold)
 
-    ax1 = MK.Axis(fig[1, 1]; title = "x–depth cross-section of Π  (ℓ = 12 km, y = mid-domain)",
-        xlabel = "x (km)", ylabel = "depth (km, nominal)", yreversed = true)
-    hm1 = MK.heatmap!(ax1, km, depth_km, Πxz; colormap = CASCADE, colorrange = (-clΠ, clΠ))
+    ax1 = MK.Axis(fig[1, 1]; title = "x–level cross-section of Π  (ℓ = 12 km, y = mid-domain)",
+        xlabel = "x (km)", ylabel = "level (km, nominal)", yreversed = true)
+    hm1 = MK.heatmap!(ax1, km, level_km, Πxz; colormap = CASCADE, colorrange = (-clΠ, clΠ))
     MK.Colorbar(fig[1, 1, MK.Right()], hm1; width = 10, label = "Π")
 
-    ax2 = MK.Axis(fig[1, 2]; title = "mean|Π| vs. depth, by scale", xlabel = "mean|Π|", ylabel = "depth (km, nominal)", yreversed = true)
+    ax2 = MK.Axis(fig[1, 2]; title = "mean|Π| vs. level, by scale", xlabel = "mean|Π|", ylabel = "level (km, nominal)", yreversed = true)
     for (sidx, ℓ) in enumerate(scales)
         sidx % 2 == 1 || continue
         prof = [Statistics.mean(abs, @view result.Π[:, :, k, sidx]) for k in 1:Nz]
-        MK.lines!(ax2, prof, depth_km; linewidth = 2.5, label = "ℓ = $(round(Int, ℓ/1e3)) km")
-        MK.scatter!(ax2, prof, depth_km; markersize = 8)
+        MK.lines!(ax2, prof, level_km; linewidth = 2.5, label = "ℓ = $(round(Int, ℓ/1e3)) km")
+        MK.scatter!(ax2, prof, level_km; markersize = 8)
     end
     MK.axislegend(ax2; position = :rb, framevisible = false, labelsize = 11)
     MK.colgap!(fig.layout, 26)
-    save_fig("depth_profile.png", fig)
+    save_fig("profile.png", fig)
 end
 
 println("Generating CoarseGrainingEnergyFluxes.jl documentation assets …")
@@ -693,5 +698,5 @@ fig_spherical()
 fig_curvilinear()
 fig_unstructured()
 fig_volumetric_3d()
-fig_depth_profile()
+fig_profile()
 println("done.")

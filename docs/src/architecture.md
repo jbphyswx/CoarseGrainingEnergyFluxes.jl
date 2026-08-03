@@ -6,18 +6,18 @@ CurrentModule = CoarseGrainingEnergyFluxes
 
 ## Module Structure
 
+Geometries and grid types come from **FlowGeometries.jl**, and the execution/spectral backend
+taxonomies from **ComputationalBackends.jl** / **SpectralBackends.jl**. This package is the
+coarse-graining engine built on them:
+
 ```
 CoarseGrainingEnergyFluxes (main module)
-├── Backends      — execution-backend taxonomy (Serial/Threaded/GPU/Distributed/MPI/Auto)
-├── Geometry      — coordinate systems (Cartesian, Spherical) + planetary-Cartesian transforms
-├── Grids         — grid types (Structured 1D/2D/3D, Curvilinear, Unstructured), each with a full
-│                   derivative/Π/coarse_grain pipeline, not just filtering
 ├── Kernels       — filter kernels + spectral transfer functions Ĝ(|k|, ℓ)
 ├── Filtering     — real-space footprint convolution engine + spectral plan dispatch
-├── Derivatives   — finite-difference stencils on StructuredGrid (1D/2D/true-3D Cartesian and
-│                   spherical, with curvature and nonuniform-axis support); weighted-least-squares
-│                   (WLSQ) tangent-plane gradients on CurvilinearGrid/UnstructuredGrid
-├── Diagnostics   — energy flux Π (2D/2.5D, depth-profile, and true 3D), filtering spectrum,
+├── Derivatives   — `FG.Discretization.derivative!` per direction on a StructuredGrid, plus a
+│                   reusable `StencilPlan`. A grid with no separable axis takes the least-squares
+│                   tangent-plane gradient from FlowGeometries directly
+├── Diagnostics   — energy flux Π (2D/2.5D, vertical-profile, and true 3D), filtering spectrum,
 │                   stress / Helmholtz / tracer decompositions
 ├── Pipeline      — high-level `coarse_grain` orchestration over scales
 └── Visualization — `plot_Π_map` / `plot_spectrum` stubs (methods provided by the CairoMakie ext)
@@ -47,32 +47,35 @@ Input: u(x,y), v(x,y) [, w], grid, kernel, scales
 Output: Π(x) per scale, cumulative_energy E(ℓ), filtering spectrum Ẽ(k_ℓ)
 ```
 
-## 2.5D depth-profile vs. true 3D
+## 2.5D vertical-profile vs. true 3D
 
-Given 3D `(lon, lat, depth)` velocity, there are two distinct, non-interchangeable ways to get a
+Given 3D `(x, y, z)` velocity, there are two distinct, non-interchangeable ways to get a
 "vertical structure":
 
 - **`coarse_grain_profile` / `compute_Π_profile!`** — the literature-standard method (Aluie, Hecht &
-  Vallis 2018): run the existing 2D/2.5D `compute_Π!` **independently at each depth level** and stack
+  Vallis 2018): run the existing 2D/2.5D `compute_Π!` **independently at each vertical level** and stack
   the results. This is the thin-layer/quasi-geostrophic regime (vertical shear subdominant to
   horizontal gradients — the usual large-scale ocean/atmosphere assumption); levels do not interact.
 - **True 3D `compute_Π!`** (`StructuredGrid{...,3}`, Cartesian or spherical-volumetric) — a genuinely
   **coupled** 3D filter kernel and all nine strain/stress components, including real vertical
   derivatives. This is the homogeneous/isotropic-turbulence regime (e.g. Rayleigh–Taylor or
-  boundary-layer studies), a different and narrower-audience physics case from the depth-profile
+  boundary-layer studies), a different and narrower-audience physics case from the vertical-profile
   method above — the two should never be conflated.
 
 ## Execution backends vs. filter method
 
 Two orthogonal choices control *how* a filter is evaluated:
 
-1. **Filter method** (`method = DirectSum()` default, or `Spectral()`):
-   - `DirectSum()` — real-space footprint convolution. Supports masks, regional/non-periodic
-     domains, and arbitrary scales. The only method for masked or bounded fields.
+1. **Filter method** (`method = RealSpace()` default, or `Spectral()`):
+   - `RealSpace()` — real-space footprint convolution. Supports masks and regional/non-periodic
+     domains at arbitrary scales. The only method for a bounded (non-periodic) domain.
    - `Spectral()` — transform → multiply by Ĝ(|k|, ℓ) → inverse transform. `O(N log N)`,
-     scale-independent cost, but assumes a homogeneous (periodic / global) domain with no mask.
+     scale-independent cost; requires a homogeneous (periodic / global) domain, but a partial mask is
+     supported (normalized convolution, Knutsson & Westin 1993 — `ZeroFill`/`Deformable` work exactly
+     as they do for `RealSpace()`, just evaluated in Fourier/spherical-harmonic space instead of real
+     space).
 
-2. **Execution backend** (for the `DirectSum()` engine): `SerialBackend`, `ThreadedBackend`
+2. **Execution backend** (for the `RealSpace()` engine): `SerialBackend`, `ThreadedBackend`
    (OhMyThreads), `GPUBackend` (KernelAbstractions), `DistributedBackend` (Distributed +
    SharedArrays), `MPIBackend` (MPI), or `AutoBackend` (picks threaded when `nthreads() > 1`). All
    backends share the *same* footprint engine, so results are identical to the serial path, and every
@@ -81,12 +84,12 @@ Two orthogonal choices control *how* a filter is evaluated:
    - `ThreadedBackend` is the only parallel backend with 1D/true-3D support: 2D `StructuredGrid`/
      `CurvilinearGrid` are decomposed by latitude row; 1D/true-3D `StructuredGrid` are decomposed by
      output point (`CartesianIndices`), reusing the same per-point kernel the serial n-D engine uses.
-   - `GPUBackend`/`DistributedBackend`/`MPIBackend` currently cover 2D `StructuredGrid`/
-     `CurvilinearGrid` only; an explicit request for one of these on an unsupported grid shape raises
-     an `ArgumentError` rather than silently falling back (only `AutoBackend` silently downgrades to
-     serial).
-   - `UnstructuredGrid` has no real-space engine at all (see the spectral lattice below), so none of
-     the `DirectSum()` backends apply to it.
+   - `GPUBackend`/`DistributedBackend`/`MPIBackend` cover 2D `StructuredGrid`/`CurvilinearGrid` only;
+     an explicit request for one of these on an unsupported grid shape raises an `ArgumentError`
+     rather than silently falling back (only `AutoBackend` silently downgrades to serial).
+   - `UnstructuredGrid` has a real-space engine (`RealSpace()` builds a `NodeFilterPlan` from the
+     grid's own ball query), but no parallel decomposition, so it runs serially whichever backend is
+     asked for. Its default method remains `Spectral()`.
 
 ## Spectral backend lattice
 
@@ -111,13 +114,13 @@ AbstractGrid{G,T}
 ├── StructuredGrid{G,T,N}      N = 1, 2, 3   (rectilinear; N-D cell measure + mask; N=3 spherical
 │                              is a genuine volumetric shell — lon,lat,radius axes, r²cosφ volume)
 ├── CurvilinearGrid{T,G,...}   2D, model-native (orthogonal curvilinear meshes); exact corner-based
-│                              quadrilateral cell areas; independent type params for lon/lat vs.
+│                              quadrilateral cell areas; independent type params for x/y vs.
 │                              the derived areas array (no shared-eltype over-constraint)
 └── UnstructuredGrid{T,G,...}  1D, scattered points; k-d tree adjacency (CSR) + Voronoi cell areas;
                                same independent-type-param split as CurvilinearGrid
 
 AbstractExecutionBackend            AbstractFilterMethod    AbstractMaskStrategy
-├── SerialBackend                   ├── DirectSum           ├── ZeroFill
+├── SerialBackend                   ├── RealSpace           ├── ZeroFill
 ├── ThreadedBackend                 └── Spectral            └── Deformable
 ├── GPUBackend{B}
 ├── DistributedBackend{Inner}
@@ -129,12 +132,12 @@ AbstractExecutionBackend            AbstractFilterMethod    AbstractMaskStrategy
 
 `UnstructuredGrid`'s adjacency and per-node area are not required at construction time (a
 zero-neighbor grid still supports spectral filtering), but the convenience constructor
-`UnstructuredGrid(geometry, lon, lat, mask; k, radius, areas)` builds both for real, dispatched on
+`UnstructuredGrid(geometry, x, y, mask; k, radius, areas)` builds both for real, dispatched on
 geometry, via three additional weak-dependency extensions:
 
 | Need | Extension | Method |
 |------|-----------|--------|
-| k-d tree neighbor search (both geometries) | `NearestNeighborsExt` | Cartesian: tree on `(lon,lat)` directly. Spherical: tree on the exact 3D unit-sphere Cartesian embedding, so chord distance ≡ great-circle distance (exact, not an approximation) |
+| k-d tree neighbor search (both geometries) | `NearestNeighborsExt` | Cartesian: tree on `(x,y)` directly. Spherical: tree on the exact 3D unit-sphere Cartesian embedding, so chord distance ≡ great-circle distance (exact, not an approximation) |
 | Voronoi cell area, Cartesian | `DelaunayTriangulationExt` | Planar Delaunay triangulation → clipped Voronoi dual |
 | Voronoi cell area, spherical | `QuickhullExt` | 3D convex hull of the unit-sphere embedding (facets ≡ spherical Delaunay) → L'Huilier spherical-triangle fan-area summation |
 
@@ -145,7 +148,7 @@ or approximate method.
 ## Plan reuse & workspace pre-allocation
 
 `plan_filter` builds the convolution footprint (or cached transform plan) once; `filter_apply!`
-reuses it across every velocity component, quadratic product, and depth layer. `compute_Π!` accepts a
+reuses it across every velocity component, quadratic product, and vertical layer. `compute_Π!` accepts a
 pre-allocated `ΠWorkspace` to avoid per-scale allocations when sweeping scales:
 
 ```julia

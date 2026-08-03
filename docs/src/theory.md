@@ -49,8 +49,8 @@ unnormalized — the filtering routines divide by the running area/volume-weight
 ### Top-Hat (box) — `TopHatKernel`
 
 Unit weight inside the disk/ball of radius `ℓ/2`, zero outside. The literature default
-(Aluie et al. 2018, Storer et al. 2022). Not available for spectral filtering (its multidimensional
-transfer function is an oscillatory Airy/sinc pattern that rings).
+(Aluie et al. 2018, Storer et al. 2022). Spectral filtering needs `using SpecialFunctions` to load
+the exact planar transfer function (Bessel `J₁`); see below.
 
 ### Gaussian — `GaussianKernel(; α = 6)`
 
@@ -77,9 +77,13 @@ For spectral filtering, each mode of wavenumber magnitude `k` is multiplied by
 |--------|-----------|
 | `GaussianKernel(α)`   | `exp(−k² ℓ² / 4α)` |
 | `SharpSpectralKernel` | `1` if `k ≤ π/ℓ`, else `0` |
-| `TopHatKernel`        | unsupported (rings) |
+| `TopHatKernel`        | `2 J₁(kR)/(kR)`, `R = ℓ/2` (needs `using SpecialFunctions`) |
 
-On the sphere the wavenumber of harmonic degree `l` is `k_l = √(l(l+1)) / R`.
+On the sphere, `GaussianKernel`/`SharpSpectralKernel` use the wavenumber of harmonic degree `l`,
+`k_l = √(l(l+1)) / R`, via the same [`Kernels.spectral_transfer`](@ref). `TopHatKernel`'s spherical-cap
+window genuinely needs the degree `l` itself (not just `k_l`), via the separate
+[`Kernels.spectral_transfer_degree`](@ref) — the exact Legendre-polynomial cap-averaging function
+(Jekeli 1981), no extra dependency needed.
 
 ## The Filtering Spectrum (Sadek & Aluie 2018)
 
@@ -150,7 +154,12 @@ The scalar analogue of Π for a tracer θ (Aluie & Eyink):
 With θ = buoyancy this is the cross-scale buoyancy-variance (APE-related) transfer, needing only
 `(u, v, θ)`.
 
-## Vertical structure: depth-profile vs. true 3D
+`τ_j` is a vector, so on a spherical grid it follows the same commutativity argument as the momentum
+stress: the velocity is rotated to planetary Cartesian before filtering and `τ` rotated back to the
+local east/north(/radial) frame before contracting with `∂_j θ̄`. Filtering the local components in
+place would average vectors expressed in a basis that turns from point to point.
+
+## Vertical structure: vertical-profile vs. true 3D
 
 In 2.5D, `compute_Π!` deliberately drops the vertical-shear strain terms (`S_xz`, `S_yz`, `S_zz` are
 either omitted or zero) whenever only `(u, v)` (optionally `w`) is supplied on a 2D grid. This is not
@@ -160,9 +169,9 @@ Oceanic Fluid Dynamics*; Pedlosky, *Geophysical Fluid Dynamics*), valid when the
 flow, where vertical shear is genuinely subdominant to horizontal gradients. The actual "vertical
 structure via coarse-graining" literature (Aluie, Hecht & Vallis 2018; the
 Buzzicotti/Storer/Khatri/Griffies/Aluie line of work) does not compute a coupled vertical-derivative
-tensor either — it runs this same 2D/2.5D method **independently at each depth level** of a
+tensor either — it runs this same 2D/2.5D method **independently at each vertical level** of a
 multi-level model and compares/stacks the resulting profiles. `coarse_grain_profile` /
-`compute_Π_profile!` implement exactly this: given 3D `(lon, lat, depth)` arrays, they loop the
+`compute_Π_profile!` implement exactly this: given 3D `(x, y, z)` arrays, they loop the
 existing 2D/2.5D `compute_Π!`/`coarse_grain` independently over each level and return the stacked
 profile — no new tensor math, a convenience wrapper over an already-correct 2D method.
 
@@ -198,14 +207,15 @@ exist (as opposed to the 2.5D flat-layer assumption above).
 
 Aluie (2019) shows that filtering vector components as scalars does **not** commute with `∇` on `S²`.
 This package transforms velocities to planetary-Cartesian components before filtering and back
-afterward (`to_planetary_cartesian` / `from_planetary_cartesian`), which is exact for non-divergent
+afterward (`Geometry.vector_to_cartesian` / `Geometry.vector_from_cartesian`), which is exact for non-divergent
 flow (Storer et al. 2022). For strongly divergent flow, decompose first (HelmholtzDecomposition.jl)
 and use [`Diagnostics.compute_Π_decomposed`](@ref).
 
 ## Curvilinear & unstructured grids: WLSQ gradients
 
-`CurvilinearGrid` and `UnstructuredGrid` have no fixed axis spacing to difference against, so `ddx!`/
-`ddy!` are reconstructed from a local weighted-least-squares (WLSQ) fit over each point's neighbor
+`CurvilinearGrid` and `UnstructuredGrid` have no fixed axis spacing to difference against, so the
+gradient (`FG.Connectivity.gradient_plan` + `FG.Discretization.gradient!`, which returns both tangent
+components from one neighbour sweep) is reconstructed from a local weighted-least-squares (WLSQ) fit over each point's neighbor
 stencil (its 4 index-offset neighbors on a curvilinear mesh; its k-d tree neighbors on a scattered
 point cloud), projected into the local tangent plane (`project_to_tangent_plane` — an exact 3D-chord
 projection for spherical grids, not a small-angle approximation). This is **not** the same as
