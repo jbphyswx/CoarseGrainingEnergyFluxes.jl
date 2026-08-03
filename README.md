@@ -26,7 +26,7 @@ variance flux** — on masked, regional, or global domains, with real-space (dir
 execution.
 
 Every diagnostic works across the full grid×dimensionality matrix: 1D transects, 2D (Cartesian or
-spherical, single-level or the standard literature "vertical structure" depth-profile method), true
+spherical, single-level or the standard literature "vertical structure" profile method), true
 3D (Cartesian and spherical-volumetric, genuinely coupled vertical derivatives), model-native
 curvilinear grids (orthogonal curvilinear meshes, via weighted-least-squares gradients), and scattered/unstructured
 point clouds (via k-d tree neighbor search, Voronoi cell areas, and non-uniform spectral transforms).
@@ -87,24 +87,25 @@ k-d tree neighbor search + exact Voronoi cell areas + non-uniform spectral filte
 
 ### True 3D volumetric flux (Cartesian and spherical shells)
 Genuinely coupled 3D strain/stress (all nine components) — homogeneous/isotropic-turbulence-style
-filtering that blends all three directions in one kernel, distinct from the 2.5D depth-profile method.
+filtering that blends all three directions in one kernel, distinct from the 2.5D vertical-profile method.
 
 ![True 3D volumetric flux](docs/src/assets/volumetric_3d.png)
 
-### Depth-profile (2.5D per-level) vertical structure
+### Vertical profile (2.5D per-level) vertical structure
 The literature-standard "vertical structure" method (Aluie, Hecht & Vallis 2018): the existing 2D/2.5D
-`compute_Π!` run independently at each depth level and stacked into a profile.
+`compute_Π!` run independently at each vertical level and stacked into a profile.
 
-![Depth profile](docs/src/assets/depth_profile.png)
+![Vertical profile](docs/src/assets/profile.png)
 
 ## Quick Start
 
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
+using FlowGeometries: FlowGeometries as FG   # geometries and grid types live here
 
 # Create grid
-geom = CGEF.SphericalGeometry(6.371e6)  # Earth radius in meters
-grid = CGEF.StructuredGrid(geom, lon_rad, lat_rad, mask)
+geom = FG.Geometry.SphericalGeometry(6.371e6)  # Earth radius in meters
+grid = FG.Grids.StructuredGrid(geom, lon_rad, lat_rad, mask)
 
 # Run multi-scale analysis
 scales = collect(10e3:10e3:300e3)  # 10 km to 300 km
@@ -117,8 +118,8 @@ result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKern
 ```
 
 Only a minimal set of names is exported at the top level (`coarse_grain`, `coarse_grain!`,
-`coarse_grain_profile`, `CoarseGrainResult`, the three grid types, the two geometries, the three
-kernels, `plot_Π_map`/`plot_spectrum`); everything else — `filter_field!`, `compute_Π!`,
+`coarse_grain_profile`, `CoarseGrainResult`, the three kernels, `plot_Π_map`/`plot_spectrum`);
+grids and geometries come from FlowGeometries.jl, and everything else — `filter_field!`, `compute_Π!`,
 `compute_Π_decomposed`, `tau_decomposition`, `tracer_variance_flux`, backends, mask strategies,
 `ddx!`/`ddy!`/`ddz!`, `plan_filter`, `ΠWorkspace`, `spectral_transfer`, … — is reached through the
 qualified submodule path shown in [Architecture](#architecture) below, e.g.
@@ -126,16 +127,17 @@ qualified submodule path shown in [Architecture](#architecture) below, e.g.
 
 ## Architecture
 
+Geometries, grid types and the execution/spectral backend taxonomies are external packages
+(`FlowGeometries.jl`, `ComputationalBackends.jl`, `SpectralBackends.jl`); this package is the
+coarse-graining engine on top of them.
+
 ```
 src/
-  Backends.jl     — execution-backend taxonomy (Serial/Threaded/GPU/Distributed/MPI/Auto)
-  Geometry.jl     — CartesianGeometry, SphericalGeometry, planetary-Cartesian rotation,
-                    tangent-plane projection (curvilinear/unstructured), volume/area elements
-  Grids.jl        — StructuredGrid (1D/2D/3D), CurvilinearGrid, UnstructuredGrid
   Kernels.jl      — TopHatKernel, GaussianKernel, SharpSpectralKernel
   Filtering.jl    — filter_field! (real-space footprint engine + spectral plan dispatch)
-  Derivatives.jl  — ddx!/ddy!/ddz! (finite-difference on StructuredGrid; weighted-least-squares
-                    gradients on CurvilinearGrid/UnstructuredGrid)
+  Derivatives.jl  — ddx!/ddy!/ddz! + StencilPlan, over FlowGeometries' discretization
+                    (least-squares gradients on CurvilinearGrid/UnstructuredGrid come from
+                    Connectivity.gradient_plan there)
   Diagnostics.jl  — compute_Π!, compute_Π_profile!, compute_Π_decomposed, tau_decomposition,
                     tracer_variance_flux, cumulative_energy, filtering_spectrum
   Pipeline.jl     — coarse_grain / coarse_grain! / coarse_grain_profile (high-level orchestration)
@@ -145,13 +147,11 @@ ext/
   FINUFFTExt                    — non-uniform FFT filtering (scattered Cartesian UnstructuredGrid)
   FastSphericalHarmonicsExt     — spherical-harmonic transform (uniform spherical StructuredGrid)
   NUFSHTExt                     — non-uniform spherical-harmonic transform (scattered spherical UnstructuredGrid)
-  NearestNeighborsExt           — k-d tree neighbor search for UnstructuredGrid construction
-  DelaunayTriangulationExt      — exact planar Voronoi cell areas for UnstructuredGrid{Cartesian}
-  QuickhullExt                  — exact spherical Voronoi cell areas for UnstructuredGrid{Spherical}
   OhMyThreadsExt                — ThreadedBackend (2D row-parallel; also 1D/true-3D point-parallel)
   GPUExt                        — GPUBackend via KernelAbstractions
   DistributedExt                — DistributedBackend (Distributed + SharedArrays)
   MPIExt                        — MPIBackend (multi-node domain decomposition)
+  SpecialFunctionsExt           — exact top-hat spectral transfer 2·J₁(kR)/(kR)
   CairoMakieExt                 — plot_Π_map / plot_spectrum implementations
 ```
 
@@ -162,9 +162,9 @@ Backend implementations and all spectral/spatial-indexing transforms live in **p
 
 | Grid | Dimensionality | Real-space filter | Spectral filter | Derivatives | `compute_Π!` |
 |------|-----------------|--------------------|-----------------|--------------|--------------|
-| `StructuredGrid` | 1D, 2D, true 3D (Cartesian or spherical-volumetric) | Yes | Yes (FFTW 2D Cartesian; FastSphericalHarmonics 2D spherical) | `ddx!`/`ddy!`/`ddz!` | Yes, all dimensionalities + a 2.5D depth-profile wrapper (`compute_Π_profile!`) |
-| `CurvilinearGrid` | 2D (model-native, orthogonal curvilinear meshes) | Yes (per-point footprint, no translation invariance assumed) | Not yet (no spectral extension targets it — real-space only) | `ddx!`/`ddy!` via weighted-least-squares (WLSQ) | Yes |
-| `UnstructuredGrid` | 1D (scattered points) | Not applicable — spectral only | Yes (FINUFFT Cartesian; NUFSHT spherical) | `ddx!`/`ddy!` via WLSQ over k-d tree adjacency | Yes |
+| `StructuredGrid` | 1D, 2D, true 3D (Cartesian or spherical-volumetric) | Yes | Yes (FFTW 2D Cartesian; FastSphericalHarmonics 2D spherical) | `ddx!`/`ddy!`/`ddz!` (+ a reusable `Derivatives.StencilPlan`) | Yes, all dimensionalities + a 2.5D vertical-profile wrapper (`compute_Π_profile!`) |
+| `CurvilinearGrid` | 2D (model-native, orthogonal curvilinear meshes) | Yes (per-point footprint, no translation invariance assumed) | Not yet (no spectral extension targets it — real-space only) | `FG.Connectivity.gradient_plan` + `FG.Discretization.gradient!` (least-squares tangent plane) | Yes |
+| `UnstructuredGrid` | 1D (scattered points) | Yes (`RealSpace()` — ball query over the grid's own adjacency; `Spectral()` is the default) | Yes (FINUFFT Cartesian; NUFSHT spherical) | the same, over the grid's k-d tree adjacency | Yes |
 
 `CurvilinearGrid` and `UnstructuredGrid` are built genuinely from scratch, not thin wrappers: exact
 quadrilateral corner-based cell areas (curvilinear) or k-d tree adjacency + real Voronoi tessellation
@@ -176,20 +176,29 @@ using NearestNeighbors: NearestNeighbors     # enables UnstructuredGrid's k-d tr
 using DelaunayTriangulation: DelaunayTriangulation  # enables exact Voronoi areas (Cartesian)
 # using Quickhull: Quickhull                 # enables exact Voronoi areas (spherical)
 
-ug = CGEF.UnstructuredGrid(geom, lon, lat, mask; k = 8)   # k-nearest neighbors, auto Voronoi areas
+ug = FlowGeometries.Grids.UnstructuredGrid(geom, x, y, mask; k = 8)  # k-nearest neighbors, auto Voronoi areas
 ```
 
 ## Filter Kernels
 
 | Kernel | Description | Use case |
 |--------|-------------|----------|
-| `TopHatKernel()` | Uniform weight within radius ℓ | Standard, most common (real-space only — its spectral transfer rings) |
-| `GaussianKernel(; α = 6)` | Gaussian with std ℓ/2 | Smooth, differentiable, has an exact spectral transfer |
+| `TopHatKernel()` | Uniform weight within radius ℓ/2 | Standard, most common (spectral transfer needs `using SpecialFunctions`) |
+| `GaussianKernel(; α = 6)` | Gaussian, variance-matched to a box of width ℓ (`σ² = ℓ²/12`) | Smooth, differentiable, has an exact spectral transfer |
 | `SharpSpectralKernel()` | Ideal low-pass in spectral space | Perfect scale separation for spectral filtering |
+
+Real-space filtering cost is **not** `O(N · window²)` for every kernel — two kernels have exact fast
+paths that make cost grow linearly, rather than quadratically, with the filter width in grid cells:
+
+| Kernel | Grid | Real-space algorithm | Cost |
+|--------|------|----------------------|------|
+| `TopHatKernel` | any rectilinear 2D `StructuredGrid` (Cartesian or spherical, uniform or nonuniform) | per-row prefix sums + monotone two-pointer interval sweep | `O(N · dj_lim)`, exact |
+| `GaussianKernel` | Cartesian `StructuredGrid`, 1D/2D/3D, uniform or stretched axes | one separable pass per axis | `O(N · Σᵈrᵈ)`, exact up to the square-vs-disk truncation shape |
+| any | everything else (curvilinear meshes, spherical Gaussians, `SharpSpectralKernel`) | bounded per-point window (optionally cached, see `AbstractCacheStrategy`) | `O(N · window)` |
 
 ## Execution Backends
 
-The backend only changes *how* the real-space (`DirectSum()`) footprint convolution is evaluated —
+The backend only changes *how* the real-space (`RealSpace()`) convolution is evaluated —
 results are identical to the serial path. Every backend below reuses a single footprint/plan built
 once per `(grid, kernel, scale)` (via `plan_filter`) rather than rebuilding it on every call.
 
@@ -197,7 +206,7 @@ once per `(grid, kernel, scale)` (via `plan_filter`) rather than rebuilding it o
 |---------|-----------|------------------------|-------|
 | `SerialBackend()` | — | All (1D/2D/3D, Structured/Curvilinear; Unstructured via spectral) | Default for small grids |
 | `ThreadedBackend()` | OhMyThreads | 2D (row-parallel) **and** 1D/true-3D (point-parallel) | Only backend with 1D/3D parallel support |
-| `GPUBackend()` | KernelAbstractions | 2D (`StructuredGrid`/`CurvilinearGrid`) | Footprint reused; device buffer upload still per-call |
+| `GPUBackend()` | KernelAbstractions | 2D (`StructuredGrid`/`CurvilinearGrid`) | Device residency established once with the plan; kernels run the grid's own ball query, so device and host results are bit-identical |
 | `DistributedBackend()` | Distributed + SharedArrays | 2D | Multi-process via `SharedArray` |
 | `MPIBackend()` | MPI | 2D | Multi-node, round-robin row decomposition + `Allreduce!`; exercised by `test/mpi_runtests.jl` under `mpiexec` |
 | `AutoBackend()` | — | — | Picks `ThreadedBackend` when `nthreads() > 1`, else `SerialBackend` |

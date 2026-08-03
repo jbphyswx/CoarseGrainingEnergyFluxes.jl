@@ -2,20 +2,20 @@ module CoarseGrainingEnergyFluxesNUFSHTExt
 
 using NUFSHT: NUFSHT
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
+using FlowGeometries: FlowGeometries
 
-# Spectral filtering for SCATTERED spherical data (an `UnstructuredGrid{Spherical}`), delegated to
-# NUFSHT.jl (Non-Uniform Fast Spherical Harmonic Transforms). NUFSHT already implements the full
-# scattered-point filter — type-1 (analysis) → per-degree transfer multiply → type-2 (synthesis), with
-# optional mask renormalization — so this extension is a thin adapter: it builds the NUSHT plan
-# from the grid's scattered (colatitude, longitude) nodes and drives `nusht_filter!`.
+# Spectral filtering for scattered spherical data, delegated to NUFSHT.jl, which already implements
+# the whole pipeline — analysis, per-degree transfer multiply, synthesis, optional mask
+# renormalization. This extension builds the plan from the grid's (colatitude, longitude) nodes and
+# drives `nusht_filter!`.
 #
-# To keep the Gaussian convention IDENTICAL to the other three spectral backends (FFTW / FINUFFT /
-# FastSphericalHarmonics), we do NOT use NUFSHT's own GaussianTransfer; instead a tiny adapter feeds
-# NUFSHT the shared `CGEF.Kernels.spectral_transfer(kernel, k_l, ℓ)` per degree, with k_l = √(l(l+1))/R.
+# NUFSHT's own `GaussianTransfer` is deliberately bypassed: an adapter feeds it the shared
+# `CGEF.Kernels.spectral_transfer(kernel, k_l, ℓ)` per degree, `k_l = √(l(l+1))/R`, so the Gaussian
+# convention matches the other spectral backends exactly.
 #
-# Conditioning note: `nusht_filter!` uses the adjoint analysis, which is exact on a Clenshaw–Curtis
-# grid and well-behaved for quasi-uniform scattered sampling; very irregular sampling is an
-# ill-conditioned inverse (see NUFSHT's `nusht_solve!` for CG inversion).
+# `nusht_filter!` uses the adjoint analysis — exact on a Clenshaw–Curtis grid, well-behaved for
+# quasi-uniform scattered sampling, ill-conditioned for very irregular sampling, where NUFSHT's
+# `nusht_solve!` offers CG inversion instead.
 
 # Adapter exposing CGEF's shared transfer function to NUFSHT's per-degree `kernel_transfer`.
 struct _CGEFTransfer{K<:CGEF.Kernels.AbstractFilterKernel, T<:AbstractFloat} <: NUFSHT.AbstractSpectralTransfer
@@ -23,30 +23,33 @@ struct _CGEFTransfer{K<:CGEF.Kernels.AbstractFilterKernel, T<:AbstractFloat} <: 
     scale::T
     R::T
 end
-@inline NUFSHT.kernel_transfer(t::_CGEFTransfer, ℓ) =
-    CGEF.Kernels.spectral_transfer(t.kernel, sqrt(oftype(t.R, ℓ * (ℓ + 1))) / t.R, t.scale)
+@inline NUFSHT.kernel_transfer(t::_CGEFTransfer, l) =
+    CGEF.Kernels.spectral_transfer_degree(t.kernel, l, t.scale, t.R)
 
 """
     NUFSHTFilterPlan
 
 Cached scattered-spherical filter plan: the NUSHT plan over the grid's nodes, the CGEF transfer
-adapter, and the (optional) mask for renormalization. Built by
-`plan_filter(scattered_spherical_grid, kernel, scale; method = Spectral())`.
+adapter, the (optional) mask, and a scratch buffer for `mask · field` so a masked apply allocates
+nothing. Built by `plan_filter(scattered_spherical_grid, kernel, scale; method = Spectral())`.
 """
-struct NUFSHTFilterPlan{P, F, T<:AbstractFloat, M} <: CGEF.Filtering.AbstractFilterPlan
+struct NUFSHTFilterPlan{P, F, T<:AbstractFloat, M, SV<:AbstractVector{T}} <: CGEF.Filtering.AbstractFilterPlan
     plan::P
     filter::F
-    mask::M        # Vector{T} of 0/1, or nothing when fully active (unmasked)
+    mask::M          # Vector{T} of 0/1, or nothing when fully active (unmasked)
+    renorm::Bool     # divide by the filtered mask mass: `Deformable` only, never `ZeroFill`
+    scratch::SV      # length-npts scratch for `mask .* field`; unused when mask === nothing
 end
 
 function CGEF.Filtering.spectral_filter_plan(
-    grid::CGEF.UnstructuredGrid{T,G},
+    ::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractNUFSHTSpectralBackend},
+    grid::FlowGeometries.Grids.UnstructuredGrid{T,G},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T;
     mask_strategy = CGEF.Filtering.Deformable(),
-    backend = CGEF.Backends.AutoBackend(),
-) where {T<:AbstractFloat, G<:CGEF.SphericalGeometry{T}}
-    npts = length(grid.lon)
+    backend = CGEF.ComputationalBackends.AutoBackend(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
+    npts = length(FlowGeometries.Grids.coordinates(grid, 1))
     npts > 0 || throw(ArgumentError("NUFSHT spectral filtering needs at least one point."))
     # Bandlimit. A Clenshaw–Curtis grid has npts = (L+1)(2L+1); detect it and use that exact L so the
     # adjoint analysis is an EXACT round-trip. For genuinely irregular sampling fall back to the
@@ -62,12 +65,17 @@ function CGEF.Filtering.spectral_filter_plan(
               "`nusht_solve!` directly for an exact (iteratively-solved) inversion instead." maxlog=1
     end
     lmax = is_clenshaw_curtis ? Lr : max(1, floor(Int, sqrt(npts)) - 1)
-    θ = T(π) / 2 .- grid.lat        # colatitude from latitude
-    φ = grid.lon
+    θ = T(π) / 2 .- FlowGeometries.Grids.coordinates(grid, 2)        # colatitude from latitude
+    φ = FlowGeometries.Grids.coordinates(grid, 1)
     nplan = NUFSHT.make_plan(collect(T, θ), collect(T, φ), lmax; T = T)
-    filter = _CGEFTransfer(kernel, scale, grid.geometry.R)
-    mask = all(grid.mask) ? nothing : T.(grid.mask)
-    return NUFSHTFilterPlan{typeof(nplan), typeof(filter), T, typeof(mask)}(nplan, filter, mask)
+    filter = _CGEFTransfer(kernel, scale, FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid)))
+    mask = all(FlowGeometries.Grids.mask(grid)) ? nothing : T.(FlowGeometries.Grids.mask(grid))
+    # `ZeroFill` is already exactly `filter(mask · field)`; only `Deformable` divides by the local mass.
+    renorm = mask !== nothing && mask_strategy isa CGEF.Filtering.Deformable
+    scratch = zeros(T, npts)
+    return NUFSHTFilterPlan{typeof(nplan), typeof(filter), T, typeof(mask), typeof(scratch)}(
+        nplan, filter, mask, renorm, scratch,
+    )
 end
 
 function CGEF.Filtering.filter_apply!(
@@ -75,14 +83,13 @@ function CGEF.Filtering.filter_apply!(
     field::AbstractVector,
     plan::NUFSHTFilterPlan{P, F, T},
 ) where {P, F, T<:AbstractFloat}
-    f = convert(Vector{T}, field)
     if plan.mask === nothing
-        NUFSHT.nusht_filter!(out, f, plan.filter, plan.plan)
-    else
-        # Zero masked points, filter, then divide by the filtered mass over active points (deformable masking).
-        NUFSHT.nusht_filter!(out, f .* plan.mask, plan.filter, plan.plan)
-        NUFSHT.nusht_filter_renorm!(out, plan.mask, plan.filter, plan.plan)
+        NUFSHT.nusht_filter!(out, convert(Vector{T}, field), plan.filter, plan.plan)
+        return out
     end
+    plan.scratch .= field .* plan.mask
+    NUFSHT.nusht_filter!(out, plan.scratch, plan.filter, plan.plan)
+    plan.renorm && NUFSHT.nusht_filter_renorm!(out, plan.mask, plan.filter, plan.plan)
     return out
 end
 

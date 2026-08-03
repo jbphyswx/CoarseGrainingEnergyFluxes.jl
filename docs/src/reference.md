@@ -28,28 +28,10 @@ Modules = [Filtering]
 Modules = [Kernels]
 ```
 
-## Grids
-
-```@autodocs
-Modules = [Grids]
-```
-
-## Geometry
-
-```@autodocs
-Modules = [Geometry]
-```
-
 ## Derivatives
 
 ```@autodocs
 Modules = [Derivatives]
-```
-
-## Backends
-
-```@autodocs
-Modules = [Backends]
 ```
 
 ## Visualization

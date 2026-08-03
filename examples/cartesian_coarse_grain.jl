@@ -4,22 +4,24 @@
 # See also in this directory: spherical_coarse_grain.jl (spherical + mask),
 # curvilinear_coarse_grain.jl (model-native curvilinear mesh), unstructured_coarse_grain.jl
 # (scattered points via k-d tree + Voronoi + spectral filtering), true_3d_coarse_grain.jl (coupled
-# 3D Cartesian + spherical-volumetric flux), depth_profile.jl (2.5D-per-level vertical structure).
+# 3D Cartesian + spherical-volumetric flux), profile_coarse_grain.jl (2.5D-per-level vertical structure).
 
 using Random: Random
 using Statistics: Statistics
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
+using FlowGeometries: FlowGeometries as FG
 
 Random.seed!(1234)
 
 # 128 x 128 Cartesian patch, 1 km spacing
 N = 128
 dx = 1_000.0
-geom = CGEF.CartesianGeometry(dx, dx)
-x = collect(0.0:dx:dx*(N - 1))
-y = collect(0.0:dx:dx*(N - 1))
-mask = trues(N, N)
-grid = CGEF.StructuredGrid(geom, x, y, mask)
+geom = FG.Geometry.CartesianGeometry()
+x = 0.0:dx:dx*(N - 1)   # a Range, not `collect`ed — keeps the fast translation-invariant footprint path
+y = 0.0:dx:dx*(N - 1)
+# No mask argument: the grid then stores `AllActive`, whose `isactive` folds to a constant. Passing an
+# all-true `BitArray` instead means a load and a branch per cell — measured 3x on the derivative sweep.
+grid = FG.Grids.StructuredGrid(geom, x, y)
 
 # Synthetic field: a large coherent eddy plus small-scale fluctuations
 L = dx * N

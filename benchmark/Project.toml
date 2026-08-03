@@ -1,6 +1,8 @@
 [deps]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 CoarseGrainingEnergyFluxes = "a8c2fbc6-778a-4d2b-8a8c-9c98efc7e8cf"
+FlowGeometries = "0ccd6995-f618-4175-b01e-f437d0cb4974"
 
 [sources]
 CoarseGrainingEnergyFluxes = { path = ".." }
+FlowGeometries = { url = "https://github.com/jbphyswx/FlowGeometries.jl" }

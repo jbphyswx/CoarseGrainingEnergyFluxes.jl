@@ -1,11 +1,10 @@
 module Diagnostics
 
-using ..Geometry: Geometry
-using ..Grids: Grids
+using FlowGeometries: FlowGeometries
 using ..Kernels: Kernels
 using ..Filtering: Filtering
 using ..Derivatives: Derivatives
-using ..Backends: Backends
+using ComputationalBackends: ComputationalBackends
 
 export ΠWorkspace, compute_Π!, compute_Π_profile!, cumulative_energy, cumulative_energy!, filtering_spectrum, spectral_density, spectral_density!
 export tau_decomposition, compute_Π_decomposed, tracer_variance_flux
@@ -20,7 +19,7 @@ struct ΠWorkspace{T<:AbstractFloat, A<:AbstractArray{T}}
     u_filt::A
     v_filt::A
     w_filt::A
-    
+
     # Planetary Cartesian velocities (if Spherical geometry is used)
     ux::A
     uy::A
@@ -28,7 +27,7 @@ struct ΠWorkspace{T<:AbstractFloat, A<:AbstractArray{T}}
     ux_filt::A
     uy_filt::A
     uz_filt::A
-    
+
     # Filtered quadratic velocity products (planetary Cartesian if Spherical, else Cartesian)
     uu_filt::A
     uv_filt::A
@@ -36,7 +35,7 @@ struct ΠWorkspace{T<:AbstractFloat, A<:AbstractArray{T}}
     vv_filt::A
     vw_filt::A
     ww_filt::A
-    
+
     # Velocity derivatives / strain rate components (local coordinates)
     S_xx::A
     S_xy::A
@@ -44,7 +43,7 @@ struct ΠWorkspace{T<:AbstractFloat, A<:AbstractArray{T}}
     S_yy::A
     S_yz::A
     S_zz::A
-    
+
     # Subfilter-scale stress components (local coordinates)
     τ_xx::A
     τ_xy::A
@@ -52,58 +51,64 @@ struct ΠWorkspace{T<:AbstractFloat, A<:AbstractArray{T}}
     τ_yy::A
     τ_yz::A
     τ_zz::A
-    
-    # General temporary array for scratch work
+
+    # Three scratch arrays, so `filter_apply_batch!` can filter all 6 quadratic velocity products in
+    # one pass. The spherical branch needs 6 simultaneous pre-filter buffers and only 3 are idle at
+    # that point (`u_filt`/`v_filt`/`w_filt`, before the planetary→local transform overwrites them).
     scratch::A
+    scratch2::A
+    scratch3::A
 end
 
 # Workspace constructor based on grid structure and float type. `A` is inferred from what
 # `zeros(T, sz...)` actually produces (Vector for a 1D grid, Matrix for 2D, Array{T,3} for 3D) —
 # NOT hardcoded, since a 1D/3D grid's `sz` is a 1- or 3-tuple, not always 2D.
-function ΠWorkspace(grid::Grids.AbstractGrid{G,T}) where {G, T<:AbstractFloat}
-    sz = Grids.size_tuple(grid)
+function ΠWorkspace(grid::FlowGeometries.Grids.AbstractGrid{G,T}) where {G, T<:AbstractFloat}
+    sz = FlowGeometries.Grids.size_tuple(grid)
 
     u_filt  = zeros(T, sz...)
     v_filt  = zeros(T, sz...)
     w_filt  = zeros(T, sz...)
-    
+
     ux      = zeros(T, sz...)
     uy      = zeros(T, sz...)
     uz      = zeros(T, sz...)
     ux_filt = zeros(T, sz...)
     uy_filt = zeros(T, sz...)
     uz_filt = zeros(T, sz...)
-    
+
     uu_filt = zeros(T, sz...)
     uv_filt = zeros(T, sz...)
     uw_filt = zeros(T, sz...)
     vv_filt = zeros(T, sz...)
     vw_filt = zeros(T, sz...)
     ww_filt = zeros(T, sz...)
-    
+
     S_xx    = zeros(T, sz...)
     S_xy    = zeros(T, sz...)
     S_xz    = zeros(T, sz...)
     S_yy    = zeros(T, sz...)
     S_yz    = zeros(T, sz...)
     S_zz    = zeros(T, sz...)
-    
+
     τ_xx    = zeros(T, sz...)
     τ_xy    = zeros(T, sz...)
     τ_xz    = zeros(T, sz...)
     τ_yy    = zeros(T, sz...)
     τ_yz    = zeros(T, sz...)
     τ_zz    = zeros(T, sz...)
-    
+
     scratch = zeros(T, sz...)
-    
+    scratch2 = zeros(T, sz...)
+    scratch3 = zeros(T, sz...)
+
     return ΠWorkspace(
         u_filt, v_filt, w_filt,
         ux, uy, uz, ux_filt, uy_filt, uz_filt,
         uu_filt, uv_filt, uw_filt, vv_filt, vw_filt, ww_filt,
         S_xx, S_xy, S_xz, S_yy, S_yz, S_zz,
         τ_xx, τ_xy, τ_xz, τ_yy, τ_yz, τ_zz,
-        scratch
+        scratch, scratch2, scratch3
     )
 end
 
@@ -112,10 +117,10 @@ end
 # ---------------------------------------------------------------------------
 
 # Boundary-only (once per top-level call, not per grid point): a mismatched v/w would otherwise be
-# silently truncated/ignored by CartesianIndices(u), not caught at all. Same idiom as the depth-count
+# silently truncated/ignored by CartesianIndices(u), not caught at all. Same idiom as the level-count
 # check in compute_Π_profile! below.
 @inline function _validate_field_sizes(grid, Π::AbstractArray, u::AbstractArray, v = nothing, w = nothing)
-    gsz = Grids.size_tuple(grid)
+    gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
     size(Π) == gsz || throw(DimensionMismatch("Π has size $(size(Π)), grid expects $gsz"))
     v === nothing || size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
@@ -135,7 +140,7 @@ energy transfer across scales in turbulent flows. Positive Π indicates forward 
 # Arguments
 - `Π::AbstractMatrix{T}`: Output array for energy flux (modified in-place)
 - `u::AbstractMatrix`: Eastward/zonal velocity component
-- `v::AbstractMatrix`: Northward/meridional velocity component  
+- `v::AbstractMatrix`: Northward/meridional velocity component
 - `w::Union{Nothing,AbstractMatrix}`: Vertical velocity (nothing for 2D calculations)
 - `grid::StructuredGrid`: Grid geometry and coordinates
 - `kernel::AbstractFilterKernel`: Filter kernel
@@ -144,7 +149,7 @@ energy transfer across scales in turbulent flows. Positive Π indicates forward 
 # Keyword Arguments
 - `workspace=nothing`: Pre-allocated ΠWorkspace for intermediate arrays
 - `backend::AbstractExecutionBackend=AutoBackend()`: Execution backend
-- `mask_strategy::AbstractMaskStrategy=Deformable()`: Land masking strategy (`ZeroFill()` or `Deformable()`)
+- `mask_strategy::AbstractMaskStrategy=Deformable()`: Masking strategy (`ZeroFill()` or `Deformable()`)
 
 # Physics
 The cross-scale energy flux is computed as:
@@ -172,7 +177,7 @@ homogeneous/isotropic 3D turbulence (e.g. boundary-layer or Rayleigh–Taylor st
 genuinely blends all three directions and vertical derivatives are real, not assumed away. The
 literature on "vertical structure via coarse-graining" (Aluie, Hecht & Vallis 2018, JPO; Buzzicotti,
 Storer, Khatri, Griffies & Aluie 2023, JAMES) analyzes vertical structure by running this SAME 2D/2.5D
-method independently at each depth level of a multi-level dataset and comparing/stacking the resulting
+method independently at each z level of a multi-level dataset and comparing/stacking the resulting
 profiles — not by computing a coupled 3D tensor — so `Pipeline.coarse_grain_profile`/
 [`compute_Π_profile!`](@ref) (looping this method per level) is the literature-matching way to get a
 vertical-structure result. A genuinely coupled, all-nine-strain-component 3D method exists separately
@@ -202,33 +207,32 @@ function compute_Π!(
     u::AbstractMatrix,
     v::AbstractMatrix,
     w::Union{Nothing, AbstractMatrix}, # nothing or zeros for 2D
-    grid::Grids.StructuredGrid{G,T},
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     workspace::Union{Nothing, ΠWorkspace} = nothing,
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable()
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     _validate_field_sizes(grid, Π, u, v, w)
     ws = workspace === nothing ? ΠWorkspace(grid) : workspace
-    # Build the filter footprint/plan ONCE for this scale; reused for every velocity component and
-    # quadratic product below (instead of rebuilding it on each of the ~9 filterings), and — when the
-    # caller passes a prebuilt `filter_plan` (e.g. a repeated call at a fixed scale, such as
-    # `compute_Π_profile!`'s per-level loop) — reused ACROSS calls too, instead of rebuilding it fresh
-    # every time despite `workspace` already being supplied (the footprint rebuild, not the workspace
-    # scratch arrays, was the dominant per-call allocation until this was added).
+    # One plan for this scale, shared by all ~9 filterings below. A caller repeating this at a fixed
+    # scale can pass a prebuilt `filter_plan` to share it across calls as well.
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend) : filter_plan
-    # A StructuredGrid's ddx!/ddy! need no prebuilt derivative cache (pass `nothing`).
-    return _compute_Π_2d!(Π, u, v, w, grid, ws, plan, nothing)
+    # The stencil weights depend only on the grid, so one table serves every derivative here and every
+    # later call at any scale.
+    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
+    return _compute_Π!(Π, u, v, w, grid, ws, plan, dplan)
 end
 
 """
     compute_Π_profile!(Π, u, v, w, grid, kernel, scale; workspace=nothing, backend=AutoBackend(), mask_strategy=Deformable())
 
-Depth-profile energy flux: given 3D `(lon, lat, depth)` velocity arrays, runs the 2D/2.5D
-[`compute_Π!`](@ref) INDEPENDENTLY at each depth level — the literature-standard way to obtain
+Vertical-profile energy flux: given 3D `(x, y, z)` velocity arrays, runs the 2D/2.5D
+[`compute_Π!`](@ref) INDEPENDENTLY at each z level — the literature-standard way to obtain
 vertical structure via coarse-graining (Aluie, Hecht & Vallis 2018; Buzzicotti et al. 2023; see the
 thin-layer/QG regime note on `compute_Π!`'s docstring) — writing each level's 2D result into the
 matching slice of the 3D `Π` output. This is NOT a coupled 3D tensor computation (no vertical
@@ -239,25 +243,24 @@ function compute_Π_profile!(
     u::AbstractArray{T,3},
     v::AbstractArray{T,3},
     w::Union{Nothing, AbstractArray{T,3}},
-    grid::Grids.StructuredGrid{G,T},
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     workspace::Union{Nothing, ΠWorkspace} = nothing,
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
+    deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    # Every level shares the grid, so one stencil table serves the whole loop.
+    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
     Nlevels = size(u, 3)
     size(Π, 3) == Nlevels || throw(DimensionMismatch(
-        "Π has $(size(Π, 3)) depth levels, u has $Nlevels",
+        "Π has $(size(Π, 3)) z levels, u has $Nlevels",
     ))
     ws = workspace === nothing ? ΠWorkspace(grid) : workspace
-    # Every level shares the SAME grid/kernel/scale, so the filter footprint is genuinely identical
-    # across the whole loop — build it once here and pass it through, instead of `compute_Π!`
-    # rebuilding it fresh at every level (the footprint rebuild, not the `ws` scratch arrays, was the
-    # dominant per-call allocation before `filter_plan` reuse was added). A caller sweeping multiple
-    # scales (`coarse_grain_profile`) can pass an externally prebuilt `filter_plan` to avoid rebuilding
-    # across scale iterations too.
+    # Every level shares the grid, kernel and scale, so one plan serves the whole loop. A caller
+    # sweeping scales can pass one in to share it across iterations too.
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) : filter_plan
     for k in 1:Nlevels
@@ -265,6 +268,7 @@ function compute_Π_profile!(
         compute_Π!(
             view(Π, :, :, k), view(u, :, :, k), view(v, :, :, k), wk, grid, kernel, scale;
             workspace = ws, filter_plan = plan, backend = backend, mask_strategy = mask_strategy,
+            deriv_plan = dplan,
         )
     end
     return Π
@@ -273,60 +277,45 @@ end
 # ---------------------------------------------------------------------------
 # Shared 2D driver for the per-point tensor physics (rotation / SFS stress / strain contraction),
 # called by BOTH the StructuredGrid and CurvilinearGrid `compute_Π!` methods. Both grids reach their
-# geometry only through `Grids.coords`/`isactive` and the `ddx!`/`ddy!` operators, so this one kernel
-# serves both — no duplicated tensor math. `deriv_plan` is `nothing` for a StructuredGrid (whose
-# `ddx!`/`ddy!` take no cache) or a prebuilt `Derivatives.WLSQGradientPlan` for a CurvilinearGrid.
+# geometry only through `FlowGeometries.Grids.coords`/`isactive` and the `ddx!`/`ddy!` operators, so this one kernel
+# serves both — no duplicated tensor math. `deriv_plan` is a `Derivatives.StencilPlan` for a
+# `StructuredGrid` and a `Connectivity.gradient_plan` for a curvilinear grid or a node set; either way
+# it is geometry only, so one holds for every scale.
 # ---------------------------------------------------------------------------
 
-# Derivative dispatch: StructuredGrid ignores the (nothing) plan; CurvilinearGrid/UnstructuredGrid use
-# their respective (index-offset vs node-index) WLSQ plans.
-@inline _ddx!(out, f, grid::Grids.StructuredGrid, ::Nothing) = Derivatives.ddx!(out, f, grid)
-@inline _ddy!(out, f, grid::Grids.StructuredGrid, ::Nothing) = Derivatives.ddy!(out, f, grid)
-@inline _ddx!(out, f, grid::Grids.CurvilinearGrid, plan::Derivatives.WLSQGradientPlan) =
-    Derivatives.ddx!(out, f, grid, plan)
-@inline _ddy!(out, f, grid::Grids.CurvilinearGrid, plan::Derivatives.WLSQGradientPlan) =
-    Derivatives.ddy!(out, f, grid, plan)
-@inline _ddx!(out, f, grid::Grids.UnstructuredGrid, plan::Derivatives.UnstructuredWLSQGradientPlan) =
-    Derivatives.ddx!(out, f, grid, plan)
-@inline _ddy!(out, f, grid::Grids.UnstructuredGrid, plan::Derivatives.UnstructuredWLSQGradientPlan) =
-    Derivatives.ddy!(out, f, grid, plan)
+# Both tangent components of one field — which is what the strain tensor needs of every field it
+# touches. A separable grid differences each direction independently; a curvilinear grid or a node set
+# has no direction to difference along and fits both components at once from the same neighbour sweep,
+# so asking for them together is one traversal there rather than two.
+@inline function _grad2!(g1, g2, f, grid::FlowGeometries.Grids.StructuredGrid, ::Nothing)
+    Derivatives.ddx!(g1, f, grid)
+    Derivatives.ddy!(g2, f, grid)
+    return nothing
+end
+@inline function _grad2!(g1, g2, f, grid::FlowGeometries.Grids.StructuredGrid, plan::Derivatives.StencilPlan)
+    Derivatives.ddx!(g1, f, grid, plan)
+    Derivatives.ddy!(g2, f, grid, plan)
+    return nothing
+end
+@inline function _grad2!(g1, g2, f, _grid, plan::FlowGeometries.Discretization.GradientPlan)
+    FlowGeometries.Discretization.gradient!(g1, g2, f, plan)
+    return nothing
+end
 
-# Rotate a planetary-Cartesian symmetric SFS stress tensor (given as its xx/xy/xz/yy/yz/zz
-# components) to the local (east, north, radial) frame at (λ,φ) — the exact algebraic transcription
-# of the per-point rotation both `_compute_Π_2d!`'s spherical branch and the new 1D-node-indexed
-# `_compute_Π_1d!` need (a spherical grid's tensor-rotation physics is identical regardless of how
-# points happen to be indexed), so this shared scalar kernel avoids duplicating that algebra between
-# the two array-shape-specific drivers. Always returns all six local components; callers that don't
-# have a genuine radial/vertical velocity simply pass zero for `txz`/`tyz`/`tzz` and discard
-# `τer`/`τnr`/`τrr` (matching the existing "not computed when !has_w" convention).
+# Rotate a planetary-Cartesian symmetric stress to the local (east, north, radial) frame at (λ,φ),
+# flattened to the component order this file's contractions read. A caller with no radial velocity
+# passes zero for `txz`/`tyz`/`tzz` and discards `τer`/`τnr`/`τrr`.
 @inline function _rotate_stress_to_local_enr(
+    geo::FlowGeometries.Geometry.AbstractSphericalGeometry,
     txx::T, txy::T, txz::T, tyy::T, tyz::T, tzz::T, λ::T, φ::T,
 ) where {T<:AbstractFloat}
-    sinφ, cosφ = sin(φ), cos(φ)
-    sinλ, cosλ = sin(λ), cos(λ)
-    # T * e_east, T * e_north, T * e_radial (e_east = [-sinλ,cosλ,0], e_north = [-sinφcosλ,-sinφsinλ,cosφ],
-    # e_radial = [cosφcosλ,cosφsinλ,sinφ]).
-    te_x = txx * (-sinλ) + txy * cosλ
-    te_y = txy * (-sinλ) + tyy * cosλ
-    te_z = txz * (-sinλ) + tyz * cosλ
-    tn_x = txx * (-sinφ * cosλ) + txy * (-sinφ * sinλ) + txz * cosφ
-    tn_y = txy * (-sinφ * cosλ) + tyy * (-sinφ * sinλ) + tyz * cosφ
-    tn_z = txz * (-sinφ * cosλ) + tyz * (-sinφ * sinλ) + tzz * cosφ
-    tr_x = txx * (cosφ * cosλ) + txy * (cosφ * sinλ) + txz * sinφ
-    tr_y = txy * (cosφ * cosλ) + tyy * (cosφ * sinλ) + tyz * sinφ
-    tr_z = txz * (cosφ * cosλ) + tyz * (cosφ * sinλ) + tzz * sinφ
-    τee = te_x * (-sinλ) + te_y * cosλ
-    τen = te_x * (-sinφ * cosλ) + te_y * (-sinφ * sinλ) + te_z * cosφ
-    τer = te_x * (cosφ * cosλ) + te_y * (cosφ * sinλ) + te_z * sinφ
-    τnn = tn_x * (-sinφ * cosλ) + tn_y * (-sinφ * sinλ) + tn_z * cosφ
-    τnr = tn_x * (cosφ * cosλ) + tn_y * (cosφ * sinλ) + tn_z * sinφ
-    τrr = tr_x * (cosφ * cosλ) + tr_y * (cosφ * sinλ) + tr_z * sinφ
-    return τee, τen, τer, τnn, τnr, τrr
+    τ = FlowGeometries.Geometry.tensor_to_local(geo, txx, tyy, tzz, txy, txz, tyz, λ, φ)
+    return τ.λλ, τ.λφ, τ.λr, τ.φφ, τ.φr, τ.rr
 end
 
 # Symmetric SFS tensor contraction S̄_ij τ_ij — the scalar sum shared by every `compute_Π!` driver's
 # final step (2D contraction, or the full six-term 3D contraction when a vertical/radial component
-# exists). Factored out so `_compute_Π_2d!` and `_compute_Π_1d!` share the identical arithmetic.
+# exists). Factored out so `_compute_Π!` and `_compute_Π!` share the identical arithmetic.
 @inline _sfs_contraction(Sxx::T, Sxy::T, Syy::T, τxx::T, τxy::T, τyy::T) where {T<:AbstractFloat} =
     Sxx * τxx + T(2) * Sxy * τxy + Syy * τyy
 
@@ -335,50 +324,53 @@ end
 ) where {T<:AbstractFloat} =
     Sxx * τxx + T(2) * Sxy * τxy + Syy * τyy + T(2) * Sxz * τxz + T(2) * Syz * τyz + Szz * τzz
 
-function _compute_Π_2d!(
-    Π::AbstractMatrix{T},
-    u::AbstractMatrix,
-    v::AbstractMatrix,
-    w::Union{Nothing, AbstractMatrix},
-    grid::Grids.AbstractGrid{G,T},
+# One driver for every point-indexed grid: the broadcasts are shape-agnostic and the explicit loops
+# run over `CartesianIndices`, so a node-indexed `UnstructuredGrid` and an `(i,j)` 2D grid take the
+# same code. The true-3D methods below are separate because their physics differs — real radial
+# derivatives and curvature terms this 2.5D path drops by construction.
+function _compute_Π!(
+    Π::AbstractArray{T},
+    u::AbstractArray,
+    v::AbstractArray,
+    w::Union{Nothing, AbstractArray},
+    grid::FlowGeometries.Grids.AbstractGrid{G,T},
     ws::ΠWorkspace,
     plan::Filtering.AbstractFilterPlan,
     deriv_plan,
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
-    Nlon, Nlat = Grids.size_tuple(grid)
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     has_w = w !== nothing
 
-    if G <: Geometry.CartesianGeometry{T}
+    if G <: FlowGeometries.Geometry.CartesianGeometry{T}
         # -------------------------------------------------------------------
         # Cartesian Case
         # -------------------------------------------------------------------
-        # Filter velocity components
-        Filtering.filter_apply!(ws.u_filt, u, plan)
-        Filtering.filter_apply!(ws.v_filt, v, plan)
+        # Filter velocity components — batched: one neighbour-list/weight derivation per point,
+        # applied to all primitives at once (see `Filtering.filter_apply_batch!`), not once per field.
         if has_w
-            Filtering.filter_apply!(ws.w_filt, w, plan)
+            Filtering.filter_apply_batch!((ws.u_filt, ws.v_filt, ws.w_filt), (u, v, w), plan)
+        else
+            Filtering.filter_apply_batch!((ws.u_filt, ws.v_filt), (u, v), plan)
         end
-        
-        # Filter products: u², uv, vv, etc.
-        # uu
-        @. ws.scratch = u * u
-        Filtering.filter_apply!(ws.uu_filt, ws.scratch, plan)
-        # uv
-        @. ws.scratch = u * v
-        Filtering.filter_apply!(ws.uv_filt, ws.scratch, plan)
-        # vv
-        @. ws.scratch = v * v
-        Filtering.filter_apply!(ws.vv_filt, ws.scratch, plan)
-        
+
+        # Filter products: u², uv, vv, etc. — also batched, in one pass. `ux`/`uy`/`uz`/`ux_filt`/
+        # `uy_filt`/`uz_filt` are spherical-only fields, genuinely idle in this Cartesian branch, so
+        # they're reused here purely as pre-filter product scratch (no new workspace fields needed).
+        @. ws.ux = u * u
+        @. ws.uy = u * v
+        @. ws.uz = v * v
         if has_w
-            @. ws.scratch = u * w
-            Filtering.filter_apply!(ws.uw_filt, ws.scratch, plan)
-            @. ws.scratch = v * w
-            Filtering.filter_apply!(ws.vw_filt, ws.scratch, plan)
-            @. ws.scratch = w * w
-            Filtering.filter_apply!(ws.ww_filt, ws.scratch, plan)
+            @. ws.ux_filt = u * w
+            @. ws.uy_filt = v * w
+            @. ws.uz_filt = w * w
+            Filtering.filter_apply_batch!(
+                (ws.uu_filt, ws.uv_filt, ws.vv_filt, ws.uw_filt, ws.vw_filt, ws.ww_filt),
+                (ws.ux, ws.uy, ws.uz, ws.ux_filt, ws.uy_filt, ws.uz_filt),
+                plan,
+            )
+        else
+            Filtering.filter_apply_batch!((ws.uu_filt, ws.uv_filt, ws.vv_filt), (ws.ux, ws.uy, ws.uz), plan)
         end
-        
+
         # Compute subfilter stresses: τ_ij = [u_i u_j]̄ - ū_i ū_j
         @. ws.τ_xx = ws.uu_filt - ws.u_filt * ws.u_filt
         @. ws.τ_xy = ws.uv_filt - ws.u_filt * ws.v_filt
@@ -388,396 +380,201 @@ function _compute_Π_2d!(
             @. ws.τ_yz = ws.vw_filt - ws.v_filt * ws.w_filt
             @. ws.τ_zz = ws.ww_filt - ws.w_filt * ws.w_filt
         end
-        
-        # Compute strain rate tensor components: S̄_ij = 0.5 * (∂ū_i/∂x_j + ∂ū_j/∂x_i)
-        # S_xx = ∂ū/∂x
-        _ddx!(ws.S_xx, ws.u_filt, grid, deriv_plan)
-        # S_yy = ∂v̄/∂y
-        _ddy!(ws.S_yy, ws.v_filt, grid, deriv_plan)
-        # S_xy = 0.5 * (∂ū/∂y + ∂v̄/∂x)
-        _ddy!(ws.S_xy, ws.u_filt, grid, deriv_plan)
-        _ddx!(ws.scratch, ws.v_filt, grid, deriv_plan)
+
+        # Strain rate: S̄_ij = 0.5 * (∂ū_i/∂x_j + ∂ū_j/∂x_i). One gradient per velocity component.
+        _grad2!(ws.S_xx, ws.S_xy, ws.u_filt, grid, deriv_plan)     # ∂ū/∂x, ∂ū/∂y
+        _grad2!(ws.scratch, ws.S_yy, ws.v_filt, grid, deriv_plan)  # ∂v̄/∂x, ∂v̄/∂y
         @. ws.S_xy = T(0.5) * (ws.S_xy + ws.scratch)
-        
+
         if has_w
-            # S_xz = 0.5 * (∂ū/∂z + ∂w̄/∂x) (assumes ∂/∂z is zero or handles vertical layers)
-            _ddx!(ws.S_xz, ws.w_filt, grid, deriv_plan)
+            # S_xz = 0.5 * (∂ū/∂z + ∂w̄/∂x), S_yz = 0.5 * (∂v̄/∂z + ∂w̄/∂y); ∂/∂z is zero for a
+            # level stack, leaving the horizontal gradient of w̄.
+            _grad2!(ws.S_xz, ws.S_yz, ws.w_filt, grid, deriv_plan)
             @. ws.S_xz = T(0.5) * ws.S_xz
-            
-            # S_yz = 0.5 * (∂v̄/∂z + ∂w̄/∂y)
-            _ddy!(ws.S_yz, ws.w_filt, grid, deriv_plan)
             @. ws.S_yz = T(0.5) * ws.S_yz
-            
+
             # S_zz = ∂w̄/∂z = 0 (for standard 2.5D datasets)
             fill!(ws.S_zz, zero(T))
         end
-        
+
     else
         # -------------------------------------------------------------------
         # Spherical Case (Aluie 2019 commutativity formulation)
         # -------------------------------------------------------------------
         # Transform local coordinates (u_east, v_north) to global Cartesian (u_X, u_Y, u_Z)
-        for j in 1:Nlat
-            for i in 1:Nlon
-                if Grids.isactive(grid, i, j)
-                    λ, φ = Grids.coords(grid, i, j)
-                    u_val = u[i, j]
-                    v_val = v[i, j]
-                    w_val = has_w ? w[i, j] : zero(T)
-                    
-                    p_vel = Geometry.to_planetary_cartesian(grid.geometry, u_val, v_val, w_val, λ, φ)
-                    ws.ux[i, j] = p_vel[1]
-                    ws.uy[i, j] = p_vel[2]
-                    ws.uz[i, j] = p_vel[3]
+        for I in CartesianIndices(Π)
+            let i = Tuple(I)
+                if FlowGeometries.Grids.isactive(grid, i...)
+                    λ, φ = FlowGeometries.Grids.coords(grid, i...)
+                    u_val = u[I]
+                    v_val = v[I]
+                    w_val = has_w ? w[I] : zero(T)
+
+                    p_vel = FlowGeometries.Geometry.vector_to_cartesian(FlowGeometries.Grids.grid_geometry(grid), u_val, v_val, w_val, λ, φ)
+                    ws.ux[I] = p_vel[1]
+                    ws.uy[I] = p_vel[2]
+                    ws.uz[I] = p_vel[3]
                 else
-                    ws.ux[i, j] = zero(T)
-                    ws.uy[i, j] = zero(T)
-                    ws.uz[i, j] = zero(T)
+                    ws.ux[I] = zero(T)
+                    ws.uy[I] = zero(T)
+                    ws.uz[I] = zero(T)
                 end
             end
         end
-        
-        # Filter planetary Cartesian components
-        Filtering.filter_apply!(ws.ux_filt, ws.ux, plan)
-        Filtering.filter_apply!(ws.uy_filt, ws.uy, plan)
-        Filtering.filter_apply!(ws.uz_filt, ws.uz, plan)
-        
-        # Filter planetary products: X-X, X-Y, X-Z, Y-Y, Y-Z, Z-Z
-        @. ws.scratch = ws.ux * ws.ux
-        Filtering.filter_apply!(ws.uu_filt, ws.scratch, plan)
-        @. ws.scratch = ws.ux * ws.uy
-        Filtering.filter_apply!(ws.uv_filt, ws.scratch, plan)
-        @. ws.scratch = ws.ux * ws.uz
-        Filtering.filter_apply!(ws.uw_filt, ws.scratch, plan)
+
+        # Filter planetary Cartesian components — batched (one derivation per point, not one per field).
+        Filtering.filter_apply_batch!((ws.ux_filt, ws.uy_filt, ws.uz_filt), (ws.ux, ws.uy, ws.uz), plan)
+
+        # Filter planetary products: X-X, X-Y, X-Z, Y-Y, Y-Z, Z-Z — also batched, in one pass. The 6
+        # pre-filter product buffers reuse `u_filt`/`v_filt`/`w_filt` (genuinely idle here — the
+        # "transform back to local coordinates" step below overwrites them with real values right
+        # after, so nothing reads their stale product-scratch content) plus `scratch`/`scratch2`/
+        # `scratch3` (the extra scratch fields added specifically so this fits in one batch).
+        @. ws.u_filt = ws.ux * ws.ux
+        @. ws.v_filt = ws.ux * ws.uy
+        @. ws.w_filt = ws.ux * ws.uz
         @. ws.scratch = ws.uy * ws.uy
-        Filtering.filter_apply!(ws.vv_filt, ws.scratch, plan)
-        @. ws.scratch = ws.uy * ws.uz
-        Filtering.filter_apply!(ws.vw_filt, ws.scratch, plan)
-        @. ws.scratch = ws.uz * ws.uz
-        Filtering.filter_apply!(ws.ww_filt, ws.scratch, plan)
-        
+        @. ws.scratch2 = ws.uy * ws.uz
+        @. ws.scratch3 = ws.uz * ws.uz
+        Filtering.filter_apply_batch!(
+            (ws.uu_filt, ws.uv_filt, ws.uw_filt, ws.vv_filt, ws.vw_filt, ws.ww_filt),
+            (ws.u_filt, ws.v_filt, ws.w_filt, ws.scratch, ws.scratch2, ws.scratch3),
+            plan,
+        )
+
         # Transform filtered planetary velocities back to local coordinates (u_filt, v_filt, w_filt)
-        for j in 1:Nlat
-            for i in 1:Nlon
-                if Grids.isactive(grid, i, j)
-                    λ, φ = Grids.coords(grid, i, j)
-                    l_vel = Geometry.from_planetary_cartesian(grid.geometry, ws.ux_filt[i, j], ws.uy_filt[i, j], ws.uz_filt[i, j], λ, φ)
-                    ws.u_filt[i, j] = l_vel[1]
-                    ws.v_filt[i, j] = l_vel[2]
-                    ws.w_filt[i, j] = l_vel[3]
+        for I in CartesianIndices(Π)
+            let i = Tuple(I)
+                if FlowGeometries.Grids.isactive(grid, i...)
+                    λ, φ = FlowGeometries.Grids.coords(grid, i...)
+                    l_vel = FlowGeometries.Geometry.vector_from_cartesian(FlowGeometries.Grids.grid_geometry(grid), ws.ux_filt[I], ws.uy_filt[I], ws.uz_filt[I], λ, φ)
+                    ws.u_filt[I] = l_vel[1]
+                    ws.v_filt[I] = l_vel[2]
+                    ws.w_filt[I] = l_vel[3]
                 else
-                    ws.u_filt[i, j] = zero(T)
-                    ws.v_filt[i, j] = zero(T)
-                    ws.w_filt[i, j] = zero(T)
+                    ws.u_filt[I] = zero(T)
+                    ws.v_filt[I] = zero(T)
+                    ws.w_filt[I] = zero(T)
                 end
             end
         end
-        
+
         # Transform planetary filtered products to local stresses at each grid point, via the shared
         # `_rotate_stress_to_local_enr` scalar kernel (τ_local = R' * ( [u_i u_j]̄ - ū_i ū_j ) * R for
         # the orthogonal local rotation R = [e_east, e_north, e_radial]) — see that function for the
         # rotation algebra itself, kept in one place so the 1D `UnstructuredGrid` driver below shares it.
-        for j in 1:Nlat
-            for i in 1:Nlon
-                if Grids.isactive(grid, i, j)
-                    λ, φ = Grids.coords(grid, i, j)
-                    # NOTE: txz/tyz/tzz are NOT gated on `has_w` — `ws.uz`/`uz_filt` (the planetary
-                    # Cartesian Z-component) is generally nonzero even for a purely horizontal
-                    # velocity (u_vertical=0 still rotates into a nonzero Z through cosφ/sinφ), so
-                    # these cross terms are real, always-defined contributions that DO feed into the
-                    # rotated τee/τen/τnn below — only τer/τnr/τrr (the genuine radial-direction
-                    # stresses) are specifically a `has_w` (real vertical-velocity) quantity, and are
-                    # the only components gated below.
-                    txx = ws.uu_filt[i, j] - ws.ux_filt[i, j] * ws.ux_filt[i, j]
-                    txy = ws.uv_filt[i, j] - ws.ux_filt[i, j] * ws.uy_filt[i, j]
-                    tyy = ws.vv_filt[i, j] - ws.uy_filt[i, j] * ws.uy_filt[i, j]
-                    txz = ws.uw_filt[i, j] - ws.ux_filt[i, j] * ws.uz_filt[i, j]
-                    tyz = ws.vw_filt[i, j] - ws.uy_filt[i, j] * ws.uz_filt[i, j]
-                    tzz = ws.ww_filt[i, j] - ws.uz_filt[i, j] * ws.uz_filt[i, j]
-                    τee, τen, τer, τnn, τnr, τrr = _rotate_stress_to_local_enr(txx, txy, txz, tyy, tyz, tzz, λ, φ)
-                    ws.τ_xx[i, j] = τee
-                    ws.τ_yy[i, j] = τnn
-                    ws.τ_xy[i, j] = τen
+        # `txz`/`tyz`/`tzz` are not gated on `has_w`: the planetary Cartesian Z component is nonzero
+        # even for a purely horizontal velocity, since that rotates into Z through cosφ/sinφ. Those
+        # cross terms feed the rotated τee/τen/τnn. Only τer/τnr/τrr are genuinely radial.
+        geo = FlowGeometries.Grids.grid_geometry(grid)
+        for I in CartesianIndices(Π)
+            let i = Tuple(I)
+                if FlowGeometries.Grids.isactive(grid, i...)
+                    λ, φ = FlowGeometries.Grids.coords(grid, i...)
+                    txx = ws.uu_filt[I] - ws.ux_filt[I] * ws.ux_filt[I]
+                    txy = ws.uv_filt[I] - ws.ux_filt[I] * ws.uy_filt[I]
+                    tyy = ws.vv_filt[I] - ws.uy_filt[I] * ws.uy_filt[I]
+                    txz = ws.uw_filt[I] - ws.ux_filt[I] * ws.uz_filt[I]
+                    tyz = ws.vw_filt[I] - ws.uy_filt[I] * ws.uz_filt[I]
+                    tzz = ws.ww_filt[I] - ws.uz_filt[I] * ws.uz_filt[I]
+                    τee, τen, τer, τnn, τnr, τrr = _rotate_stress_to_local_enr(geo, txx, txy, txz, tyy, tyz, tzz, λ, φ)
+                    ws.τ_xx[I] = τee
+                    ws.τ_yy[I] = τnn
+                    ws.τ_xy[I] = τen
                     if has_w
-                        ws.τ_xz[i, j] = τer
-                        ws.τ_yz[i, j] = τnr
-                        ws.τ_zz[i, j] = τrr
+                        ws.τ_xz[I] = τer
+                        ws.τ_yz[I] = τnr
+                        ws.τ_zz[I] = τrr
                     end
                 else
-                    ws.τ_xx[i, j] = zero(T)
-                    ws.τ_yy[i, j] = zero(T)
-                    ws.τ_xy[i, j] = zero(T)
+                    ws.τ_xx[I] = zero(T)
+                    ws.τ_yy[I] = zero(T)
+                    ws.τ_xy[I] = zero(T)
                     if has_w
-                        ws.τ_xz[i, j] = zero(T)
-                        ws.τ_yz[i, j] = zero(T)
-                        ws.τ_zz[i, j] = zero(T)
+                        ws.τ_xz[I] = zero(T)
+                        ws.τ_yz[I] = zero(T)
+                        ws.τ_zz[I] = zero(T)
                     end
                 end
             end
         end
-        
+
         # Compute Spherical Strain Rates (with geometry curvature correction terms)
-        # S_ee = 1/(R cosφ) * ∂ū_e/∂λ - v̄_n * sinφ / (R cosφ)
-        _ddx!(ws.S_xx, ws.u_filt, grid, deriv_plan)
-        # S_nn = 1/R * ∂v̄_n/∂φ
-        _ddy!(ws.S_yy, ws.v_filt, grid, deriv_plan)
-        # S_en = 0.5 * ( 1/(R cosφ) ∂v̄_n/∂λ + 1/R ∂ū_e/∂φ + ū_e * sinφ / (R cosφ) )
-        _ddy!(ws.S_xy, ws.u_filt, grid, deriv_plan)
-        _ddx!(ws.scratch, ws.v_filt, grid, deriv_plan)
-        
-        R = grid.geometry.R
-        for j in 1:Nlat
-            for i in 1:Nlon
-                if Grids.isactive(grid, i, j)
-                    _, φ = Grids.coords(grid, i, j)
-                    cosφ = cos(φ)
-                    sinφ = sin(φ)
+        # S_ee = 1/(R cosφ) ∂ū_e/∂λ − v̄_n sinφ/(R cosφ);  S_nn = 1/R ∂v̄_n/∂φ
+        # S_en = 0.5 ( 1/(R cosφ) ∂v̄_n/∂λ + 1/R ∂ū_e/∂φ + ū_e sinφ/(R cosφ) )
+        _grad2!(ws.S_xx, ws.S_xy, ws.u_filt, grid, deriv_plan)
+        _grad2!(ws.scratch, ws.S_yy, ws.v_filt, grid, deriv_plan)
+
+        R = FlowGeometries.Geometry.radius(geo)
+        for I in CartesianIndices(Π)
+            let i = Tuple(I)
+                if FlowGeometries.Grids.isactive(grid, i...)
+                    _, φ = FlowGeometries.Grids.coords(grid, i...)
+                    sinφ, cosφ = sincos(φ)
                     tan_fact = abs(cosφ) > T(1e-12) ? sinφ / (R * cosφ) : zero(T)
-                    # S_ee correction
-                    ws.S_xx[i, j] -= ws.v_filt[i, j] * tan_fact
-                    
-                    # S_en correction
-                    ws.S_xy[i, j] = T(0.5) * (ws.S_xy[i, j] + ws.scratch[i, j] + ws.u_filt[i, j] * tan_fact)
+                    ws.S_xx[I] -= ws.v_filt[I] * tan_fact                    # S_ee correction
+                    ws.S_xy[I] = T(0.5) * (ws.S_xy[I] + ws.scratch[I] + ws.u_filt[I] * tan_fact)  # S_en
                 end
             end
         end
-        
+
         if has_w
-            # S_er = 0.5 * (∂ū_e/∂r + 1/(R cosφ) ∂w̄/∂λ) = 0.5 * 1/(R cosφ) ∂w̄/∂λ (if vertically flat layers)
-            _ddx!(ws.S_xz, ws.w_filt, grid, deriv_plan)
+            # S_er = 0.5 (∂ū_e/∂r + 1/(R cosφ) ∂w̄/∂λ) and S_nr = 0.5 (∂v̄_n/∂r + 1/R ∂w̄/∂φ); with
+            # vertically flat layers ∂/∂r drops and each is half the horizontal gradient of w̄.
+            _grad2!(ws.S_xz, ws.S_yz, ws.w_filt, grid, deriv_plan)
             @. ws.S_xz = T(0.5) * ws.S_xz
-            
-            # S_nr = 0.5 * (∂v̄_n/∂r + 1/R ∂w̄/∂φ) = 0.5 * 1/R ∂w̄/∂φ
-            _ddy!(ws.S_yz, ws.w_filt, grid, deriv_plan)
             @. ws.S_yz = T(0.5) * ws.S_yz
-            
+
             # S_rr = ∂w̄/∂r = 0
             fill!(ws.S_zz, zero(T))
         end
     end
-    
+
     # -----------------------------------------------------------------------
     # Tensor contraction: Π = -Σ_ij S̄_ij τ_ij
     # -----------------------------------------------------------------------
     # Since stress & strain rates are symmetric:
     # S̄_ij τ_ij = S_xx*τ_xx + 2*S_xy*τ_xy + S_yy*τ_yy (2D)
     # S̄_ij τ_ij = S_xx*τ_xx + 2*S_xy*τ_xy + S_yy*τ_yy + 2*S_xz*τ_xz + 2*S_yz*τ_yz + S_zz*τ_zz (3D)
+    mask = FlowGeometries.Grids.mask(grid)
     if has_w
-        for j in 1:Nlat
-            for i in 1:Nlon
-                if Grids.isactive(grid, i, j)
-                    Π[i, j] = -_sfs_contraction(
-                        ws.S_xx[i, j], ws.S_xy[i, j], ws.S_xz[i, j], ws.S_yy[i, j], ws.S_yz[i, j], ws.S_zz[i, j],
-                        ws.τ_xx[i, j], ws.τ_xy[i, j], ws.τ_xz[i, j], ws.τ_yy[i, j], ws.τ_yz[i, j], ws.τ_zz[i, j],
-                    )
-                else
-                    Π[i, j] = zero(T)
-                end
-            end
-        end
+        @. Π = ifelse(mask, -_sfs_contraction(
+            ws.S_xx, ws.S_xy, ws.S_xz, ws.S_yy, ws.S_yz, ws.S_zz,
+            ws.τ_xx, ws.τ_xy, ws.τ_xz, ws.τ_yy, ws.τ_yz, ws.τ_zz,
+        ), zero(T))
     else
-        for j in 1:Nlat
-            for i in 1:Nlon
-                if Grids.isactive(grid, i, j)
-                    Π[i, j] = -_sfs_contraction(
-                        ws.S_xx[i, j], ws.S_xy[i, j], ws.S_yy[i, j], ws.τ_xx[i, j], ws.τ_xy[i, j], ws.τ_yy[i, j],
-                    )
-                else
-                    Π[i, j] = zero(T)
-                end
-            end
-        end
+        @. Π = ifelse(mask, -_sfs_contraction(
+            ws.S_xx, ws.S_xy, ws.S_yy, ws.τ_xx, ws.τ_xy, ws.τ_yy,
+        ), zero(T))
     end
 
     return Π
 end
 
-# 1D node-indexed driver for `UnstructuredGrid` — the exact scalar physics of `_compute_Π_2d!`'s
-# spherical/Cartesian branches, looped over `1:N` nodes instead of `(i,j)` pairs, reusing
-# `_rotate_stress_to_local_enr`/`_sfs_contraction` so none of that algebra is duplicated.
-function _compute_Π_1d!(
-    Π::AbstractVector{T},
-    u::AbstractVector,
-    v::AbstractVector,
-    w::Union{Nothing, AbstractVector},
-    grid::Grids.UnstructuredGrid{T,G},
-    ws::ΠWorkspace,
-    plan::Filtering.AbstractFilterPlan,
-    deriv_plan::Derivatives.UnstructuredWLSQGradientPlan,
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
-    N = length(grid.mask)
-    has_w = w !== nothing
-
-    if G <: Geometry.CartesianGeometry{T}
-        Filtering.filter_apply!(ws.u_filt, u, plan)
-        Filtering.filter_apply!(ws.v_filt, v, plan)
-        has_w && Filtering.filter_apply!(ws.w_filt, w, plan)
-
-        @. ws.scratch = u * u
-        Filtering.filter_apply!(ws.uu_filt, ws.scratch, plan)
-        @. ws.scratch = u * v
-        Filtering.filter_apply!(ws.uv_filt, ws.scratch, plan)
-        @. ws.scratch = v * v
-        Filtering.filter_apply!(ws.vv_filt, ws.scratch, plan)
-        if has_w
-            @. ws.scratch = u * w
-            Filtering.filter_apply!(ws.uw_filt, ws.scratch, plan)
-            @. ws.scratch = v * w
-            Filtering.filter_apply!(ws.vw_filt, ws.scratch, plan)
-            @. ws.scratch = w * w
-            Filtering.filter_apply!(ws.ww_filt, ws.scratch, plan)
-        end
-
-        @. ws.τ_xx = ws.uu_filt - ws.u_filt * ws.u_filt
-        @. ws.τ_xy = ws.uv_filt - ws.u_filt * ws.v_filt
-        @. ws.τ_yy = ws.vv_filt - ws.v_filt * ws.v_filt
-        if has_w
-            @. ws.τ_xz = ws.uw_filt - ws.u_filt * ws.w_filt
-            @. ws.τ_yz = ws.vw_filt - ws.v_filt * ws.w_filt
-            @. ws.τ_zz = ws.ww_filt - ws.w_filt * ws.w_filt
-        end
-
-        _ddx!(ws.S_xx, ws.u_filt, grid, deriv_plan)
-        _ddy!(ws.S_yy, ws.v_filt, grid, deriv_plan)
-        _ddy!(ws.S_xy, ws.u_filt, grid, deriv_plan)
-        _ddx!(ws.scratch, ws.v_filt, grid, deriv_plan)
-        @. ws.S_xy = T(0.5) * (ws.S_xy + ws.scratch)
-
-        if has_w
-            _ddx!(ws.S_xz, ws.w_filt, grid, deriv_plan)
-            @. ws.S_xz = T(0.5) * ws.S_xz
-            _ddy!(ws.S_yz, ws.w_filt, grid, deriv_plan)
-            @. ws.S_yz = T(0.5) * ws.S_yz
-            fill!(ws.S_zz, zero(T))
-        end
-    else
-        # Spherical: local (u,v[,w]) -> planetary Cartesian, filter, rotate back — identical algebra
-        # to `_compute_Π_2d!`'s spherical branch, node-indexed.
-        for i in 1:N
-            if Grids.isactive(grid, i)
-                λ, φ = Grids.coords(grid, i)
-                w_val = has_w ? w[i] : zero(T)
-                p_vel = Geometry.to_planetary_cartesian(grid.geometry, u[i], v[i], w_val, λ, φ)
-                ws.ux[i], ws.uy[i], ws.uz[i] = p_vel[1], p_vel[2], p_vel[3]
-            else
-                ws.ux[i] = zero(T); ws.uy[i] = zero(T); ws.uz[i] = zero(T)
-            end
-        end
-
-        Filtering.filter_apply!(ws.ux_filt, ws.ux, plan)
-        Filtering.filter_apply!(ws.uy_filt, ws.uy, plan)
-        Filtering.filter_apply!(ws.uz_filt, ws.uz, plan)
-
-        @. ws.scratch = ws.ux * ws.ux
-        Filtering.filter_apply!(ws.uu_filt, ws.scratch, plan)
-        @. ws.scratch = ws.ux * ws.uy
-        Filtering.filter_apply!(ws.uv_filt, ws.scratch, plan)
-        @. ws.scratch = ws.ux * ws.uz
-        Filtering.filter_apply!(ws.uw_filt, ws.scratch, plan)
-        @. ws.scratch = ws.uy * ws.uy
-        Filtering.filter_apply!(ws.vv_filt, ws.scratch, plan)
-        @. ws.scratch = ws.uy * ws.uz
-        Filtering.filter_apply!(ws.vw_filt, ws.scratch, plan)
-        @. ws.scratch = ws.uz * ws.uz
-        Filtering.filter_apply!(ws.ww_filt, ws.scratch, plan)
-
-        for i in 1:N
-            if Grids.isactive(grid, i)
-                λ, φ = Grids.coords(grid, i)
-                l_vel = Geometry.from_planetary_cartesian(grid.geometry, ws.ux_filt[i], ws.uy_filt[i], ws.uz_filt[i], λ, φ)
-                ws.u_filt[i], ws.v_filt[i], ws.w_filt[i] = l_vel[1], l_vel[2], l_vel[3]
-            else
-                ws.u_filt[i] = zero(T); ws.v_filt[i] = zero(T); ws.w_filt[i] = zero(T)
-            end
-        end
-
-        for i in 1:N
-            if Grids.isactive(grid, i)
-                λ, φ = Grids.coords(grid, i)
-                txx = ws.uu_filt[i] - ws.ux_filt[i] * ws.ux_filt[i]
-                txy = ws.uv_filt[i] - ws.ux_filt[i] * ws.uy_filt[i]
-                tyy = ws.vv_filt[i] - ws.uy_filt[i] * ws.uy_filt[i]
-                txz = ws.uw_filt[i] - ws.ux_filt[i] * ws.uz_filt[i]
-                tyz = ws.vw_filt[i] - ws.uy_filt[i] * ws.uz_filt[i]
-                tzz = ws.ww_filt[i] - ws.uz_filt[i] * ws.uz_filt[i]
-                τee, τen, τer, τnn, τnr, τrr = _rotate_stress_to_local_enr(txx, txy, txz, tyy, tyz, tzz, λ, φ)
-                ws.τ_xx[i] = τee; ws.τ_yy[i] = τnn; ws.τ_xy[i] = τen
-                if has_w
-                    ws.τ_xz[i] = τer; ws.τ_yz[i] = τnr; ws.τ_zz[i] = τrr
-                end
-            else
-                ws.τ_xx[i] = zero(T); ws.τ_yy[i] = zero(T); ws.τ_xy[i] = zero(T)
-                if has_w
-                    ws.τ_xz[i] = zero(T); ws.τ_yz[i] = zero(T); ws.τ_zz[i] = zero(T)
-                end
-            end
-        end
-
-        _ddx!(ws.S_xx, ws.u_filt, grid, deriv_plan)
-        _ddy!(ws.S_yy, ws.v_filt, grid, deriv_plan)
-        _ddy!(ws.S_xy, ws.u_filt, grid, deriv_plan)
-        _ddx!(ws.scratch, ws.v_filt, grid, deriv_plan)
-
-        R = grid.geometry.R
-        for i in 1:N
-            if Grids.isactive(grid, i)
-                _, φ = Grids.coords(grid, i)
-                cosφ, sinφ = cos(φ), sin(φ)
-                tan_fact = abs(cosφ) > T(1e-12) ? sinφ / (R * cosφ) : zero(T)
-                ws.S_xx[i] -= ws.v_filt[i] * tan_fact
-                ws.S_xy[i] = T(0.5) * (ws.S_xy[i] + ws.scratch[i] + ws.u_filt[i] * tan_fact)
-            end
-        end
-
-        if has_w
-            _ddx!(ws.S_xz, ws.w_filt, grid, deriv_plan)
-            @. ws.S_xz = T(0.5) * ws.S_xz
-            _ddy!(ws.S_yz, ws.w_filt, grid, deriv_plan)
-            @. ws.S_yz = T(0.5) * ws.S_yz
-            fill!(ws.S_zz, zero(T))
-        end
-    end
-
-    if has_w
-        for i in 1:N
-            Π[i] = Grids.isactive(grid, i) ? -_sfs_contraction(
-                ws.S_xx[i], ws.S_xy[i], ws.S_xz[i], ws.S_yy[i], ws.S_yz[i], ws.S_zz[i],
-                ws.τ_xx[i], ws.τ_xy[i], ws.τ_xz[i], ws.τ_yy[i], ws.τ_yz[i], ws.τ_zz[i],
-            ) : zero(T)
-        end
-    else
-        for i in 1:N
-            Π[i] = Grids.isactive(grid, i) ?
-                -_sfs_contraction(ws.S_xx[i], ws.S_xy[i], ws.S_yy[i], ws.τ_xx[i], ws.τ_xy[i], ws.τ_yy[i]) :
-                zero(T)
-        end
-    end
-
-    return Π
-end
 
 """
     compute_Π!(Π, u, v, w, grid::UnstructuredGrid, kernel, scale; workspace=nothing, deriv_plan=nothing, backend=AutoBackend(), mask_strategy=Deformable(), method=Spectral())
 
-Cross-scale kinetic energy flux Π = -S̄_ij τ_ij on a [`Grids.UnstructuredGrid`](@ref) (scattered
+Cross-scale kinetic energy flux Π = -S̄_ij τ_ij on a `FlowGeometries.Grids.UnstructuredGrid` (scattered
 points, node-indexed) — the same physics as the 2D methods (planetary-Cartesian rotation for
-spherical geometry), via `_compute_Π_1d!`. The resolved strain uses the node-indexed WLSQ
-gradient (`Derivatives.ddx!`/`ddy!` with an `UnstructuredWLSQGradientPlan`). `UnstructuredGrid` has no
-real-space (direct-sum) filtering engine yet — only spectral (FINUFFT/NUFSHT) — so `method` defaults
-to `Spectral()`, unlike the other grid types' `DirectSum()` default.
+spherical geometry), via `_compute_Π!`. The resolved strain uses the node-indexed WLSQ
+gradient (`Connectivity.gradient_plan` + `Discretization.gradient!`). `method` defaults to
+`Spectral()` here, unlike the other grid types' `RealSpace()` default: the transform is exact for a
+band-limited field and its per-apply cost does not grow with the filter scale. `RealSpace()` applies
+the kernel as written, with compact support; a transform's support is global.
 """
 function compute_Π!(
     Π::AbstractVector{T},
     u::AbstractVector,
     v::AbstractVector,
     w::Union{Nothing, AbstractVector},
-    grid::Grids.UnstructuredGrid{T},
+    grid::FlowGeometries.Grids.UnstructuredGrid{T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     workspace::Union{Nothing, ΠWorkspace} = nothing,
-    deriv_plan::Union{Nothing, Derivatives.UnstructuredWLSQGradientPlan} = nothing,
+    deriv_plan::Union{Nothing, FlowGeometries.Discretization.GradientPlan} = nothing,
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
     method::Filtering.AbstractFilterMethod = Filtering.Spectral(),
 ) where {T<:AbstractFloat}
@@ -785,18 +582,19 @@ function compute_Π!(
     ws = workspace === nothing ? ΠWorkspace(grid) : workspace
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend, method=method) : filter_plan
-    dplan = deriv_plan === nothing ? Derivatives.WLSQGradientPlan(grid) : deriv_plan
-    return _compute_Π_1d!(Π, u, v, w, grid, ws, plan, dplan)
+    dplan = deriv_plan === nothing ? FlowGeometries.Connectivity.gradient_plan(grid) : deriv_plan
+    return _compute_Π!(Π, u, v, w, grid, ws, plan, dplan)
 end
 
 """
     compute_Π!(Π, u, v, w, grid::CurvilinearGrid, kernel, scale; workspace=nothing, deriv_plan=nothing, backend=AutoBackend(), mask_strategy=Deformable())
 
-Cross-scale kinetic energy flux Π = -S̄_ij τ_ij on a [`Grids.CurvilinearGrid`](@ref). Identical
-physics to the `StructuredGrid` 2D method — it shares the same `_compute_Π_2d!` tensor kernel
-— but the resolved strain uses the curvilinear WLSQ gradient (`Derivatives.ddx!`/`ddy!` with a
-`WLSQGradientPlan`) and real-space filtering uses the scattered per-point footprint. Pass a prebuilt
-`deriv_plan = WLSQGradientPlan(grid)` (and a reusable `workspace`) to avoid rebuilding them per call
+Cross-scale kinetic energy flux Π = -S̄_ij τ_ij on a `FlowGeometries.Grids.CurvilinearGrid`. Identical
+physics to the `StructuredGrid` 2D method — it shares the same `_compute_Π!` tensor kernel
+— but the resolved strain uses the least-squares tangent-plane gradient
+(`Discretization.gradient!` over a `Connectivity.gradient_plan`, both components from one neighbour
+sweep) and real-space filtering uses the scattered per-point footprint. Pass a prebuilt
+`deriv_plan = FG.Connectivity.gradient_plan(grid)` (and a reusable `workspace`) to avoid rebuilding them per call
 across a scale sweep.
 """
 function compute_Π!(
@@ -804,21 +602,21 @@ function compute_Π!(
     u::AbstractMatrix,
     v::AbstractMatrix,
     w::Union{Nothing, AbstractMatrix},
-    grid::Grids.CurvilinearGrid{T},
+    grid::FlowGeometries.Grids.CurvilinearGrid{T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     workspace::Union{Nothing, ΠWorkspace} = nothing,
-    deriv_plan::Union{Nothing, Derivatives.WLSQGradientPlan} = nothing,
+    deriv_plan::Union{Nothing, FlowGeometries.Discretization.GradientPlan} = nothing,
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
 ) where {T<:AbstractFloat}
     _validate_field_sizes(grid, Π, u, v, w)
     ws = workspace === nothing ? ΠWorkspace(grid) : workspace
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend) : filter_plan
-    dplan = deriv_plan === nothing ? Derivatives.WLSQGradientPlan(grid) : deriv_plan
-    return _compute_Π_2d!(Π, u, v, w, grid, ws, plan, dplan)
+    dplan = deriv_plan === nothing ? FlowGeometries.Connectivity.gradient_plan(grid) : deriv_plan
+    return _compute_Π!(Π, u, v, w, grid, ws, plan, dplan)
 end
 
 """
@@ -844,29 +642,37 @@ function compute_Π!(
     u::AbstractArray{<:Any,3},
     v::AbstractArray{<:Any,3},
     w::AbstractArray{<:Any,3},
-    grid::Grids.StructuredGrid{G,T,3},
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,3},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     workspace::Union{Nothing, ΠWorkspace} = nothing,
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
+    deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _validate_field_sizes(grid, Π, u, v, w)
     ws = workspace === nothing ? ΠWorkspace(grid) : workspace
+    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend) : filter_plan
 
-    # Filtered velocities and the six independent filtered quadratic products.
-    Filtering.filter_apply!(ws.u_filt, u, plan)
-    Filtering.filter_apply!(ws.v_filt, v, plan)
-    Filtering.filter_apply!(ws.w_filt, w, plan)
-    @. ws.scratch = u * u; Filtering.filter_apply!(ws.uu_filt, ws.scratch, plan)
-    @. ws.scratch = u * v; Filtering.filter_apply!(ws.uv_filt, ws.scratch, plan)
-    @. ws.scratch = u * w; Filtering.filter_apply!(ws.uw_filt, ws.scratch, plan)
-    @. ws.scratch = v * v; Filtering.filter_apply!(ws.vv_filt, ws.scratch, plan)
-    @. ws.scratch = v * w; Filtering.filter_apply!(ws.vw_filt, ws.scratch, plan)
-    @. ws.scratch = w * w; Filtering.filter_apply!(ws.ww_filt, ws.scratch, plan)
+    # Filtered velocities and the six independent filtered quadratic products — batched (one
+    # neighbour-list/weight derivation per point, applied to the whole group at once). `ux`/`uy`/`uz`/
+    # `ux_filt`/`uy_filt`/`uz_filt` are spherical-only fields, genuinely idle here, reused purely as
+    # pre-filter product scratch (no new workspace fields needed) — same pattern as `_compute_Π!`.
+    Filtering.filter_apply_batch!((ws.u_filt, ws.v_filt, ws.w_filt), (u, v, w), plan)
+    @. ws.ux = u * u
+    @. ws.uy = u * v
+    @. ws.uz = u * w
+    @. ws.ux_filt = v * v
+    @. ws.uy_filt = v * w
+    @. ws.uz_filt = w * w
+    Filtering.filter_apply_batch!(
+        (ws.uu_filt, ws.uv_filt, ws.uw_filt, ws.vv_filt, ws.vw_filt, ws.ww_filt),
+        (ws.ux, ws.uy, ws.uz, ws.ux_filt, ws.uy_filt, ws.uz_filt),
+        plan,
+    )
 
     # Subfilter stress τ_ij = ⟨u_i u_j⟩ - ū_i ū_j (symmetric, six components).
     @. ws.τ_xx = ws.uu_filt - ws.u_filt * ws.u_filt
@@ -877,23 +683,24 @@ function compute_Π!(
     @. ws.τ_zz = ws.ww_filt - ws.w_filt * ws.w_filt
 
     # Strain S̄_ij = ½(∂ū_i/∂x_j + ∂ū_j/∂x_i): three diagonals + three off-diagonals.
-    Derivatives.ddx!(ws.S_xx, ws.u_filt, grid)
-    Derivatives.ddy!(ws.S_yy, ws.v_filt, grid)
-    Derivatives.ddz!(ws.S_zz, ws.w_filt, grid)
-    Derivatives.ddy!(ws.S_xy, ws.u_filt, grid); Derivatives.ddx!(ws.scratch, ws.v_filt, grid)
+    Derivatives.ddx!(ws.S_xx, ws.u_filt, grid, dplan)
+    Derivatives.ddy!(ws.S_yy, ws.v_filt, grid, dplan)
+    Derivatives.ddz!(ws.S_zz, ws.w_filt, grid, dplan)
+    Derivatives.ddy!(ws.S_xy, ws.u_filt, grid, dplan); Derivatives.ddx!(ws.scratch, ws.v_filt, grid, dplan)
     @. ws.S_xy = T(0.5) * (ws.S_xy + ws.scratch)
-    Derivatives.ddz!(ws.S_xz, ws.u_filt, grid); Derivatives.ddx!(ws.scratch, ws.w_filt, grid)
+    Derivatives.ddz!(ws.S_xz, ws.u_filt, grid, dplan); Derivatives.ddx!(ws.scratch, ws.w_filt, grid, dplan)
     @. ws.S_xz = T(0.5) * (ws.S_xz + ws.scratch)
-    Derivatives.ddz!(ws.S_yz, ws.v_filt, grid); Derivatives.ddy!(ws.scratch, ws.w_filt, grid)
+    Derivatives.ddz!(ws.S_yz, ws.v_filt, grid, dplan); Derivatives.ddy!(ws.scratch, ws.w_filt, grid, dplan)
     @. ws.S_yz = T(0.5) * (ws.S_yz + ws.scratch)
 
-    mask = grid.mask
-    @inbounds @. Π = ifelse(
-        mask,
-        -(ws.S_xx * ws.τ_xx + ws.S_yy * ws.τ_yy + ws.S_zz * ws.τ_zz +
-          T(2) * (ws.S_xy * ws.τ_xy + ws.S_xz * ws.τ_xz + ws.S_yz * ws.τ_yz)),
-        zero(T),
-    )
+    # A loop, not a broadcast: fusing thirteen arrays builds a `Broadcasted` wide enough to spill.
+    mask = FlowGeometries.Grids.mask(grid)
+    @inbounds for I in CartesianIndices(Π)
+        Π[I] = mask[I] ? -_sfs_contraction(
+            ws.S_xx[I], ws.S_xy[I], ws.S_xz[I], ws.S_yy[I], ws.S_yz[I], ws.S_zz[I],
+            ws.τ_xx[I], ws.τ_xy[I], ws.τ_xz[I], ws.τ_yy[I], ws.τ_yz[I], ws.τ_zz[I],
+        ) : zero(T)
+    end
     return Π
 end
 
@@ -901,16 +708,16 @@ end
     compute_Π!(Π::AbstractArray{T,3}, u, v, w, grid::StructuredGrid{Spherical,T,3}, kernel, scale; workspace=nothing, backend=AutoBackend(), mask_strategy=Deformable())
 
 Full **three-dimensional spherical** cross-scale energy flux Π = -S̄_ij τ_ij: a genuine radius axis
-`r[k]` (absolute distance from the planet center — see [`Grids.StructuredGrid`](@ref)'s 3D
+`r[k]` (absolute distance from the planet center — see `FlowGeometries.Grids.StructuredGrid`'s 3D
 constructor) and real vertical derivatives `∂/∂r`, unlike the 2.5D layer-by-layer path (which drops
 the `u_r/r` curvature terms in `S_ee`/`S_nn` and the `S_er`/`S_nr`/`S_rr` radial strain entirely, since
 it has no radial axis to differentiate against).
 
 Velocities are rotated to planetary Cartesian for filtering (Aluie 2019 commutativity), then rotated
-back to local (east, north, radial) — reusing the exact same `_rotate_stress_to_local_enr`/
-`_sfs_contraction` kernels the 2D spherical driver uses, since that rotation algebra is
-already fully 3×3-general (only the 2D/2.5D caller previously discarded the radial components). The
-new physics here is the strain: the standard spherical strain-rate tensor in orthogonal curvilinear
+back to local (east, north, radial), through the same `_rotate_stress_to_local_enr`/`_sfs_contraction`
+kernels the 2D spherical driver uses — that rotation is fully 3×3-general, and the 2.5D caller simply
+discards its radial components. What differs here is the strain: the spherical strain-rate tensor in
+orthogonal curvilinear
 coordinates (scale factors `h_λ = r cosφ, h_φ = r, h_r = 1`),
 
     S_ee = (1/(r cosφ))∂ū_e/∂λ - v̄_n·tanφ/r + w̄_r/r
@@ -929,47 +736,54 @@ function compute_Π!(
     u::AbstractArray{<:Any,3},
     v::AbstractArray{<:Any,3},
     w::AbstractArray{<:Any,3},
-    grid::Grids.StructuredGrid{G,T,3},
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,3},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     workspace::Union{Nothing, ΠWorkspace} = nothing,
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-) where {T<:AbstractFloat, G<:Geometry.SphericalGeometry{T}}
+    deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     _validate_field_sizes(grid, Π, u, v, w)
     ws = workspace === nothing ? ΠWorkspace(grid) : workspace
+    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend) : filter_plan
-    Nlon, Nlat, Nr = Grids.size_tuple(grid)
+    Nx, Ny, Nr = FlowGeometries.Grids.size_tuple(grid)
 
     # Rotate local (east, north, radial) velocity to planetary Cartesian at each point.
-    @inbounds for k in 1:Nr, j in 1:Nlat, i in 1:Nlon
-        if Grids.isactive(grid, i, j, k)
-            λ, φ, _ = Grids.coords(grid, i, j, k)
-            p_vel = Geometry.to_planetary_cartesian(grid.geometry, u[i, j, k], v[i, j, k], w[i, j, k], λ, φ)
+    @inbounds for k in 1:Nr, j in 1:Ny, i in 1:Nx
+        if FlowGeometries.Grids.isactive(grid, i, j, k)
+            λ, φ, _ = FlowGeometries.Grids.coords(grid, i, j, k)
+            p_vel = FlowGeometries.Geometry.vector_to_cartesian(FlowGeometries.Grids.grid_geometry(grid), u[i, j, k], v[i, j, k], w[i, j, k], λ, φ)
             ws.ux[i, j, k] = p_vel[1]; ws.uy[i, j, k] = p_vel[2]; ws.uz[i, j, k] = p_vel[3]
         else
             ws.ux[i, j, k] = zero(T); ws.uy[i, j, k] = zero(T); ws.uz[i, j, k] = zero(T)
         end
     end
 
-    Filtering.filter_apply!(ws.ux_filt, ws.ux, plan)
-    Filtering.filter_apply!(ws.uy_filt, ws.uy, plan)
-    Filtering.filter_apply!(ws.uz_filt, ws.uz, plan)
-    @. ws.scratch = ws.ux * ws.ux; Filtering.filter_apply!(ws.uu_filt, ws.scratch, plan)
-    @. ws.scratch = ws.ux * ws.uy; Filtering.filter_apply!(ws.uv_filt, ws.scratch, plan)
-    @. ws.scratch = ws.ux * ws.uz; Filtering.filter_apply!(ws.uw_filt, ws.scratch, plan)
-    @. ws.scratch = ws.uy * ws.uy; Filtering.filter_apply!(ws.vv_filt, ws.scratch, plan)
-    @. ws.scratch = ws.uy * ws.uz; Filtering.filter_apply!(ws.vw_filt, ws.scratch, plan)
-    @. ws.scratch = ws.uz * ws.uz; Filtering.filter_apply!(ws.ww_filt, ws.scratch, plan)
+    Filtering.filter_apply_batch!((ws.ux_filt, ws.uy_filt, ws.uz_filt), (ws.ux, ws.uy, ws.uz), plan)
+    # Pre-filter product scratch reuses `u_filt`/`v_filt`/`w_filt` (idle until the "rotate back to
+    # local" loop below overwrites them with real values) plus `scratch`/`scratch2`/`scratch3`.
+    @. ws.u_filt = ws.ux * ws.ux
+    @. ws.v_filt = ws.ux * ws.uy
+    @. ws.w_filt = ws.ux * ws.uz
+    @. ws.scratch = ws.uy * ws.uy
+    @. ws.scratch2 = ws.uy * ws.uz
+    @. ws.scratch3 = ws.uz * ws.uz
+    Filtering.filter_apply_batch!(
+        (ws.uu_filt, ws.uv_filt, ws.uw_filt, ws.vv_filt, ws.vw_filt, ws.ww_filt),
+        (ws.u_filt, ws.v_filt, ws.w_filt, ws.scratch, ws.scratch2, ws.scratch3),
+        plan,
+    )
 
     # Rotate filtered planetary velocities back to local (east, north, radial).
-    @inbounds for k in 1:Nr, j in 1:Nlat, i in 1:Nlon
-        if Grids.isactive(grid, i, j, k)
-            λ, φ, _ = Grids.coords(grid, i, j, k)
-            l_vel = Geometry.from_planetary_cartesian(
-                grid.geometry, ws.ux_filt[i, j, k], ws.uy_filt[i, j, k], ws.uz_filt[i, j, k], λ, φ,
+    @inbounds for k in 1:Nr, j in 1:Ny, i in 1:Nx
+        if FlowGeometries.Grids.isactive(grid, i, j, k)
+            λ, φ, _ = FlowGeometries.Grids.coords(grid, i, j, k)
+            l_vel = FlowGeometries.Geometry.vector_from_cartesian(
+                FlowGeometries.Grids.grid_geometry(grid), ws.ux_filt[i, j, k], ws.uy_filt[i, j, k], ws.uz_filt[i, j, k], λ, φ,
             )
             ws.u_filt[i, j, k] = l_vel[1]; ws.v_filt[i, j, k] = l_vel[2]; ws.w_filt[i, j, k] = l_vel[3]
         else
@@ -978,16 +792,17 @@ function compute_Π!(
     end
 
     # Rotate filtered planetary quadratic products into the local (east,north,radial) stress tensor.
-    @inbounds for k in 1:Nr, j in 1:Nlat, i in 1:Nlon
-        if Grids.isactive(grid, i, j, k)
-            λ, φ, _ = Grids.coords(grid, i, j, k)
+    geo = FlowGeometries.Grids.grid_geometry(grid)
+    @inbounds for k in 1:Nr, j in 1:Ny, i in 1:Nx
+        if FlowGeometries.Grids.isactive(grid, i, j, k)
+            λ, φ, _ = FlowGeometries.Grids.coords(grid, i, j, k)
             txx = ws.uu_filt[i, j, k] - ws.ux_filt[i, j, k] * ws.ux_filt[i, j, k]
             txy = ws.uv_filt[i, j, k] - ws.ux_filt[i, j, k] * ws.uy_filt[i, j, k]
             tyy = ws.vv_filt[i, j, k] - ws.uy_filt[i, j, k] * ws.uy_filt[i, j, k]
             txz = ws.uw_filt[i, j, k] - ws.ux_filt[i, j, k] * ws.uz_filt[i, j, k]
             tyz = ws.vw_filt[i, j, k] - ws.uy_filt[i, j, k] * ws.uz_filt[i, j, k]
             tzz = ws.ww_filt[i, j, k] - ws.uz_filt[i, j, k] * ws.uz_filt[i, j, k]
-            τee, τen, τer, τnn, τnr, τrr = _rotate_stress_to_local_enr(txx, txy, txz, tyy, tyz, tzz, λ, φ)
+            τee, τen, τer, τnn, τnr, τrr = _rotate_stress_to_local_enr(geo, txx, txy, txz, tyy, tyz, tzz, λ, φ)
             ws.τ_xx[i, j, k] = τee; ws.τ_xy[i, j, k] = τen; ws.τ_xz[i, j, k] = τer
             ws.τ_yy[i, j, k] = τnn; ws.τ_yz[i, j, k] = τnr; ws.τ_zz[i, j, k] = τrr
         else
@@ -999,20 +814,20 @@ function compute_Π!(
     # Strain: ddx!/ddy!/ddz! are already metric-scaled (1/(r cosφ), 1/r, and a plain radial
     # derivative respectively, using the LOCAL r[k] at each level), so this gives the "flat" part of
     # each component; the curvature-correction terms are added in the loop below.
-    Derivatives.ddx!(ws.S_xx, ws.u_filt, grid)
-    Derivatives.ddy!(ws.S_yy, ws.v_filt, grid)
-    Derivatives.ddz!(ws.S_zz, ws.w_filt, grid)
-    Derivatives.ddy!(ws.S_xy, ws.u_filt, grid); Derivatives.ddx!(ws.scratch, ws.v_filt, grid)
+    Derivatives.ddx!(ws.S_xx, ws.u_filt, grid, dplan)
+    Derivatives.ddy!(ws.S_yy, ws.v_filt, grid, dplan)
+    Derivatives.ddz!(ws.S_zz, ws.w_filt, grid, dplan)
+    Derivatives.ddy!(ws.S_xy, ws.u_filt, grid, dplan); Derivatives.ddx!(ws.scratch, ws.v_filt, grid, dplan)
     @. ws.S_xy = T(0.5) * (ws.S_xy + ws.scratch)
-    Derivatives.ddz!(ws.S_xz, ws.u_filt, grid); Derivatives.ddx!(ws.scratch, ws.w_filt, grid)
+    Derivatives.ddz!(ws.S_xz, ws.u_filt, grid, dplan); Derivatives.ddx!(ws.scratch, ws.w_filt, grid, dplan)
     @. ws.S_xz = T(0.5) * (ws.S_xz + ws.scratch)
-    Derivatives.ddz!(ws.S_yz, ws.v_filt, grid); Derivatives.ddy!(ws.scratch, ws.w_filt, grid)
+    Derivatives.ddz!(ws.S_yz, ws.v_filt, grid, dplan); Derivatives.ddy!(ws.scratch, ws.w_filt, grid, dplan)
     @. ws.S_yz = T(0.5) * (ws.S_yz + ws.scratch)
 
-    @inbounds for k in 1:Nr, j in 1:Nlat, i in 1:Nlon
-        if Grids.isactive(grid, i, j, k)
-            _, φ, rk = Grids.coords(grid, i, j, k)
-            cosφ = cos(φ); sinφ = sin(φ)
+    @inbounds for k in 1:Nr, j in 1:Ny, i in 1:Nx
+        if FlowGeometries.Grids.isactive(grid, i, j, k)
+            _, φ, rk = FlowGeometries.Grids.coords(grid, i, j, k)
+            sinφ, cosφ = sincos(φ)
             tan_fact = abs(cosφ) > T(1e-12) ? sinφ / (rk * cosφ) : zero(T)
             inv_r = one(T) / rk
             u_e = ws.u_filt[i, j, k]; v_n = ws.v_filt[i, j, k]; w_r = ws.w_filt[i, j, k]
@@ -1024,8 +839,8 @@ function compute_Π!(
         end
     end
 
-    @inbounds for k in 1:Nr, j in 1:Nlat, i in 1:Nlon
-        Π[i, j, k] = Grids.isactive(grid, i, j, k) ? -_sfs_contraction(
+    @inbounds for k in 1:Nr, j in 1:Ny, i in 1:Nx
+        Π[i, j, k] = FlowGeometries.Grids.isactive(grid, i, j, k) ? -_sfs_contraction(
             ws.S_xx[i, j, k], ws.S_xy[i, j, k], ws.S_xz[i, j, k],
             ws.S_yy[i, j, k], ws.S_yz[i, j, k], ws.S_zz[i, j, k],
             ws.τ_xx[i, j, k], ws.τ_xy[i, j, k], ws.τ_xz[i, j, k],
@@ -1046,27 +861,28 @@ case (which reuses the 2D methods directly).
 function compute_Π!(
     Π::AbstractVector{T},
     u::AbstractVector,
-    grid::Grids.StructuredGrid{G,T,1},
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,1},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     workspace::Union{Nothing, ΠWorkspace} = nothing,
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
+    deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _validate_field_sizes(grid, Π, u)
     ws = workspace === nothing ? ΠWorkspace(grid) : workspace
+    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend) : filter_plan
 
-    Filtering.filter_apply!(ws.u_filt, u, plan)
     @. ws.scratch = u * u
-    Filtering.filter_apply!(ws.uu_filt, ws.scratch, plan)
+    Filtering.filter_apply_batch!((ws.u_filt, ws.uu_filt), (u, ws.scratch), plan)
     @. ws.τ_xx = ws.uu_filt - ws.u_filt * ws.u_filt
 
-    Derivatives.ddx!(ws.S_xx, ws.u_filt, grid)
+    Derivatives.ddx!(ws.S_xx, ws.u_filt, grid, dplan)
 
-    mask = grid.mask
+    mask = FlowGeometries.Grids.mask(grid)
     @inbounds @. Π = ifelse(mask, -(ws.S_xx * ws.τ_xx), zero(T))
     return Π
 end
@@ -1088,16 +904,16 @@ function cumulative_energy!(
     u::AbstractArray,
     v::AbstractArray,
     w::Union{Nothing, AbstractArray},
-    grid::Union{Grids.StructuredGrid{G,T}, Grids.CurvilinearGrid{T,G}, Grids.UnstructuredGrid{T,G}},
+    grid::Union{FlowGeometries.Grids.StructuredGrid{G,T}, FlowGeometries.Grids.CurvilinearGrid{T,G}, FlowGeometries.Grids.UnstructuredGrid{T,G}},
     kernel::Kernels.AbstractFilterKernel,
     scales::AbstractVector;
     workspace::Union{Nothing, ΠWorkspace} = nothing,
     filter_plans::Union{Nothing, AbstractVector} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-    method::Filtering.AbstractFilterMethod = Filtering.DirectSum(),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
-    gsz = Grids.size_tuple(grid)
+    method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
     size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
     w === nothing || size(w) == gsz || throw(DimensionMismatch("w has size $(size(w)), grid expects $gsz"))
@@ -1117,8 +933,8 @@ function cumulative_energy!(
     # Precompute total active-cell area for spatial averaging
     total_area = zero(T)
     for I in idxs
-        if Grids.isactive(grid, Tuple(I)...)
-            total_area += Grids.area(grid, Tuple(I)...)
+        if FlowGeometries.Grids.isactive(grid, Tuple(I)...)
+            total_area += FlowGeometries.Grids.area(grid, Tuple(I)...)
         end
     end
     total_area > zero(T) || throw(ArgumentError("grid has no active cells (all masked out)"))
@@ -1133,22 +949,22 @@ function cumulative_energy!(
             Filtering.plan_filter(grid, kernel, ℓ; mask_strategy=mask_strategy, backend=backend, method=method) :
             filter_plans[s_idx]
 
-        # Filter velocity fields at this scale
-        Filtering.filter_apply!(u_filt, u, plan)
-        Filtering.filter_apply!(v_filt, v, plan)
+        # Filter velocity fields at this scale — batched (one derivation per point, not one per field).
         if w !== nothing
-            Filtering.filter_apply!(w_filt, w, plan)
+            Filtering.filter_apply_batch!((u_filt, v_filt, w_filt), (u, v, w), plan)
+        else
+            Filtering.filter_apply_batch!((u_filt, v_filt), (u, v), plan)
         end
 
         # Compute spatial average specific energy: E(ℓ) = 0.5 * ∫ |ū_ℓ|² dA / ∫ dA
         integrated_energy = zero(T)
         for I in idxs
-            if Grids.isactive(grid, Tuple(I)...)
+            if FlowGeometries.Grids.isactive(grid, Tuple(I)...)
                 vel2 = u_filt[I]^2 + v_filt[I]^2
                 if w !== nothing
                     vel2 += w_filt[I]^2
                 end
-                integrated_energy += vel2 * Grids.area(grid, Tuple(I)...)
+                integrated_energy += vel2 * FlowGeometries.Grids.area(grid, Tuple(I)...)
             end
         end
 
@@ -1181,13 +997,13 @@ function cumulative_energy(
     u::AbstractArray,
     v::AbstractArray,
     w::Union{Nothing, AbstractArray},
-    grid::Union{Grids.StructuredGrid{G,T}, Grids.CurvilinearGrid{T,G}, Grids.UnstructuredGrid{T,G}},
+    grid::Union{FlowGeometries.Grids.StructuredGrid{G,T}, FlowGeometries.Grids.CurvilinearGrid{T,G}, FlowGeometries.Grids.UnstructuredGrid{T,G}},
     kernel::Kernels.AbstractFilterKernel,
     scales::AbstractVector;
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-    method::Filtering.AbstractFilterMethod = Filtering.DirectSum(),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
+    method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     spectrum = zeros(T, length(scales))
     return cumulative_energy!(spectrum, u, v, w, grid, kernel, scales; backend=backend, mask_strategy=mask_strategy, method=method)
 end
@@ -1213,14 +1029,14 @@ function filtering_spectrum(
     u::AbstractArray,
     v::AbstractArray,
     w::Union{Nothing, AbstractArray},
-    grid::Union{Grids.StructuredGrid{G,T}, Grids.CurvilinearGrid{T,G}, Grids.UnstructuredGrid{T,G}},
+    grid::Union{FlowGeometries.Grids.StructuredGrid{G,T}, FlowGeometries.Grids.CurvilinearGrid{T,G}, FlowGeometries.Grids.UnstructuredGrid{T,G}},
     kernel::Kernels.AbstractFilterKernel,
     scales::AbstractVector;
     L::Real = one(T),
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-    method::Filtering.AbstractFilterMethod = Filtering.DirectSum(),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
+    method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     cum = cumulative_energy(u, v, w, grid, kernel, scales; backend=backend, mask_strategy=mask_strategy, method=method)
     kℓ = T(L) ./ T.(scales)
     return kℓ, spectral_density(cum, kℓ)
@@ -1282,12 +1098,12 @@ with `L + C + R = τ` exactly. Returns a named tuple of named tuples, each holdi
 function tau_decomposition(
     u::AbstractMatrix,
     v::AbstractMatrix,
-    grid::Grids.StructuredGrid{G,T},
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
     # Filter operator (linear): allocate a fresh output (this is a diagnostic, not an inner loop).
     flt(f) = (o = zeros(T, size(f)); Filtering.filter_apply!(o, f, plan); o)
@@ -1316,24 +1132,14 @@ function tau_decomposition(
     return (; L = L, C = C, R = R)
 end
 
-# Rotate a planetary-Cartesian symmetric 2-tensor (given as its xx/xy/xz/yy/yz/zz components) to the
-# local (east, north) frame at (λ,φ) — the same rotation `_compute_Π_2d!`'s spherical branch uses for
-# τ, factored out here so `tau_decomposition` can apply it to L/C/R without duplicating the algebra.
+# The (east, north) block of the same rotation, for callers with no radial component. Inlined, so the
+# three unused contractions are dead code the compiler drops.
 @inline function _rotate_sym_to_local_en(
+    geo::FlowGeometries.Geometry.AbstractSphericalGeometry,
     txx::T, txy::T, txz::T, tyy::T, tyz::T, tzz::T, λ::T, φ::T,
 ) where {T<:AbstractFloat}
-    sinφ, cosφ = sin(φ), cos(φ)
-    sinλ, cosλ = sin(λ), cos(λ)
-    te_x = txx * (-sinλ) + txy * cosλ
-    te_y = txy * (-sinλ) + tyy * cosλ
-    te_z = txz * (-sinλ) + tyz * cosλ
-    τ_ee = te_x * (-sinλ) + te_y * cosλ
-    tn_x = txx * (-sinφ * cosλ) + txy * (-sinφ * sinλ) + txz * cosφ
-    tn_y = txy * (-sinφ * cosλ) + tyy * (-sinφ * sinλ) + tyz * cosφ
-    tn_z = txz * (-sinφ * cosλ) + tyz * (-sinφ * sinλ) + tzz * cosφ
-    τ_nn = tn_x * (-sinφ * cosλ) + tn_y * (-sinφ * sinλ) + tn_z * cosφ
-    τ_en = te_x * (-sinφ * cosλ) + te_y * (-sinφ * sinλ) + te_z * cosφ
-    return τ_ee, τ_en, τ_nn
+    τ = FlowGeometries.Geometry.tensor_to_local(geo, txx, tyy, tzz, txy, txz, tyz, λ, φ)
+    return τ.λλ, τ.λφ, τ.φφ
 end
 
 """
@@ -1349,22 +1155,22 @@ method — local `(; xx, xy, yy)` (≡ east-east/east-north/north-north) compone
 function tau_decomposition(
     u::AbstractMatrix,
     v::AbstractMatrix,
-    grid::Grids.StructuredGrid{G,T},
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-) where {T<:AbstractFloat, G<:Geometry.SphericalGeometry{T}}
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
     flt(f) = (o = zeros(T, size(f)); Filtering.filter_apply!(o, f, plan); o)
-    Nlon, Nlat = Grids.size_tuple(grid)
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
 
     # Local (u,v) -> planetary Cartesian (ux,uy,uz) at every point.
-    ux = zeros(T, Nlon, Nlat); uy = zeros(T, Nlon, Nlat); uz = zeros(T, Nlon, Nlat)
-    for j in 1:Nlat, i in 1:Nlon
-        if Grids.isactive(grid, i, j)
-            λ, φ = Grids.coords(grid, i, j)
-            pc = Geometry.to_planetary_cartesian(grid.geometry, u[i, j], v[i, j], λ, φ)
+    ux = zeros(T, Nx, Ny); uy = zeros(T, Nx, Ny); uz = zeros(T, Nx, Ny)
+    for j in 1:Ny, i in 1:Nx
+        if FlowGeometries.Grids.isactive(grid, i, j)
+            λ, φ = FlowGeometries.Grids.coords(grid, i, j)
+            pc = FlowGeometries.Geometry.vector_to_cartesian(FlowGeometries.Grids.grid_geometry(grid), u[i, j], v[i, j], λ, φ)
             ux[i, j], uy[i, j], uz[i, j] = pc[1], pc[2], pc[3]
         end
     end
@@ -1387,15 +1193,16 @@ function tau_decomposition(
     Rxx = M(uxp, uxp, uxpb, uxpb); Rxy = M(uxp, uyp, uxpb, uypb); Rxz = M(uxp, uzp, uxpb, uzpb)
     Ryy = M(uyp, uyp, uypb, uypb); Ryz = M(uyp, uzp, uypb, uzpb); Rzz = M(uzp, uzp, uzpb, uzpb)
 
-    Lee = zeros(T, Nlon, Nlat); Len = zeros(T, Nlon, Nlat); Lnn = zeros(T, Nlon, Nlat)
-    Cee = zeros(T, Nlon, Nlat); Cen = zeros(T, Nlon, Nlat); Cnn = zeros(T, Nlon, Nlat)
-    Ree = zeros(T, Nlon, Nlat); Ren = zeros(T, Nlon, Nlat); Rnn = zeros(T, Nlon, Nlat)
-    for j in 1:Nlat, i in 1:Nlon
-        if Grids.isactive(grid, i, j)
-            λ, φ = Grids.coords(grid, i, j)
-            Lee[i,j], Len[i,j], Lnn[i,j] = _rotate_sym_to_local_en(Lxx[i,j], Lxy[i,j], Lxz[i,j], Lyy[i,j], Lyz[i,j], Lzz[i,j], λ, φ)
-            Cee[i,j], Cen[i,j], Cnn[i,j] = _rotate_sym_to_local_en(Cxx[i,j], Cxy[i,j], Cxz[i,j], Cyy[i,j], Cyz[i,j], Czz[i,j], λ, φ)
-            Ree[i,j], Ren[i,j], Rnn[i,j] = _rotate_sym_to_local_en(Rxx[i,j], Rxy[i,j], Rxz[i,j], Ryy[i,j], Ryz[i,j], Rzz[i,j], λ, φ)
+    Lee = zeros(T, Nx, Ny); Len = zeros(T, Nx, Ny); Lnn = zeros(T, Nx, Ny)
+    Cee = zeros(T, Nx, Ny); Cen = zeros(T, Nx, Ny); Cnn = zeros(T, Nx, Ny)
+    Ree = zeros(T, Nx, Ny); Ren = zeros(T, Nx, Ny); Rnn = zeros(T, Nx, Ny)
+    geo = FlowGeometries.Grids.grid_geometry(grid)
+    for j in 1:Ny, i in 1:Nx
+        if FlowGeometries.Grids.isactive(grid, i, j)
+            λ, φ = FlowGeometries.Grids.coords(grid, i, j)
+            Lee[i,j], Len[i,j], Lnn[i,j] = _rotate_sym_to_local_en(geo, Lxx[i,j], Lxy[i,j], Lxz[i,j], Lyy[i,j], Lyz[i,j], Lzz[i,j], λ, φ)
+            Cee[i,j], Cen[i,j], Cnn[i,j] = _rotate_sym_to_local_en(geo, Cxx[i,j], Cxy[i,j], Cxz[i,j], Cyy[i,j], Cyz[i,j], Czz[i,j], λ, φ)
+            Ree[i,j], Ren[i,j], Rnn[i,j] = _rotate_sym_to_local_en(geo, Rxx[i,j], Rxy[i,j], Rxz[i,j], Ryy[i,j], Ryz[i,j], Rzz[i,j], λ, φ)
         end
     end
     return (;
@@ -1447,13 +1254,15 @@ function compute_Π_decomposed(
     v::AbstractMatrix,
     u_rot::AbstractMatrix,
     v_rot::AbstractMatrix,
-    grid::Grids.StructuredGrid{G,T},
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
-    gsz = Grids.size_tuple(grid)
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    # One stencil table for every derivative below; they differ only in direction and field.
+    dplan = Derivatives.StencilPlan(grid)
+    gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
     size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
     size(u_rot) == gsz || throw(DimensionMismatch("u_rot has size $(size(u_rot)), grid expects $gsz"))
@@ -1489,16 +1298,16 @@ function compute_Π_decomposed(
     # Strain S̄_xx = ∂ū/∂x, S̄_yy = ∂v̄/∂y, S̄_xy = ½(∂ū/∂y + ∂v̄/∂x), from a velocity pair.
     function strain(a, b)
         ā = flt(a); b̄ = flt(b)
-        Sxx = similar(ā); Derivatives.ddx!(Sxx, ā, grid)
-        Syy = similar(ā); Derivatives.ddy!(Syy, b̄, grid)
+        Sxx = similar(ā); Derivatives.ddx!(Sxx, ā, grid, dplan)
+        Syy = similar(ā); Derivatives.ddy!(Syy, b̄, grid, dplan)
         p = similar(ā); q = similar(ā)
-        Derivatives.ddy!(p, ā, grid); Derivatives.ddx!(q, b̄, grid)
+        Derivatives.ddy!(p, ā, grid, dplan); Derivatives.ddx!(q, b̄, grid, dplan)
         return (xx = Sxx, xy = T(0.5) .* (p .+ q), yy = Syy)
     end
     S_R = strain(u_rot, v_rot)
     S_D = strain(u_div, v_div)
 
-    mask = grid.mask
+    mask = FlowGeometries.Grids.mask(grid)
     contract(S, τ) = ifelse.(mask, -(S.xx .* τ.xx .+ T(2) .* S.xy .* τ.xy .+ S.yy .* τ.yy), zero(T))
 
     Πrr = contract(S_R, τ_RR)
@@ -1523,13 +1332,15 @@ function compute_Π_decomposed(
     u_rot::AbstractArray{<:Any,3},
     v_rot::AbstractArray{<:Any,3},
     w_rot::AbstractArray{<:Any,3},
-    grid::Grids.StructuredGrid{G,T,3},
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,3},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
-    gsz = Grids.size_tuple(grid)
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    # One stencil table for every derivative below; they differ only in direction and field.
+    dplan = Derivatives.StencilPlan(grid)
+    gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
     size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
     size(w) == gsz || throw(DimensionMismatch("w has size $(size(w)), grid expects $gsz"))
@@ -1569,22 +1380,22 @@ function compute_Π_decomposed(
     # Strain from a velocity triple (a,b,c): three diagonals + three off-diagonals.
     function strain(a, b, c)
         ā = flt(a); b̄ = flt(b); c̄ = flt(c)
-        Sxx = similar(ā); Derivatives.ddx!(Sxx, ā, grid)
-        Syy = similar(ā); Derivatives.ddy!(Syy, b̄, grid)
-        Szz = similar(ā); Derivatives.ddz!(Szz, c̄, grid)
+        Sxx = similar(ā); Derivatives.ddx!(Sxx, ā, grid, dplan)
+        Syy = similar(ā); Derivatives.ddy!(Syy, b̄, grid, dplan)
+        Szz = similar(ā); Derivatives.ddz!(Szz, c̄, grid, dplan)
         p = similar(ā); q = similar(ā)
-        Derivatives.ddy!(p, ā, grid); Derivatives.ddx!(q, b̄, grid)
+        Derivatives.ddy!(p, ā, grid, dplan); Derivatives.ddx!(q, b̄, grid, dplan)
         Sxy = T(0.5) .* (p .+ q)
-        Derivatives.ddz!(p, ā, grid); Derivatives.ddx!(q, c̄, grid)
+        Derivatives.ddz!(p, ā, grid, dplan); Derivatives.ddx!(q, c̄, grid, dplan)
         Sxz = T(0.5) .* (p .+ q)
-        Derivatives.ddz!(p, b̄, grid); Derivatives.ddy!(q, c̄, grid)
+        Derivatives.ddz!(p, b̄, grid, dplan); Derivatives.ddy!(q, c̄, grid, dplan)
         Syz = T(0.5) .* (p .+ q)
         return (xx = Sxx, xy = Sxy, xz = Sxz, yy = Syy, yz = Syz, zz = Szz)
     end
     S_R = strain(u_rot, v_rot, w_rot)
     S_D = strain(u_div, v_div, w_div)
 
-    mask = grid.mask
+    mask = FlowGeometries.Grids.mask(grid)
     contract(S, τ) = ifelse.(
         mask,
         -(S.xx .* τ.xx .+ S.yy .* τ.yy .+ S.zz .* τ.zz .+
@@ -1618,36 +1429,116 @@ Taking `θ` to be the **buoyancy** `b = -g ρ'/ρ₀` makes this the cross-scale
 variance (the available-potential-energy-related transfer). Unlike the full Lees & Aluie (2019)
 baropycnal work — which additionally requires the pressure field — this needs only `(u, v, θ)`.
 
-Cartesian 2D (uses the physical-gradient derivatives `ddx!`/`ddy!`); spherical/3D deferred.
+Cartesian and spherical, on a 2D grid; the true-3D Cartesian method is below. `ddx!`/`ddy!` supply the
+physical gradient in either geometry.
 """
 function tracer_variance_flux(
     u::AbstractMatrix,
     v::AbstractMatrix,
     θ::AbstractMatrix,
-    grid::Grids.StructuredGrid{G,T},
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
-    gsz = Grids.size_tuple(grid)
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    # One stencil table for every derivative below; they differ only in direction and field.
+    dplan = Derivatives.StencilPlan(grid)
+    gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
     size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
     size(θ) == gsz || throw(DimensionMismatch("θ has size $(size(θ)), grid expects $gsz"))
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
-    flt(f) = (o = zeros(T, size(f)); Filtering.filter_apply!(o, f, plan); o)
 
-    ū = flt(u); v̄ = flt(v); θ̄ = flt(θ)
+    θ̄ = zeros(T, gsz)
+    ū = zeros(T, gsz)
+    v̄ = zeros(T, gsz)
+    uθ = zeros(T, gsz)
+    vθ = zeros(T, gsz)
+    @. uθ = u * θ
+    @. vθ = v * θ
+    τx = zeros(T, gsz)
+    τy = zeros(T, gsz)
+    Filtering.filter_apply_batch!((ū, v̄, θ̄, τx, τy), (u, v, θ, uθ, vθ), plan)
+
     # Subfilter tracer flux τ_j = ⟨u_j θ⟩ - ū_j θ̄.
-    τx = flt(u .* θ) .- ū .* θ̄
-    τy = flt(v .* θ) .- v̄ .* θ̄
+    @. τx -= ū * θ̄
+    @. τy -= v̄ * θ̄
 
     # Resolved tracer gradient ∂_j θ̄.
-    gx = similar(θ̄); Derivatives.ddx!(gx, θ̄, grid)
-    gy = similar(θ̄); Derivatives.ddy!(gy, θ̄, grid)
+    gx = similar(θ̄); Derivatives.ddx!(gx, θ̄, grid, dplan)
+    gy = similar(θ̄); Derivatives.ddy!(gy, θ̄, grid, dplan)
 
-    mask = grid.mask
+    mask = FlowGeometries.Grids.mask(grid)
     return ifelse.(mask, .-(τx .* gx .+ τy .* gy), zero(T))
+end
+
+"""
+    tracer_variance_flux(u, v, θ, grid::StructuredGrid{<:SphericalGeometry}, kernel, scale; ...) -> Πθ
+
+Spherical form of the tracer-variance flux. `τ_j = ⟨u_j θ⟩ - ū_j θ̄` is a vector, so — exactly as in
+[`compute_Π!`](@ref) and [`tau_decomposition`](@ref) — the velocity is rotated to planetary Cartesian
+before filtering (Aluie 2019 commutativity: component-wise filtering of a local east/north pair is not
+a filtered vector, since the local basis turns from point to point), and the filtered flux is rotated
+back to the local east/north frame to contract against `∂_j θ̄`. The scalar `θ` needs no rotation. The
+radial component of `τ` is dropped, matching this 2-D shell's dropping of radial derivatives.
+"""
+function tracer_variance_flux(
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    θ::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
+    # One stencil table for every derivative below; they differ only in direction and field.
+    dplan = Derivatives.StencilPlan(grid)
+    gsz = FlowGeometries.Grids.size_tuple(grid)
+    size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
+    size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
+    size(θ) == gsz || throw(DimensionMismatch("θ has size $(size(θ)), grid expects $gsz"))
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+    geo = FlowGeometries.Grids.grid_geometry(grid)
+
+    ux = zeros(T, gsz); uy = zeros(T, gsz); uz = zeros(T, gsz)
+    uxθ = zeros(T, gsz); uyθ = zeros(T, gsz); uzθ = zeros(T, gsz)
+    @inbounds for I in CartesianIndices(u)
+        i = Tuple(I)
+        FlowGeometries.Grids.isactive(grid, i...) || continue
+        λ, φ = FlowGeometries.Grids.coords(grid, i...)
+        p = FlowGeometries.Geometry.vector_to_cartesian(geo, u[I], v[I], λ, φ)
+        ux[I] = p[1]; uy[I] = p[2]; uz[I] = p[3]
+        uxθ[I] = p[1] * θ[I]; uyθ[I] = p[2] * θ[I]; uzθ[I] = p[3] * θ[I]
+    end
+
+    θ̄ = zeros(T, gsz)
+    ūx = zeros(T, gsz); ūy = zeros(T, gsz); ūz = zeros(T, gsz)
+    τX = zeros(T, gsz); τY = zeros(T, gsz); τZ = zeros(T, gsz)
+    Filtering.filter_apply_batch!(
+        (ūx, ūy, ūz, θ̄, τX, τY, τZ), (ux, uy, uz, θ, uxθ, uyθ, uzθ), plan,
+    )
+    @. τX -= ūx * θ̄
+    @. τY -= ūy * θ̄
+    @. τZ -= ūz * θ̄
+
+    # Rotate the planetary-Cartesian subfilter flux back to local (east, north, radial); the radial
+    # component is not used, as the resolved gradient here has no radial part.
+    τe = zeros(T, gsz); τn = zeros(T, gsz)
+    @inbounds for I in CartesianIndices(u)
+        i = Tuple(I)
+        FlowGeometries.Grids.isactive(grid, i...) || continue
+        λ, φ = FlowGeometries.Grids.coords(grid, i...)
+        l = FlowGeometries.Geometry.vector_from_cartesian(geo, τX[I], τY[I], τZ[I], λ, φ)
+        τe[I] = l[1]; τn[I] = l[2]
+    end
+
+    gx = similar(θ̄); Derivatives.ddx!(gx, θ̄, grid, dplan)
+    gy = similar(θ̄); Derivatives.ddy!(gy, θ̄, grid, dplan)
+
+    mask = FlowGeometries.Grids.mask(grid)
+    return ifelse.(mask, .-(τe .* gx .+ τn .* gy), zero(T))
 end
 
 """
@@ -1663,33 +1554,105 @@ function tracer_variance_flux(
     v::AbstractArray{<:Any,3},
     w::AbstractArray{<:Any,3},
     θ::AbstractArray{<:Any,3},
-    grid::Grids.StructuredGrid{G,T,3},
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,3},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
-    gsz = Grids.size_tuple(grid)
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    # One stencil table for every derivative below; they differ only in direction and field.
+    dplan = Derivatives.StencilPlan(grid)
+    gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
     size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
     size(w) == gsz || throw(DimensionMismatch("w has size $(size(w)), grid expects $gsz"))
     size(θ) == gsz || throw(DimensionMismatch("θ has size $(size(θ)), grid expects $gsz"))
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
-    flt(f) = (o = zeros(T, size(f)); Filtering.filter_apply!(o, f, plan); o)
 
-    ū = flt(u); v̄ = flt(v); w̄ = flt(w); θ̄ = flt(θ)
+    uθ = u .* θ; vθ = v .* θ; wθ = w .* θ
+    ū = zeros(T, gsz); v̄ = zeros(T, gsz); w̄ = zeros(T, gsz); θ̄ = zeros(T, gsz)
+    τx = zeros(T, gsz); τy = zeros(T, gsz); τz = zeros(T, gsz)
+    Filtering.filter_apply_batch!((ū, v̄, w̄, θ̄, τx, τy, τz), (u, v, w, θ, uθ, vθ, wθ), plan)
+
     # Subfilter tracer flux τ_j = ⟨u_j θ⟩ - ū_j θ̄, now with a genuine vertical component.
-    τx = flt(u .* θ) .- ū .* θ̄
-    τy = flt(v .* θ) .- v̄ .* θ̄
-    τz = flt(w .* θ) .- w̄ .* θ̄
+    @. τx -= ū * θ̄
+    @. τy -= v̄ * θ̄
+    @. τz -= w̄ * θ̄
 
     # Resolved tracer gradient ∂_j θ̄, including the real vertical derivative.
-    gx = similar(θ̄); Derivatives.ddx!(gx, θ̄, grid)
-    gy = similar(θ̄); Derivatives.ddy!(gy, θ̄, grid)
-    gz = similar(θ̄); Derivatives.ddz!(gz, θ̄, grid)
+    gx = similar(θ̄); Derivatives.ddx!(gx, θ̄, grid, dplan)
+    gy = similar(θ̄); Derivatives.ddy!(gy, θ̄, grid, dplan)
+    gz = similar(θ̄); Derivatives.ddz!(gz, θ̄, grid, dplan)
 
-    mask = grid.mask
+    mask = FlowGeometries.Grids.mask(grid)
     return ifelse.(mask, .-(τx .* gx .+ τy .* gy .+ τz .* gz), zero(T))
+end
+
+"""
+    tracer_variance_flux(u, v, w, θ, grid::StructuredGrid{<:SphericalGeometry,T,3}, kernel, scale; ...) -> Πθ
+
+Volumetric spherical shell (lon, lat, radius): the 3D counterpart of the spherical 2D method, keeping
+the radial component of both the subfilter tracer flux and the resolved gradient. Velocities are
+rotated to planetary Cartesian for filtering and the filtered flux is rotated back to local (east,
+north, radial), the same convention the true-3D [`compute_Π!`](@ref) uses.
+"""
+function tracer_variance_flux(
+    u::AbstractArray{<:Any,3},
+    v::AbstractArray{<:Any,3},
+    w::AbstractArray{<:Any,3},
+    θ::AbstractArray{<:Any,3},
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,3},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
+    # One stencil table for every derivative below; they differ only in direction and field.
+    dplan = Derivatives.StencilPlan(grid)
+    gsz = FlowGeometries.Grids.size_tuple(grid)
+    size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
+    size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
+    size(w) == gsz || throw(DimensionMismatch("w has size $(size(w)), grid expects $gsz"))
+    size(θ) == gsz || throw(DimensionMismatch("θ has size $(size(θ)), grid expects $gsz"))
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+    geo = FlowGeometries.Grids.grid_geometry(grid)
+
+    ux = zeros(T, gsz); uy = zeros(T, gsz); uz = zeros(T, gsz)
+    uxθ = zeros(T, gsz); uyθ = zeros(T, gsz); uzθ = zeros(T, gsz)
+    @inbounds for I in CartesianIndices(u)
+        i = Tuple(I)
+        FlowGeometries.Grids.isactive(grid, i...) || continue
+        λ, φ = FlowGeometries.Grids.coords(grid, i...)
+        p = FlowGeometries.Geometry.vector_to_cartesian(geo, u[I], v[I], w[I], λ, φ)
+        ux[I] = p[1]; uy[I] = p[2]; uz[I] = p[3]
+        uxθ[I] = p[1] * θ[I]; uyθ[I] = p[2] * θ[I]; uzθ[I] = p[3] * θ[I]
+    end
+
+    θ̄ = zeros(T, gsz)
+    ūx = zeros(T, gsz); ūy = zeros(T, gsz); ūz = zeros(T, gsz)
+    τX = zeros(T, gsz); τY = zeros(T, gsz); τZ = zeros(T, gsz)
+    Filtering.filter_apply_batch!(
+        (ūx, ūy, ūz, θ̄, τX, τY, τZ), (ux, uy, uz, θ, uxθ, uyθ, uzθ), plan,
+    )
+    @. τX -= ūx * θ̄
+    @. τY -= ūy * θ̄
+    @. τZ -= ūz * θ̄
+
+    τe = zeros(T, gsz); τn = zeros(T, gsz); τr = zeros(T, gsz)
+    @inbounds for I in CartesianIndices(u)
+        i = Tuple(I)
+        FlowGeometries.Grids.isactive(grid, i...) || continue
+        λ, φ = FlowGeometries.Grids.coords(grid, i...)
+        l = FlowGeometries.Geometry.vector_from_cartesian(geo, τX[I], τY[I], τZ[I], λ, φ)
+        τe[I] = l[1]; τn[I] = l[2]; τr[I] = l[3]
+    end
+
+    gx = similar(θ̄); Derivatives.ddx!(gx, θ̄, grid, dplan)
+    gy = similar(θ̄); Derivatives.ddy!(gy, θ̄, grid, dplan)
+    gz = similar(θ̄); Derivatives.ddz!(gz, θ̄, grid, dplan)
+
+    mask = FlowGeometries.Grids.mask(grid)
+    return ifelse.(mask, .-(τe .* gx .+ τn .* gy .+ τr .* gz), zero(T))
 end
 
 end # module

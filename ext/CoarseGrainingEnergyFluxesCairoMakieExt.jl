@@ -2,6 +2,7 @@ module CoarseGrainingEnergyFluxesCairoMakieExt
 
 using CairoMakie: CairoMakie
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
+using FlowGeometries: FlowGeometries
 
 # Methods for the parent-owned visualization stubs (`CGEF.plot_Π_map`, `CGEF.plot_spectrum`). Every
 # Makie call stays qualified (`CairoMakie.Figure`, …) per the package's explicit-import policy.
@@ -15,7 +16,7 @@ forward (Π>0) and inverse (Π<0) cascade read at a glance.
 function CGEF.plot_Π_map(
     res::CGEF.CoarseGrainResult{T},
     scale_idx::Integer,
-    grid::CGEF.StructuredGrid{G,T};
+    grid::FlowGeometries.Grids.StructuredGrid{G,T};
     colormap = :balance,
     title = nothing,
 ) where {T<:AbstractFloat, G}
@@ -23,7 +24,7 @@ function CGEF.plot_Π_map(
 
     Π_map = @view res.Π[:, :, scale_idx]
     scale = res.scales[scale_idx]
-    spherical = G <: CGEF.SphericalGeometry
+    spherical = G <: FlowGeometries.Geometry.SphericalGeometry
 
     fig = CairoMakie.Figure(size = (800, 650))
     ax = CairoMakie.Axis(
@@ -38,7 +39,7 @@ function CGEF.plot_Π_map(
     max_val = maximum(abs, Π_map)
     colorrange = max_val > 0 ? (-max_val, max_val) : (-one(T), one(T))
 
-    hm = CairoMakie.heatmap!(ax, grid.lon, grid.lat, Π_map; colormap = colormap, colorrange = colorrange)
+    hm = CairoMakie.heatmap!(ax, FlowGeometries.Grids.coordinates(grid, 1), FlowGeometries.Grids.coordinates(grid, 2), Π_map; colormap = colormap, colorrange = colorrange)
     CairoMakie.Colorbar(fig[1, 2], hm; label = "Π (m² s⁻³)")
     return fig
 end

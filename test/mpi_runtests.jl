@@ -11,6 +11,7 @@ using MPI: MPI
 using Test: Test
 using Random: Random
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
+using FlowGeometries: FlowGeometries as FG
 
 MPI.Init()
 comm = MPI.COMM_WORLD
@@ -21,44 +22,44 @@ function _serial_vs_mpi(grid, field, kernel, scale; mask_strategy = CGEF.Filteri
     serial = zeros(size(field))
     CGEF.Filtering.filter_field!(
         serial, field, grid, kernel, scale;
-        backend = CGEF.Backends.SerialBackend(), mask_strategy = mask_strategy,
+        backend = CGEF.ComputationalBackends.SerialBackend(), mask_strategy = mask_strategy,
     )
     mpi_out = zeros(size(field))
     CGEF.Filtering.filter_field!(
         mpi_out, field, grid, kernel, scale;
-        backend = CGEF.Backends.MPIBackend(), mask_strategy = mask_strategy,
+        backend = CGEF.ComputationalBackends.MPIBackend(), mask_strategy = mask_strategy,
     )
     return serial, mpi_out
 end
 
 Test.@testset "MPI backend (rank $rank of $nproc)" begin
     # Cartesian.
-    geom = CGEF.CartesianGeometry(1000.0, 1000.0)
-    lon = collect(0.0:1000.0:30e3)
-    lat = collect(0.0:1000.0:30e3)
-    grid = CGEF.StructuredGrid(geom, lon, lat, trues(length(lon), length(lat)))
+    geom = FG.Geometry.CartesianGeometry()
+    x = collect(0.0:1000.0:30e3)
+    y = collect(0.0:1000.0:30e3)
+    grid = FG.Grids.StructuredGrid(geom, x, y, trues(length(x), length(y)))
     # Each rank is a SEPARATE OS process (mpiexec launches independent `julia` instances), so an
     # unseeded `rand()` gives every rank a DIFFERENT field — silently violating the MPIBackend's
     # documented "field replicated across ranks" assumption and making the Allreduce-combined result
     # meaningless. Seed identically on every rank so the field truly is replicated, matching the
     # assumption under test.
     Random.seed!(1234)
-    field = rand(length(lon), length(lat))
+    field = rand(length(x), length(y))
     serial, mpi_out = _serial_vs_mpi(grid, field, CGEF.TopHatKernel(), 5000.0)
     Test.@test mpi_out ≈ serial
 
     # Masked Cartesian — exercises Deformable-strategy renormalization across rank boundaries (a
     # masked cell's neighbours may be owned by a different rank than the cell being filtered).
-    mask = trues(length(lon), length(lat)); mask[5:8, 5:8] .= false
-    mgrid = CGEF.StructuredGrid(geom, lon, lat, mask)
+    mask = trues(length(x), length(y)); mask[5:8, 5:8] .= false
+    mgrid = FG.Grids.StructuredGrid(geom, x, y, mask)
     serial_m, mpi_m = _serial_vs_mpi(mgrid, field, CGEF.GaussianKernel(), 4000.0)
     Test.@test mpi_m ≈ serial_m
 
     # Periodic spherical — exercises longitude-seam wrapping across rank boundaries.
-    sgeom = CGEF.SphericalGeometry(6371000.0)
+    sgeom = FG.Geometry.SphericalGeometry(6371000.0)
     slon = deg2rad.(collect(0.0:5.0:355.0))
     slat = deg2rad.(collect(-40.0:5.0:40.0))
-    sgrid = CGEF.StructuredGrid(sgeom, slon, slat, trues(length(slon), length(slat)))
+    sgrid = FG.Grids.StructuredGrid(sgeom, slon, slat, trues(length(slon), length(slat)))
     Random.seed!(5678)   # identical across ranks — see the Cartesian case above for why
     sfield = rand(length(slon), length(slat))
     serial_s, mpi_s = _serial_vs_mpi(sgrid, sfield, CGEF.TopHatKernel(), 300e3)
