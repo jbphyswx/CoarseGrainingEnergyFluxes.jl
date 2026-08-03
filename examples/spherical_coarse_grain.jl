@@ -8,14 +8,21 @@
 using Random: Random
 using Statistics: Statistics
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
+using FlowGeometries: FlowGeometries as FG
 
 Random.seed!(2024)
 
 # Regional spherical patch: 20°×20° box at mid-latitude, 0.1° resolution.
 R = 6.371e6
-geom = CGEF.SphericalGeometry(R)
-lon = deg2rad.(collect(-70.0:0.1:-50.0))
-lat = deg2rad.(collect(30.0:0.1:50.0))
+geom = FG.Geometry.SphericalGeometry(R)
+# A Range, not `deg2rad.(collect(...))` (broadcast returns a Vector, losing the fast translation-
+# invariant footprint path) — `range(...; length=...)` from the ALREADY-computed degree-range length
+# (not re-deriving it from the deg2rad-scaled start/stop, which rounds to a different point count due
+# to floating-point error in the scaled step).
+lon_deg = -70.0:0.1:-50.0
+lat_deg = 30.0:0.1:50.0
+lon = range(deg2rad(first(lon_deg)); step = deg2rad(step(lon_deg)), length = length(lon_deg))
+lat = range(deg2rad(first(lat_deg)); step = deg2rad(step(lat_deg)), length = length(lat_deg))
 Nlon, Nlat = length(lon), length(lat)
 
 # A simple circular excluded region in the middle of the domain.
@@ -26,7 +33,7 @@ for j in 1:Nlat, i in 1:Nlon
         mask[i, j] = false
     end
 end
-grid = CGEF.StructuredGrid(geom, lon, lat, mask)
+grid = FG.Grids.StructuredGrid(geom, lon, lat, mask)
 
 # Non-divergent velocity from a two-scale streamfunction ψ: u = (1/R) ∂ψ/∂φ, v = -(1/(R cosφ)) ∂ψ/∂λ
 # (here we just sample the analytic derivatives of ψ = sin(kλ)cos(kφ) for two wavenumbers).
