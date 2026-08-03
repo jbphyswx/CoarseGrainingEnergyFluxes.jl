@@ -1,9 +1,12 @@
 
 # Execution backend lattice (ComputationalBackends.jl)
 Test.@testset "Backends" begin
-    # resolve_backend returns INSTANCES; AutoBackend picks a concrete local backend
+    # Backend resolution returns INSTANCES; AutoBackend picks a concrete local backend. Auto is
+    # resolved by this package, not upstream — upstream leaves that method to the consumer — so it is
+    # asserted through the local resolver rather than through `ComputationalBackends.resolve_backend`.
     Test.@test CGEF.ComputationalBackends.resolve_backend(CGEF.ComputationalBackends.SerialBackend()) === CGEF.ComputationalBackends.SerialBackend()
-    Test.@test CGEF.ComputationalBackends.resolve_backend(CGEF.ComputationalBackends.AutoBackend()) isa Union{CGEF.ComputationalBackends.SerialBackend, CGEF.ComputationalBackends.ThreadedBackend}
+    Test.@test CGEF.Filtering._resolve_backend(CGEF.ComputationalBackends.SerialBackend()) === CGEF.ComputationalBackends.SerialBackend()
+    Test.@test CGEF.Filtering._resolve_backend(CGEF.ComputationalBackends.AutoBackend()) isa Union{CGEF.ComputationalBackends.SerialBackend, CGEF.ComputationalBackends.ThreadedBackend}
 
     # distribution wrappers are parametric over an inner local backend
     Test.@test CGEF.ComputationalBackends.DistributedBackend(CGEF.ComputationalBackends.SerialBackend()) isa CGEF.ComputationalBackends.DistributedBackend
