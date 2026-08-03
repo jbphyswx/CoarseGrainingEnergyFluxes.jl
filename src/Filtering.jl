@@ -2596,7 +2596,7 @@ function plan_filter(
     if method isa Spectral
         return spectral_filter_plan(spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
     end
-    resolved = ComputationalBackends.resolve_backend(backend)
+    resolved = _resolve_backend(backend)
     _check_backend_compatible(grid, backend)
     fp = build_footprint(grid, kernel, scale; mask_strategy = mask_strategy, cache_strategy = cache_strategy, cache_byte_budget = cache_byte_budget)
     return PhysicalFilterPlan(prepare_workspace(resolved, grid, fp), grid, mask_strategy, kernel, scale, resolved)
@@ -2626,8 +2626,21 @@ _backend_supported(grid::FlowGeometries.Grids.AbstractGrid, ::ComputationalBacke
 # `AutoBackend()` landing on serial is auto-selection working; an explicit non-serial request that
 # cannot be honoured is an error, since the caller would otherwise run on believing they had the
 # parallelism. Checked against the original `backend`, before `AutoBackend()` is resolved away.
+@inline _threading_available() =
+    Base.get_extension(parentmodule(@__MODULE__), :CoarseGrainingEnergyFluxesOhMyThreadsExt) !== nothing
+
+# Upstream leaves `resolve_backend(::AutoBackend)` to the consumer, since it cannot see whether this
+# package's threading extension is loaded. Kept package-local rather than added as a method there:
+# that signature is ComputationalBackends' own, so every consumer defining it would overwrite the rest.
+@inline function _resolve_backend(backend::ComputationalBackends.AbstractExecutionBackend)
+    backend isa ComputationalBackends.AbstractAutoBackend ||
+        return ComputationalBackends.resolve_backend(backend)
+    return (Threads.nthreads() > 1 && _threading_available()) ?
+        ComputationalBackends.ThreadedBackend() : ComputationalBackends.SerialBackend()
+end
+
 function _check_backend_compatible(grid::FlowGeometries.Grids.AbstractGrid, backend::ComputationalBackends.AbstractExecutionBackend)
-    if !(backend isa ComputationalBackends.AutoBackend) && !(backend isa ComputationalBackends.SerialBackend) && !_backend_supported(grid, ComputationalBackends.resolve_backend(backend))
+    if !(backend isa ComputationalBackends.AutoBackend) && !(backend isa ComputationalBackends.SerialBackend) && !_backend_supported(grid, _resolve_backend(backend))
         throw(ArgumentError(
             "backend = $(typeof(backend)) was requested explicitly, but $(typeof(grid)) has no " *
             "matching parallel hook for it — there is no way to honor this request. Pass " *
@@ -2764,7 +2777,7 @@ function plan_filter(
     )
     return PhysicalFilterPlan(
         build_footprint(grid, kernel, scale), grid, mask_strategy, kernel, scale,
-        ComputationalBackends.resolve_backend(backend),
+        _resolve_backend(backend),
     )
 end
 
@@ -2788,7 +2801,7 @@ function plan_filter(
         # so this raises the standard informative "spectral unavailable" error.
         return spectral_filter_plan(spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
     end
-    resolved = ComputationalBackends.resolve_backend(backend)
+    resolved = _resolve_backend(backend)
     _check_backend_compatible(grid, backend)
     fp = build_footprint(grid, kernel, scale; cache_strategy = cache_strategy, cache_byte_budget = cache_byte_budget)
     return PhysicalFilterPlan(prepare_workspace(resolved, grid, fp), grid, mask_strategy, kernel, scale, resolved)
