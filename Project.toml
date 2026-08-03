@@ -6,11 +6,6 @@ authors = ["Jordan Benjamin"]
 [workspace]
 projects = ["test", "docs"]
 
-# Unregistered jbphyswx-ecosystem packages; a source lets Pkg resolve them. Registering them would let
-# these be dropped. NUFSHT backs the optional scattered-spherical spectral weakdep/extension;
-# FlowGeometries supplies the geometry/grid types, and ComputationalBackends/SpectralBackends are
-# zero-dependency dispatch-tag packages shared across the ecosystem so backend and transform-algorithm
-# selection mean the same thing in every package.
 [sources]
 ComputationalBackends = { url = "https://github.com/jbphyswx/ComputationalBackends.jl" }
 FlowGeometries = { url = "https://github.com/jbphyswx/FlowGeometries.jl" }
