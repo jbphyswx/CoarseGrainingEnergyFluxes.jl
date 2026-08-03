@@ -1,19 +1,20 @@
 module Pipeline
 
-using ..Geometry: Geometry
-using ..Grids: Grids
+using FlowGeometries: FlowGeometries
 using ..Kernels: Kernels
 using ..Filtering: Filtering
 using ..Derivatives: Derivatives
 using ..Diagnostics: Diagnostics
-using ..Backends: Backends
+using ComputationalBackends: ComputationalBackends
 
 export CoarseGrainResult, coarse_grain, coarse_grain!
 
 """
-    CoarseGrainResult{T<:AbstractFloat, N, A<:AbstractArray{T,N}}
+    CoarseGrainResult(scales, Π, cumulative_energy, wavenumber, filtering_spectrum)
 
-Container for results of a complete coarse-graining multiscale analysis.
+Container for results of a complete coarse-graining multiscale analysis. Every field's container type
+is a type parameter, inferred by the constructor above, so nothing here is stored behind an abstract
+annotation.
 
 # Fields
 - `scales::AbstractVector{T}`: filter scales ℓ in meters
@@ -22,7 +23,7 @@ Container for results of a complete coarse-graining multiscale analysis.
   and each scale's map is a zero-copy view (`compute_Π!` writes directly into its slice).
 - `cumulative_energy::AbstractArray{T}`: cumulative coarse specific KE ½⟨|ū_ℓ|²⟩ per scale (Sadek–Aluie Eq.
   15) — a `Vector` (per scale) for `coarse_grain`, or a `(Nlevels, Nscales)` `Matrix` for
-  `coarse_grain_profile` (per depth level AND scale — deliberately not summed across levels, since
+  `coarse_grain_profile` (per vertical level AND scale — deliberately not summed across levels, since
   that would need volume/thickness weighting this function doesn't have).
 - `wavenumber::AbstractVector{T}`: filtering wavenumber `k_ℓ = L/ℓ` per scale (level-independent)
 - `filtering_spectrum::AbstractArray{T}`: filtering spectral density `Ẽ(k_ℓ)` per scale (Eq. 14), same
@@ -38,20 +39,28 @@ res.cumulative_energy[1]   # cumulative coarse KE at 10 km
 res.filtering_spectrum[1]  # filtering spectral density at k_ℓ = res.wavenumber[1]
 ```
 """
-struct CoarseGrainResult{T<:AbstractFloat, N, A<:AbstractArray{T,N}}
-    scales::AbstractVector{T}
+struct CoarseGrainResult{T<:AbstractFloat, N, A<:AbstractArray{T,N}, V<:AbstractVector{T}, C<:AbstractArray{T}}
+    scales::V
     Π::A
-    cumulative_energy::AbstractArray{T}
-    wavenumber::AbstractVector{T}
-    filtering_spectrum::AbstractArray{T}
+    cumulative_energy::C
+    wavenumber::V
+    filtering_spectrum::C
 end
+
+# Every field is a type parameter rather than an `AbstractArray{T}` annotation: an abstract field type
+# makes each access a dynamic dispatch, so even `wavenumber .= L ./ scales` allocated.
+# `cumulative_energy` and `filtering_spectrum` share one parameter because they share a shape by
+# construction — a vector per scale here, a `(level, scale)` matrix from `coarse_grain_profile`.
+CoarseGrainResult(scales::AbstractVector{T}, Π::AbstractArray{T,N}, cumE::AbstractArray{T},
+                  kℓ::AbstractVector{T}, spec::AbstractArray{T}) where {T<:AbstractFloat, N} =
+    CoarseGrainResult{T, N, typeof(Π), typeof(scales), typeof(cumE)}(scales, Π, cumE, kℓ, spec)
 
 # ---------------------------------------------------------------------------
 # StructuredGrid pipeline
 # ---------------------------------------------------------------------------
 
 """
-    coarse_grain(u, v, w, grid; scales, kernel=TopHatKernel(), backend=AutoBackend(), mask_strategy=Deformable(), L=1)
+    coarse_grain(u, v, w, grid; scales, kernel=TopHatKernel(), backend=AutoBackend(), mask_strategy=Deformable(), method=nothing, L=1)
     coarse_grain(u, v, grid; scales, ...)  # 2D convenience wrapper
 
 Perform complete coarse-graining analysis across multiple filter scales, allocating a fresh
@@ -69,7 +78,10 @@ and call `coarse_grain!` directly to reuse its buffers.
 - `scales::AbstractVector`: Vector of filter scales ℓ in meters (e.g., `10e3:10e3:100e3`)
 - `kernel::AbstractFilterKernel=TopHatKernel()`: Filter kernel
 - `backend::AbstractExecutionBackend=AutoBackend()`: Execution backend
-- `mask_strategy::AbstractMaskStrategy=Deformable()`: Land masking strategy (`ZeroFill()` or `Deformable()`)
+- `mask_strategy::AbstractMaskStrategy=Deformable()`: Masking strategy (`ZeroFill()` or `Deformable()`)
+- `method::Union{Nothing,AbstractFilterMethod}=nothing`: filtering engine; `nothing` takes
+  `plan_filter`'s per-grid default (real space where a grid has that engine)
+- `L::Real=1`: reference length setting the wavenumber normalization `k_ℓ = L/ℓ`
 
 # Returns
 - `CoarseGrainResult`: Container with scales, Π maps, and spectrum
@@ -88,73 +100,90 @@ function coarse_grain(
     u::AbstractMatrix,
     v::AbstractMatrix,
     w::Union{Nothing, AbstractMatrix},
-    grid::Grids.StructuredGrid{G,T};
+    grid::FlowGeometries.Grids.StructuredGrid{G,T};
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
     return coarse_grain!(
         result, u, v, w, grid;
         scales = scales, kernel = kernel, workspace = workspace,
-        backend = backend, mask_strategy = mask_strategy, L = L,
+        backend = backend, mask_strategy = mask_strategy, method = method, L = L,
     )
 end
 
+# The derivative cache is geometry only — a stencil table on a rectilinear grid, a least-squares fit on
+# a curvilinear or node grid — so one serves the whole scale sweep rather than being rebuilt per scale.
+@inline _deriv_plan(grid::FlowGeometries.Grids.StructuredGrid, dp) =
+    dp === nothing ? Derivatives.StencilPlan(grid) : dp
+@inline _deriv_plan(grid, dp) = dp === nothing ? FlowGeometries.Connectivity.gradient_plan(grid) : dp
+
+# `method === nothing` OMITS the keyword rather than forwarding it, so `plan_filter`'s per-grid
+# default engine still applies.
+@inline _plan_filter(grid, kernel, scale, strat, backend, method) =
+    method === nothing ?
+        Filtering.plan_filter(grid, kernel, scale; mask_strategy = strat, backend = backend) :
+        Filtering.plan_filter(grid, kernel, scale; mask_strategy = strat, backend = backend, method = method)
+
+@inline _flux!(out, u, v, w, grid, kernel, scale, ws, plan, backend, strat, dplan) =
+    Diagnostics.compute_Π!(out, u, v, w, grid, kernel, scale;
+        workspace = ws, filter_plan = plan, backend = backend, mask_strategy = strat, deriv_plan = dplan)
+
 """
-    coarse_grain!(result, u, v, w, grid; scales, kernel=TopHatKernel(), workspace=nothing, backend=AutoBackend(), mask_strategy=Deformable(), L=1)
+    coarse_grain!(result, u, v, w, grid; scales, kernel, workspace, filter_plans, deriv_plan, backend, mask_strategy, method, L)
     coarse_grain!(result, u, v, grid; scales, ...)  # 2D convenience wrapper
 
-In-place [`coarse_grain`](@ref): refills an existing [`CoarseGrainResult`](@ref)'s buffers (scales,
-the stacked `Π` array, cumulative energy, wavenumber, spectrum) instead of allocating fresh ones.
-When `workspace` (a [`Diagnostics.ΠWorkspace`](@ref)) is supplied, its filtered-velocity/strain/stress scratch
-arrays are reused too — for a sweep repeated across many timesteps of the same grid/scale set, this
-is the zero-(re)allocation entry point (`coarse_grain` is a thin allocating wrapper around it).
+In-place [`coarse_grain`](@ref): refills an existing [`CoarseGrainResult`](@ref)'s buffers — scales,
+the stacked `Π` array, cumulative energy, wavenumber, spectrum — instead of allocating fresh ones.
+Supplying `workspace` and `filter_plans` reuses the scratch arrays and the per-scale plans too, which
+is the zero-reallocation entry point for a sweep repeated across timesteps.
 
-`result` must already be sized for `length(scales)` scales over `grid`'s shape (as produced by a
-prior `coarse_grain` call) — a mismatch throws `DimensionMismatch`.
+`result` must already be sized for `length(scales)` scales over `grid`'s shape; a mismatch throws
+`DimensionMismatch`.
+
+One driver for every grid architecture: the scale loop, the plan reuse and the spectrum are the same
+for all of them. Only the derivative plan and the trailing dimension of `result.Π` vary.
 """
 function coarse_grain!(
     result::CoarseGrainResult{T},
-    u::AbstractMatrix,
-    v::AbstractMatrix,
-    w::Union{Nothing, AbstractMatrix},
-    grid::Grids.StructuredGrid{G,T};
+    u::AbstractArray,
+    v::AbstractArray,
+    w::Union{Nothing, AbstractArray},
+    grid::FlowGeometries.Grids.AbstractGrid{G,T};
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     workspace::Union{Nothing, Diagnostics.ΠWorkspace} = nothing,
     filter_plans::Union{Nothing, AbstractVector} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    deriv_plan = nothing,
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    # `nothing` leaves the choice to `plan_filter`, whose default differs by grid: real space where a
+    # grid has that engine, spectral for a node set.
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     _check_result_shape(result, grid, scales)
     ws = workspace === nothing ? Diagnostics.ΠWorkspace(grid) : workspace
-
-    # Each scale's filter plan is reused for both `compute_Π!` (below) and `cumulative_energy!`
-    # (after the loop) — they used to each independently rebuild the same footprint per scale
-    # (measured: a 3-scale sweep allocated ~4.6x the raw sum of the three footprint builds, because
-    # `cumulative_energy!` redundantly re-filtered u/v/w from scratch instead of reusing the plan
-    # `compute_Π!` had just built for that exact same scale). For a sweep repeated across many
-    # timesteps of the SAME grid/kernel/scales (this function's own documented zero-allocation use
-    # case), pass a prebuilt `filter_plans` (one entry per scale, e.g. from a first `coarse_grain`
-    # call) so this doesn't allocate a fresh plan vector — or fresh plans — on every repeat call.
+    dplan = _deriv_plan(grid, deriv_plan)
+    # Each scale's plan is shared by `compute_Π!` and `cumulative_energy!`. A sweep repeated over many
+    # timesteps of the same grid, kernel and scales should pass a prebuilt `filter_plans`, so neither
+    # the vector nor the plans are reallocated.
     plans = filter_plans === nothing ? Vector{Filtering.AbstractFilterPlan}(undef, length(scales)) : filter_plans
     for s_idx in eachindex(scales)
         scale = T(scales[s_idx])
         result.scales[s_idx] = scale
         filter_plans === nothing &&
-            (plans[s_idx] = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend))
-        Diagnostics.compute_Π!(
-            view(result.Π, :, :, s_idx),
-            u, v, w, grid, kernel, scale;
-            workspace = ws, filter_plan = plans[s_idx], backend = backend, mask_strategy = mask_strategy,
+            (plans[s_idx] = _plan_filter(grid, kernel, scale, mask_strategy, backend, method))
+        _flux!(
+            selectdim(result.Π, ndims(result.Π), s_idx), u, v, w, grid, kernel, scale,
+            ws, plans[s_idx], backend, mask_strategy, dplan,
         )
     end
-
     Diagnostics.cumulative_energy!(
         result.cumulative_energy, u, v, w, grid, kernel, scales;
         workspace = ws, filter_plans = plans, backend = backend, mask_strategy = mask_strategy,
@@ -168,59 +197,66 @@ end
 function coarse_grain(
     u::AbstractMatrix,
     v::AbstractMatrix,
-    grid::Grids.StructuredGrid{G,T};
+    grid::FlowGeometries.Grids.StructuredGrid{G,T};
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
-    return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, backend=backend, mask_strategy=mask_strategy, L=L)
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, backend=backend, mask_strategy=mask_strategy, method=method, L=L)
 end
 
 function coarse_grain!(
     result::CoarseGrainResult{T},
     u::AbstractMatrix,
     v::AbstractMatrix,
-    grid::Grids.StructuredGrid{G,T};
+    grid::FlowGeometries.Grids.StructuredGrid{G,T};
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     workspace::Union{Nothing, Diagnostics.ΠWorkspace} = nothing,
     filter_plans::Union{Nothing, AbstractVector} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    deriv_plan = nothing,
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
-    return coarse_grain!(result, u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, filter_plans=filter_plans, backend=backend, mask_strategy=mask_strategy, L=L)
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    return coarse_grain!(result, u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, filter_plans=filter_plans, deriv_plan=deriv_plan, backend=backend, mask_strategy=mask_strategy, method=method, L=L)
 end
 
 """
-    coarse_grain_profile(u, v, w, grid, scales; kernel=TopHatKernel(), backend=AutoBackend(), mask_strategy=Deformable(), L=1)
+    coarse_grain_profile(u, v, w, grid; scales, kernel=TopHatKernel(), backend=AutoBackend(), mask_strategy=Deformable(), method=nothing, L=1)
 
-Depth-profile sweep: given 3D `(lon, lat, depth)` velocity arrays, runs [`Diagnostics.compute_Π_profile!`](@ref)
+Vertical-profile sweep: given 3D `(x, y, z)` velocity arrays, runs [`Diagnostics.compute_Π_profile!`](@ref)
 (the literature-standard independent-per-level 2D/2.5D method — see [`Diagnostics.compute_Π!`](@ref)'s
 thin-layer/QG regime note) at every scale, returning a [`CoarseGrainResult`](@ref) whose `Π` is one
-contiguous `(Nlon, Nlat, Nlevels, Nscales)` array. The workspace is built once and reused across the
+contiguous `(Nx, Ny, Nlevels, Nscales)` array. The workspace is built once and reused across the
 whole level × scale sweep.
 """
 function coarse_grain_profile(
     u::AbstractArray{T,3},
     v::AbstractArray{T,3},
     w::Union{Nothing, AbstractArray{T,3}},
-    grid::Grids.StructuredGrid{G,T};
+    grid::FlowGeometries.Grids.StructuredGrid{G,T};
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     workspace::Union{Nothing, Diagnostics.ΠWorkspace} = nothing,
     filter_plans::Union{Nothing, AbstractVector} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
+    deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
     L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    # Grid-only, so one table serves every level of every scale.
+    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
     Nscales = length(scales)
-    Nlon, Nlat = Grids.size_tuple(grid)
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     Nlevels = size(u, 3)
 
-    Π = zeros(T, Nlon, Nlat, Nlevels, Nscales)
+    Π = zeros(T, Nx, Ny, Nlevels, Nscales)
     ws = workspace === nothing ? Diagnostics.ΠWorkspace(grid) : workspace
     scales_vec = zeros(T, Nscales)
     # One filter plan per scale, reused both across all levels of the Π sweep below AND across all
@@ -235,10 +271,11 @@ function coarse_grain_profile(
         scale = T(scales[s_idx])
         scales_vec[s_idx] = scale
         filter_plans === nothing &&
-            (plans[s_idx] = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend))
+            (plans[s_idx] = _plan_filter(grid, kernel, scale, mask_strategy, backend, method))
         Diagnostics.compute_Π_profile!(
             view(Π, :, :, :, s_idx), u, v, w, grid, kernel, scale;
             workspace = ws, filter_plan = plans[s_idx], backend = backend, mask_strategy = mask_strategy,
+            deriv_plan = dplan,
         )
     end
 
@@ -259,23 +296,25 @@ function coarse_grain_profile(
 
     # cumE/spec are kept as genuine (Nlevels, Nscales) matrices — not summed across levels, which
     # would need volume/thickness weighting this function isn't given.
-    return CoarseGrainResult{T, 4, Array{T,4}}(scales_vec, Π, cumE, kℓ, spec)
+    return CoarseGrainResult(scales_vec, Π, cumE, kℓ, spec)
 end
 
 # 2.5D convenience wrapper (no vertical velocity).
 function coarse_grain_profile(
     u::AbstractArray{T,3},
     v::AbstractArray{T,3},
-    grid::Grids.StructuredGrid{G,T};
+    grid::FlowGeometries.Grids.StructuredGrid{G,T};
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     workspace::Union{Nothing, Diagnostics.ΠWorkspace} = nothing,
     filter_plans::Union{Nothing, AbstractVector} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
+    deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
     L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
-    return coarse_grain_profile(u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, filter_plans=filter_plans, backend=backend, mask_strategy=mask_strategy, L=L)
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    return coarse_grain_profile(u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, filter_plans=filter_plans, backend=backend, mask_strategy=mask_strategy, method=method, deriv_plan=deriv_plan, L=L)
 end
 
 # ---------------------------------------------------------------------------
@@ -286,51 +325,59 @@ end
 # ---------------------------------------------------------------------------
 function coarse_grain(
     u::AbstractVector,
-    grid::Grids.StructuredGrid{G,T,1};
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,1};
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    filter_plans::Union{Nothing, AbstractVector} = nothing,
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
     return coarse_grain!(
         result, u, grid;
-        scales = scales, kernel = kernel, workspace = workspace,
-        backend = backend, mask_strategy = mask_strategy, L = L,
+        scales = scales, kernel = kernel, workspace = workspace, filter_plans = filter_plans,
+        backend = backend, mask_strategy = mask_strategy, method = method, L = L,
     )
 end
 
 function coarse_grain!(
     result::CoarseGrainResult{T},
     u::AbstractVector,
-    grid::Grids.StructuredGrid{G,T,1};
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,1};
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     workspace::Union{Nothing, Diagnostics.ΠWorkspace} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    filter_plans::Union{Nothing, AbstractVector} = nothing,
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.CartesianGeometry{T}}
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _check_result_shape(result, grid, scales)
     ws = workspace === nothing ? Diagnostics.ΠWorkspace(grid) : workspace
-    Nlon = Grids.size_tuple(grid)[1]
+    plans = filter_plans === nothing ? Vector{Filtering.AbstractFilterPlan}(undef, length(scales)) : filter_plans
+    Nx = FlowGeometries.Grids.size_tuple(grid)[1]
 
-    total_area = sum(Grids.area(grid, i) for i in 1:Nlon if Grids.isactive(grid, i))
+    total_area = sum(FlowGeometries.Grids.area(grid, i) for i in 1:Nx if FlowGeometries.Grids.isactive(grid, i))
 
     for s_idx in eachindex(scales)
         scale = T(scales[s_idx])
         result.scales[s_idx] = scale
+        # One plan per scale, shared by the flux and the energy integral below, and reusable across
+        # calls through `filter_plans` — as every other grid type's method already allows.
+        filter_plans === nothing &&
+            (plans[s_idx] = _plan_filter(grid, kernel, scale, mask_strategy, backend, method))
+        plan = plans[s_idx]
         Diagnostics.compute_Π!(
             view(result.Π, :, s_idx),
             u, grid, kernel, scale;
-            workspace = ws, backend = backend, mask_strategy = mask_strategy,
+            workspace = ws, filter_plan = plan, backend = backend, mask_strategy = mask_strategy,
         )
-
-        plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
         Filtering.filter_apply!(ws.u_filt, u, plan)
-        integrated_energy = sum(ws.u_filt[i]^2 * Grids.area(grid, i) for i in 1:Nlon if Grids.isactive(grid, i))
+        integrated_energy = sum(ws.u_filt[i]^2 * FlowGeometries.Grids.area(grid, i) for i in 1:Nx if FlowGeometries.Grids.isactive(grid, i))
         result.cumulative_energy[s_idx] = T(0.5) * integrated_energy / total_area
     end
 
@@ -343,69 +390,29 @@ end
 # True-3D pipeline (Cartesian OR spherical volumetric): genuinely coupled (all nine strain
 # components, real vertical/radial derivatives), distinct from `coarse_grain_profile`'s per-level
 # 2.5D sweep above — dispatches on a `StructuredGrid{G,T,3}` (3D grid) + 3D velocity arrays, not a 2D
-# grid with a depth-stacked array. `Diagnostics.compute_Π!` itself dispatches Cartesian vs. spherical.
+# grid with a level-stacked array. `Diagnostics.compute_Π!` itself dispatches Cartesian vs. spherical.
 # ---------------------------------------------------------------------------
 function coarse_grain(
     u::AbstractArray{<:Any,3},
     v::AbstractArray{<:Any,3},
     w::AbstractArray{<:Any,3},
-    grid::Grids.StructuredGrid{G,T,3};
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,3};
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
     return coarse_grain!(
         result, u, v, w, grid;
         scales = scales, kernel = kernel, workspace = workspace,
-        backend = backend, mask_strategy = mask_strategy, L = L,
+        backend = backend, mask_strategy = mask_strategy, method = method, L = L,
     )
 end
 
-function coarse_grain!(
-    result::CoarseGrainResult{T},
-    u::AbstractArray{<:Any,3},
-    v::AbstractArray{<:Any,3},
-    w::AbstractArray{<:Any,3},
-    grid::Grids.StructuredGrid{G,T,3};
-    scales::AbstractVector,
-    kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
-    workspace::Union{Nothing, Diagnostics.ΠWorkspace} = nothing,
-    filter_plans::Union{Nothing, AbstractVector} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-    L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
-    _check_result_shape(result, grid, scales)
-    ws = workspace === nothing ? Diagnostics.ΠWorkspace(grid) : workspace
-
-    # See the 2D `coarse_grain!` method above for why `plans` is reused with `cumulative_energy!`
-    # below (instead of each independently rebuilding the same footprint) and why a caller doing a
-    # repeated sweep should pass a prebuilt `filter_plans` rather than let this allocate a fresh one.
-    plans = filter_plans === nothing ? Vector{Filtering.AbstractFilterPlan}(undef, length(scales)) : filter_plans
-    for s_idx in eachindex(scales)
-        scale = T(scales[s_idx])
-        result.scales[s_idx] = scale
-        filter_plans === nothing &&
-            (plans[s_idx] = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend))
-        Diagnostics.compute_Π!(
-            view(result.Π, :, :, :, s_idx),
-            u, v, w, grid, kernel, scale;
-            workspace = ws, filter_plan = plans[s_idx], backend = backend, mask_strategy = mask_strategy,
-        )
-    end
-
-    Diagnostics.cumulative_energy!(
-        result.cumulative_energy, u, v, w, grid, kernel, scales;
-        workspace = ws, filter_plans = plans, backend = backend, mask_strategy = mask_strategy,
-    )
-    result.wavenumber .= T(L) ./ result.scales
-    Diagnostics.spectral_density!(result.filtering_spectrum, result.cumulative_energy, result.wavenumber)
-    return result
-end
 
 # ---------------------------------------------------------------------------
 # Curvilinear-grid pipeline: same orchestration as the StructuredGrid path, but the WLSQ derivative
@@ -415,118 +422,17 @@ function coarse_grain(
     u::AbstractMatrix,
     v::AbstractMatrix,
     w::Union{Nothing, AbstractMatrix},
-    grid::Grids.CurvilinearGrid{T,G};
+    grid::FlowGeometries.Grids.CurvilinearGrid{T,G};
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
-    deriv_plan = Derivatives.WLSQGradientPlan(grid)
-    return coarse_grain!(
-        result, u, v, w, grid;
-        scales = scales, kernel = kernel, workspace = workspace, deriv_plan = deriv_plan,
-        backend = backend, mask_strategy = mask_strategy, L = L,
-    )
-end
-
-function coarse_grain!(
-    result::CoarseGrainResult{T},
-    u::AbstractMatrix,
-    v::AbstractMatrix,
-    w::Union{Nothing, AbstractMatrix},
-    grid::Grids.CurvilinearGrid{T,G};
-    scales::AbstractVector,
-    kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
-    workspace::Union{Nothing, Diagnostics.ΠWorkspace} = nothing,
-    deriv_plan::Union{Nothing, Derivatives.WLSQGradientPlan} = nothing,
-    filter_plans::Union{Nothing, AbstractVector} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-    L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
-    _check_result_shape(result, grid, scales)
-    ws = workspace === nothing ? Diagnostics.ΠWorkspace(grid) : workspace
-    dplan = deriv_plan === nothing ? Derivatives.WLSQGradientPlan(grid) : deriv_plan
-
-    # See the 2D `StructuredGrid` `coarse_grain!` method above for why `plans` is reused with
-    # `cumulative_energy!` below, and why a repeated sweep should pass a prebuilt `filter_plans`.
-    plans = filter_plans === nothing ? Vector{Filtering.AbstractFilterPlan}(undef, length(scales)) : filter_plans
-    for s_idx in eachindex(scales)
-        scale = T(scales[s_idx])
-        result.scales[s_idx] = scale
-        filter_plans === nothing &&
-            (plans[s_idx] = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend))
-        Diagnostics.compute_Π!(
-            view(result.Π, :, :, s_idx),
-            u, v, w, grid, kernel, scale;
-            workspace = ws, deriv_plan = dplan, filter_plan = plans[s_idx], backend = backend, mask_strategy = mask_strategy,
-        )
-    end
-
-    Diagnostics.cumulative_energy!(
-        result.cumulative_energy, u, v, w, grid, kernel, scales;
-        filter_plans = plans,
-        workspace = ws, backend = backend, mask_strategy = mask_strategy,
-    )
-    result.wavenumber .= T(L) ./ result.scales
-    Diagnostics.spectral_density!(result.filtering_spectrum, result.cumulative_energy, result.wavenumber)
-    return result
-end
-
-# 2D curvilinear convenience wrapper (no vertical velocity).
-function coarse_grain(
-    u::AbstractMatrix,
-    v::AbstractMatrix,
-    grid::Grids.CurvilinearGrid{T,G};
-    scales::AbstractVector,
-    kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-    L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
-    return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, backend=backend, mask_strategy=mask_strategy, L=L)
-end
-
-function coarse_grain!(
-    result::CoarseGrainResult{T},
-    u::AbstractMatrix,
-    v::AbstractMatrix,
-    grid::Grids.CurvilinearGrid{T,G};
-    scales::AbstractVector,
-    kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
-    workspace::Union{Nothing, Diagnostics.ΠWorkspace} = nothing,
-    deriv_plan::Union{Nothing, Derivatives.WLSQGradientPlan} = nothing,
-    filter_plans::Union{Nothing, AbstractVector} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-    L::Real = one(T),
-) where {T<:AbstractFloat, G<:Geometry.AbstractGeometry{T}}
-    return coarse_grain!(result, u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, deriv_plan=deriv_plan, filter_plans=filter_plans, backend=backend, mask_strategy=mask_strategy, L=L)
-end
-
-# ---------------------------------------------------------------------------
-# UnstructuredGrid pipeline: 1D node-indexed, same orchestration pattern as CurvilinearGrid but using
-# `Derivatives.UnstructuredWLSQGradientPlan` (node-adjacency WLSQ, not index-offset WLSQ) and defaulting
-# to spectral filtering (no real-space engine exists yet for scattered points).
-# ---------------------------------------------------------------------------
-function coarse_grain(
-    u::AbstractVector,
-    v::AbstractVector,
-    w::Union{Nothing, AbstractVector},
-    grid::Grids.UnstructuredGrid{T};
-    scales::AbstractVector,
-    kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-    method::Filtering.AbstractFilterMethod = Filtering.Spectral(),
-    L::Real = one(T),
-) where {T<:AbstractFloat}
-    result = _allocate_result(grid, length(scales))
-    workspace = Diagnostics.ΠWorkspace(grid)
-    deriv_plan = Derivatives.WLSQGradientPlan(grid)
+    deriv_plan = FlowGeometries.Connectivity.gradient_plan(grid)
     return coarse_grain!(
         result, u, v, w, grid;
         scales = scales, kernel = kernel, workspace = workspace, deriv_plan = deriv_plan,
@@ -534,58 +440,76 @@ function coarse_grain(
     )
 end
 
+
+# 2D curvilinear convenience wrapper (no vertical velocity).
+function coarse_grain(
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    grid::FlowGeometries.Grids.CurvilinearGrid{T,G};
+    scales::AbstractVector,
+    kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
+    L::Real = one(T),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, backend=backend, mask_strategy=mask_strategy, method=method, L=L)
+end
+
 function coarse_grain!(
     result::CoarseGrainResult{T},
-    u::AbstractVector,
-    v::AbstractVector,
-    w::Union{Nothing, AbstractVector},
-    grid::Grids.UnstructuredGrid{T};
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    grid::FlowGeometries.Grids.CurvilinearGrid{T,G};
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     workspace::Union{Nothing, Diagnostics.ΠWorkspace} = nothing,
-    deriv_plan::Union{Nothing, Derivatives.UnstructuredWLSQGradientPlan} = nothing,
+    deriv_plan::Union{Nothing, FlowGeometries.Discretization.GradientPlan} = nothing,
     filter_plans::Union{Nothing, AbstractVector} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
+    L::Real = one(T),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    return coarse_grain!(result, u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, deriv_plan=deriv_plan, filter_plans=filter_plans, backend=backend, mask_strategy=mask_strategy, method=method, L=L)
+end
+
+# ---------------------------------------------------------------------------
+# UnstructuredGrid pipeline: 1D node-indexed, same orchestration pattern as CurvilinearGrid — the same
+# `Connectivity.gradient_plan`, built over the stored adjacency rather than an index stencil — and
+# defaulting to spectral filtering.
+# ---------------------------------------------------------------------------
+function coarse_grain(
+    u::AbstractVector,
+    v::AbstractVector,
+    w::Union{Nothing, AbstractVector},
+    grid::FlowGeometries.Grids.UnstructuredGrid{T};
+    scales::AbstractVector,
+    kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
     method::Filtering.AbstractFilterMethod = Filtering.Spectral(),
     L::Real = one(T),
 ) where {T<:AbstractFloat}
-    _check_result_shape(result, grid, scales)
-    ws = workspace === nothing ? Diagnostics.ΠWorkspace(grid) : workspace
-    dplan = deriv_plan === nothing ? Derivatives.WLSQGradientPlan(grid) : deriv_plan
-
-    # See the 2D `StructuredGrid` `coarse_grain!` method above for why `plans` is reused with
-    # `cumulative_energy!` below, and why a repeated sweep should pass a prebuilt `filter_plans`.
-    plans = filter_plans === nothing ? Vector{Filtering.AbstractFilterPlan}(undef, length(scales)) : filter_plans
-    for s_idx in eachindex(scales)
-        scale = T(scales[s_idx])
-        result.scales[s_idx] = scale
-        filter_plans === nothing &&
-            (plans[s_idx] = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend, method = method))
-        Diagnostics.compute_Π!(
-            view(result.Π, :, s_idx),
-            u, v, w, grid, kernel, scale;
-            workspace = ws, deriv_plan = dplan, filter_plan = plans[s_idx], backend = backend, mask_strategy = mask_strategy, method = method,
-        )
-    end
-
-    Diagnostics.cumulative_energy!(
-        result.cumulative_energy, u, v, w, grid, kernel, scales;
-        workspace = ws, filter_plans = plans, backend = backend, mask_strategy = mask_strategy, method = method,
+    result = _allocate_result(grid, length(scales))
+    workspace = Diagnostics.ΠWorkspace(grid)
+    deriv_plan = FlowGeometries.Connectivity.gradient_plan(grid)
+    return coarse_grain!(
+        result, u, v, w, grid;
+        scales = scales, kernel = kernel, workspace = workspace, deriv_plan = deriv_plan,
+        backend = backend, mask_strategy = mask_strategy, method = method, L = L,
     )
-    result.wavenumber .= T(L) ./ result.scales
-    Diagnostics.spectral_density!(result.filtering_spectrum, result.cumulative_energy, result.wavenumber)
-    return result
 end
+
 
 # 2D-velocity convenience wrapper (no vertical component).
 function coarse_grain(
     u::AbstractVector,
     v::AbstractVector,
-    grid::Grids.UnstructuredGrid{T};
+    grid::FlowGeometries.Grids.UnstructuredGrid{T};
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
     method::Filtering.AbstractFilterMethod = Filtering.Spectral(),
     L::Real = one(T),
@@ -597,13 +521,13 @@ function coarse_grain!(
     result::CoarseGrainResult{T},
     u::AbstractVector,
     v::AbstractVector,
-    grid::Grids.UnstructuredGrid{T};
+    grid::FlowGeometries.Grids.UnstructuredGrid{T};
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     workspace::Union{Nothing, Diagnostics.ΠWorkspace} = nothing,
-    deriv_plan::Union{Nothing, Derivatives.UnstructuredWLSQGradientPlan} = nothing,
+    deriv_plan::Union{Nothing, FlowGeometries.Discretization.GradientPlan} = nothing,
     filter_plans::Union{Nothing, AbstractVector} = nothing,
-    backend::Backends.AbstractExecutionBackend = Backends.AutoBackend(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
     method::Filtering.AbstractFilterMethod = Filtering.Spectral(),
     L::Real = one(T),
@@ -618,10 +542,9 @@ end
 # Allocates a result sized for `Nscales` scales over `grid`'s current spatial shape — dimension
 # generic (a 1-tuple for UnstructuredGrid, 2-tuple for Structured/CurvilinearGrid, 3-tuple for a true
 # 3D StructuredGrid), not hardcoded to 2D.
-function _allocate_result(grid::Grids.AbstractGrid{G,T}, Nscales::Integer) where {G, T<:AbstractFloat}
-    spatial = Grids.size_tuple(grid)
-    N = length(spatial) + 1
-    return CoarseGrainResult{T, N, Array{T,N}}(
+function _allocate_result(grid::FlowGeometries.Grids.AbstractGrid{G,T}, Nscales::Integer) where {G, T<:AbstractFloat}
+    spatial = FlowGeometries.Grids.size_tuple(grid)
+    return CoarseGrainResult(
         zeros(T, Nscales),
         zeros(T, spatial..., Nscales),
         zeros(T, Nscales),
@@ -630,7 +553,7 @@ function _allocate_result(grid::Grids.AbstractGrid{G,T}, Nscales::Integer) where
     )
 end
 
-function _check_result_shape(result::CoarseGrainResult, grid::Grids.AbstractGrid, scales::AbstractVector)
+function _check_result_shape(result::CoarseGrainResult, grid::FlowGeometries.Grids.AbstractGrid, scales::AbstractVector)
     Nscales = length(scales)
     length(result.scales) == Nscales || throw(DimensionMismatch(
         "result holds $(length(result.scales)) scales, got $Nscales scales to sweep",
@@ -638,8 +561,8 @@ function _check_result_shape(result::CoarseGrainResult, grid::Grids.AbstractGrid
     size(result.Π, ndims(result.Π)) == Nscales || throw(DimensionMismatch(
         "result.Π's last dimension holds $(size(result.Π, ndims(result.Π))) scales, got $Nscales",
     ))
-    size(result.Π)[1:(end-1)] == Grids.size_tuple(grid) || throw(DimensionMismatch(
-        "result.Π's spatial shape $(size(result.Π)[1:(end-1)]) does not match grid shape $(Grids.size_tuple(grid))",
+    size(result.Π)[1:(end-1)] == FlowGeometries.Grids.size_tuple(grid) || throw(DimensionMismatch(
+        "result.Π's spatial shape $(size(result.Π)[1:(end-1)]) does not match grid shape $(FlowGeometries.Grids.size_tuple(grid))",
     ))
     return nothing
 end
