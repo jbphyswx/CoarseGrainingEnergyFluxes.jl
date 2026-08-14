@@ -1,5 +1,9 @@
 # CoarseGrainingEnergyFluxes.jl
 
+[![Build Status](https://github.com/jbphyswx/CoarseGrainingEnergyFluxes.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/jbphyswx/CoarseGrainingEnergyFluxes.jl/actions/workflows/CI.yml)
+[![Dev Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://jbphyswx.github.io/CoarseGrainingEnergyFluxes.jl/dev/)
+[![Coverage](https://codecov.io/gh/jbphyswx/CoarseGrainingEnergyFluxes.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/jbphyswx/CoarseGrainingEnergyFluxes.jl)
+
 Spatial coarse-graining (Aluie/FlowSieve-style) analysis of energy fluxes in geophysical fluid
 dynamics: cross-scale kinetic-energy transfer Π(x, ℓ), the filtering spectrum, and related
 diagnostics from velocity fields on Cartesian or spherical grids — structured, curvilinear
