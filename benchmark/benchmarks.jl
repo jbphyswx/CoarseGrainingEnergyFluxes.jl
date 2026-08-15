@@ -49,6 +49,70 @@ let
         )
 end
 
+# The three diagnostics that have workspace forms, each measured BOTH ways. The allocating form is
+# what a one-shot caller gets; the held form is the repeated-sweep path and is the one whose
+# allocation must stay flat — these entries exist so a regression to per-call allocation is visible
+# in the baseline rather than discovered later.
+let
+    N = 192
+    dx = 1_000.0
+    geom = FG.Geometry.CartesianGeometry()
+    x = 0.0:dx:dx*(N - 1)
+    grid = FG.Grids.StructuredGrid(geom, x, x)
+    u = rand(N, N); v = rand(N, N); θ = rand(N, N)
+    u_rot = rand(N, N); v_rot = rand(N, N)
+    ker = CGEF.TopHatKernel()
+    scale = 12_000.0
+    plan = CGEF.Filtering.plan_filter(grid, ker, scale)
+    dplan = CGEF.Derivatives.StencilPlan(grid)
+
+    SUITE["tau_decomposition/192x192/allocating"] =
+        BenchmarkTools.@benchmarkable CGEF.Diagnostics.tau_decomposition($u, $v, $grid, $ker, $scale)
+    let ws = CGEF.Diagnostics.TauWorkspace(grid)
+        SUITE["tau_decomposition!/192x192/workspace-held"] =
+            BenchmarkTools.@benchmarkable CGEF.Diagnostics.tau_decomposition!(
+                $ws, $u, $v, $grid, $ker, $scale; filter_plan = $plan)
+    end
+
+    SUITE["tracer_variance_flux/192x192/allocating"] =
+        BenchmarkTools.@benchmarkable CGEF.Diagnostics.tracer_variance_flux(
+            $u, $v, $θ, $grid, $ker, $scale)
+    let ws = CGEF.Diagnostics.TracerFluxWorkspace(grid), out = zeros(N, N)
+        SUITE["tracer_variance_flux!/192x192/workspace-held"] =
+            BenchmarkTools.@benchmarkable CGEF.Diagnostics.tracer_variance_flux!(
+                $out, $ws, $u, $v, $θ, $grid, $ker, $scale;
+                filter_plan = $plan, deriv_plan = $dplan)
+    end
+
+    SUITE["compute_Pi_decomposed/192x192/allocating"] =
+        BenchmarkTools.@benchmarkable CGEF.Diagnostics.compute_Π_decomposed(
+            $u, $v, $u_rot, $v_rot, $grid, $ker, $scale)
+    let ws = CGEF.Diagnostics.PiDecomposedWorkspace(grid)
+        SUITE["compute_Pi_decomposed!/192x192/workspace-held"] =
+            BenchmarkTools.@benchmarkable CGEF.Diagnostics.compute_Π_decomposed!(
+                $ws, $u, $v, $u_rot, $v_rot, $grid, $ker, $scale;
+                filter_plan = $plan, deriv_plan = $dplan)
+    end
+end
+
+# Slice axis: many independent problems, one plan each. Ragged point counts, since that is the shape
+# the longest-first schedule exists for and an equal-count baseline would hide the imbalance.
+let
+    nslices = 64
+    dx = 1_000.0
+    geom = FG.Geometry.CartesianGeometry()
+    counts = [1_232 + 47 * i % 2_350 for i in 1:nslices]
+    plans = map(counts) do n
+        xs = collect(range(0.0, dx * 60; length = n))
+        g = FG.Grids.StructuredGrid(geom, xs)
+        CGEF.Filtering.plan_filter(g, CGEF.GaussianKernel(), 8_000.0)
+    end
+    fields = [rand(n) for n in counts]
+    outs = [zeros(n) for n in counts]
+    SUITE["filter_slices!/64-ragged-slices"] =
+        BenchmarkTools.@benchmarkable CGEF.Filtering.filter_slices!($outs, $fields, $plans)
+end
+
 # Realistic-scale real-space filtering: a 100 km filter on 1 km data (top-hat radius = 50 grid cells).
 # This is the regime where cost is dominated by the filter WIDTH rather than the point count, and where
 # an O(N·di_lim·dj_lim) windowed sum stops being usable. Run on a genuinely NONUNIFORM axis — both the

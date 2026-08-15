@@ -1,8 +1,13 @@
 [deps]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 CoarseGrainingEnergyFluxes = "a8c2fbc6-778a-4d2b-8a8c-9c98efc7e8cf"
+ComputationalBackends = "5c6e2104-4040-447f-8fc0-66ec2223b019"
 FlowGeometries = "0ccd6995-f618-4175-b01e-f437d0cb4974"
+NearestNeighbors = "b8a86587-4115-5ab1-83bc-aa920d37bbce"
+OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 
 [sources]
 CoarseGrainingEnergyFluxes = { path = ".." }
+ComputationalBackends = { url = "https://github.com/jbphyswx/ComputationalBackends.jl" }
 FlowGeometries = { url = "https://github.com/jbphyswx/FlowGeometries.jl" }

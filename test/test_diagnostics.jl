@@ -357,6 +357,24 @@ Test.@testset "Stress decomposition (Leonard/Cross/Reynolds)" begin
 
     d = CGEF.Diagnostics.tau_decomposition(u, v, grid, kern, scale)
 
+    # The workspace form is the same implementation the allocating one delegates to, so it must agree
+    # exactly; with the workspace AND the plan held it also stops allocating per call.
+    let ws = CGEF.Diagnostics.TauWorkspace(grid),
+        pl = CGEF.Filtering.plan_filter(grid, kern, scale;
+            backend = CGEF.ComputationalBackends.SerialBackend())
+        dw = CGEF.Diagnostics.tau_decomposition!(ws, u, v, grid, kern, scale; filter_plan = pl)
+        for blk in (:L, :C, :R), comp in (:xx, :xy, :yy)
+            Test.@test getproperty(getproperty(dw, blk), comp) ==
+                       getproperty(getproperty(d, blk), comp)
+        end
+        # Reusing the workspace must give the same answer, not accumulate into stale buffers.
+        dw2 = CGEF.Diagnostics.tau_decomposition!(ws, u, v, grid, kern, scale; filter_plan = pl)
+        Test.@test dw2.C.xy == dw.C.xy
+        # Per-call cost is the returned NamedTuple only — no field-sized allocation.
+        Test.@test (@allocated CGEF.Diagnostics.tau_decomposition!(
+            ws, u, v, grid, kern, scale; filter_plan = pl)) < 4096
+    end
+
     # Reference τ_ij = filter(u_i u_j) - ū_i ū_j with the same filter.
     ub = zeros(size(u)); vb = zeros(size(v))
     CGEF.Filtering.filter_field!(ub, u, grid, kern, scale)
@@ -406,6 +424,26 @@ Test.@testset "Helmholtz flux decomposition" begin
 
     dec = CGEF.Diagnostics.compute_Π_decomposed(u, v, u_rot, v_rot, grid, kern, scale)
     Πfull = zeros(size(u)); CGEF.Diagnostics.compute_Π!(Πfull, u, v, nothing, grid, kern, scale)
+
+    # The workspace form is the implementation the allocating one delegates to, so it agrees exactly;
+    # holding the workspace and both plans makes a repeated evaluation allocation-free.
+    let ws = CGEF.Diagnostics.PiDecomposedWorkspace(grid),
+        pl = CGEF.Filtering.plan_filter(grid, kern, scale;
+            backend = CGEF.ComputationalBackends.SerialBackend()),
+        dp = CGEF.Derivatives.StencilPlan(grid)
+        dw = CGEF.Diagnostics.compute_Π_decomposed!(ws, u, v, u_rot, v_rot, grid, kern, scale;
+            filter_plan = pl, deriv_plan = dp)
+        for k in (:total, :rotational, :cross, :divergent)
+            Test.@test getproperty(dw, k) == getproperty(dec, k)
+        end
+        # Reuse must recompute from scratch, not accumulate into the previous call's buffers.
+        dw2 = CGEF.Diagnostics.compute_Π_decomposed!(ws, u, v, u_rot, v_rot, grid, kern, scale;
+            filter_plan = pl, deriv_plan = dp)
+        Test.@test dw2.total == dw.total
+        Test.@test (@allocated CGEF.Diagnostics.compute_Π_decomposed!(
+            ws, u, v, u_rot, v_rot, grid, kern, scale;
+            filter_plan = pl, deriv_plan = dp)) < 4096
+    end
 
     # (1) channels sum EXACTLY to the total, matching the standard full-flux computation.
     Test.@test dec.total ≈ dec.rotational .+ dec.cross .+ dec.divergent
@@ -469,6 +507,24 @@ Test.@testset "Tracer variance flux" begin
 
     # (2) matches the explicit definition Πθ = -(τx ∂x θ̄ + τy ∂y θ̄) built from primitives.
     Πθ = CGEF.Diagnostics.tracer_variance_flux(u, v, θ, grid, kern, scale)
+
+    # The workspace form is the implementation the allocating one delegates to, so it agrees exactly;
+    # with the workspace and both plans held it stops allocating per call.
+    let ws = CGEF.Diagnostics.TracerFluxWorkspace(grid),
+        pl = CGEF.Filtering.plan_filter(grid, kern, scale;
+            backend = CGEF.ComputationalBackends.SerialBackend()),
+        dp = CGEF.Derivatives.StencilPlan(grid),
+        got = zeros(size(Πθ))
+        CGEF.Diagnostics.tracer_variance_flux!(got, ws, u, v, θ, grid, kern, scale;
+            filter_plan = pl, deriv_plan = dp)
+        Test.@test got == Πθ
+        # Reusing the workspace must recompute, not accumulate into stale buffers.
+        CGEF.Diagnostics.tracer_variance_flux!(got, ws, u, v, θ, grid, kern, scale;
+            filter_plan = pl, deriv_plan = dp)
+        Test.@test got == Πθ
+        Test.@test (@allocated CGEF.Diagnostics.tracer_variance_flux!(
+            got, ws, u, v, θ, grid, kern, scale; filter_plan = pl, deriv_plan = dp)) < 4096
+    end
     ub = zeros(size(u)); vb = zeros(size(v)); θb = zeros(size(θ))
     CGEF.Filtering.filter_field!(ub, u, grid, kern, scale)
     CGEF.Filtering.filter_field!(vb, v, grid, kern, scale)

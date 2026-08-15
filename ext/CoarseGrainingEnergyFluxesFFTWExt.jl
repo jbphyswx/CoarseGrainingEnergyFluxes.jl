@@ -113,4 +113,111 @@ function CGEF.Filtering.filter_apply!(
     return out
 end
 
+# ---------------------------------------------------------------------------
+# Padded-FFT real-space engine
+# ---------------------------------------------------------------------------
+#
+# A non-separable kernel has no factored form, so the direct engine enumerates a whole disk per point:
+# O(N·w²), and `SharpSpectralKernel`'s radius is 10ℓ. Zero-padding to `N + 2w` makes the circular
+# convolution equal the LINEAR one, so this computes exactly what the direct sum computes — including
+# on bounded and masked domains, where a periodic transform would be wrong.
+#
+# `Deformable`/`ZeroFill` are normalized convolution: num = conv(mask·f, g), den = conv(mask, g). `den`
+# depends only on grid/kernel/scale/mask, so it is built once here rather than per apply.
+struct PaddedFFTFootprint{T<:AbstractFloat, A<:AbstractMatrix{T}, C<:AbstractMatrix{Complex{T}}, FP, IP, S}
+    Ĝ::C            # kernel spectrum on the padded grid
+    den::A          # the normalization, cropped and precomputed — it depends on the mask STRATEGY
+    pad::A          # padded scratch for mask·field
+    num::A          # padded scratch for the inverse transform
+    spec::C         # spectrum scratch
+    fwd::FP
+    inv::IP
+    strategy::S     # the strategy `den` was built for; applying another one would be wrong
+    N::NTuple{2,Int}
+    P::Int
+end
+
+function CGEF.Filtering.padded_fft_footprint(
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,2},
+    kernel::CGEF.Kernels.AbstractFilterKernel,
+    scale::T;
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy = CGEF.Filtering.Deformable(),
+    kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
+    dx = step(FlowGeometries.Grids.coordinates(grid, 1))
+    dy = step(FlowGeometries.Grids.coordinates(grid, 2))
+    rad = CGEF.Kernels.kernel_radius(kernel, scale)
+    wx = ceil(Int, rad / dx)
+    wy = ceil(Int, rad / dy)
+    P = max(Nx + 2wx, Ny + 2wy)
+    A = FlowGeometries.Grids.area(grid, 1, 1)
+
+    # Kernel field, wrapped so index (1,1) is the zero offset — otherwise the result is shifted. Gated
+    # on `d <= rad`: the footprint is a DISK, and including the enclosing box's corners changes a
+    # slowly-decaying kernel's answer outright.
+    gpad = zeros(T, P, P)
+    for dj in (-wy):wy, di in (-wx):wx
+        d = hypot(di * dx, dj * dy)
+        d <= rad || continue
+        wt = CGEF.Kernels.kernel_weight(kernel, d, scale) * A
+        iszero(wt) && continue
+        gpad[mod1(1 + di, P), mod1(1 + dj, P)] += wt
+    end
+
+    fwd = FFTW.plan_rfft(gpad)
+    Ĝ = fwd * gpad
+    spec = similar(Ĝ)
+    inv = FFTW.plan_irfft(spec, P)
+
+    # The denominator differs by strategy, exactly as it does in the direct engine: `Deformable`
+    # renormalizes over ACTIVE cells, `ZeroFill` keeps a masked neighbour in the denominator and
+    # contributes nothing for it, so its denominator is the in-domain kernel mass.
+    maskv = FlowGeometries.Grids.mask(grid)
+    dpad = zeros(T, P, P)
+    @inbounds for j in 1:Ny, i in 1:Nx
+        dpad[i, j] = (mask_strategy isa CGEF.Filtering.ZeroFill || maskv[i, j]) ? one(T) : zero(T)
+    end
+    spec = fwd * dpad
+    spec .*= Ĝ
+    denfull = inv * spec
+    den = Array{T}(undef, Nx, Ny)
+    @inbounds for j in 1:Ny, i in 1:Nx
+        den[i, j] = denfull[i, j]
+    end
+
+    return PaddedFFTFootprint(
+        Ĝ, den, zeros(T, P, P), zeros(T, P, P), similar(Ĝ), fwd, inv, mask_strategy, (Nx, Ny), P,
+    )
+end
+
+function CGEF.Filtering.apply_footprint!(
+    out::AbstractMatrix{T}, field::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,2},
+    fp::PaddedFFTFootprint{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    strategy === fp.strategy || throw(ArgumentError(
+        "this padded-FFT footprint was built for $(typeof(fp.strategy)); its denominator is not the " *
+        "one $(typeof(strategy)) needs. Rebuild the plan with the strategy you intend to apply.",
+    ))
+    Nx, Ny = fp.N
+    maskv = FlowGeometries.Grids.mask(grid)
+    fill!(fp.pad, zero(T))
+    @inbounds for j in 1:Ny, i in 1:Nx
+        fp.pad[i, j] = maskv[i, j] ? T(field[i, j]) : zero(T)
+    end
+    # In place through the held buffers: `plan * array` allocates a fresh result on every apply.
+    LA.mul!(fp.spec, fp.fwd, fp.pad)
+    fp.spec .*= fp.Ĝ
+    LA.mul!(fp.num, fp.inv, fp.spec)
+    @inbounds for j in 1:Ny, i in 1:Nx
+        d = fp.den[i, j]
+        out[i, j] = (maskv[i, j] && d > T(1e-15)) ? fp.num[i, j] / d : zero(T)
+    end
+    return out
+end
+
+CGEF.Filtering._apply_serial!(out, field, grid, fp::PaddedFFTFootprint, strategy) =
+    CGEF.Filtering.apply_footprint!(out, field, grid, fp, strategy)
+
 end # module

@@ -337,3 +337,65 @@ Test.@testset "Filtering spectrum" begin
     kk = collect(1.0:1.0:5.0)
     Test.@test CGEF.Diagnostics.spectral_density(kk .^ 2, kk)[3] ≈ 2 * kk[3]
 end
+
+# The padded-FFT engine computes the LINEAR convolution, so it is the real-space answer on a bounded,
+# masked grid — the configuration a periodic transform cannot serve. Reference is a direct disk sum.
+Test.@testset "Padded-FFT real-space engine" begin
+    geom = FG.Geometry.CartesianGeometry()
+    N = 64
+    dx = 1000.0
+    x = 0.0:dx:dx*(N - 1)                      # bounded
+    m = trues(N, N); m[15:25, 15:25] .= false
+    grid = FG.Grids.StructuredGrid(geom, x, x, m)
+    u = randn(N, N)
+    ker = CGEF.SharpSpectralKernel()           # non-separable: no factored engine exists for it
+    sc = 2000.0
+    rad = CGEF.Kernels.kernel_radius(ker, sc)
+    w = ceil(Int, rad / dx)
+
+    # `RealSpace` must stay the direct sum, whatever extensions are loaded.
+    p_rs = CGEF.Filtering.plan_filter(grid, ker, sc;
+        backend = CGEF.ComputationalBackends.SerialBackend(), method = CGEF.Filtering.RealSpace())
+    Test.@test p_rs.footprint isa CGEF.Filtering.FilterFootprint
+
+    for (strat, zerofill) in ((CGEF.Filtering.Deformable(), false), (CGEF.Filtering.ZeroFill(), true))
+        ref = zeros(N, N)
+        for j in 1:N, i in 1:N
+            m[i, j] || continue
+            ws = 0.0; wn = 0.0
+            for dj in -w:w, di in -w:w
+                ii = i + di; jj = j + dj
+                (1 <= ii <= N && 1 <= jj <= N) || continue
+                d = hypot(di * dx, dj * dx)
+                d <= rad || continue
+                wt = CGEF.Kernels.kernel_weight(ker, d, sc)
+                if zerofill
+                    wn += wt; m[ii, jj] && (ws += wt * u[ii, jj])
+                else
+                    m[ii, jj] || continue
+                    wn += wt; ws += wt * u[ii, jj]
+                end
+            end
+            ref[i, j] = wn > 1e-15 ? ws / wn : 0.0
+        end
+        p = CGEF.Filtering.plan_filter(grid, ker, sc;
+            backend = CGEF.ComputationalBackends.SerialBackend(),
+            method = CGEF.Filtering.AutoMethod(), mask_strategy = strat)
+        got = zeros(N, N)
+        CGEF.Filtering.filter_apply!(got, u, p)
+        Test.@test maximum(abs, got .- ref) / maximum(abs, ref) < 1e-9
+        # Applying a strategy the denominator was not built for must error, not renormalize wrongly.
+        other = zerofill ? CGEF.Filtering.Deformable() : CGEF.Filtering.ZeroFill()
+        Test.@test_throws ArgumentError CGEF.Filtering.apply_footprint!(
+            zeros(N, N), u, grid, p.footprint, other)
+    end
+
+    # AutoMethod picks on real capability: a transform only where it is exact for the grid.
+    let xp = range(0.0, dx * N; length = N + 1)[1:N],
+        gper = FG.Grids.StructuredGrid(geom, xp, xp; periodic = (true, true)),
+        gbnd = FG.Grids.StructuredGrid(geom, x, x)
+        Test.@test CGEF.Filtering._resolve_method(gper, CGEF.GaussianKernel(), CGEF.Filtering.AutoMethod()) isa CGEF.Filtering.Spectral
+        Test.@test CGEF.Filtering._resolve_method(gbnd, CGEF.GaussianKernel(), CGEF.Filtering.AutoMethod()) isa CGEF.Filtering.RealSpace
+        Test.@test CGEF.Filtering._resolve_method(gbnd, CGEF.GaussianKernel(), CGEF.Filtering.RealSpace()) isa CGEF.Filtering.RealSpace
+    end
+end

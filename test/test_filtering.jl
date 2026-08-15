@@ -484,7 +484,7 @@ Test.@testset "separable Gaussian fast path — dispatch and correctness against
 
     # Dispatch: separability is a property of the KERNEL, so a `Vector` axis takes the same engine.
     # What the axis type decides is the weight table's rank — a vector when the spacing is constant
-    # and known from the type, a column per position otherwise — not which algorithm runs.
+    # and known from the type, a row per position otherwise — not which algorithm runs.
     grid_uniform_vec = FG.Grids.StructuredGrid(geom, collect(xsR), collect(ysR), trues(N, N))
     fp_uniform_vec = CGEF.Filtering.build_footprint(grid_uniform_vec, ker, scale)
     Test.@test fp_uniform_vec isa CGEF.Filtering.SeparableGaussianFootprint
@@ -495,7 +495,7 @@ Test.@testset "separable Gaussian fast path — dispatch and correctness against
     grid_nonuniform = FG.Grids.StructuredGrid(geom, x_nu, collect(ysR), trues(N, N))
     fp_nonuniform = CGEF.Filtering.build_footprint(grid_nonuniform, ker, scale)
     Test.@test fp_nonuniform isa CGEF.Filtering.SeparableGaussianFootprint
-    Test.@test size(fp_nonuniform.gx, 2) == N
+    Test.@test size(fp_nonuniform.gx, 1) == N
 
     # Dispatch: Spherical + Gaussian never takes the Cartesian-only separable path, even with
     # Range axes (great-circle distance does not factor into Gx(Δx)·Gy(Δy)).
@@ -567,8 +567,8 @@ Test.@testset "Separable Gaussian on a stretched Cartesian grid" begin
     Test.@test pr.footprint isa CGEF.Filtering.SeparableGaussianFootprint
     Test.@test ps.footprint isa CGEF.Filtering.SeparableGaussianFootprint
     Test.@test pr.footprint.gx isa AbstractVector          # shared across positions
-    Test.@test ps.footprint.gx isa AbstractMatrix          # one column per position
-    Test.@test size(ps.footprint.gx, 2) == n
+    Test.@test ps.footprint.gx isa AbstractMatrix          # one row per position
+    Test.@test size(ps.footprint.gx, 1) == n
 
     # The scattered engine is the independent reference: it forms `kernel_weight(d)·area` per
     # candidate with no separability assumption at all. Agreement to ~1e-10 is the square-vs-disk
@@ -747,5 +747,66 @@ Test.@testset "Uniform spherical footprint: window covers the pole and counts ea
             den += wgt
         end
         Test.@test out[i, j] ≈ (den > 0 ? num / den : 0.0) rtol = 1e-12
+    end
+end
+
+# The engine restructures below all have a same-answer reference available, so each is asserted
+# against it rather than against a recorded number.
+Test.@testset "Real-space engine fast paths" begin
+    geom = FG.Geometry.CartesianGeometry()
+    N = 96
+    dx = 1000.0
+    xr = 0.0:dx:dx*(N - 1)
+    xv = collect(xr)              # same coordinates, but a Vector axis takes the GENERAL path
+    u = randn(N, N)
+
+    # Top-hat: the uniform-axis window collapses the two-pointer walk. Same coordinates through both
+    # paths must agree EXACTLY — the fast path makes the same boundary decision, it does not
+    # approximate it.
+    for m in (nothing, (mm = trues(N, N); mm[20:40, 20:40] .= false; mm)),
+        strat in (CGEF.Filtering.Deformable(), CGEF.Filtering.ZeroFill()),
+        sc in (4000.0, 16000.0)
+
+        gR = m === nothing ? FG.Grids.StructuredGrid(geom, xr, xr) : FG.Grids.StructuredGrid(geom, xr, xr, m)
+        gV = m === nothing ? FG.Grids.StructuredGrid(geom, xv, xv) : FG.Grids.StructuredGrid(geom, xv, xv, m)
+        oR = zeros(N, N); oV = zeros(N, N)
+        CGEF.Filtering.filter_apply!(oR, u, CGEF.Filtering.plan_filter(gR, CGEF.TopHatKernel(), sc;
+            backend = CGEF.ComputationalBackends.SerialBackend(), mask_strategy = strat))
+        CGEF.Filtering.filter_apply!(oV, u, CGEF.Filtering.plan_filter(gV, CGEF.TopHatKernel(), sc;
+            backend = CGEF.ComputationalBackends.SerialBackend(), mask_strategy = strat))
+        Test.@test oR == oV
+    end
+
+    # Separable Gaussian: the position-major weight table is the matrix path, reached by a Vector axis;
+    # the vector-table path is reached by a Range. Same geometry, so they agree to round-off.
+    let gR = FG.Grids.StructuredGrid(geom, xr, xr),
+        gV = FG.Grids.StructuredGrid(geom, xv, xv),
+        oR = zeros(N, N), oV = zeros(N, N)
+        CGEF.Filtering.filter_apply!(oR, u, CGEF.Filtering.plan_filter(gR, CGEF.GaussianKernel(), 8000.0;
+            backend = CGEF.ComputationalBackends.SerialBackend()))
+        CGEF.Filtering.filter_apply!(oV, u, CGEF.Filtering.plan_filter(gV, CGEF.GaussianKernel(), 8000.0;
+            backend = CGEF.ComputationalBackends.SerialBackend()))
+        Test.@test oR ≈ oV rtol = 1e-12
+        # A normalized low-pass returns a constant unchanged, on both tables.
+        cR = zeros(N, N); cV = zeros(N, N)
+        CGEF.Filtering.filter_apply!(cR, fill(2.75, N, N), CGEF.Filtering.plan_filter(gR, CGEF.GaussianKernel(), 8000.0;
+            backend = CGEF.ComputationalBackends.SerialBackend()))
+        CGEF.Filtering.filter_apply!(cV, fill(2.75, N, N), CGEF.Filtering.plan_filter(gV, CGEF.GaussianKernel(), 8000.0;
+            backend = CGEF.ComputationalBackends.SerialBackend()))
+        Test.@test all(≈(2.75; rtol = 1e-12), cR)
+        Test.@test all(≈(2.75; rtol = 1e-12), cV)
+    end
+
+    # Periodic wrap is split into two constant-offset runs rather than indexed through `mod1`; a
+    # nonuniform periodic axis still takes the general path, so it is the reference.
+    let xp = range(0.0, dx * N; length = N + 1)[1:N],
+        gP = FG.Grids.StructuredGrid(geom, xp, xp; periodic = (true, true)),
+        gN = FG.Grids.StructuredGrid(geom, collect(xp), collect(xp); periodic = (true, true), period = (dx * N, dx * N)),
+        oP = zeros(N, N), oN = zeros(N, N)
+        CGEF.Filtering.filter_apply!(oP, u, CGEF.Filtering.plan_filter(gP, CGEF.GaussianKernel(), 8000.0;
+            backend = CGEF.ComputationalBackends.SerialBackend()))
+        CGEF.Filtering.filter_apply!(oN, u, CGEF.Filtering.plan_filter(gN, CGEF.GaussianKernel(), 8000.0;
+            backend = CGEF.ComputationalBackends.SerialBackend()))
+        Test.@test oP ≈ oN rtol = 1e-12
     end
 end
