@@ -70,4 +70,102 @@ function _distributed_apply_separable_gaussian!(
     return out
 end
 
+
+# Distributed analogue of the driver the serial and threaded backends pass to
+# `apply_separable_gaussian_nd!`, so the `N`-pass engine has one implementation across all three.
+@inline function _dist_driver(f::F, indices) where {F}
+    @sync Distributed.@distributed for i in eachindex(indices)
+        f(indices[i])
+    end
+    return nothing
+end
+
+_shared_like(a::AbstractArray{T}) where {T} =
+    (sh = SharedArrays.SharedArray{T}(size(a)); copyto!(sh, a); sh)
+
+# 1-D and true-3-D grids. `N` is unconstrained, so the 2-D method above is more specific and still wins
+# for N=2. Point-indexed footprints decompose over linear indices; the separable Gaussian instead has
+# its plan-local pass buffers REBUILT as SharedArrays, because a `@distributed` loop writing the plan's
+# own arrays would write them in the workers' address spaces and the caller would see nothing.
+function CGEF.Filtering.distributed_filter_field!(
+    out::AbstractArray{T,N},
+    field::AbstractArray,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+    kernel::CGEF.Kernels.AbstractFilterKernel,
+    scale::T,
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
+    workspace,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
+    fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    dims = FlowGeometries.Grids.size_tuple(grid)
+    mask = FlowGeometries.Grids.mask(grid)
+
+    if fp isa CGEF.Filtering.SeparableGaussianFootprintND
+        CGEF.Filtering._separable_check_strategy(fp, mask_strategy)
+        sfp = CGEF.Filtering.SeparableGaussianFootprintND(
+            fp.g, fp.lim, fp.periodic, fp.profiles, fp.invrenorm, fp.masked,
+            _shared_like(fp.masked_input), _shared_like(fp.scratch),
+        )
+        s_out = SharedArrays.SharedArray{T}(dims)
+        CGEF.Filtering.apply_separable_gaussian_nd!(s_out, field, grid, sfp, mask_strategy, _dist_driver)
+        copyto!(out, s_out)
+        return out
+    end
+
+    s_out = SharedArrays.SharedArray{T}(dims)
+    fill!(s_out, zero(T))
+    cart = CartesianIndices(dims)
+    if fp isa CGEF.Filtering.FilterFootprintND
+        periodic = FlowGeometries.Grids.periodic_flags(grid)
+        @sync Distributed.@distributed for lin in 1:length(s_out)
+            I = cart[lin]
+            if mask[I]
+                s_out[I] = CGEF.Filtering._footprint_nd_point(field, fp, mask_strategy, dims, periodic, mask, I)
+            end
+        end
+    elseif fp.cache !== nothing
+        lin_idx = LinearIndices(dims)
+        cache = fp.cache
+        @sync Distributed.@distributed for lin in 1:length(s_out)
+            I = cart[lin]
+            if mask[I]
+                s_out[I] = CGEF.Filtering._footprint_nd_point_cached(field, cache, mask_strategy, mask, lin_idx, I)
+            end
+        end
+    else
+        @sync Distributed.@distributed for lin in 1:length(s_out)
+            I = cart[lin]
+            if mask[I]
+                s_out[I] = CGEF.Filtering._footprint_nd_point_streaming(field, grid, fp, mask_strategy, mask, dims, I)
+            end
+        end
+    end
+    copyto!(out, s_out)
+    return out
+end
+
+# Node sets. A node grid's real-space footprint is always a `NodeFilterPlan`, so unlike the 2-D method
+# there is no separable or prefix-sum variant to branch on. Nodes carry no row structure, so the
+# decomposition is over `eachindex(out)` directly; node `t` writes only `out[t]`, so the SharedArray
+# needs no reduction and the result is identical to serial.
+function CGEF.Filtering.distributed_filter_field!(
+    out::AbstractVector{T},
+    field::AbstractVector,
+    grid::FlowGeometries.Grids.UnstructuredGrid{T},
+    kernel::CGEF.Kernels.AbstractFilterKernel,
+    scale::T,
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
+    workspace,
+) where {T<:AbstractFloat}
+    fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    n = length(out)
+    s_out = SharedArrays.SharedArray{T}(n)
+    fill!(s_out, zero(T))
+    @sync Distributed.@distributed for t in 1:n
+        s_out[t] = CGEF.Filtering._footprint_node_point(field, grid, fp, mask_strategy, t)
+    end
+    copyto!(out, s_out)
+    return out
+end
+
 end # module

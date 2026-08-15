@@ -197,4 +197,60 @@ function CGEF.Filtering.threaded_filter_field!(
     return out
 end
 
+
+# Node sets are point-indexed with no row structure, so this parallelizes over `eachindex(out)` on
+# the same argument as the 1D/true-3D method above: node `t` writes only `out[t]`. It reuses the
+# serial per-node kernel, so the result is bit-identical to serial.
+function CGEF.Filtering.threaded_filter_field!(
+    out::AbstractVector{T},
+    field::AbstractVector,
+    grid::FlowGeometries.Grids.UnstructuredGrid{T},
+    kernel::CGEF.Kernels.AbstractFilterKernel,
+    scale::T,
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
+    workspace,
+) where {T<:AbstractFloat}
+    fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    OhMyThreads.tforeach(eachindex(out); scheduler = _sched()) do t
+        out[t] = CGEF.Filtering._footprint_node_point(field, grid, fp, mask_strategy, t)
+    end
+    return out
+end
+
+# Batched form: one pass over the nodes applying the shared neighbourhood to every field, so the
+# adjacency walk is done once per node rather than once per node per field.
+function CGEF.Filtering.threaded_filter_fields!(
+    outs,
+    fields,
+    grid::FlowGeometries.Grids.UnstructuredGrid{T},
+    kernel::CGEF.Kernels.AbstractFilterKernel,
+    scale::T,
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
+    workspace,
+) where {T<:AbstractFloat}
+    fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    OhMyThreads.tforeach(eachindex(first(outs)); scheduler = _sched()) do t
+        for k in eachindex(outs)
+            outs[k][t] = CGEF.Filtering._footprint_node_point(fields[k], grid, fp, mask_strategy, t)
+        end
+    end
+    return outs
+end
+
+
+# Slice-parallel apply. Slices are independent and each writes only its own output, so this needs no
+# synchronization; the inner apply is forced serial so the two levels of threading never nest.
+#
+# Slices are dispatched LONGEST-FIRST under a dynamic scheduler. Per-slice cost grows at least
+# linearly in the point count and the counts are ragged in practice, so equal-count chunking leaves
+# one worker holding the largest slice after the others have drained. Longest-processing-time-first
+# is the standard remedy and bounds the makespan at 4/3 of optimal.
+function CGEF.Filtering.threaded_filter_slices!(outs, fields, plans)
+    order = sortperm(CGEF.Filtering.slice_costs(plans); rev = true)
+    OhMyThreads.tforeach(order; scheduler = OhMyThreads.DynamicScheduler()) do t
+        CGEF.Filtering.apply_slice_serial!(outs[t], fields[t], plans[t])
+    end
+    return outs
+end
+
 end # module

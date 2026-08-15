@@ -2,11 +2,13 @@
 # Execution backend lattice (ComputationalBackends.jl)
 Test.@testset "Backends" begin
     # Backend resolution returns INSTANCES; AutoBackend picks a concrete local backend. Auto is
-    # resolved by this package, not upstream — upstream leaves that method to the consumer — so it is
-    # asserted through the local resolver rather than through `ComputationalBackends.resolve_backend`.
+    # resolved by this package, not upstream — upstream leaves that method to the consumer — and it
+    # takes the grid, since a backend is only selectable if that grid has a path for it.
     Test.@test CGEF.ComputationalBackends.resolve_backend(CGEF.ComputationalBackends.SerialBackend()) === CGEF.ComputationalBackends.SerialBackend()
-    Test.@test CGEF.Filtering._resolve_backend(CGEF.ComputationalBackends.SerialBackend()) === CGEF.ComputationalBackends.SerialBackend()
-    Test.@test CGEF.Filtering._resolve_backend(CGEF.ComputationalBackends.AutoBackend()) isa Union{CGEF.ComputationalBackends.SerialBackend, CGEF.ComputationalBackends.ThreadedBackend}
+    let g2 = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), 0.0:1000.0:23e3, 0.0:1000.0:23e3)
+        Test.@test CGEF.Filtering._resolve_backend(CGEF.ComputationalBackends.SerialBackend(), g2) === CGEF.ComputationalBackends.SerialBackend()
+        Test.@test CGEF.Filtering._resolve_backend(CGEF.ComputationalBackends.AutoBackend(), g2) isa Union{CGEF.ComputationalBackends.SerialBackend, CGEF.ComputationalBackends.ThreadedBackend}
+    end
 
     # distribution wrappers are parametric over an inner local backend
     Test.@test CGEF.ComputationalBackends.DistributedBackend(CGEF.ComputationalBackends.SerialBackend()) isa CGEF.ComputationalBackends.DistributedBackend
@@ -14,6 +16,143 @@ Test.@testset "Backends" begin
     Test.@test CGEF.ComputationalBackends.DistributedBackend().inner === CGEF.ComputationalBackends.SerialBackend()
     Test.@test CGEF.ComputationalBackends.local_backend(CGEF.ComputationalBackends.DistributedBackend(CGEF.ComputationalBackends.ThreadedBackend())) === CGEF.ComputationalBackends.ThreadedBackend()
     Test.@test CGEF.ComputationalBackends.is_distributed(CGEF.ComputationalBackends.MPIBackend()) && !CGEF.ComputationalBackends.is_distributed(CGEF.ComputationalBackends.SerialBackend())
+
+    # Backend honesty, over every (grid architecture x backend) pair. A backend request is either
+    # honored exactly or refused; `AutoBackend` may choose, but only among backends the grid can
+    # actually run. Asserted on the resolution itself rather than on timing, so it is deterministic.
+    let cart = FG.Geometry.CartesianGeometry(),
+        xr = 0.0:1000.0:23e3,
+        nn = 24
+        xg = [Float64(i - 1) * 1000.0 for i in 1:nn, j in 1:nn]
+        yg = [Float64(j - 1) * 1000.0 for i in 1:nn, j in 1:nn]
+        honesty_grids = (
+            FG.Grids.StructuredGrid(cart, xr),                       # 1D
+            FG.Grids.StructuredGrid(cart, xr, xr),                   # 2D
+            FG.Grids.StructuredGrid(cart, 0.0:1e3:7e3, 0.0:1e3:7e3, 0.0:1e3:7e3),  # true 3D
+            FG.Grids.CurvilinearGrid(cart, xg, yg, trues(nn, nn)),
+            FG.Grids.UnstructuredGrid(cart, vec(xg), vec(yg), trues(nn * nn);
+                                      k = 4, areas = fill(1.0e6, nn * nn)),
+        )
+        backends = (
+            CGEF.ComputationalBackends.SerialBackend(),
+            CGEF.ComputationalBackends.ThreadedBackend(),
+            CGEF.ComputationalBackends.DistributedBackend(),
+            CGEF.ComputationalBackends.MPIBackend(),
+        )
+        for g in honesty_grids
+            # Auto never selects a backend this grid cannot honor.
+            picked = CGEF.Filtering._resolve_backend(CGEF.ComputationalBackends.AutoBackend(), g)
+            Test.@test CGEF.Filtering._backend_supported(g, picked)
+            # An explicit unsupported request errors rather than silently running serial.
+            for b in backends
+                CGEF.Filtering._backend_supported(g, b) && continue
+                Test.@test_throws ArgumentError CGEF.Filtering.plan_filter(
+                    g, CGEF.TopHatKernel(), 5000.0;
+                    backend = b, method = CGEF.Filtering.RealSpace(),
+                )
+            end
+        end
+        # Slice-parallel apply: many independent problems, one plan each. Ragged point counts, since
+        # that is what a real batch looks like and it is what the longest-first schedule exists for.
+        let counts = [37, 121, 64, 199, 88, 150, 45, 176],
+            sl_plans = map(counts) do n
+                xs = collect(range(0.0, 1.0e4; length = n))
+                sg = FG.Grids.StructuredGrid(cart, xs)
+                CGEF.Filtering.plan_filter(sg, CGEF.GaussianKernel(), 2000.0;
+                    backend = CGEF.ComputationalBackends.SerialBackend(),
+                    method = CGEF.Filtering.RealSpace())
+            end
+            sl_fields = [randn(n) for n in counts]
+            o_ser = [zeros(n) for n in counts]
+            o_thr = [zeros(n) for n in counts]
+            o_ref = [zeros(n) for n in counts]
+
+            CGEF.Filtering.filter_slices!(o_ser, sl_fields, sl_plans;
+                backend = CGEF.ComputationalBackends.SerialBackend())
+            CGEF.Filtering.filter_slices!(o_thr, sl_fields, sl_plans;
+                backend = CGEF.ComputationalBackends.ThreadedBackend())
+            # Reference: each slice applied on its own through the ordinary single-plan entry point.
+            for t in eachindex(sl_plans)
+                CGEF.Filtering.filter_apply!(o_ref[t], sl_fields[t], sl_plans[t])
+            end
+
+            # Threading the slice axis reorders nothing within a slice, so this is exact, not ≈.
+            Test.@test all(o_ser[t] == o_ref[t] for t in eachindex(sl_plans))
+            Test.@test all(o_thr[t] == o_ref[t] for t in eachindex(sl_plans))
+            # Cost proxy drives the longest-first schedule, so it must track the point counts.
+            Test.@test CGEF.Filtering.slice_costs(sl_plans) == counts
+            # Mismatched collection lengths are a caller error, not something to silently truncate.
+            Test.@test_throws DimensionMismatch CGEF.Filtering.filter_slices!(
+                o_ser[1:3], sl_fields, sl_plans)
+        end
+
+        # A node set is point-parallel, so threading it is supported and bit-identical to serial.
+        ug = honesty_grids[end]
+        Test.@test CGEF.Filtering._backend_supported(ug, CGEF.ComputationalBackends.ThreadedBackend())
+        uf = randn(nn * nn)
+        os = zeros(nn * nn); ot = zeros(nn * nn)
+        CGEF.Filtering.filter_apply!(os, uf, CGEF.Filtering.plan_filter(
+            ug, CGEF.GaussianKernel(), 5000.0;
+            backend = CGEF.ComputationalBackends.SerialBackend(), method = CGEF.Filtering.RealSpace()))
+        CGEF.Filtering.filter_apply!(ot, uf, CGEF.Filtering.plan_filter(
+            ug, CGEF.GaussianKernel(), 5000.0;
+            backend = CGEF.ComputationalBackends.ThreadedBackend(), method = CGEF.Filtering.RealSpace()))
+        Test.@test os == ot
+
+        # Every point-indexed grid (1D, true-3D, node) against every parallel backend, both kernels and
+        # both mask strategies, asserted BIT-identical to serial. These paths decompose over linear
+        # indices rather than rows; the assertion is `==` because none of them reorders a reduction.
+        let dx = 1000.0,
+            x1 = 0.0:dx:dx*39,
+            x3 = 0.0:dx:dx*9,
+            m3 = (mm = trues(10, 10, 10); mm[3:4, 3:4, 3:4] .= false; mm),
+            pt_grids = (
+                (FG.Grids.StructuredGrid(cart, x1), (40,)),
+                (FG.Grids.StructuredGrid(cart, collect(x1) .+ [iseven(i) ? 3.0 : -2.0 for i in 1:40]), (40,)),
+                (FG.Grids.StructuredGrid(cart, x3, x3, x3), (10, 10, 10)),
+                (FG.Grids.StructuredGrid(cart, x3, x3, x3, m3), (10, 10, 10)),
+            ),
+            par_backends = (
+                CGEF.ComputationalBackends.ThreadedBackend(),
+                CGEF.ComputationalBackends.DistributedBackend(),
+                CGEF.ComputationalBackends.MPIBackend(),
+                CGEF.ComputationalBackends.GPUBackend(KA.CPU()),
+            )
+            for (pg, sz) in pt_grids
+                pu = randn(sz...)
+                for kern in (CGEF.TopHatKernel(), CGEF.GaussianKernel()),
+                    strat in (CGEF.Filtering.Deformable(), CGEF.Filtering.ZeroFill())
+                    ref = zeros(sz...)
+                    CGEF.Filtering.filter_apply!(ref, pu, CGEF.Filtering.plan_filter(
+                        pg, kern, 4000.0;
+                        backend = CGEF.ComputationalBackends.SerialBackend(), mask_strategy = strat))
+                    for b in par_backends
+                        Test.@test CGEF.Filtering._backend_supported(pg, b)
+                        got = zeros(sz...)
+                        CGEF.Filtering.filter_apply!(got, pu, CGEF.Filtering.plan_filter(
+                            pg, kern, 4000.0; backend = b, mask_strategy = strat))
+                        Test.@test got == ref
+                    end
+                end
+            end
+        end
+
+        # Node sets also have a device path: the footprint is a CSR adjacency, so the kernel is a flat
+        # per-node gather with no row decomposition. Verified on `KA.CPU()`, which needs no hardware.
+        Test.@test CGEF.Filtering._backend_supported(ug, CGEF.ComputationalBackends.GPUBackend(KA.CPU()))
+        for strat in (CGEF.Filtering.Deformable(), CGEF.Filtering.ZeroFill())
+            p_ser = CGEF.Filtering.plan_filter(ug, CGEF.GaussianKernel(), 5000.0;
+                backend = CGEF.ComputationalBackends.SerialBackend(),
+                method = CGEF.Filtering.RealSpace(), mask_strategy = strat)
+            p_gpu = CGEF.Filtering.plan_filter(ug, CGEF.GaussianKernel(), 5000.0;
+                backend = CGEF.ComputationalBackends.GPUBackend(KA.CPU()),
+                method = CGEF.Filtering.RealSpace(), mask_strategy = strat)
+            g_ser = zeros(nn * nn); g_gpu = zeros(nn * nn)
+            CGEF.Filtering.filter_apply!(g_ser, uf, p_ser)
+            CGEF.Filtering.filter_apply!(g_gpu, uf, p_gpu)
+            Test.@test g_ser == g_gpu
+        end
+    end
 
     geom = FG.Geometry.CartesianGeometry()
     x = collect(0.0:1000.0:20e3)
@@ -132,9 +271,12 @@ Test.@testset "Threaded backend: 1D/true-3D StructuredGrid (ND footprint)" begin
     CGEF.Filtering.filter_field!(ost3, su3, sgrid, CGEF.TopHatKernel(), 150e3; backend = CGEF.ComputationalBackends.ThreadedBackend())
     Test.@test ost3 ≈ oss3
 
-    # Distributed/GPU/MPI still have no ND hook -- an explicit request must error, not silently
-    # downgrade to serial.
-    Test.@test_throws ArgumentError CGEF.Filtering.filter_field!(os1, u1, grid1, CGEF.TopHatKernel(), 5000.0; backend = CGEF.ComputationalBackends.DistributedBackend())
+    # Distributed now has an ND hook: it decomposes over linear indices into a SharedArray instead of
+    # over rows, so a 1D grid is honored rather than refused, and agrees with serial exactly.
+    osd1 = zeros(size(u1))
+    CGEF.Filtering.filter_field!(osd1, u1, grid1, CGEF.TopHatKernel(), 5000.0;
+        backend = CGEF.ComputationalBackends.DistributedBackend())
+    Test.@test osd1 == os1
 end
 
 

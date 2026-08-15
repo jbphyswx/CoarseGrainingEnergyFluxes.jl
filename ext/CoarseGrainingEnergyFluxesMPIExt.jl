@@ -96,4 +96,87 @@ function _mpi_apply_prefixsum_tophat!(
     return out
 end
 
+
+# 1-D and true-3-D grids. `N` unconstrained, so the 2-D method above stays more specific for N=2. Ranks
+# take a round-robin stride of linear indices and recombine with `Allreduce!`; strides are disjoint, so
+# the sum reassembles the field exactly as the row partition does.
+#
+# The separable Gaussian is run WHOLE on every rank rather than partitioned: its `N` passes each read
+# across the previous pass's entire output, so a strided partition would need an Allreduce between
+# passes, and the passes write buffers held inside the plan. Replicating it costs one rank's work and
+# keeps the result exact; partitioning it needs a halo exchange per pass, which is a real design, not a
+# loop change.
+function CGEF.Filtering.mpi_filter_field!(
+    out::AbstractArray{T,N},
+    field::AbstractArray,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+    kernel::CGEF.Kernels.AbstractFilterKernel,
+    scale::T,
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
+    workspace,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+    nproc = MPI.Comm_size(comm)
+    fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    dims = FlowGeometries.Grids.size_tuple(grid)
+    mask = FlowGeometries.Grids.mask(grid)
+
+    if fp isa CGEF.Filtering.SeparableGaussianFootprintND
+        return CGEF.Filtering.apply_separable_gaussian_nd!(out, field, grid, fp, mask_strategy)
+    end
+
+    fill!(out, zero(T))
+    cart = CartesianIndices(dims)
+    if fp isa CGEF.Filtering.FilterFootprintND
+        periodic = FlowGeometries.Grids.periodic_flags(grid)
+        for lin in (rank + 1):nproc:length(out)
+            I = cart[lin]
+            mask[I] || continue
+            out[I] = CGEF.Filtering._footprint_nd_point(field, fp, mask_strategy, dims, periodic, mask, I)
+        end
+    elseif fp.cache !== nothing
+        lin_idx = LinearIndices(dims)
+        for lin in (rank + 1):nproc:length(out)
+            I = cart[lin]
+            mask[I] || continue
+            out[I] = CGEF.Filtering._footprint_nd_point_cached(field, fp.cache, mask_strategy, mask, lin_idx, I)
+        end
+    else
+        for lin in (rank + 1):nproc:length(out)
+            I = cart[lin]
+            mask[I] || continue
+            out[I] = CGEF.Filtering._footprint_nd_point_streaming(field, grid, fp, mask_strategy, mask, dims, I)
+        end
+    end
+    MPI.Allreduce!(out, +, comm)
+    return out
+end
+
+# Node sets. A node grid's real-space footprint is always a `NodeFilterPlan`, so there is no separable
+# or prefix-sum variant to branch on, and nodes have no row structure — the partition is round-robin
+# over nodes instead. Ranks own disjoint nodes, so the `Allreduce!` sum reassembles the field exactly
+# as the row version does, and the result is identical to serial.
+function CGEF.Filtering.mpi_filter_field!(
+    out::AbstractVector{T},
+    field::AbstractVector,
+    grid::FlowGeometries.Grids.UnstructuredGrid{T},
+    kernel::CGEF.Kernels.AbstractFilterKernel,
+    scale::T,
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
+    workspace,
+) where {T<:AbstractFloat}
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+    nproc = MPI.Comm_size(comm)
+    fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+
+    fill!(out, zero(T))
+    for t in (rank + 1):nproc:length(out)
+        out[t] = CGEF.Filtering._footprint_node_point(field, grid, fp, mask_strategy, t)
+    end
+    MPI.Allreduce!(out, +, comm)
+    return out
+end
+
 end # module

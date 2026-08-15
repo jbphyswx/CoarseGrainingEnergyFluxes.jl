@@ -67,7 +67,8 @@ function CGEF.Filtering.spectral_filter_plan(
     lmax = is_clenshaw_curtis ? Lr : max(1, floor(Int, sqrt(npts)) - 1)
     θ = T(π) / 2 .- FlowGeometries.Grids.coordinates(grid, 2)        # colatitude from latitude
     φ = FlowGeometries.Grids.coordinates(grid, 1)
-    nplan = NUFSHT.make_plan(collect(T, θ), collect(T, φ), lmax; T = T)
+    # Element type is the leading positional argument, not a keyword.
+    nplan = NUFSHT.make_plan(T, collect(T, θ), collect(T, φ), lmax)
     filter = _CGEFTransfer(kernel, scale, FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid)))
     mask = all(FlowGeometries.Grids.mask(grid)) ? nothing : T.(FlowGeometries.Grids.mask(grid))
     # `ZeroFill` is already exactly `filter(mask · field)`; only `Deformable` divides by the local mass.

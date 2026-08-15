@@ -892,6 +892,41 @@ end
 # ---------------------------------------------------------------------------
 
 """
+    active_area(grid) -> T
+
+Total area of the active cells: the denominator of every spatial average here.
+"""
+function active_area(grid::FlowGeometries.Grids.AbstractGrid{G,T}) where {G, T<:AbstractFloat}
+    total = zero(T)
+    for I in CartesianIndices(FlowGeometries.Grids.size_tuple(grid))
+        FlowGeometries.Grids.isactive(grid, Tuple(I)...) || continue
+        total += FlowGeometries.Grids.area(grid, Tuple(I)...)
+    end
+    total > zero(T) || throw(ArgumentError("grid has no active cells (all masked out)"))
+    return total
+end
+
+"""
+    energy_from_filtered(ws, grid, has_w, total_area) -> E(ℓ)
+
+`E(ℓ) = ½⟨|ū_ℓ|²⟩` read from the filtered velocities already in `ws`. [`compute_Π!`](@ref) leaves
+exactly those there, so calling this straight after it filters `u`/`v` once per scale rather than
+twice.
+"""
+function energy_from_filtered(
+    ws::ΠWorkspace{T}, grid::FlowGeometries.Grids.AbstractGrid, has_w::Bool, total_area::T,
+) where {T<:AbstractFloat}
+    e = zero(T)
+    @inbounds for I in CartesianIndices(ws.u_filt)
+        FlowGeometries.Grids.isactive(grid, Tuple(I)...) || continue
+        v2 = ws.u_filt[I]^2 + ws.v_filt[I]^2
+        has_w && (v2 += ws.w_filt[I]^2)
+        e += v2 * FlowGeometries.Grids.area(grid, Tuple(I)...)
+    end
+    return T(0.5) * e / total_area
+end
+
+"""
     cumulative_energy!(spectrum, u, v, w, grid, kernel, scales; workspace=nothing, backend=AutoBackend(), mask_strategy=Deformable())
 
 In-place [`cumulative_energy`](@ref): writes into the caller-supplied `spectrum` vector and, when
@@ -1104,32 +1139,94 @@ function tau_decomposition(
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
-    # Filter operator (linear): allocate a fresh output (this is a diagnostic, not an inner loop).
-    flt(f) = (o = zeros(T, size(f)); Filtering.filter_apply!(o, f, plan); o)
+    return tau_decomposition!(TauWorkspace(grid), u, v, grid, kernel, scale;
+        backend = backend, mask_strategy = mask_strategy)
+end
 
-    ub = flt(u);  vb = flt(v)          # ū, v̄
-    up = u .- ub; vp = v .- vb         # residuals u', v'
-    ubb = flt(ub); vbb = flt(vb)       # double-filtered ū̄, v̄̄
-    upb = flt(up); vpb = flt(vp)       # filtered residuals ū', v̄'
+"""
+    TauWorkspace(grid)
 
-    # Generalized second moment M(f,g) = (fg)‾ - f̄ ḡ, with f̄ = flt(f).
-    L = (
-        xx = flt(ub .* ub) .- ubb .* ubb,
-        xy = flt(ub .* vb) .- ubb .* vbb,
-        yy = flt(vb .* vb) .- vbb .* vbb,
+Scratch for [`tau_decomposition!`](@ref): the nine output components, the filtered fields and
+residuals, and two product buffers. Allocated once and reused, so a repeated decomposition — over
+timesteps, or over scales — costs no allocation after the first.
+"""
+struct TauWorkspace{T<:AbstractFloat, M<:AbstractMatrix{T}}
+    ub::M; vb::M; up::M; vp::M
+    ubb::M; vbb::M; upb::M; vpb::M
+    prod::M; fprod::M; fprod2::M
+    Lxx::M; Lxy::M; Lyy::M
+    Cxx::M; Cxy::M; Cyy::M
+    Rxx::M; Rxy::M; Ryy::M
+end
+
+function TauWorkspace(grid::FlowGeometries.Grids.StructuredGrid{G,T}) where {T<:AbstractFloat, G}
+    gsz = FlowGeometries.Grids.size_tuple(grid)
+    z() = zeros(T, gsz)
+    return TauWorkspace(z(), z(), z(), z(), z(), z(), z(), z(), z(), z(), z(),
+                        z(), z(), z(), z(), z(), z(), z(), z(), z())
+end
+
+# Generalized second moment M(a,b) = (ab)‾ - ā b̄, written into `dst` through the shared product and
+# filtered-product buffers. A plain function rather than a closure over the workspace: a closure that
+# captured these would box them.
+@inline function _second_moment!(dst, a, b, fa, fb, prod, fprod, plan)
+    @. prod = a * b
+    Filtering.filter_apply!(fprod, prod, plan)
+    @. dst = fprod - fa * fb
+    return dst
+end
+
+"""
+    tau_decomposition!(ws::TauWorkspace, u, v, grid, kernel, scale; filter_plan=nothing, ...) -> (; L, C, R)
+
+In-place [`tau_decomposition`](@ref). Writes into `ws` and returns views of its component buffers, so
+the result is valid until the next call on the same workspace. Supplying `filter_plan` as well makes a
+repeated decomposition allocation-free.
+"""
+function tau_decomposition!(
+    ws::TauWorkspace{T},
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    plan = filter_plan === nothing ?
+        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
+        filter_plan
+
+    Filtering.filter_apply_batch!((ws.ub, ws.vb), (u, v), plan)      # ū, v̄
+    @. ws.up = u - ws.ub                                             # residuals u', v'
+    @. ws.vp = v - ws.vb
+    Filtering.filter_apply_batch!(                                   # ū̄, v̄̄, ū', v̄'
+        (ws.ubb, ws.vbb, ws.upb, ws.vpb), (ws.ub, ws.vb, ws.up, ws.vp), plan,
     )
-    C = (
-        xx = T(2) .* (flt(ub .* up) .- ubb .* upb),
-        xy = (flt(ub .* vp) .- ubb .* vpb) .+ (flt(up .* vb) .- upb .* vbb),
-        yy = T(2) .* (flt(vb .* vp) .- vbb .* vpb),
+
+    _second_moment!(ws.Lxx, ws.ub, ws.ub, ws.ubb, ws.ubb, ws.prod, ws.fprod, plan)
+    _second_moment!(ws.Lxy, ws.ub, ws.vb, ws.ubb, ws.vbb, ws.prod, ws.fprod, plan)
+    _second_moment!(ws.Lyy, ws.vb, ws.vb, ws.vbb, ws.vbb, ws.prod, ws.fprod, plan)
+
+    _second_moment!(ws.Cxx, ws.ub, ws.up, ws.ubb, ws.upb, ws.prod, ws.fprod, plan)
+    @. ws.Cxx *= T(2)
+    # The cross term is the sum of both orderings, so the second lands in `fprod2` before adding.
+    _second_moment!(ws.Cxy, ws.ub, ws.vp, ws.ubb, ws.vpb, ws.prod, ws.fprod, plan)
+    _second_moment!(ws.fprod2, ws.up, ws.vb, ws.upb, ws.vbb, ws.prod, ws.fprod, plan)
+    @. ws.Cxy += ws.fprod2
+    _second_moment!(ws.Cyy, ws.vb, ws.vp, ws.vbb, ws.vpb, ws.prod, ws.fprod, plan)
+    @. ws.Cyy *= T(2)
+
+    _second_moment!(ws.Rxx, ws.up, ws.up, ws.upb, ws.upb, ws.prod, ws.fprod, plan)
+    _second_moment!(ws.Rxy, ws.up, ws.vp, ws.upb, ws.vpb, ws.prod, ws.fprod, plan)
+    _second_moment!(ws.Ryy, ws.vp, ws.vp, ws.vpb, ws.vpb, ws.prod, ws.fprod, plan)
+
+    return (
+        L = (xx = ws.Lxx, xy = ws.Lxy, yy = ws.Lyy),
+        C = (xx = ws.Cxx, xy = ws.Cxy, yy = ws.Cyy),
+        R = (xx = ws.Rxx, xy = ws.Rxy, yy = ws.Ryy),
     )
-    R = (
-        xx = flt(up .* up) .- upb .* upb,
-        xy = flt(up .* vp) .- upb .* vpb,
-        yy = flt(vp .* vp) .- vpb .* vpb,
-    )
-    return (; L = L, C = C, R = R)
 end
 
 # The (east, north) block of the same rotation, for callers with no radial component. Inlined, so the
@@ -1268,52 +1365,118 @@ function compute_Π_decomposed(
     size(u_rot) == gsz || throw(DimensionMismatch("u_rot has size $(size(u_rot)), grid expects $gsz"))
     size(v_rot) == gsz || throw(DimensionMismatch("v_rot has size $(size(v_rot)), grid expects $gsz"))
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
-    flt(f) = (o = zeros(T, size(f)); Filtering.filter_apply!(o, f, plan); o)
+    return compute_Π_decomposed!(
+        PiDecomposedWorkspace(grid), u, v, u_rot, v_rot, grid, kernel, scale;
+        filter_plan = plan, deriv_plan = dplan,
+    )
+end
+
+"""
+    PiDecomposedWorkspace(grid)
+
+Scratch for [`compute_Π_decomposed!`](@ref): the divergent components, the four filtered means, the
+three stress tensors, the two strain tensors, the four flux fields and three shared temporaries.
+"""
+struct PiDecomposedWorkspace{T<:AbstractFloat, M<:AbstractMatrix{T}}
+    u_div::M; v_div::M
+    ūr::M; v̄r::M; ūd::M; v̄d::M
+    prod::M; fbuf::M; scratch::M
+    τRR_xx::M; τRR_xy::M; τRR_yy::M
+    τDD_xx::M; τDD_xy::M; τDD_yy::M
+    τX_xx::M;  τX_xy::M;  τX_yy::M
+    SR_xx::M;  SR_xy::M;  SR_yy::M
+    SD_xx::M;  SD_xy::M;  SD_yy::M
+    Πrr::M; Πdd::M; Πx::M; total::M
+end
+
+function PiDecomposedWorkspace(grid::FlowGeometries.Grids.StructuredGrid{G,T}) where {T<:AbstractFloat, G}
+    gsz = FlowGeometries.Grids.size_tuple(grid)
+    z() = zeros(T, gsz)
+    return PiDecomposedWorkspace(ntuple(_ -> z(), 28)...)
+end
+
+# S̄_xx = ∂ā/∂x, S̄_yy = ∂b̄/∂y, S̄_xy = ½(∂ā/∂y + ∂b̄/∂x), from an already-filtered pair, into caller
+# buffers. `tmp` is scratch for the second cross derivative.
+@inline function _strain_into!(Sxx, Sxy, Syy, ā, b̄, tmp, grid, dplan, ::Type{T}) where {T}
+    Derivatives.ddx!(Sxx, ā, grid, dplan)
+    Derivatives.ddy!(Syy, b̄, grid, dplan)
+    Derivatives.ddy!(Sxy, ā, grid, dplan)
+    Derivatives.ddx!(tmp, b̄, grid, dplan)
+    @. Sxy = T(0.5) * (Sxy + tmp)
+    return nothing
+end
+
+"""
+    compute_Π_decomposed!(ws, u, v, u_rot, v_rot, grid, kernel, scale; filter_plan=nothing, deriv_plan=nothing, ...)
+        -> (; total, rotational, cross, divergent)
+
+In-place [`compute_Π_decomposed`](@ref). Returns views of `ws`'s buffers, valid until the next call on
+the same workspace. With `ws` and both plans supplied, a repeated evaluation allocates nothing.
+"""
+function compute_Π_decomposed!(
+    ws::PiDecomposedWorkspace{T},
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    u_rot::AbstractMatrix,
+    v_rot::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
+    deriv_plan::Union{Nothing,Derivatives.StencilPlan} = nothing,
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    plan = filter_plan === nothing ?
+        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
+        filter_plan
+    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
 
     # Divergent (irrotational) part is the complement of the supplied rotational part.
-    u_div = u .- u_rot
-    v_div = v .- v_rot
+    @. ws.u_div = u - u_rot
+    @. ws.v_div = v - v_rot
 
-    # Self subfilter stress τ(a,a): (xx, xy, yy) of τ_ij = ⟨a_i a_j⟩ - ā_i ā_j.
-    function self_stress(a, b)
-        ā = flt(a); b̄ = flt(b)
-        return (xx = flt(a .* a) .- ā .* ā,
-                xy = flt(a .* b) .- ā .* b̄,
-                yy = flt(b .* b) .- b̄ .* b̄)
-    end
-    # Combined cross stress τ(a,b) + τ(b,a) for two DIFFERENT vector fields a=(a1,a2), b=(b1,b2):
-    # the diagonal (xx, yy) components are automatically symmetric under a↔b (a1*b1 = b1*a1
-    # pointwise), so each just doubles; the off-diagonal (xy) component genuinely needs both terms.
-    function cross_stress(a1, a2, b1, b2)
-        ā1 = flt(a1); ā2 = flt(a2); b̄1 = flt(b1); b̄2 = flt(b2)
-        return (xx = T(2) .* (flt(a1 .* b1) .- ā1 .* b̄1),
-                xy = (flt(a1 .* b2) .- ā1 .* b̄2) .+ (flt(b1 .* a2) .- b̄1 .* ā2),
-                yy = T(2) .* (flt(a2 .* b2) .- ā2 .* b̄2))
-    end
+    # The four filtered means each feed a self stress, the cross stress AND a strain, so they are
+    # filtered once. One batch, so a scattered engine derives each neighbourhood once for all four.
+    Filtering.filter_apply_batch!(
+        (ws.ūr, ws.v̄r, ws.ūd, ws.v̄d), (u_rot, v_rot, ws.u_div, ws.v_div), plan,
+    )
 
-    τ_RR = self_stress(u_rot, v_rot)
-    τ_DD = self_stress(u_div, v_div)
-    τ_X  = cross_stress(u_rot, v_rot, u_div, v_div)
+    # Self stresses τ(a,a)_ij = ⟨a_i a_j⟩ - ā_i ā_j.
+    _second_moment!(ws.τRR_xx, u_rot, u_rot, ws.ūr, ws.ūr, ws.prod, ws.fbuf, plan)
+    _second_moment!(ws.τRR_xy, u_rot, v_rot, ws.ūr, ws.v̄r, ws.prod, ws.fbuf, plan)
+    _second_moment!(ws.τRR_yy, v_rot, v_rot, ws.v̄r, ws.v̄r, ws.prod, ws.fbuf, plan)
+    _second_moment!(ws.τDD_xx, ws.u_div, ws.u_div, ws.ūd, ws.ūd, ws.prod, ws.fbuf, plan)
+    _second_moment!(ws.τDD_xy, ws.u_div, ws.v_div, ws.ūd, ws.v̄d, ws.prod, ws.fbuf, plan)
+    _second_moment!(ws.τDD_yy, ws.v_div, ws.v_div, ws.v̄d, ws.v̄d, ws.prod, ws.fbuf, plan)
 
-    # Strain S̄_xx = ∂ū/∂x, S̄_yy = ∂v̄/∂y, S̄_xy = ½(∂ū/∂y + ∂v̄/∂x), from a velocity pair.
-    function strain(a, b)
-        ā = flt(a); b̄ = flt(b)
-        Sxx = similar(ā); Derivatives.ddx!(Sxx, ā, grid, dplan)
-        Syy = similar(ā); Derivatives.ddy!(Syy, b̄, grid, dplan)
-        p = similar(ā); q = similar(ā)
-        Derivatives.ddy!(p, ā, grid, dplan); Derivatives.ddx!(q, b̄, grid, dplan)
-        return (xx = Sxx, xy = T(0.5) .* (p .+ q), yy = Syy)
-    end
-    S_R = strain(u_rot, v_rot)
-    S_D = strain(u_div, v_div)
+    # Cross stress τ(rot,div) + τ(div,rot). The diagonals are symmetric under the swap so they just
+    # double; the off-diagonal genuinely needs both orderings.
+    _second_moment!(ws.τX_xx, u_rot, ws.u_div, ws.ūr, ws.ūd, ws.prod, ws.fbuf, plan)
+    @. ws.τX_xx *= T(2)
+    _second_moment!(ws.τX_yy, v_rot, ws.v_div, ws.v̄r, ws.v̄d, ws.prod, ws.fbuf, plan)
+    @. ws.τX_yy *= T(2)
+    _second_moment!(ws.τX_xy, u_rot, ws.v_div, ws.ūr, ws.v̄d, ws.prod, ws.fbuf, plan)
+    _second_moment!(ws.scratch, ws.u_div, v_rot, ws.ūd, ws.v̄r, ws.prod, ws.fbuf, plan)
+    @. ws.τX_xy += ws.scratch
+
+    _strain_into!(ws.SR_xx, ws.SR_xy, ws.SR_yy, ws.ūr, ws.v̄r, ws.scratch, grid, dplan, T)
+    _strain_into!(ws.SD_xx, ws.SD_xy, ws.SD_yy, ws.ūd, ws.v̄d, ws.scratch, grid, dplan, T)
 
     mask = FlowGeometries.Grids.mask(grid)
-    contract(S, τ) = ifelse.(mask, -(S.xx .* τ.xx .+ T(2) .* S.xy .* τ.xy .+ S.yy .* τ.yy), zero(T))
-
-    Πrr = contract(S_R, τ_RR)
-    Πdd = contract(S_D, τ_DD)
-    Πx  = contract(S_R, τ_DD) .+ contract(S_D, τ_RR) .+ contract(S_R, τ_X) .+ contract(S_D, τ_X)
-    return (; total = Πrr .+ Πx .+ Πdd, rotational = Πrr, cross = Πx, divergent = Πdd)
+    @. ws.Πrr = ifelse(mask,
+        -(ws.SR_xx * ws.τRR_xx + T(2) * ws.SR_xy * ws.τRR_xy + ws.SR_yy * ws.τRR_yy), zero(T))
+    @. ws.Πdd = ifelse(mask,
+        -(ws.SD_xx * ws.τDD_xx + T(2) * ws.SD_xy * ws.τDD_xy + ws.SD_yy * ws.τDD_yy), zero(T))
+    # Masking is linear, so the four interaction contractions sum inside one `ifelse`.
+    @. ws.Πx = ifelse(mask, -(
+        ws.SR_xx * ws.τDD_xx + T(2) * ws.SR_xy * ws.τDD_xy + ws.SR_yy * ws.τDD_yy +
+        ws.SD_xx * ws.τRR_xx + T(2) * ws.SD_xy * ws.τRR_xy + ws.SD_yy * ws.τRR_yy +
+        ws.SR_xx * ws.τX_xx  + T(2) * ws.SR_xy * ws.τX_xy  + ws.SR_yy * ws.τX_yy  +
+        ws.SD_xx * ws.τX_xx  + T(2) * ws.SD_xy * ws.τX_xy  + ws.SD_yy * ws.τX_yy
+    ), zero(T))
+    @. ws.total = ws.Πrr + ws.Πx + ws.Πdd
+    return (; total = ws.total, rotational = ws.Πrr, cross = ws.Πx, divergent = ws.Πdd)
 end
 
 """
@@ -1450,27 +1613,73 @@ function tracer_variance_flux(
     size(θ) == gsz || throw(DimensionMismatch("θ has size $(size(θ)), grid expects $gsz"))
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
 
-    θ̄ = zeros(T, gsz)
-    ū = zeros(T, gsz)
-    v̄ = zeros(T, gsz)
-    uθ = zeros(T, gsz)
-    vθ = zeros(T, gsz)
-    @. uθ = u * θ
-    @. vθ = v * θ
-    τx = zeros(T, gsz)
-    τy = zeros(T, gsz)
-    Filtering.filter_apply_batch!((ū, v̄, θ̄, τx, τy), (u, v, θ, uθ, vθ), plan)
+    return tracer_variance_flux!(
+        zeros(T, gsz), TracerFluxWorkspace(grid), u, v, θ, grid, kernel, scale;
+        filter_plan = plan, deriv_plan = dplan,
+    )
+end
+
+"""
+    TracerFluxWorkspace(grid)
+
+Scratch for [`tracer_variance_flux!`](@ref): the filtered fields, the two products, the subfilter
+flux components and the resolved tracer gradient. Allocated once and reused.
+"""
+struct TracerFluxWorkspace{T<:AbstractFloat, M<:AbstractMatrix{T}}
+    ū::M; v̄::M; θ̄::M
+    uθ::M; vθ::M
+    τx::M; τy::M
+    gx::M; gy::M
+end
+
+function TracerFluxWorkspace(grid::FlowGeometries.Grids.StructuredGrid{G,T}) where {T<:AbstractFloat, G}
+    gsz = FlowGeometries.Grids.size_tuple(grid)
+    z() = zeros(T, gsz)
+    return TracerFluxWorkspace(z(), z(), z(), z(), z(), z(), z(), z(), z())
+end
+
+"""
+    tracer_variance_flux!(Πθ, ws, u, v, θ, grid, kernel, scale; filter_plan=nothing, deriv_plan=nothing, ...) -> Πθ
+
+In-place [`tracer_variance_flux`](@ref). With `ws`, `filter_plan` and `deriv_plan` all supplied, a
+repeated evaluation — over timesteps or scales — allocates nothing.
+"""
+function tracer_variance_flux!(
+    Πθ::AbstractMatrix{T},
+    ws::TracerFluxWorkspace{T},
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    θ::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
+    deriv_plan::Union{Nothing,Derivatives.StencilPlan} = nothing,
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    plan = filter_plan === nothing ?
+        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
+        filter_plan
+    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
+
+    @. ws.uθ = u * θ
+    @. ws.vθ = v * θ
+    Filtering.filter_apply_batch!(
+        (ws.ū, ws.v̄, ws.θ̄, ws.τx, ws.τy), (u, v, θ, ws.uθ, ws.vθ), plan,
+    )
 
     # Subfilter tracer flux τ_j = ⟨u_j θ⟩ - ū_j θ̄.
-    @. τx -= ū * θ̄
-    @. τy -= v̄ * θ̄
+    @. ws.τx -= ws.ū * ws.θ̄
+    @. ws.τy -= ws.v̄ * ws.θ̄
 
     # Resolved tracer gradient ∂_j θ̄.
-    gx = similar(θ̄); Derivatives.ddx!(gx, θ̄, grid, dplan)
-    gy = similar(θ̄); Derivatives.ddy!(gy, θ̄, grid, dplan)
+    Derivatives.ddx!(ws.gx, ws.θ̄, grid, dplan)
+    Derivatives.ddy!(ws.gy, ws.θ̄, grid, dplan)
 
     mask = FlowGeometries.Grids.mask(grid)
-    return ifelse.(mask, .-(τx .* gx .+ τy .* gy), zero(T))
+    @. Πθ = ifelse(mask, -(ws.τx * ws.gx + ws.τy * ws.gy), zero(T))
+    return Πθ
 end
 
 """

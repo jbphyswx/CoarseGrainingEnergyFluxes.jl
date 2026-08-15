@@ -10,6 +10,34 @@ A correctness/performance/feature overhaul is in progress (see the project plan)
 tracks the work as it lands.
 
 ### Added
+- **Every grid architecture now reaches every execution backend.** Node sets gained threaded, GPU,
+  Distributed and MPI paths (they previously had none — a 48-thread run on scattered data executed
+  serially); 1-D and true-3-D structured grids gained GPU, Distributed and MPI. All decompose over
+  points or linear indices rather than rows; the separable Gaussian's `N`-pass engine now takes a
+  per-backend driver, so serial, threaded, distributed and device runs share one implementation.
+  Every cell of the (grid × kernel × backend) matrix — 88 combinations across all nine footprint
+  engines — is executed in the test suite and asserted **bit-identical** to serial.
+- **Backend requests are honored or refused, never silently downgraded.** `AutoBackend` resolves
+  against the grid's actual capability (previously it could select a backend the grid had no path
+  for, which then ran serial without notice); an explicit unsupported request throws `ArgumentError`.
+- **`Filtering.filter_slices!`** — apply per-slice plans over many independent slices, the outermost
+  race-free parallel axis. Threaded via longest-first dynamic scheduling (per-slice cost is ragged),
+  with each slice forced serial inside so thread pools never nest. Bit-identical to per-slice
+  `filter_apply!`.
+- **Workspace forms for the three allocating diagnostics** — `tau_decomposition!`,
+  `tracer_variance_flux!` and `compute_Π_decomposed!`, with `TauWorkspace`, `TracerFluxWorkspace`
+  and `PiDecomposedWorkspace`. With the workspace and plans held, per-call allocation drops from
+  46.0 MB / 14.2 MB / 88.5 MB to under 1.1 kB each (the returned NamedTuple); outputs are
+  bit-identical and the `total = rotational + cross + divergent` identity is exact. The allocating
+  forms delegate to these, and `compute_Π_decomposed` also stops re-filtering the four filtered
+  means three times apiece (8 of its 22 filter sweeps were that redundancy).
+- **`benchmark/scaling.jl`** — parallel scaling versus the machine's own measured ceilings. A
+  filtering sweep is a scattered gather, which is memory-latency bound: its achievable speedup is
+  roughly half the core count, so speedups are reported against that measured gather ceiling rather
+  than an ideal `n×` the kernel cannot reach.
+- **The per-scale plan vector in `coarse_grain!`/`coarse_grain_profile` is concretely typed** —
+  built by comprehension instead of `Vector{AbstractFilterPlan}`, whose per-scale dynamic dispatch
+  measured 3.1% of a 256² 8-scale sweep and 21 kB per call against 0 B concrete.
 - **`Derivatives.StencilPlan(grid)`** — the finite-difference weights of every direction, built once.
   They depend only on the axis, its wrap period and the order, never on a field, so a caller taking
   many derivatives on one grid builds this once and passes it; `compute_Π!` builds one internally and

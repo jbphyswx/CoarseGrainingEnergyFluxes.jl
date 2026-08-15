@@ -7,9 +7,9 @@ using SpectralBackends: SpectralBackends
 using StaticArrays: StaticArrays as SA
 
 export AbstractMaskStrategy, ZeroFill, Deformable
-export AbstractFilterMethod, RealSpace, Spectral
+export AbstractFilterMethod, RealSpace, Spectral, AutoMethod
 export AbstractCacheStrategy, AutoCache, AlwaysCache, NeverCache
-export filter_field!, filter_fields!
+export filter_field!, filter_fields!, filter_slices!
 export AbstractFilterPlan, plan_filter, filter_apply!, filter_apply_batch!
 
 # ---------------------------------------------------------------------------
@@ -64,6 +64,18 @@ Transform-space filtering (kernel applied as a multiply on the transformed field
 spectral extension and a compatible grid (e.g. `using FFTW` for a uniform, periodic Cartesian grid).
 """
 struct Spectral <: AbstractFilterMethod end
+
+"""
+    AutoMethod <: AbstractFilterMethod
+
+Pick the engine from real capability, the same contract [`AutoCache`](@ref) and `AutoBackend` follow:
+[`Spectral`](@ref) only where a transform is available AND exact for this grid, otherwise
+[`RealSpace`](@ref).
+
+Selects [`Spectral`](@ref) only where every axis is periodic and uniform and a transform backend is
+loaded — the case where a periodic transform is the exact filter. Otherwise [`RealSpace`](@ref).
+"""
+struct AutoMethod <: AbstractFilterMethod end
 
 """
     AbstractFilterPlan
@@ -155,6 +167,18 @@ end
 # is shared across the batch — a per-field loop would repeat it once per field.
 function threaded_filter_fields!(args...; kwargs...)
     throw(ArgumentError("ThreadedBackend is unavailable — run `using OhMyThreads` (or use SerialBackend())."))
+end
+
+# Slice-parallel form: many INDEPENDENT problems, one plan each. A different axis from
+# `threaded_filter_fields!`, which shares one grid across several fields.
+function threaded_filter_slices!(args...; kwargs...)
+    throw(ArgumentError("ThreadedBackend is unavailable — run `using OhMyThreads` (or use SerialBackend())."))
+end
+
+# Padded-FFT real-space engine (FFTW extension). Zero-padding makes the transform compute the LINEAR
+# convolution, so unlike a periodic transform it holds on bounded and masked domains.
+function padded_fft_footprint(args...; kwargs...)
+    throw(ArgumentError("The padded-FFT real-space engine needs FFTW — run `using FFTW`."))
 end
 
 function distributed_filter_field!(args...; kwargs...)
@@ -591,6 +615,7 @@ function build_footprint(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, TP<:NTuple{2,FlowGeometries.Grids.AbstractTopology}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     rad = Kernels.kernel_radius(kernel, scale)
+
     di = Int[]
     dj = Int[]
     w = T[]
@@ -959,6 +984,37 @@ function apply_prefixsum_tophat_row!(
                 out[i, j] += wyj * num_all
                 den[i, j] += wyj * den_all
             end
+        elseif !fp.periodic_x && ne == Nx && x isa AbstractRange && step(x) > zero(T)
+            # Uniform ascending axis: the two pointers advance by exactly one per target, so the window
+            # is a constant ±w and the walk collapses. `w` is found with the same `≤` the pointer loop
+            # uses, so it makes the same boundary decision. Peeling the interior leaves it branch-free.
+            w = 0
+            while (w + 1) * step(x) <= hw
+                w += 1
+            end
+            ilo = min(w + 1, Nx + 1)
+            ihi = max(Nx - w, 0)
+            @inbounds for i in 1:min(w, Nx)                     # left edge: lo clamps to 1
+                hi = min(Nx, i + w)
+                out[i, j] += wyj * (Pn[hi + 1, jj] - Pn[1, jj])
+                den[i, j] += wyj * (use_mask_den ? (Pd[hi + 1, jj] - Pd[1, jj]) : (Pwx[hi + 1] - Pwx[1]))
+            end
+            if use_mask_den
+                @inbounds @simd for i in ilo:ihi                # interior: no clamping at all
+                    out[i, j] += wyj * (Pn[i + w + 1, jj] - Pn[i - w, jj])
+                    den[i, j] += wyj * (Pd[i + w + 1, jj] - Pd[i - w, jj])
+                end
+            else
+                @inbounds @simd for i in ilo:ihi
+                    out[i, j] += wyj * (Pn[i + w + 1, jj] - Pn[i - w, jj])
+                    den[i, j] += wyj * (Pwx[i + w + 1] - Pwx[i - w])
+                end
+            end
+            @inbounds for i in max(ihi + 1, w + 1):Nx           # right edge: hi clamps to Nx
+                lo = max(1, i - w)
+                out[i, j] += wyj * (Pn[Nx + 1, jj] - Pn[lo, jj])
+                den[i, j] += wyj * (use_mask_den ? (Pd[Nx + 1, jj] - Pd[lo, jj]) : (Pwx[Nx + 1] - Pwx[lo]))
+            end
         else
             lo = 1
             hi = 0
@@ -1120,23 +1176,50 @@ are one code path distinguished by the table's rank: a vector is shared across p
 is `(2·lim+1) × N`, column-major so each position's stencil is contiguous.
 """
 @inline _sepw(g::AbstractVector, ::Int, k::Int) = @inbounds g[k]
-@inline _sepw(g::AbstractMatrix, i::Int, k::Int) = @inbounds g[k, i]
+@inline _sepw(g::AbstractMatrix, i::Int, k::Int) = @inbounds g[i, k]
 
 @inline function _separable_row_pass_at!(
     row_pass::AbstractMatrix{T}, src::AbstractMatrix{T}, gx::AbstractVecOrMat{T},
     di_lim::Int, periodic_x::Bool, Nx::Int, j::Int,
 ) where {T<:AbstractFloat}
-    @inbounds for i in 1:Nx
-        s = zero(T)
-        for ddi in -di_lim:di_lim
-            ii = i + ddi
-            if ii < 1 || ii > Nx
-                periodic_x || continue
-                ii = mod1(ii, Nx)
-            end
-            s += _sepw(gx, i, ddi + di_lim + 1) * src[ii, j]
+    # Taps outermost, position innermost. Accumulating one output point at a time makes the inner loop
+    # an FP reduction, which cannot be reassociated and so never vectorizes; this way the inner loop is
+    # a unit-stride axpy over `i` and does. Measured 1.29 → 0.30 ns per weighted add at Nx=512, w=32.
+    @inbounds begin
+        for i in 1:Nx
+            row_pass[i, j] = zero(T)
         end
-        row_pass[i, j] = s
+        for ddi in (-di_lim):di_lim
+            k = ddi + di_lim + 1
+            if periodic_x && abs(ddi) < Nx
+                # A wrapped tap is two contiguous runs, each at a CONSTANT offset. Writing it as one
+                # loop over `mod1` costs the vectorization, since the index is then data-dependent.
+                if ddi >= 0
+                    @simd for i in 1:(Nx - ddi)
+                        row_pass[i, j] += _sepw(gx, i, k) * src[i + ddi, j]
+                    end
+                    @simd for i in (Nx - ddi + 1):Nx
+                        row_pass[i, j] += _sepw(gx, i, k) * src[i + ddi - Nx, j]
+                    end
+                else
+                    @simd for i in 1:(-ddi)
+                        row_pass[i, j] += _sepw(gx, i, k) * src[i + ddi + Nx, j]
+                    end
+                    @simd for i in (-ddi + 1):Nx
+                        row_pass[i, j] += _sepw(gx, i, k) * src[i + ddi, j]
+                    end
+                end
+            elseif periodic_x
+                # A tap wider than the axis wraps more than once, so it needs the general index.
+                @simd for i in 1:Nx
+                    row_pass[i, j] += _sepw(gx, i, k) * src[mod1(i + ddi, Nx), j]
+                end
+            else
+                @simd for i in max(1, 1 - ddi):min(Nx, Nx - ddi)
+                    row_pass[i, j] += _sepw(gx, i, k) * src[i + ddi, j]
+                end
+            end
+        end
     end
     return nothing
 end
@@ -1145,17 +1228,23 @@ end
     dst::AbstractMatrix{T}, row_pass::AbstractMatrix{T}, gy::AbstractVecOrMat{T},
     dj_lim::Int, periodic_y::Bool, Nx::Int, Ny::Int, j::Int,
 ) where {T<:AbstractFloat}
-    @inbounds for i in 1:Nx
-        s = zero(T)
-        for ddj in -dj_lim:dj_lim
+    # Same inversion as the row pass, and here the weight is constant across `i` — it is indexed by the
+    # output column `j` — so it hoists out of the inner loop entirely.
+    @inbounds begin
+        for i in 1:Nx
+            dst[i, j] = zero(T)
+        end
+        for ddj in (-dj_lim):dj_lim
             jj = j + ddj
             if jj < 1 || jj > Ny
                 periodic_y || continue
                 jj = mod1(jj, Ny)
             end
-            s += _sepw(gy, j, ddj + dj_lim + 1) * row_pass[i, jj]
+            wt = _sepw(gy, j, ddj + dj_lim + 1)
+            @simd for i in 1:Nx
+                dst[i, j] += wt * row_pass[i, jj]
+            end
         end
-        dst[i, j] = s
     end
     return nothing
 end
@@ -1207,7 +1296,10 @@ function _separable_axis_weights(
     wfac::AbstractVector{T},
 ) where {T<:AbstractFloat}
     n = length(x)
-    g = zeros(T, 2 * lim + 1, n)          # an untouched slot is an exact zero: outside the domain
+    # POSITION-major, `(n, 2·lim+1)`: the passes hold a tap fixed and sweep position, so position must
+    # be the contiguous axis or every inner loop gathers with stride `2·lim+1`.
+    # An untouched slot is an exact zero: outside the domain.
+    g = zeros(T, n, 2 * lim + 1)
     @inbounds for i in 1:n, ddi in -lim:lim
         ii = i + ddi
         shift = zero(T)
@@ -1221,7 +1313,7 @@ function _separable_axis_weights(
         # A rectilinear measure is itself a product of per-axis factors, so it splits over the passes
         # exactly as the kernel does. On a uniform axis it is a constant that cancels in the
         # normalization, which is why the vector method above can leave it out.
-        g[ddi + lim + 1, i] = exp(-α * ((x[ii] + shift - x[i]) / scale)^2) * wfac[ii]
+        g[i, ddi + lim + 1] = exp(-α * ((x[ii] + shift - x[i]) / scale)^2) * wfac[ii]
     end
     return g
 end
@@ -1435,6 +1527,127 @@ Fill output row `j` (`out[:, j]`) from a precomputed footprint. Rows are indepen
 disjoint column of the column-major output), so this is the unit of parallelism for the threaded /
 distributed backends. Callers must `fill!(out, 0)` first (masked cells are left untouched here).
 """
+@inline function _footprint_point(
+    field::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid,
+    fp::FilterFootprint{T},
+    lo::Int,
+    hi::Int,
+    strategy::AbstractMaskStrategy,
+    periodic_x::Bool,
+    periodic_y::Bool,
+    Nx::Int,
+    Ny::Int,
+    i::Integer,
+    j::Integer,
+) where {T<:AbstractFloat}
+    weighted_sum = zero(T)
+    weight_norm = zero(T)
+    @inbounds for k in lo:hi
+        jj = j + fp.dj[k]
+        if jj < 1 || jj > Ny
+            periodic_y || continue
+            jj = mod1(jj, Ny)
+        end
+        ii = i + fp.di[k]
+        if ii < 1 || ii > Nx
+            periodic_x || continue
+            ii = mod1(ii, Nx)
+        end
+        active = FlowGeometries.Grids.isactive(grid, ii, jj)
+        w = fp.w[k]
+        if strategy isa ZeroFill
+            # Excluded cells count in the denominator (as zero).
+            weight_norm += w
+            active && (weighted_sum += w * field[ii, jj])
+        else
+            # Deformable: masked cells excluded from numerator AND denominator.
+            active || continue
+            weight_norm += w
+            weighted_sum += w * field[ii, jj]
+        end
+    end
+    return weight_norm > T(1e-15) ? weighted_sum / weight_norm : zero(T)
+end
+
+# Unmasked: every entry contributes at every column, so the denominator is constant across the row
+# interior and both mask strategies coincide. That lets the footprint index move to the outer loop,
+# making the inner loop a contiguous axpy along x. Returns the interior columns handled here; the
+# remaining edge columns (non-periodic x only) go through the general per-point path.
+function _footprint_row_axpy!(
+    out::AbstractMatrix{T},
+    field::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid,
+    fp::FilterFootprint{T},
+    lo::Int,
+    hi::Int,
+    periodic_x::Bool,
+    periodic_y::Bool,
+    Nx::Int,
+    Ny::Int,
+    j::Integer,
+) where {T<:AbstractFloat}
+    grid.mask isa FlowGeometries.Grids.AllActive || return (1, 0)
+    wsum = zero(T)
+    dilim = 0
+    @inbounds for k in lo:hi
+        jj = j + fp.dj[k]
+        if (jj < 1 || jj > Ny) && !periodic_y
+            continue
+        end
+        wsum += fp.w[k]
+        dilim = max(dilim, abs(fp.di[k]))
+    end
+    ilo = periodic_x ? 1 : min(dilim + 1, Nx + 1)
+    ihi = periodic_x ? Nx : max(Nx - dilim, 0)
+    ihi >= ilo || return (1, 0)
+    oc = view(out, :, j)
+    @inbounds @simd for i in ilo:ihi
+        oc[i] = zero(T)
+    end
+    @inbounds for k in lo:hi
+        jj = j + fp.dj[k]
+        if jj < 1 || jj > Ny
+            periodic_y || continue
+            jj = mod1(jj, Ny)
+        end
+        w = fp.w[k]
+        d = fp.di[k]
+        fc = view(field, :, jj)
+        if periodic_x && abs(d) < Nx
+            # Split the wrap into two constant-offset runs so the inner loop stays unit-stride.
+            if d >= 0
+                @simd for i in 1:(Nx-d)
+                    oc[i] += w * fc[i+d]
+                end
+                @simd for i in (Nx-d+1):Nx
+                    oc[i] += w * fc[i+d-Nx]
+                end
+            else
+                @simd for i in 1:(-d)
+                    oc[i] += w * fc[i+d+Nx]
+                end
+                @simd for i in (1-d):Nx
+                    oc[i] += w * fc[i+d]
+                end
+            end
+        elseif periodic_x
+            @simd for i in ilo:ihi
+                oc[i] += w * fc[mod1(i + d, Nx)]
+            end
+        else
+            @simd for i in ilo:ihi
+                oc[i] += w * fc[i+d]
+            end
+        end
+    end
+    s = wsum > T(1e-15) ? inv(wsum) : zero(T)
+    @inbounds @simd for i in ilo:ihi
+        oc[i] *= s
+    end
+    return (ilo, ihi)
+end
+
 function apply_footprint_row!(
     out::AbstractMatrix{T},
     field::AbstractMatrix,
@@ -1449,35 +1662,14 @@ function apply_footprint_row!(
     b = _band(fp, grid, j)
     lo = fp.ptr[b]
     hi = fp.ptr[b+1] - 1
-    for i in 1:Nx
+    ilo, ihi = _footprint_row_axpy!(out, field, grid, fp, lo, hi, periodic_x, periodic_y, Nx, Ny, j)
+    for i in 1:(ilo-1)
         FlowGeometries.Grids.isactive(grid, i, j) || continue
-        weighted_sum = zero(T)
-        weight_norm = zero(T)
-        @inbounds for k in lo:hi
-            jj = j + fp.dj[k]
-            if jj < 1 || jj > Ny
-                periodic_y || continue
-                jj = mod1(jj, Ny)
-            end
-            ii = i + fp.di[k]
-            if ii < 1 || ii > Nx
-                periodic_x || continue
-                ii = mod1(ii, Nx)
-            end
-            active = FlowGeometries.Grids.isactive(grid, ii, jj)
-            w = fp.w[k]
-            if strategy isa ZeroFill
-                # Excluded cells count in the denominator (as zero).
-                weight_norm += w
-                active && (weighted_sum += w * field[ii, jj])
-            else
-                # Deformable: masked cells excluded from numerator AND denominator.
-                active || continue
-                weight_norm += w
-                weighted_sum += w * field[ii, jj]
-            end
-        end
-        out[i, j] = weight_norm > T(1e-15) ? weighted_sum / weight_norm : zero(T)
+        out[i, j] = _footprint_point(field, grid, fp, lo, hi, strategy, periodic_x, periodic_y, Nx, Ny, i, j)
+    end
+    for i in (ihi+1):Nx
+        FlowGeometries.Grids.isactive(grid, i, j) || continue
+        out[i, j] = _footprint_point(field, grid, fp, lo, hi, strategy, periodic_x, periodic_y, Nx, Ny, i, j)
     end
     return out
 end
@@ -1604,7 +1796,7 @@ This is the same factorization the 2-D path uses, and the reason it matters grow
 `FilterFootprintND` enumerates the whole `∏(2wᵈ+1)` box per point; `N` passes cost `∑(2wᵈ+1)`. At
 `w = 20` in 3-D that is 68,921 multiply-adds per point against 123.
 
-Weight tables follow [`_sepw`](@ref): a vector where the axis is uniform, a `(2wᵈ+1) × Nᵈ` matrix where
+Weight tables follow [`_sepw`](@ref): a vector where the axis is uniform, an `Nᵈ × (2wᵈ+1)` matrix where
 it is stretched.
 """
 struct SeparableGaussianFootprintND{
@@ -1633,7 +1825,15 @@ end
     It = Tuple(I)
     i = It[d]
     s = zero(T)
-    @inbounds for dd in -lim:lim
+    # Interior points need no bounds test at all, so peel them: carrying the branch through the tap
+    # loop blocks vectorization for every point, and the interior is nearly all of them.
+    if lim < i <= n - lim
+        @inbounds @simd for dd in (-lim):lim
+            s += _sepw(g, i, dd + lim + 1) * src[Base.setindex(It, i + dd, d)...]
+        end
+        return s
+    end
+    @inbounds for dd in (-lim):lim
         ii = i + dd
         if ii < 1 || ii > n
             periodic || continue
@@ -1663,10 +1863,96 @@ end
     lim::Int, periodic::Bool, dims::NTuple{N,Int}, ::Val{d}, driver::D,
 ) where {T<:AbstractFloat, N, d, D}
     n = dims[d]
+    if N > 1
+        # Driven over COLUMNS, not points: taps move to the outer loop so the inner loop always walks
+        # dimension 1 with unit stride, whichever axis the pass is along. A per-point form cannot do
+        # this — for `d ≥ 2` it strides by `∏dims[1:d-1]` on every tap. Each column is written by
+        # exactly one task, so this is as race-free as the per-point form and every backend gets the
+        # same answer.
+        driver(CartesianIndices(Base.tail(dims))) do J
+            if d == 1
+                _separable_col_pass!(dst, src, g, lim, periodic, dims[1], Tuple(J))
+            else
+                _separable_slab_pass!(dst, src, g, lim, periodic, n, dims[1], Tuple(J), Val(d))
+            end
+        end
+        return dst
+    end
     driver(CartesianIndices(dims)) do I
         @inbounds dst[I] = _separable_pass_point(src, g, lim, periodic, n, I, Val(d))
     end
     return dst
+end
+
+# One line along dimension `d > 1`. The weight is indexed by the OUTPUT position along `d`, which is
+# fixed for this line, so it hoists out of the inner loop entirely and each tap is a plain axpy.
+@inline function _separable_slab_pass!(
+    dst::AbstractArray{T}, src::AbstractArray{T}, g::AbstractVecOrMat{T},
+    lim::Int, periodic::Bool, n::Int, n1::Int, J::Tuple, ::Val{d},
+) where {T<:AbstractFloat, d}
+    jd = J[d - 1]
+    dv = view(dst, :, J...)
+    @inbounds begin
+        for i in 1:n1
+            dv[i] = zero(T)
+        end
+        for dd in (-lim):lim
+            jj = jd + dd
+            if jj < 1 || jj > n
+                periodic || continue
+                jj = mod1(jj, n)
+            end
+            wt = _sepw(g, jd, dd + lim + 1)
+            sv = view(src, :, Base.setindex(J, jj, d - 1)...)
+            @simd for i in 1:n1
+                dv[i] += wt * sv[i]
+            end
+        end
+    end
+    return nothing
+end
+
+# One line along dimension 1, tap-outer. `dv`/`sv` are contiguous views, so each tap is an axpy.
+@inline function _separable_col_pass!(
+    dst::AbstractArray{T}, src::AbstractArray{T}, g::AbstractVecOrMat{T},
+    lim::Int, periodic::Bool, n1::Int, J::Tuple,
+) where {T<:AbstractFloat}
+    dv = view(dst, :, J...)
+    sv = view(src, :, J...)
+    @inbounds begin
+        for i in 1:n1
+            dv[i] = zero(T)
+        end
+        for dd in (-lim):lim
+            k = dd + lim + 1
+            if periodic && abs(dd) < n1
+                if dd >= 0
+                    @simd for i in 1:(n1 - dd)
+                        dv[i] += _sepw(g, i, k) * sv[i + dd]
+                    end
+                    @simd for i in (n1 - dd + 1):n1
+                        dv[i] += _sepw(g, i, k) * sv[i + dd - n1]
+                    end
+                else
+                    @simd for i in 1:(-dd)
+                        dv[i] += _sepw(g, i, k) * sv[i + dd + n1]
+                    end
+                    @simd for i in (-dd + 1):n1
+                        dv[i] += _sepw(g, i, k) * sv[i + dd]
+                    end
+                end
+            elseif periodic
+                @simd for i in 1:n1
+                    dv[i] += _sepw(g, i, k) * sv[mod1(i + dd, n1)]
+                end
+            else
+                @simd for i in max(1, 1 - dd):min(n1, n1 - dd)
+                    dv[i] += _sepw(g, i, k) * sv[i + dd]
+                end
+            end
+        end
+    end
+    return nothing
 end
 
 # The passes, unrolled by recursion on `Val(d)`. Buffers alternate and the last pass writes `dst`, so
@@ -2593,12 +2879,15 @@ function plan_filter(
     cache_byte_budget::Integer = DEFAULT_CACHE_BYTE_BUDGET,
 ) where {G<:FlowGeometries.Geometry.AbstractGeometry{T}} where {T<:AbstractFloat}
     _validate_scale(scale)
-    if method isa Spectral
+    if _resolve_method(grid, kernel, method) isa Spectral
         return spectral_filter_plan(spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
     end
-    resolved = _resolve_backend(backend)
+    resolved = _resolve_backend(backend, grid)
     _check_backend_compatible(grid, backend)
-    fp = build_footprint(grid, kernel, scale; mask_strategy = mask_strategy, cache_strategy = cache_strategy, cache_byte_budget = cache_byte_budget)
+    fp = _padded_fft_applicable(grid, kernel, method) ?
+        padded_fft_footprint(grid, kernel, scale; mask_strategy = mask_strategy) :
+        build_footprint(grid, kernel, scale; mask_strategy = mask_strategy,
+            cache_strategy = cache_strategy, cache_byte_budget = cache_byte_budget)
     return PhysicalFilterPlan(prepare_workspace(resolved, grid, fp), grid, mask_strategy, kernel, scale, resolved)
 end
 
@@ -2614,33 +2903,97 @@ _row_parallelizable(::FlowGeometries.Grids.AbstractGrid) = false
 # Threaded only; Distributed/GPU/MPI would need a domain decomposition for the ND case.
 _nd_parallelizable(::FlowGeometries.Grids.StructuredGrid{G,T,1}) where {G,T} = true
 _nd_parallelizable(::FlowGeometries.Grids.StructuredGrid{G,T,3}) where {G,T} = true
+# A node set is point-indexed with no row structure, so it parallelizes on the same argument as the
+# 1D/true-3D grids: `_footprint_node_point` writes only node `t`'s own cell.
+_nd_parallelizable(::FlowGeometries.Grids.UnstructuredGrid) = true
 _nd_parallelizable(::FlowGeometries.Grids.AbstractGrid) = false
 
 # Whether `grid` can actually honor a specific concrete backend request.
 _backend_supported(grid::FlowGeometries.Grids.AbstractGrid, ::ComputationalBackends.SerialBackend) = true
 _backend_supported(grid::FlowGeometries.Grids.AbstractGrid, ::ComputationalBackends.ThreadedBackend) = _row_parallelizable(grid) || _nd_parallelizable(grid)
-_backend_supported(grid::FlowGeometries.Grids.AbstractGrid, ::ComputationalBackends.DistributedBackend) = _row_parallelizable(grid)
-_backend_supported(grid::FlowGeometries.Grids.AbstractGrid, ::ComputationalBackends.GPUBackend) = _row_parallelizable(grid)
-_backend_supported(grid::FlowGeometries.Grids.AbstractGrid, ::ComputationalBackends.MPIBackend) = _row_parallelizable(grid)
+# Point-indexed grids decompose over linear indices into a SharedArray rather than over rows, so they
+# are supported even though `_row_parallelizable` is false for them.
+_backend_supported(grid::FlowGeometries.Grids.AbstractGrid, ::ComputationalBackends.DistributedBackend) =
+    _row_parallelizable(grid) || _nd_parallelizable(grid)
+# The device kernels for point-indexed footprints need no row decomposition, so GPU support follows
+# `_nd_parallelizable` as well as `_row_parallelizable` — one kernel over a linear index serves 1-D,
+# true-3-D and node sets alike.
+_backend_supported(grid::FlowGeometries.Grids.AbstractGrid, ::ComputationalBackends.GPUBackend) =
+    _row_parallelizable(grid) || _nd_parallelizable(grid)
+# Point-indexed grids partition round-robin over linear indices and recombine with `Allreduce!`, so
+# they are supported even though `_row_parallelizable` is false for them.
+_backend_supported(grid::FlowGeometries.Grids.AbstractGrid, ::ComputationalBackends.MPIBackend) =
+    _row_parallelizable(grid) || _nd_parallelizable(grid)
 
 # `AutoBackend()` landing on serial is auto-selection working; an explicit non-serial request that
 # cannot be honoured is an error, since the caller would otherwise run on believing they had the
 # parallelism. Checked against the original `backend`, before `AutoBackend()` is resolved away.
+@inline _fftw_available() =
+    Base.get_extension(parentmodule(@__MODULE__), :CoarseGrainingEnergyFluxesFFTWExt) !== nothing
+
+# A transform filters by PERIODIC convolution, so it reproduces the intended filter only where every
+# axis wraps, and it needs constant spacing — which a `Range` axis proves at the type level.
+_spectral_exact(grid::FlowGeometries.Grids.StructuredGrid{G,T,N}) where {
+    T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, N,
+} =
+    all(ntuple(d -> FlowGeometries.Grids.isperiodic(grid, d), N)) &&
+    all(ntuple(d -> FlowGeometries.Grids.coordinates(grid, d) isa AbstractRange, N))
+_spectral_exact(::FlowGeometries.Grids.AbstractGrid) = false
+
+@inline _besselj1_available() =
+    Base.get_extension(parentmodule(@__MODULE__), :CoarseGrainingEnergyFluxesSpecialFunctionsExt) !== nothing
+
+# `AutoMethod` picks on real capability, never on a preference: a transform only where it is available
+# AND exact for this grid. Every kernel wins there, including the top-hat — its prefix-sum engine is
+# O(N) but with a large enough constant to lose 60x to a transform whose cost does not scale with the
+# filter width at all (30.0 ms vs 0.5 ms at half-width 64 on a periodic 256^2 grid).
+@inline function _resolve_method(grid, kernel, method::AbstractFilterMethod)
+    method isa AutoMethod || return method
+    (_fftw_available() && _spectral_exact(grid)) || return RealSpace()
+    # The planar top-hat's transfer function is the Bessel-J₁ form, which only exists when the
+    # SpecialFunctions extension is loaded; without it there is no spectral top-hat to select.
+    kernel isa Kernels.TopHatKernel && !_besselj1_available() && return RealSpace()
+    return Spectral()
+end
+
+# Which kernels have a factored real-space engine. A `SharpSpectralKernel` has none — its radial `sinc`
+# does not separate — so it falls to the banded disk sum at O(N·w²) with a 10ℓ radius.
+_has_fast_real_space_engine(::Kernels.TopHatKernel) = true       # O(N) prefix sum
+_has_fast_real_space_engine(::Kernels.GaussianKernel) = true     # O(N·(wx+wy)) separable
+_has_fast_real_space_engine(::Kernels.AbstractFilterKernel) = false
+
+# `AutoMethod` may evaluate a real-space filter by padded transform: it is the SAME linear convolution,
+# valid on bounded and masked domains, at O(N log N) instead of O(N·w²) — 716.7 → 0.7 ms at half-width
+# 40. Only for a kernel with no factored engine, and Cartesian only, since the padded transform assumes
+# one translation-invariant footprint and a spherical grid's per-latitude bands are not that.
+_padded_fft_applicable(grid, kernel, method::AbstractFilterMethod) = false
+_padded_fft_applicable(
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,2,TP,<:Tuple{AbstractRange,AbstractRange}},
+    kernel::Kernels.AbstractFilterKernel, ::AutoMethod,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, TP} =
+    !_has_fast_real_space_engine(kernel) && _fftw_available()
+
 @inline _threading_available() =
     Base.get_extension(parentmodule(@__MODULE__), :CoarseGrainingEnergyFluxesOhMyThreadsExt) !== nothing
 
 # Upstream leaves `resolve_backend(::AutoBackend)` to the consumer, since it cannot see whether this
 # package's threading extension is loaded. Kept package-local rather than added as a method there:
 # that signature is ComputationalBackends' own, so every consumer defining it would overwrite the rest.
-@inline function _resolve_backend(backend::ComputationalBackends.AbstractExecutionBackend)
+@inline function _resolve_backend(
+    backend::ComputationalBackends.AbstractExecutionBackend, grid::FlowGeometries.Grids.AbstractGrid,
+)
     backend isa ComputationalBackends.AbstractAutoBackend ||
         return ComputationalBackends.resolve_backend(backend)
-    return (Threads.nthreads() > 1 && _threading_available()) ?
-        ComputationalBackends.ThreadedBackend() : ComputationalBackends.SerialBackend()
+    threaded = ComputationalBackends.ThreadedBackend()
+    # Auto must choose on REAL capability: threads available, the extension that implements them
+    # loaded, AND this grid having a parallel path. Choosing a backend the grid cannot honor is what
+    # silently produced serial execution under a reported parallel backend.
+    return (Threads.nthreads() > 1 && _threading_available() && _backend_supported(grid, threaded)) ?
+        threaded : ComputationalBackends.SerialBackend()
 end
 
 function _check_backend_compatible(grid::FlowGeometries.Grids.AbstractGrid, backend::ComputationalBackends.AbstractExecutionBackend)
-    if !(backend isa ComputationalBackends.AutoBackend) && !(backend isa ComputationalBackends.SerialBackend) && !_backend_supported(grid, _resolve_backend(backend))
+    if !(backend isa ComputationalBackends.AutoBackend) && !(backend isa ComputationalBackends.SerialBackend) && !_backend_supported(grid, _resolve_backend(backend, grid))
         throw(ArgumentError(
             "backend = $(typeof(backend)) was requested explicitly, but $(typeof(grid)) has no " *
             "matching parallel hook for it — there is no way to honor this request. Pass " *
@@ -2708,28 +3061,35 @@ function apply_footprint!(
     fp::NodeFilterPlan{T}, strategy::AbstractMaskStrategy,
 ) where {T<:AbstractFloat}
     @inbounds for t in eachindex(out)
-        if !FlowGeometries.Grids.isactive(grid, t)
-            out[t] = zero(T)
-            continue
-        end
-        ws = zero(T)
-        wn = zero(T)
-        for k in fp.ptr[t]:(fp.ptr[t+1] - 1)
-            j = fp.nbrs[k]
-            wj = fp.w[k]
-            active = FlowGeometries.Grids.isactive(grid, j)
-            if strategy isa ZeroFill
-                wn += wj
-                active && (ws += wj * field[j])
-            else
-                active || continue
-                wn += wj
-                ws += wj * field[j]
-            end
-        end
-        out[t] = wn > T(1e-15) ? ws / wn : zero(T)
+        out[t] = _footprint_node_point(field, grid, fp, strategy, t)
     end
     return out
+end
+
+# Per-node kernel, factored out of the loop above so a parallel driver reuses the exact same
+# arithmetic rather than duplicating it — node `t` reads neighbours and writes only its own cell, so
+# the threaded result is bit-identical. Mirrors `_footprint_nd_point`'s role for the ND engines.
+@inline function _footprint_node_point(
+    field::AbstractVector, grid::FlowGeometries.Grids.UnstructuredGrid,
+    fp::NodeFilterPlan{T}, strategy::AbstractMaskStrategy, t::Integer,
+) where {T<:AbstractFloat}
+    FlowGeometries.Grids.isactive(grid, t) || return zero(T)
+    ws = zero(T)
+    wn = zero(T)
+    @inbounds for k in fp.ptr[t]:(fp.ptr[t+1] - 1)
+        j = fp.nbrs[k]
+        wj = fp.w[k]
+        active = FlowGeometries.Grids.isactive(grid, j)
+        if strategy isa ZeroFill
+            wn += wj
+            active && (ws += wj * field[j])
+        else
+            active || continue
+            wn += wj
+            ws += wj * field[j]
+        end
+    end
+    return wn > T(1e-15) ? ws / wn : zero(T)
 end
 
 # A node set now has a real-space engine as well as the spectral one, so it gets a `PhysicalFilterPlan`
@@ -2775,9 +3135,10 @@ function plan_filter(
     method isa Spectral && return spectral_filter_plan(
         spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend,
     )
+    _check_backend_compatible(grid, backend)
     return PhysicalFilterPlan(
         build_footprint(grid, kernel, scale), grid, mask_strategy, kernel, scale,
-        _resolve_backend(backend),
+        _resolve_backend(backend, grid),
     )
 end
 
@@ -2801,7 +3162,7 @@ function plan_filter(
         # so this raises the standard informative "spectral unavailable" error.
         return spectral_filter_plan(spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
     end
-    resolved = _resolve_backend(backend)
+    resolved = _resolve_backend(backend, grid)
     _check_backend_compatible(grid, backend)
     fp = build_footprint(grid, kernel, scale; cache_strategy = cache_strategy, cache_byte_budget = cache_byte_budget)
     return PhysicalFilterPlan(prepare_workspace(resolved, grid, fp), grid, mask_strategy, kernel, scale, resolved)
@@ -2815,7 +3176,7 @@ plan was built for — the footprint is ALWAYS the one cached in `plan`, never r
 backend (serial, threaded, distributed, GPU, MPI).
 """
 function filter_apply!(out::AbstractArray, field::AbstractArray, plan::PhysicalFilterPlan)
-    if plan.backend isa ComputationalBackends.SerialBackend || !_backend_supported(plan.grid, plan.backend)
+    if plan.backend isa ComputationalBackends.SerialBackend
         return _apply_serial!(out, field, plan.grid, plan.footprint, plan.strategy)
     elseif plan.backend isa ComputationalBackends.ThreadedBackend
         return threaded_filter_field!(out, field, plan.grid, plan.kernel, plan.scale, plan.strategy, plan.footprint)
@@ -2840,7 +3201,7 @@ per field. `outs`/`fields` must be equal-length, matching-shape collections of a
 `_batch_zeros`), or an `AbstractVector` for a runtime-determined batch size.
 """
 function filter_apply_batch!(outs, fields, plan::PhysicalFilterPlan)
-    if plan.backend isa ComputationalBackends.SerialBackend || !_backend_supported(plan.grid, plan.backend)
+    if plan.backend isa ComputationalBackends.SerialBackend
         return _apply_serial_batch!(outs, fields, plan.grid, plan.footprint, plan.strategy)
     elseif plan.backend isa ComputationalBackends.ThreadedBackend
         return threaded_filter_fields!(outs, fields, plan.grid, plan.kernel, plan.scale, plan.strategy, plan.footprint)
@@ -2885,5 +3246,70 @@ function filter_fields!(
     plan = filter_plan === nothing ? plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) : filter_plan
     return filter_apply_batch!(outs, fields, plan)
 end
+
+# ---------------------------------------------------------------------------
+# Slice-parallel apply: many independent problems, one plan each
+# ---------------------------------------------------------------------------
+
+"""
+    filter_slices!(outs, fields, plans; backend = AutoBackend()) -> outs
+
+Apply `plans[t]` to `fields[t]`, writing `outs[t]`, over a collection of **independent** slices.
+
+This is a different parallel axis from [`filter_apply_batch!`](@ref), which shares one grid across
+several fields: here each slice has its own grid, plan and point count, and slices share nothing, so
+there is no synchronization at all. Where a workload has many slices, this is the outermost
+race-free axis and the one that converts thread count into throughput — threading *within* one slice
+saturates once the slice is small enough that per-task overhead dominates its work.
+
+Each slice runs **serially inside**, whatever backend its own plan carries: nesting a threaded apply
+under a threaded slice loop would have both levels claim the whole thread pool.
+"""
+function filter_slices!(
+    outs, fields, plans;
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+)
+    length(outs) == length(fields) == length(plans) || throw(DimensionMismatch(
+        "filter_slices! got $(length(outs)) outputs, $(length(fields)) fields and $(length(plans)) plans",
+    ))
+    resolved = _resolve_slice_backend(backend)
+    resolved isa ComputationalBackends.ThreadedBackend &&
+        return threaded_filter_slices!(outs, fields, plans)
+    for t in eachindex(plans)
+        apply_slice_serial!(outs[t], fields[t], plans[t])
+    end
+    return outs
+end
+
+# Slices are independent for every grid architecture, so — unlike `_resolve_backend` — this needs no
+# grid capability check: the parallelism is over the collection, not inside any one slice.
+@inline function _resolve_slice_backend(backend::ComputationalBackends.AbstractExecutionBackend)
+    backend isa ComputationalBackends.AbstractAutoBackend ||
+        return ComputationalBackends.resolve_backend(backend)
+    return (Threads.nthreads() > 1 && _threading_available()) ?
+        ComputationalBackends.ThreadedBackend() : ComputationalBackends.SerialBackend()
+end
+
+"""
+    apply_slice_serial!(out, field, plan) -> out
+
+One slice, forced down the serial engine regardless of the backend recorded in `plan`. The slice
+loop owns the parallelism; see [`filter_slices!`](@ref).
+"""
+@inline apply_slice_serial!(out, field, plan::PhysicalFilterPlan) =
+    _apply_serial!(out, field, plan.grid, plan.footprint, plan.strategy)
+# A spectral plan has no separate serial engine — its transform is already the whole apply.
+@inline apply_slice_serial!(out, field, plan::AbstractFilterPlan) = filter_apply!(out, field, plan)
+
+"""
+    slice_costs(plans) -> Vector{Int}
+
+Per-slice work proxy: the number of target points each plan writes. A slice's cost grows at least
+linearly in this, so it is what a longest-first schedule should sort on.
+"""
+slice_costs(plans) = [_plan_npoints(p) for p in plans]
+
+@inline _plan_npoints(p::PhysicalFilterPlan) = prod(FlowGeometries.Grids.size_tuple(p.grid))
+@inline _plan_npoints(p::AbstractFilterPlan) = 1
 
 end # module

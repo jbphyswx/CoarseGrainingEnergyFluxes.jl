@@ -96,11 +96,12 @@ Test.@testset "Nonuniform axes" begin
     # ...and a Gaussian takes the SEPARABLE engine, because separability is a property of the kernel
     # rather than of the spacing: a stretched axis makes the per-axis weight depend on position as
     # well as offset, which is a wider weight table, not a different algorithm. The table's rank is
-    # what distinguishes the two — a vector when the spacing is constant, a column per position here.
+    # what distinguishes the two — a vector when the spacing is constant, a row per position here
+    # (the table is position-major so that a row pass reads it along the contiguous axis).
     fp_g = CGEF.Filtering.build_footprint(grid_nu, CGEF.GaussianKernel(), 2.0)
     Test.@test fp_g isa CGEF.Filtering.SeparableGaussianFootprint
     Test.@test fp_g.gx isa AbstractMatrix
-    Test.@test size(fp_g.gx, 2) == Nx_nu
+    Test.@test size(fp_g.gx, 1) == Nx_nu
     # A kernel with no separable form still takes the general scattered engine, which is what proves
     # the nonuniform axis itself is handled by the general machinery.
     Test.@test CGEF.Filtering.build_footprint(grid_nu, CGEF.SharpSpectralKernel(), 2.0) isa
