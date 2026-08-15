@@ -25,7 +25,7 @@ Documenter.makedocs(;
 )
 
 Documenter.deploydocs(;
-    repo = "github.com/jbphyswx/CoarseGrainingEnergyFluxes.git",
+    repo = "github.com/jbphyswx/CoarseGrainingEnergyFluxes.jl.git",
     devbranch = "main",
     push_preview = true,
 )
