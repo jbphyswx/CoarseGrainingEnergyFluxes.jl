@@ -18,9 +18,11 @@ Documenter.makedocs(;
     pages = [
         "Home" => "index.md",
         "Theory" => "theory.md",
+        "Requirements from the literature" => "requirements_from_literature.md",
         "Architecture" => "architecture.md",
         "Examples" => "examples.md",
         "API Reference" => "reference.md",
+        "Development plan" => "development_plan.md",
     ],
 )
 
