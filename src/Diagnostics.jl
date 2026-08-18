@@ -177,6 +177,58 @@ end
 @inline _batch_dims(A::AbstractArray, grid) =
     _batch_dims(A, Val(length(FlowGeometries.Grids.size_tuple(grid))))
 
+# The fields a flux computation filters, in the order their spectra are stored. Every one of them is a
+# RAW input — the velocities and their products — so none depends on the filter scale, which is what lets
+# a sweep transform them once and only synthesize per scale.
+@inline _velocity_outs(ws::ΠWorkspace, has_w::Bool) =
+    has_w ? (ws.u_filt, ws.v_filt, ws.w_filt) : (ws.u_filt, ws.v_filt)
+@inline _velocity_ins(u, v, w, has_w::Bool) = has_w ? (u, v, w) : (u, v)
+@inline _product_outs(ws::ΠWorkspace, has_w::Bool) =
+    has_w ? (ws.uu_filt, ws.uv_filt, ws.vv_filt, ws.uw_filt, ws.vw_filt, ws.ww_filt) :
+            (ws.uu_filt, ws.uv_filt, ws.vv_filt)
+@inline _product_ins(ws::ΠWorkspace, has_w::Bool) =
+    has_w ? (ws.ux, ws.uy, ws.uz, ws.ux_filt, ws.uy_filt, ws.uz_filt) : (ws.ux, ws.uy, ws.uz)
+
+@inline function _synthesize_all!(outs::Tuple, spectra::Tuple, plan)
+    for k in eachindex(outs)
+        Filtering.filter_synthesize!(outs[k], spectra[k], plan)
+    end
+    return outs
+end
+
+"""
+    analyze_sweep(u, v, w, grid, ws, plan) -> analysis or nothing
+
+Forward-transform the raw inputs of a flux computation once, for reuse across every scale of a sweep.
+
+A spectral filter is analyze → multiply by `Ĝ(|k|, ℓ)` → synthesize, and only the multiply depends on
+the scale, while every field a flux computation filters is raw: the velocities and their pairwise
+products. So a sweep over `S` scales needs `5 + 5S` transforms rather than `10S`.
+
+Returns `nothing` for an engine with no shareable analysis — a real-space filter does all its work per
+scale — and the caller then runs the ordinary per-scale path. `plan` may be any one of the sweep's
+per-scale plans; they share a forward transform.
+"""
+function analyze_sweep(u, v, w, grid, ws::ΠWorkspace, plan::Filtering.AbstractFilterPlan)
+    Filtering.analyze_buffer(plan, u) === nothing && return nothing
+    has_w = w !== nothing
+    # Products are formed into the same scratch the per-scale path uses; once analyzed, the spectra hold
+    # everything the sweep needs and the scratch is free again.
+    @. ws.ux = u * u
+    @. ws.uy = u * v
+    @. ws.uz = v * v
+    if has_w
+        @. ws.ux_filt = u * w
+        @. ws.uy_filt = v * w
+        @. ws.uz_filt = w * w
+    end
+    vel = map(f -> Filtering.filter_analyze!(Filtering.analyze_buffer(plan, f), f, plan),
+              _velocity_ins(u, v, w, has_w))
+    prod = map(f -> Filtering.filter_analyze!(Filtering.analyze_buffer(plan, f), f, plan),
+               _product_ins(ws, has_w))
+    return (velocity = vel, product = prod)
+end
+
 """
     compute_Π!(Π, u, v, w, grid, kernel, scale; workspace=nothing, backend=AutoBackend(), mask_strategy=Deformable())
 
@@ -273,6 +325,9 @@ function compute_Π!(
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
     deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
+    # Spectra of the raw inputs from [`analyze_sweep`](@ref), when a sweep has hoisted the
+    # scale-independent forward transform out of its scale loop.
+    analyzed = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     _validate_field_sizes(grid, Π, u, v, w)
     ws = workspace === nothing ? ΠWorkspace(grid, _batch_dims(Π, grid)) : workspace
@@ -283,7 +338,7 @@ function compute_Π!(
     # The stencil weights depend only on the grid, so one table serves every derivative here and every
     # later call at any scale.
     dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
-    return _compute_Π!(Π, u, v, w, grid, ws, plan, dplan)
+    return _compute_Π!(Π, u, v, w, grid, ws, plan, dplan, analyzed)
 end
 
 # ---------------------------------------------------------------------------
@@ -349,6 +404,7 @@ function _compute_Π!(
     ws::ΠWorkspace,
     plan::Filtering.AbstractFilterPlan,
     deriv_plan,
+    analyzed = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     has_w = w !== nothing
 
@@ -358,7 +414,11 @@ function _compute_Π!(
         # -------------------------------------------------------------------
         # Filter velocity components — batched: one neighbour-list/weight derivation per point,
         # applied to all primitives at once (see `Filtering.filter_apply_batch!`), not once per field.
-        if has_w
+        if analyzed !== nothing
+            # A sweep hoists the scale-independent forward transform out of the scale loop, so only the
+            # per-scale synthesis is left here.
+            _synthesize_all!(_velocity_outs(ws, has_w), analyzed.velocity, plan)
+        elseif has_w
             Filtering.filter_apply_batch!((ws.u_filt, ws.v_filt, ws.w_filt), (u, v, w), plan)
         else
             Filtering.filter_apply_batch!((ws.u_filt, ws.v_filt), (u, v), plan)
@@ -367,20 +427,24 @@ function _compute_Π!(
         # Filter products: u², uv, vv, etc. — also batched, in one pass. `ux`/`uy`/`uz`/`ux_filt`/
         # `uy_filt`/`uz_filt` are spherical-only fields, genuinely idle in this Cartesian branch, so
         # they're reused here purely as pre-filter product scratch (no new workspace fields needed).
-        @. ws.ux = u * u
-        @. ws.uy = u * v
-        @. ws.uz = v * v
-        if has_w
-            @. ws.ux_filt = u * w
-            @. ws.uy_filt = v * w
-            @. ws.uz_filt = w * w
-            Filtering.filter_apply_batch!(
-                (ws.uu_filt, ws.uv_filt, ws.vv_filt, ws.uw_filt, ws.vw_filt, ws.ww_filt),
-                (ws.ux, ws.uy, ws.uz, ws.ux_filt, ws.uy_filt, ws.uz_filt),
-                plan,
-            )
+        if analyzed !== nothing
+            _synthesize_all!(_product_outs(ws, has_w), analyzed.product, plan)
         else
-            Filtering.filter_apply_batch!((ws.uu_filt, ws.uv_filt, ws.vv_filt), (ws.ux, ws.uy, ws.uz), plan)
+            @. ws.ux = u * u
+            @. ws.uy = u * v
+            @. ws.uz = v * v
+            if has_w
+                @. ws.ux_filt = u * w
+                @. ws.uy_filt = v * w
+                @. ws.uz_filt = w * w
+                Filtering.filter_apply_batch!(
+                    (ws.uu_filt, ws.uv_filt, ws.vv_filt, ws.uw_filt, ws.vw_filt, ws.ww_filt),
+                    (ws.ux, ws.uy, ws.uz, ws.ux_filt, ws.uy_filt, ws.uz_filt),
+                    plan,
+                )
+            else
+                Filtering.filter_apply_batch!((ws.uu_filt, ws.uv_filt, ws.vv_filt), (ws.ux, ws.uy, ws.uz), plan)
+            end
         end
 
         # Compute subfilter stresses: τ_ij = [u_i u_j]̄ - ū_i ū_j
@@ -589,13 +653,14 @@ function compute_Π!(
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
     method::Filtering.AbstractFilterMethod = Filtering.Spectral(),
+    analyzed = nothing,
 ) where {T<:AbstractFloat}
     _validate_field_sizes(grid, Π, u, v, w)
     ws = workspace === nothing ? ΠWorkspace(grid) : workspace
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend, method=method) : filter_plan
     dplan = deriv_plan === nothing ? FlowGeometries.Connectivity.gradient_plan(grid) : deriv_plan
-    return _compute_Π!(Π, u, v, w, grid, ws, plan, dplan)
+    return _compute_Π!(Π, u, v, w, grid, ws, plan, dplan, analyzed)
 end
 
 """
@@ -622,13 +687,14 @@ function compute_Π!(
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    analyzed = nothing,
 ) where {T<:AbstractFloat}
     _validate_field_sizes(grid, Π, u, v, w)
     ws = workspace === nothing ? ΠWorkspace(grid) : workspace
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend) : filter_plan
     dplan = deriv_plan === nothing ? FlowGeometries.Connectivity.gradient_plan(grid) : deriv_plan
-    return _compute_Π!(Π, u, v, w, grid, ws, plan, dplan)
+    return _compute_Π!(Π, u, v, w, grid, ws, plan, dplan, analyzed)
 end
 
 """

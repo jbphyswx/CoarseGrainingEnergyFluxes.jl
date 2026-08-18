@@ -3254,6 +3254,29 @@ function _check_batched_shape(
     return nothing
 end
 
+"""
+    analyze_buffer(plan, field) -> F̂ or nothing
+    filter_analyze!(F̂, field, plan) -> F̂
+    filter_synthesize!(out, F̂, plan) -> out
+
+Split of a spectral apply into its two halves. A spectral filter is forward transform → multiply by
+`Ĝ(|k|, ℓ)` → inverse transform, and only the multiply depends on the scale, so a sweep over S scales
+needs the forward ONCE per field rather than once per (field, scale): `5 + 5S` transforms instead of
+`10S`.
+
+`analyze_buffer` returns `nothing` for an engine with no transform to share — a real-space filter does
+all its work per scale — and callers fall back to [`filter_apply!`](@ref).
+
+Plans for different scales over the same grid share a forward transform, so `F̂` produced with any one
+of them may be synthesized with any other.
+"""
+function analyze_buffer end
+function filter_analyze! end
+function filter_synthesize! end
+
+# Real-space engines have no scale-independent half to hoist.
+analyze_buffer(::AbstractFilterPlan, ::AbstractArray) = nothing
+
 function gpu_filter_field_batched!(args...; kwargs...)
     throw(ArgumentError("GPUBackend is unavailable — run `using KernelAbstractions` (or use SerialBackend())."))
 end

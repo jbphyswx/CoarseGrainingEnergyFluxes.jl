@@ -79,6 +79,31 @@ function CGEF.Filtering.spectral_filter_plan(
     )
 end
 
+# The forward transform (points → harmonic coefficients) depends on the field alone, so a sweep runs it
+# once and each scale only applies its own transfer function and evaluates back to points.
+# `nusht_synthesize!` does not consume `C`, which is what lets the same coefficients serve every scale.
+CGEF.Filtering.analyze_buffer(plan::NUFSHTFilterPlan, ::AbstractVector) = similar(plan.plan.C)
+
+function CGEF.Filtering.filter_analyze!(
+    Ĉ::AbstractArray, field::AbstractVector, plan::NUFSHTFilterPlan{P, F, T},
+) where {P, F, T<:AbstractFloat}
+    if plan.mask === nothing
+        NUFSHT.nusht_type1!(Ĉ, convert(Vector{T}, field), plan.plan)
+    else
+        plan.scratch .= field .* plan.mask
+        NUFSHT.nusht_type1!(Ĉ, plan.scratch, plan.plan)
+    end
+    return Ĉ
+end
+
+function CGEF.Filtering.filter_synthesize!(
+    out::AbstractVector{T}, Ĉ::AbstractArray, plan::NUFSHTFilterPlan{P, F, T},
+) where {P, F, T<:AbstractFloat}
+    NUFSHT.nusht_synthesize!(out, Ĉ, plan.filter, plan.plan)
+    plan.renorm && NUFSHT.nusht_filter_renorm!(out, plan.mask, plan.filter, plan.plan)
+    return out
+end
+
 function CGEF.Filtering.filter_apply!(
     out::AbstractVector{T},
     field::AbstractVector,

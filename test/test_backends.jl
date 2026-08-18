@@ -600,6 +600,68 @@ Test.@testset "filter_apply_batched!: fused device batch and exact slice-loop fa
     end
 end
 
+# A spectral apply is analyze → ×Ĝ(|k|, ℓ) → synthesize, and only the multiply depends on the scale while
+# every field the flux computation filters is raw. So a sweep analyzes once and synthesizes per scale:
+# 5 + 5S transforms rather than 10S. The result must not move.
+Test.@testset "Spectral sweep analyzes once and synthesizes per scale" begin
+    CB = CGEF.ComputationalBackends
+    F = CGEF.Filtering
+    D = CGEF.Diagnostics
+    P = CGEF.Pipeline
+    N = 48
+    xs = range(0.0, (N - 1) * 1000.0; length = N)
+    scales = collect(range(4e3, 20e3; length = 5))
+    msk = trues(N, N)
+    msk[:, 1:5] .= false
+    msk[18:24, :] .= false
+
+    for mk in (trues(N, N), msk), st in (F.Deformable(), F.ZeroFill())
+        g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs, mk; periodic = (true, true))
+        u = randn(N, N)
+        v = randn(N, N)
+        kern = CGEF.GaussianKernel()
+
+        # Analysis covers exactly the raw fields: the two velocities and their three products. That count
+        # IS the saving — those five are what would otherwise be re-transformed at every scale.
+        ws = D.ΠWorkspace(g)
+        p1 = F.plan_filter(g, kern, first(scales); method = F.Spectral(), mask_strategy = st)
+        a = D.analyze_sweep(u, v, nothing, g, ws, p1)
+        Test.@test a !== nothing
+        Test.@test length(a.velocity) == 2
+        Test.@test length(a.product) == 3
+
+        # Synthesizing from the shared analysis equals filtering that field at that scale directly.
+        for s in scales
+            ps = F.plan_filter(g, kern, s; method = F.Spectral(), mask_strategy = st)
+            ref = zeros(N, N)
+            F.filter_apply!(ref, u, ps)
+            got = zeros(N, N)
+            F.filter_synthesize!(got, a.velocity[1], ps)
+            Test.@test got == ref
+        end
+
+        # And the whole sweep is unchanged against a per-scale reference.
+        got = P.coarse_grain(u, v, g; scales = scales, kernel = kern, method = F.Spectral(),
+                             mask_strategy = st, backend = CB.SerialBackend())
+        wsr = D.ΠWorkspace(g)
+        dpr = CGEF.Derivatives.StencilPlan(g)
+        for (i, s) in enumerate(scales)
+            pl = F.plan_filter(g, kern, s; method = F.Spectral(), mask_strategy = st)
+            ref = zeros(N, N)
+            D.compute_Π!(ref, u, v, nothing, g, kern, s; workspace = wsr, filter_plan = pl,
+                         backend = CB.SerialBackend(), mask_strategy = st, deriv_plan = dpr)
+            Test.@test got.Π[:, :, i] == ref
+        end
+    end
+
+    # A real-space engine has no scale-independent half, so the sweep keeps the per-scale path untouched.
+    let g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs),
+        p = F.plan_filter(g, CGEF.TopHatKernel(), 8e3)
+        Test.@test F.analyze_buffer(p, zeros(N, N)) === nothing
+        Test.@test D.analyze_sweep(randn(N, N), randn(N, N), nothing, g, D.ΠWorkspace(g), p) === nothing
+    end
+end
+
 # The flux path itself over a batch. `compute_Π!` pins the GRID's rank and leaves the arrays' free, so a
 # `(Nx, Ny, Nb)` field is a batch of 2-D slices while the same shape against a rank-3 grid stays
 # volumetric. Everything under it is rank-agnostic — filters route to a fused pass, the tensor algebra

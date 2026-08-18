@@ -114,6 +114,34 @@ function CGEF.Filtering.spectral_filter_plan(
     return SHTFilterPlan(mult, scratch, cache, N, M, mask, masked_input, invrenorm)
 end
 
+# The forward harmonic transform depends on the field alone, so a sweep runs it once and each scale only
+# scales the coefficients by its own `Ĝ(k_l, ℓ)` and evaluates back to points.
+CGEF.Filtering.analyze_buffer(plan::SHTFilterPlan, ::AbstractMatrix) = similar(plan.scratch)
+
+function CGEF.Filtering.filter_analyze!(
+    Ĉ::AbstractMatrix{T}, field::AbstractMatrix{T}, plan::SHTFilterPlan{T},
+) where {T<:AbstractFloat}
+    if plan.mask === nothing
+        permutedims!(Ĉ, field, (2, 1))
+    else
+        @. plan.masked_input = plan.mask * field
+        permutedims!(Ĉ, plan.masked_input, (2, 1))
+    end
+    FSH.sph_transform!(Ĉ; cache = plan.cache)
+    return Ĉ
+end
+
+function CGEF.Filtering.filter_synthesize!(
+    out::AbstractMatrix{T}, Ĉ::AbstractMatrix{T}, plan::SHTFilterPlan{T},
+) where {T<:AbstractFloat}
+    # `sph_evaluate!` works in place, and `Ĉ` is reused by every later scale, so evaluate a scaled copy.
+    plan.scratch .= Ĉ .* plan.mult
+    FSH.sph_evaluate!(plan.scratch; cache = plan.cache)
+    permutedims!(out, plan.scratch, (2, 1))
+    plan.invrenorm === nothing || (out .*= plan.invrenorm)
+    return out
+end
+
 function CGEF.Filtering.filter_apply!(
     out::AbstractMatrix{T},
     field::AbstractMatrix{T},

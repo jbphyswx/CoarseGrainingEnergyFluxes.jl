@@ -132,9 +132,16 @@ end
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = strat, backend = backend) :
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = strat, backend = backend, method = method)
 
-@inline _flux!(out, u, v, w, grid, kernel, scale, ws, plan, backend, strat, dplan) =
+# Only the paths that can share a scale-independent analysis are handed one; the keyword is omitted
+# entirely otherwise, so a grid whose flux method has no such half never sees it.
+@inline _flux!(out, u, v, w, grid, kernel, scale, ws, plan, backend, strat, dplan, ::Nothing = nothing) =
     Diagnostics.compute_Π!(out, u, v, w, grid, kernel, scale;
         workspace = ws, filter_plan = plan, backend = backend, mask_strategy = strat, deriv_plan = dplan)
+
+@inline _flux!(out, u, v, w, grid, kernel, scale, ws, plan, backend, strat, dplan, analyzed) =
+    Diagnostics.compute_Π!(out, u, v, w, grid, kernel, scale;
+        workspace = ws, filter_plan = plan, backend = backend, mask_strategy = strat,
+        deriv_plan = dplan, analyzed = analyzed)
 
 """
     coarse_grain!(result, u, v, w, grid; scales, kernel, workspace, filter_plans, deriv_plan, backend, mask_strategy, method, L)
@@ -187,12 +194,17 @@ function coarse_grain!(
     # every scale — two of the seven applies per scale — because the buffers holding them are
     # overwritten by the next scale.
     total_area = Diagnostics.active_area(grid)
+    # A spectral filter's forward transform depends on the field, not the scale, and every field the flux
+    # computation filters is raw — the velocities and their products. Transforming them once here rather
+    # than once per scale takes a sweep from 10·S transforms to 5 + 5S. Real-space engines have no such
+    # half to share and return `nothing`, leaving the per-scale path exactly as it was.
+    analyzed = isempty(scales) ? nothing : Diagnostics.analyze_sweep(u, v, w, grid, ws, first(plans))
     for s_idx in eachindex(scales)
         scale = T(scales[s_idx])
         result.scales[s_idx] = scale
         _flux!(
             selectdim(result.Π, ndims(result.Π), s_idx), u, v, w, grid, kernel, scale,
-            ws, plans[s_idx], backend, mask_strategy, dplan,
+            ws, plans[s_idx], backend, mask_strategy, dplan, analyzed,
         )
         result.cumulative_energy[s_idx] =
             Diagnostics.energy_from_filtered(ws, grid, w !== nothing, total_area)

@@ -145,6 +145,35 @@ function CGEF.Filtering.spectral_filter_plan(
     )
 end
 
+# Analysis (pts → modes) depends on the field alone, so a sweep runs it once and each scale only applies
+# its own transfer function and evaluates back to points.
+CGEF.Filtering.analyze_buffer(plan::FINUFFTFilterPlan, ::AbstractVector) = similar(plan.F_scratch)
+
+function CGEF.Filtering.filter_analyze!(
+    F̂::AbstractArray, field::AbstractVector, plan::FINUFFTFilterPlan{XT, YT, T},
+) where {XT, YT, T<:AbstractFloat}
+    if plan.mask === nothing
+        @. plan.c_scratch = Complex{T}(field)
+    else
+        @. plan.masked_input = plan.mask * field
+        @. plan.c_scratch = Complex{T}(plan.masked_input)
+    end
+    FINUFFT.finufft_exec!(plan.plan1, plan.c_scratch, F̂)
+    return F̂
+end
+
+function CGEF.Filtering.filter_synthesize!(
+    out::AbstractVector{T}, F̂::AbstractArray, plan::FINUFFTFilterPlan{XT, YT, T},
+) where {XT, YT, T<:AbstractFloat}
+    # `finufft_exec!` consumes its input, and `F̂` is reused by every later scale, so the scaled copy goes
+    # through the plan's own mode scratch.
+    plan.F_scratch .= F̂ .* plan.transfer
+    FINUFFT.finufft_exec!(plan.plan2, plan.F_scratch, plan.c_scratch)
+    @. out = real(plan.c_scratch) / plan.npts
+    plan.invrenorm === nothing || (out .*= plan.invrenorm)
+    return out
+end
+
 function CGEF.Filtering.filter_apply!(
     out::AbstractVector{T},
     field::AbstractVector,

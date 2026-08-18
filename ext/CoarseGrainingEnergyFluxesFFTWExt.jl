@@ -89,6 +89,35 @@ function CGEF.Filtering.filter_apply_batched!(
     return out
 end
 
+# Analysis is scale-independent, so a sweep transforms each field once and then only multiplies by each
+# scale's transfer function and inverts. `masked_input` is the plan's own scratch and is not touched
+# after analysis, so the mask is applied here rather than being redone per scale.
+CGEF.Filtering.analyze_buffer(plan::FFTWFilterPlan, field::AbstractMatrix) = similar(plan.cbuf)
+CGEF.Filtering.analyze_buffer(plan::FFTWFilterPlan, field::AbstractArray{<:Any,3}) =
+    similar(plan.cbuf, size(plan.cbuf)..., size(field, 3))
+
+function CGEF.Filtering.filter_analyze!(
+    F̂::AbstractMatrix{Complex{T}}, field::AbstractMatrix{T}, plan::FFTWFilterPlan{T},
+) where {T<:AbstractFloat}
+    if plan.mask === nothing
+        LA.mul!(F̂, plan.fwd, field)
+    else
+        @. plan.masked_input = plan.mask * field
+        LA.mul!(F̂, plan.fwd, plan.masked_input)
+    end
+    return F̂
+end
+
+function CGEF.Filtering.filter_synthesize!(
+    out::AbstractMatrix{T}, F̂::AbstractMatrix{Complex{T}}, plan::FFTWFilterPlan{T},
+) where {T<:AbstractFloat}
+    # `plan.inv` consumes its input, so synthesize from a copy — `F̂` is reused by every later scale.
+    plan.cbuf .= F̂ .* plan.transfer
+    LA.mul!(out, plan.inv, plan.cbuf)
+    plan.invrenorm === nothing || (out .*= plan.invrenorm)
+    return out
+end
+
 function CGEF.Filtering.spectral_filter_plan(
     ::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractFFTSpectralBackend},
     grid::FlowGeometries.Grids.StructuredGrid{G,T},
