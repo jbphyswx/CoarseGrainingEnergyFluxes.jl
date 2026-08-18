@@ -52,9 +52,10 @@ Output: Π(x) per scale, cumulative_energy E(ℓ), filtering spectrum Ẽ(k_ℓ)
 Given 3D `(x, y, z)` velocity, there are two distinct, non-interchangeable ways to get a
 "vertical structure":
 
-- **`coarse_grain_profile` / `compute_Π_profile!`** — the literature-standard method (Aluie, Hecht &
+- **`coarse_grain_profile`** — the literature-standard method (Aluie, Hecht &
   Vallis 2018): run the existing 2D/2.5D `compute_Π!` **independently at each vertical level** and stack
-  the results. This is the thin-layer/quasi-geostrophic regime (vertical shear subdominant to
+  the results. The vertical axis is a batch axis over the shared horizontal grid, so this is
+  `coarse_grain_batch!` with the batch named "level". This is the thin-layer/quasi-geostrophic regime (vertical shear subdominant to
   horizontal gradients — the usual large-scale ocean/atmosphere assumption); levels do not interact.
 - **True 3D `compute_Π!`** (`StructuredGrid{...,3}`, Cartesian or spherical-volumetric) — a genuinely
   **coupled** 3D filter kernel and all nine strain/stress components, including real vertical

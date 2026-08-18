@@ -6,7 +6,7 @@ using ..Filtering: Filtering
 using ..Derivatives: Derivatives
 using ComputationalBackends: ComputationalBackends
 
-export ΠWorkspace, compute_Π!, compute_Π_profile!, cumulative_energy, cumulative_energy!, filtering_spectrum, spectral_density, spectral_density!
+export ΠWorkspace, compute_Π!, cumulative_energy, cumulative_energy!, filtering_spectrum, spectral_density, spectral_density!
 export tau_decomposition, compute_Π_decomposed, tracer_variance_flux
 
 """
@@ -63,8 +63,18 @@ end
 # Workspace constructor based on grid structure and float type. `A` is inferred from what
 # `zeros(T, sz...)` actually produces (Vector for a 1D grid, Matrix for 2D, Array{T,3} for 3D) —
 # NOT hardcoded, since a 1D/3D grid's `sz` is a 1- or 3-tuple, not always 2D.
-function ΠWorkspace(grid::FlowGeometries.Grids.AbstractGrid{G,T}) where {G, T<:AbstractFloat}
-    sz = FlowGeometries.Grids.size_tuple(grid)
+"""
+    ΠWorkspace(grid)
+    ΠWorkspace(grid, batch_size)
+
+Scratch for a flux computation. Passing `batch_size` sizes every buffer as `(spatial..., batch...)` so a
+whole batch of slices is held at once; the elementwise algebra then broadcasts over the trailing axes
+unchanged, and a filter apply can cover the batch in one pass instead of one per slice.
+"""
+function ΠWorkspace(
+    grid::FlowGeometries.Grids.AbstractGrid{G,T}, batch_size::Tuple = (),
+) where {G, T<:AbstractFloat}
+    sz = (FlowGeometries.Grids.size_tuple(grid)..., batch_size...)
 
     u_filt  = zeros(T, sz...)
     v_filt  = zeros(T, sz...)
@@ -117,16 +127,55 @@ end
 # ---------------------------------------------------------------------------
 
 # Boundary-only (once per top-level call, not per grid point): a mismatched v/w would otherwise be
-# silently truncated/ignored by CartesianIndices(u), not caught at all. Same idiom as the level-count
-# check in compute_Π_profile! below.
+# silently truncated/ignored by CartesianIndices(u), not caught at all.
+#
+# Fields may carry trailing batch axes beyond the grid's rank, so what has to match is the LEADING axes
+# plus the batch shape being common to every field — not the full size. Checking full equality would
+# reject a batch; checking only the leading axes would let a `(Nx,Ny,3)` u pair with a `(Nx,Ny,5)` v and
+# then silently truncate against whichever is shorter, which is the failure this guard exists to catch.
 @inline function _validate_field_sizes(grid, Π::AbstractArray, u::AbstractArray, v = nothing, w = nothing)
     gsz = FlowGeometries.Grids.size_tuple(grid)
-    size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
-    size(Π) == gsz || throw(DimensionMismatch("Π has size $(size(Π)), grid expects $gsz"))
-    v === nothing || size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
-    w === nothing || size(w) == gsz || throw(DimensionMismatch("w has size $(size(w)), grid expects $gsz"))
+    valR = Val(length(gsz))
+    _check_leading(Π, "Π", gsz, valR)
+    _check_leading(u, "u", gsz, valR)
+    bsz = _batch_dims(Π, valR)
+    _batch_dims(u, valR) == bsz || throw(DimensionMismatch(
+        "u's batch axes $(_batch_dims(u, valR)) do not match Π's $bsz",
+    ))
+    if v !== nothing
+        _check_leading(v, "v", gsz, valR)
+        _batch_dims(v, valR) == bsz || throw(DimensionMismatch(
+            "v's batch axes $(_batch_dims(v, valR)) do not match Π's $bsz",
+        ))
+    end
+    if w !== nothing
+        _check_leading(w, "w", gsz, valR)
+        _batch_dims(w, valR) == bsz || throw(DimensionMismatch(
+            "w's batch axes $(_batch_dims(w, valR)) do not match Π's $bsz",
+        ))
+    end
     return nothing
 end
+
+# `Val`-typed ranks throughout: slicing `size(A)` with a runtime range cannot infer a fixed-size tuple and
+# allocates on every call, which is why these are built with `ntuple` at a statically known length.
+@inline function _check_leading(
+    A::AbstractArray, name::AbstractString, gsz::NTuple{R,Int}, ::Val{R},
+) where {R}
+    ndims(A) >= R || throw(DimensionMismatch(
+        "$name has $(ndims(A)) dimensions, grid expects at least $R",
+    ))
+    ntuple(i -> size(A, i), Val(R)) == gsz || throw(DimensionMismatch(
+        "$name's leading axes $(ntuple(i -> size(A, i), Val(R))) do not match grid shape $gsz",
+    ))
+    return nothing
+end
+
+# Trailing axes of a field beyond the grid's rank — the batch shape a workspace must be sized for.
+@inline _batch_dims(A::AbstractArray, ::Val{R}) where {R} =
+    ntuple(i -> size(A, R + i), Val(ndims(A) - R))
+@inline _batch_dims(A::AbstractArray, grid) =
+    _batch_dims(A, Val(length(FlowGeometries.Grids.size_tuple(grid))))
 
 """
     compute_Π!(Π, u, v, w, grid, kernel, scale; workspace=nothing, backend=AutoBackend(), mask_strategy=Deformable())
@@ -178,9 +227,9 @@ genuinely blends all three directions and vertical derivatives are real, not ass
 literature on "vertical structure via coarse-graining" (Aluie, Hecht & Vallis 2018, JPO; Buzzicotti,
 Storer, Khatri, Griffies & Aluie 2023, JAMES) analyzes vertical structure by running this SAME 2D/2.5D
 method independently at each z level of a multi-level dataset and comparing/stacking the resulting
-profiles — not by computing a coupled 3D tensor — so `Pipeline.coarse_grain_profile`/
-[`compute_Π_profile!`](@ref) (looping this method per level) is the literature-matching way to get a
-vertical-structure result. A genuinely coupled, all-nine-strain-component 3D method exists separately
+profiles — not by computing a coupled 3D tensor — so `Pipeline.coarse_grain_profile` (which sweeps this
+method over the vertical axis as a batch) is the literature-matching way to get a vertical-structure
+result. A genuinely coupled, all-nine-strain-component 3D method exists separately
 for the true-3D Cartesian case (see the `AbstractArray{T,3}` `compute_Π!` method).
 
 # Returns
@@ -202,12 +251,21 @@ compute_Π!(Π, u, v, nothing, grid, TopHatKernel(), 30000.0)
 - Buzzicotti, Storer, Khatri, Griffies & Aluie (2023), *J. Adv. Model. Earth Syst.*:
   https://doi.org/10.1029/2021MS002583
 """
+#
+# The GRID's rank is pinned and the arrays' is not, which is what lets a field carry trailing batch axes:
+# `(Nx, Ny, Nb)` here is a batch of 2-D slices, while the same shape against a rank-3 grid is genuine
+# volumetric data and takes the true-3D method. Binding the array rank instead — as this once did — makes
+# a batch unrepresentable, and binding neither makes the two indistinguishable.
+#
+# Nothing below needs to know about the batch: the filter applies route themselves to a fused pass, the
+# tensor algebra is elementwise so it broadcasts over trailing axes, and the stencil derivatives carry the
+# extra axes through.
 function compute_Π!(
-    Π::AbstractMatrix{T},
-    u::AbstractMatrix,
-    v::AbstractMatrix,
-    w::Union{Nothing, AbstractMatrix}, # nothing or zeros for 2D
-    grid::FlowGeometries.Grids.StructuredGrid{G,T},
+    Π::AbstractArray{T},
+    u::AbstractArray,
+    v::AbstractArray,
+    w::Union{Nothing, AbstractArray}, # nothing or zeros for 2D
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,2},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     workspace::Union{Nothing, ΠWorkspace} = nothing,
@@ -217,7 +275,7 @@ function compute_Π!(
     deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     _validate_field_sizes(grid, Π, u, v, w)
-    ws = workspace === nothing ? ΠWorkspace(grid) : workspace
+    ws = workspace === nothing ? ΠWorkspace(grid, _batch_dims(Π, grid)) : workspace
     # One plan for this scale, shared by all ~9 filterings below. A caller repeating this at a fixed
     # scale can pass a prebuilt `filter_plan` to share it across calls as well.
     plan = filter_plan === nothing ?
@@ -226,52 +284,6 @@ function compute_Π!(
     # later call at any scale.
     dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
     return _compute_Π!(Π, u, v, w, grid, ws, plan, dplan)
-end
-
-"""
-    compute_Π_profile!(Π, u, v, w, grid, kernel, scale; workspace=nothing, backend=AutoBackend(), mask_strategy=Deformable())
-
-Vertical-profile energy flux: given 3D `(x, y, z)` velocity arrays, runs the 2D/2.5D
-[`compute_Π!`](@ref) INDEPENDENTLY at each z level — the literature-standard way to obtain
-vertical structure via coarse-graining (Aluie, Hecht & Vallis 2018; Buzzicotti et al. 2023; see the
-thin-layer/QG regime note on `compute_Π!`'s docstring) — writing each level's 2D result into the
-matching slice of the 3D `Π` output. This is NOT a coupled 3D tensor computation (no vertical
-derivatives are taken across levels); for that, see the true-3D `compute_Π!` method instead.
-"""
-function compute_Π_profile!(
-    Π::AbstractArray{T,3},
-    u::AbstractArray{T,3},
-    v::AbstractArray{T,3},
-    w::Union{Nothing, AbstractArray{T,3}},
-    grid::FlowGeometries.Grids.StructuredGrid{G,T},
-    kernel::Kernels.AbstractFilterKernel,
-    scale::T;
-    workspace::Union{Nothing, ΠWorkspace} = nothing,
-    filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
-    deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    # Every level shares the grid, so one stencil table serves the whole loop.
-    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
-    Nlevels = size(u, 3)
-    size(Π, 3) == Nlevels || throw(DimensionMismatch(
-        "Π has $(size(Π, 3)) z levels, u has $Nlevels",
-    ))
-    ws = workspace === nothing ? ΠWorkspace(grid) : workspace
-    # Every level shares the grid, kernel and scale, so one plan serves the whole loop. A caller
-    # sweeping scales can pass one in to share it across iterations too.
-    plan = filter_plan === nothing ?
-        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) : filter_plan
-    for k in 1:Nlevels
-        wk = w === nothing ? nothing : view(w, :, :, k)
-        compute_Π!(
-            view(Π, :, :, k), view(u, :, :, k), view(v, :, :, k), wk, grid, kernel, scale;
-            workspace = ws, filter_plan = plan, backend = backend, mask_strategy = mask_strategy,
-            deriv_plan = dplan,
-        )
-    end
-    return Π
 end
 
 # ---------------------------------------------------------------------------
@@ -916,11 +928,48 @@ twice.
 function energy_from_filtered(
     ws::ΠWorkspace{T}, grid::FlowGeometries.Grids.AbstractGrid, has_w::Bool, total_area::T,
 ) where {T<:AbstractFloat}
+    return _energy_over(ws.u_filt, ws.v_filt, ws.w_filt, grid, has_w, total_area,
+                        FlowGeometries.Grids.size_tuple(grid))
+end
+
+"""
+    energy_from_filtered!(out, ws, grid, has_w, total_area) -> out
+
+Per-slice `E(ℓ)` from a **batched** workspace: `out` holds one energy per slice, shaped like the
+workspace's trailing axes.
+
+`E(ℓ)` is a mean over the domain, so unlike everything else on the batch path this reduces the spatial
+axes away while leaving the batch axes intact — it cannot simply broadcast. The mask and cell areas are
+spatial-only, so each slice reduces against the same geometry.
+"""
+function energy_from_filtered!(
+    out::AbstractArray{T}, ws::ΠWorkspace{T}, grid::FlowGeometries.Grids.AbstractGrid,
+    has_w::Bool, total_area::T,
+) where {T<:AbstractFloat}
+    gsz = FlowGeometries.Grids.size_tuple(grid)
+    colons = ntuple(_ -> Colon(), Val(length(gsz)))
+    size(out) == size(ws.u_filt)[(length(gsz)+1):end] || throw(DimensionMismatch(
+        "out has size $(size(out)); the workspace's batch axes are $(size(ws.u_filt)[(length(gsz)+1):end])",
+    ))
+    @inbounds for J in CartesianIndices(size(out))
+        out[J] = _energy_over(
+            view(ws.u_filt, colons..., Tuple(J)...),
+            view(ws.v_filt, colons..., Tuple(J)...),
+            view(ws.w_filt, colons..., Tuple(J)...),
+            grid, has_w, total_area, gsz,
+        )
+    end
+    return out
+end
+
+# One slice's domain mean, indexed over the GRID's extent rather than the array's, so it is unaffected by
+# any trailing batch axes the caller has already sliced away.
+@inline function _energy_over(uf, vf, wf, grid, has_w::Bool, total_area::T, gsz::Tuple) where {T}
     e = zero(T)
-    @inbounds for I in CartesianIndices(ws.u_filt)
+    @inbounds for I in CartesianIndices(gsz)
         FlowGeometries.Grids.isactive(grid, Tuple(I)...) || continue
-        v2 = ws.u_filt[I]^2 + ws.v_filt[I]^2
-        has_w && (v2 += ws.w_filt[I]^2)
+        v2 = uf[I]^2 + vf[I]^2
+        has_w && (v2 += wf[I]^2)
         e += v2 * FlowGeometries.Grids.area(grid, Tuple(I)...)
     end
     return T(0.5) * e / total_area

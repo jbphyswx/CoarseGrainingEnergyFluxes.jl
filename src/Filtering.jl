@@ -1641,9 +1641,15 @@ function _footprint_row_axpy!(
             end
         end
     end
-    s = wsum > T(1e-15) ? inv(wsum) : zero(T)
-    @inbounds @simd for i in ilo:ihi
-        oc[i] *= s
+
+    if wsum > T(1e-15)
+        @inbounds @simd for i in ilo:ihi
+            oc[i] /= wsum # could be hoisted as * f, where f = inv(wsum)
+        end
+    else
+        @inbounds @simd for i in ilo:ihi
+            oc[i] = zero(T)
+        end
     end
     return (ilo, ihi)
 end
@@ -1816,34 +1822,6 @@ struct SeparableGaussianFootprintND{
     scratch::AT
 end
 
-# One output point of the pass along direction `d`. `d` arrives as a `Val` so the dimension is a
-# compile-time constant and `Base.setindex` on the index tuple folds to a plain index computation.
-@inline function _separable_pass_point(
-    src::AbstractArray{T,N}, g::AbstractVecOrMat{T}, lim::Int, periodic::Bool, n::Int,
-    I::CartesianIndex{N}, ::Val{d},
-) where {T<:AbstractFloat, N, d}
-    It = Tuple(I)
-    i = It[d]
-    s = zero(T)
-    # Interior points need no bounds test at all, so peel them: carrying the branch through the tap
-    # loop blocks vectorization for every point, and the interior is nearly all of them.
-    if lim < i <= n - lim
-        @inbounds @simd for dd in (-lim):lim
-            s += _sepw(g, i, dd + lim + 1) * src[Base.setindex(It, i + dd, d)...]
-        end
-        return s
-    end
-    @inbounds for dd in (-lim):lim
-        ii = i + dd
-        if ii < 1 || ii > n
-            periodic || continue
-            ii = mod1(ii, n)
-        end
-        s += _sepw(g, i, dd + lim + 1) * src[Base.setindex(It, ii, d)...]
-    end
-    return s
-end
-
 """
     _sep_serial(f, indices)
 
@@ -1863,23 +1841,19 @@ end
     lim::Int, periodic::Bool, dims::NTuple{N,Int}, ::Val{d}, driver::D,
 ) where {T<:AbstractFloat, N, d, D}
     n = dims[d]
-    if N > 1
-        # Driven over COLUMNS, not points: taps move to the outer loop so the inner loop always walks
-        # dimension 1 with unit stride, whichever axis the pass is along. A per-point form cannot do
-        # this — for `d ≥ 2` it strides by `∏dims[1:d-1]` on every tap. Each column is written by
-        # exactly one task, so this is as race-free as the per-point form and every backend gets the
-        # same answer.
-        driver(CartesianIndices(Base.tail(dims))) do J
-            if d == 1
-                _separable_col_pass!(dst, src, g, lim, periodic, dims[1], Tuple(J))
-            else
-                _separable_slab_pass!(dst, src, g, lim, periodic, n, dims[1], Tuple(J), Val(d))
-            end
+    # Driven over COLUMNS, not points: taps move to the outer loop so the inner loop always walks
+    # dimension 1 with unit stride, whichever axis the pass is along. A per-point form cannot do this —
+    # for `d ≥ 2` it strides by `∏dims[1:d-1]` on every tap. Each column is written by exactly one task,
+    # so this is as race-free as a per-point form and every backend gets the same answer.
+    #
+    # Rank 1 needs no separate branch: `Base.tail((n,))` is `()` and `CartesianIndices(())` holds one
+    # 0-dimensional index, so the column pass runs once over the whole vector.
+    driver(CartesianIndices(Base.tail(dims))) do J
+        if d == 1
+            _separable_col_pass!(dst, src, g, lim, periodic, dims[1], Tuple(J))
+        else
+            _separable_slab_pass!(dst, src, g, lim, periodic, n, dims[1], Tuple(J), Val(d))
         end
-        return dst
-    end
-    driver(CartesianIndices(dims)) do I
-        @inbounds dst[I] = _separable_pass_point(src, g, lim, periodic, n, I, Val(d))
     end
     return dst
 end
@@ -1958,14 +1932,22 @@ end
 # The passes, unrolled by recursion on `Val(d)`. Buffers alternate and the last pass writes `dst`, so
 # nothing aliases: pass 1 reads the caller's masked input and writes `scratch`, and every later pass
 # reads what its predecessor just wrote. `masked_input` is free to be reused from pass 2 on.
-@inline _sep_pass_chain!(dst, src, fp, dims, ::Val{N}, ::Val{N}, driver::D = _sep_serial) where {N,D} =
+# The two alternating intermediates are passed IN rather than taken from the footprint, because a batched
+# apply needs batch-sized ones and the footprint's are sized for a single slice. `dims` is the driven
+# array's shape, so trailing batch axes ride along; `Val(N)` is the number of PASSES, which stays at the
+# grid's rank so no pass ever differences along a batch axis.
+@inline _sep_pass_chain!(dst, src, fp, dims, ::Val{N}, ::Val{N}, driver::D, b1, b2) where {N,D} =
     _separable_pass!(dst, src, fp.g[N], fp.lim[N], fp.periodic[N], dims, Val(N), driver)
 
-@inline function _sep_pass_chain!(dst, src, fp, dims, ::Val{N}, ::Val{d}, driver::D = _sep_serial) where {N,d,D}
-    buf = isodd(d) ? fp.scratch : fp.masked_input
+@inline function _sep_pass_chain!(dst, src, fp, dims, ::Val{N}, ::Val{d}, driver::D, b1, b2) where {N,d,D}
+    buf = isodd(d) ? b1 : b2
     _separable_pass!(buf, src, fp.g[d], fp.lim[d], fp.periodic[d], dims, Val(d), driver)
-    return _sep_pass_chain!(dst, buf, fp, dims, Val(N), Val(d + 1), driver)
+    return _sep_pass_chain!(dst, buf, fp, dims, Val(N), Val(d + 1), driver, b1, b2)
 end
+
+# Unbatched callers keep the footprint's own buffers.
+@inline _sep_pass_chain!(dst, src, fp, dims, vn::Val, vd::Val, driver::D = _sep_serial) where {D} =
+    _sep_pass_chain!(dst, src, fp, dims, vn, vd, driver, fp.scratch, fp.masked_input)
 
 function _build_separable_gaussian_nd(
     grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
@@ -2034,29 +2016,46 @@ Run the `N` separable passes and the pointwise normalization. `driver` supplies 
 sweep — see [`_sep_serial`](@ref); a threaded backend passes its own and gets the same answer, since
 every point within a pass is independent and the passes themselves stay ordered.
 """
+#
+# The array rank is free while the footprint stays at the grid's rank `R`, so `out`/`field` may carry
+# trailing batch axes. Everything below is driven over the ARRAY's shape, which is what folds a batch into
+# the driven index space — one pass over the whole batch instead of one per slice, and on a device one
+# launch instead of `Nb`. The pass count stays `R`, so no pass differences along a batch axis.
+#
+# The profile tables, the renormalization array and the mask are all spatial-only, so they are indexed with
+# the leading `R` components of the driven index rather than the index itself.
 function apply_separable_gaussian_nd!(
-    out::AbstractArray{T,N}, field::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid,
-    fp::SeparableGaussianFootprintND{N,T}, strategy::AbstractMaskStrategy, driver::D = _sep_serial,
-) where {T<:AbstractFloat, N, D}
+    out::AbstractArray{T}, field::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid,
+    fp::SeparableGaussianFootprintND{R,T}, strategy::AbstractMaskStrategy, driver::D = _sep_serial,
+) where {T<:AbstractFloat, R, D}
     _separable_check_strategy(fp, strategy)
-    dims = FlowGeometries.Grids.size_tuple(grid)
+    dims = size(out)
     mask = FlowGeometries.Grids.mask(grid)
-    @. fp.masked_input = T(mask) * field
-    _sep_pass_chain!(out, fp.masked_input, fp, dims, Val(N), Val(1), driver)
+    b1, b2 = _sep_nd_buffers(fp, out, Val(R))
+    @. b2 = T(mask) * field
+    _sep_pass_chain!(out, b2, fp, dims, Val(R), Val(1), driver, b1, b2)
     prof = fp.profiles
     inv = fp.invrenorm
     driver(CartesianIndices(dims)) do I
         @inbounds begin
+            Is = CartesianIndex(ntuple(d -> I[d], Val(R)))
             if inv === nothing
-                den = prod(ntuple(d -> prof[d][I[d]], Val(N)))
+                den = prod(ntuple(d -> prof[d][I[d]], Val(R)))
                 out[I] = den > T(1e-15) ? out[I] / den : zero(T)
             else
-                out[I] *= inv[I]
+                out[I] *= inv[Is]
             end
-            mask[I] || (out[I] = zero(T))
+            mask[Is] || (out[I] = zero(T))
         end
     end
     return out
+end
+
+# The footprint's own pass buffers when the apply is unbatched; batch-sized ones otherwise, since the
+# chain's intermediates must match the driven shape.
+@inline function _sep_nd_buffers(fp, out::AbstractArray{T}, ::Val{R}) where {T,R}
+    ndims(out) == R && return (fp.scratch, fp.masked_input)
+    return (similar(out), similar(out))
 end
 
 # A Gaussian on a 1-D or true-3-D Cartesian grid is separable exactly as it is in 2-D, so it takes the
@@ -2877,10 +2876,11 @@ function plan_filter(
     spectral_backend::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
     cache_strategy::AbstractCacheStrategy = AutoCache(),
     cache_byte_budget::Integer = DEFAULT_CACHE_BYTE_BUDGET,
+    kwargs...,
 ) where {G<:FlowGeometries.Geometry.AbstractGeometry{T}} where {T<:AbstractFloat}
     _validate_scale(scale)
     if _resolve_method(grid, kernel, method) isa Spectral
-        return spectral_filter_plan(spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
+        return spectral_filter_plan(spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend, kwargs...)
     end
     resolved = _resolve_backend(backend, grid)
     _check_backend_compatible(grid, backend)
@@ -3102,6 +3102,7 @@ function plan_filter(
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     method::AbstractFilterMethod = Spectral(),
     spectral_backend::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
+    kwargs...,
 ) where {T<:AbstractFloat}
     _validate_scale(scale)
     method isa Spectral || throw(ArgumentError(
@@ -3110,7 +3111,7 @@ function plan_filter(
         "architecture provides no query for; use `Spectral()`, or a StructuredGrid, CurvilinearGrid " *
         "or UnstructuredGrid, which have real-space engines.",
     ))
-    return spectral_filter_plan(spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
+    return spectral_filter_plan(spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend, kwargs...)
 end
 
 """
@@ -3133,7 +3134,7 @@ function plan_filter(
 ) where {T<:AbstractFloat}
     _validate_scale(scale)
     method isa Spectral && return spectral_filter_plan(
-        spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend,
+        spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend, kwargs...,
     )
     _check_backend_compatible(grid, backend)
     return PhysicalFilterPlan(
@@ -3155,12 +3156,13 @@ function plan_filter(
     spectral_backend::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
     cache_strategy::AbstractCacheStrategy = AutoCache(),
     cache_byte_budget::Integer = DEFAULT_CACHE_BYTE_BUDGET,
+    kwargs...,
 ) where {T<:AbstractFloat}
     _validate_scale(scale)
     if method isa Spectral
         # No spectral backend targets a CurvilinearGrid (FINUFFT/NUFSHT are UnstructuredGrid-only),
         # so this raises the standard informative "spectral unavailable" error.
-        return spectral_filter_plan(spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
+        return spectral_filter_plan(spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend, kwargs...)
     end
     resolved = _resolve_backend(backend, grid)
     _check_backend_compatible(grid, backend)
@@ -3200,7 +3202,64 @@ per field. `outs`/`fields` must be equal-length, matching-shape collections of a
 `NTuple{K,V}` (single concrete array type `V`) for a compile-time-known batch size (fastest — see
 `_batch_zeros`), or an `AbstractVector` for a runtime-determined batch size.
 """
+# A fused device batch exists only for engines whose kernel carries a batch index; the extension
+# overrides this for those. Never guess — an unfused engine must take the slice loop, not a wrong kernel.
+_gpu_batched_supported(::AbstractFilterPlan) = false
+
+"""
+    filter_apply_batched!(out, field, plan) -> out
+
+Apply `plan` across a **trailing batch axis**: `out` and `field` are `(spatial..., Nb)` over the plan's
+grid. The filter gathers only along spatial axes, so slices are independent and the batch index is
+carried through untouched.
+
+On a device this issues ONE launch of `prod(spatial) * Nb` work items instead of `Nb` launches of
+`prod(spatial)`, which is what matters when a single slice does not fill the device — a 64² slice is
+4k work items. On the host it is the same work as slicing and looping, and exists so callers have one
+shape-generic entry point rather than reimplementing the loop.
+
+Differs from [`filter_apply_batch!`](@ref), which takes several *separate* fields sharing a grid; here
+the batch is one contiguous array, which is what allows the fused launch.
+"""
+function filter_apply_batched!(out::AbstractArray, field::AbstractArray, plan::AbstractFilterPlan)
+    spatial = FlowGeometries.Grids.size_tuple(plan.grid)
+    valR = Val(length(spatial))
+    _check_batched_shape(out, "out", spatial, valR)
+    _check_batched_shape(field, "field", spatial, valR)
+    size(out) == size(field) || throw(DimensionMismatch(
+        "filter_apply_batched! got out $(size(out)) and field $(size(field))",
+    ))
+    if plan.backend isa ComputationalBackends.GPUBackend && _gpu_batched_supported(plan)
+        gpu_filter_field_batched!(
+            plan.backend, out, field, plan.grid, plan.kernel, plan.scale, plan.strategy, plan.footprint,
+        )
+        return out
+    end
+    d = ndims(out)
+    for b in axes(out, d)
+        filter_apply!(selectdim(out, d, b), selectdim(field, d, b), plan)
+    end
+    return out
+end
+
+function _check_batched_shape(
+    A::AbstractArray, name::AbstractString, spatial::NTuple{R,Int}, ::Val{R},
+) where {R}
+    ndims(A) == R + 1 || throw(DimensionMismatch(
+        "$name has $(ndims(A)) dimensions; filter_apply_batched! expects $R spatial + 1 batch",
+    ))
+    ntuple(i -> size(A, i), Val(R)) == spatial || throw(DimensionMismatch(
+        "$name's leading dimensions $(ntuple(i -> size(A, i), Val(R))) do not match grid shape $spatial",
+    ))
+    return nothing
+end
+
+function gpu_filter_field_batched!(args...; kwargs...)
+    throw(ArgumentError("GPUBackend is unavailable — run `using KernelAbstractions` (or use SerialBackend())."))
+end
+
 function filter_apply_batch!(outs, fields, plan::PhysicalFilterPlan)
+    _batched_fields(outs, plan) && return filter_apply_batch_trailing!(outs, fields, plan)
     if plan.backend isa ComputationalBackends.SerialBackend
         return _apply_serial_batch!(outs, fields, plan.grid, plan.footprint, plan.strategy)
     elseif plan.backend isa ComputationalBackends.ThreadedBackend
@@ -3219,8 +3278,29 @@ end
 # Spectral plans have no per-point neighbour derivation to hoist out of a per-field loop — each apply
 # is an independent transform pass — so batching has nothing to collapse and they apply sequentially.
 function filter_apply_batch!(outs, fields, plan::AbstractFilterPlan)
+    _batched_fields(outs, plan) && return filter_apply_batch_trailing!(outs, fields, plan)
     for k in eachindex(outs)
         filter_apply!(outs[k], fields[k], plan)
+    end
+    return outs
+end
+
+# When the fields themselves carry a trailing batch axis, each one goes through the batched entry point
+# rather than the per-slice apply: the field axis stays a loop, but every field's whole batch is one pass.
+# `_batched_fields` is checked against the plan's grid, so a true-3D field on a 3D grid is not mistaken
+# for a batched 2D field.
+@inline function _batched_fields(outs, plan::PhysicalFilterPlan)
+    R = length(FlowGeometries.Grids.size_tuple(plan.grid))
+    return ndims(first(outs)) == R + 1
+end
+
+# A spectral plan carries transforms rather than a grid, so it has no spatial rank to compare against and
+# no trailing-batch form; it keeps the per-field loop.
+@inline _batched_fields(outs, ::AbstractFilterPlan) = false
+
+function filter_apply_batch_trailing!(outs, fields, plan::AbstractFilterPlan)
+    for k in eachindex(outs)
+        filter_apply_batched!(outs[k], fields[k], plan)
     end
     return outs
 end

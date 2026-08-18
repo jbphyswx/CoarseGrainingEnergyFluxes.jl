@@ -253,4 +253,36 @@ function CGEF.Filtering.threaded_filter_slices!(outs, fields, plans)
     return outs
 end
 
+# Batch-parallel PIPELINE sweeps over one shared grid — the whole sweep per slice, not just the filter
+# step. Slices write disjoint views of the batched result, so this needs no synchronization, and the
+# inner sweep is forced serial so the two levels of threading never nest.
+#
+# Scratch is pooled per WORKER: chunk the flat slice list and let each chunk own pool entry `ci`, so
+# pool memory is bounded by thread count rather than by batch length. No longest-first ordering here —
+# one shared grid makes every slice the same cost, unlike `threaded_coarse_grain_slices!`.
+function CGEF.Pipeline.threaded_coarse_grain_batch!(batch, u, v, w, grid, valR, ctx)
+    n = length(batch.slices)
+    groups = OhMyThreads.chunks(1:n; n = CGEF.Pipeline.batch_concurrency(ctx, n))
+    OhMyThreads.tforeach(enumerate(groups); scheduler = _sched()) do (ci, group)
+        for t in group
+            CGEF.Pipeline.coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, t, ci)
+        end
+    end
+    return batch
+end
+
+# Batch-parallel PIPELINE sweeps whose slices carry their own grids. Scratch is per slice here — a
+# workspace is grid-shaped and cannot be reused across differing shapes — so slices index it directly
+# and no chunk mapping is needed.
+#
+# Dispatched LONGEST-FIRST under a dynamic scheduler: ragged point counts mean equal chunking leaves
+# one worker holding the largest sweep after the others have drained.
+function CGEF.Pipeline.threaded_coarse_grain_slices!(results, us, vs, ws, grids, ctx)
+    order = sortperm(CGEF.Pipeline.slice_pipeline_costs(grids, length(ctx.scales)); rev = true)
+    OhMyThreads.tforeach(order; scheduler = _sched()) do t
+        CGEF.Pipeline.coarse_grain_slice_serial!(results, us, vs, ws, grids, ctx, t)
+    end
+    return results
+end
+
 end # module
