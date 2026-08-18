@@ -20,7 +20,7 @@ Test.@testset "Explicit imports (core)" begin
         :CoarseGrainingEnergyFluxesNUFSHTExt,
         :CoarseGrainingEnergyFluxesOhMyThreadsExt,
         :CoarseGrainingEnergyFluxesDistributedExt,
-        :CoarseGrainingEnergyFluxesGPUExt,
+        :CoarseGrainingEnergyFluxesKernelAbstractionsExt,
         :CoarseGrainingEnergyFluxesMPIExt,
     )
         ext = Base.get_extension(CGEF, extname)
@@ -54,7 +54,7 @@ Test.@testset "JET type stability (hot path)" begin
             :CoarseGrainingEnergyFluxesNUFSHTExt,
             :CoarseGrainingEnergyFluxesOhMyThreadsExt,
             :CoarseGrainingEnergyFluxesDistributedExt,
-            :CoarseGrainingEnergyFluxesGPUExt,
+            :CoarseGrainingEnergyFluxesKernelAbstractionsExt,
             :CoarseGrainingEnergyFluxesMPIExt,
         )
             ext = Base.get_extension(CGEF, extname)

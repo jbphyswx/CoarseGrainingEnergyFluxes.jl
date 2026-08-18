@@ -179,4 +179,64 @@ function CGEF.Filtering.mpi_filter_field!(
     return out
 end
 
+# Batch-parallel PIPELINE sweeps across ranks: each rank takes a round-robin stride of slices, and the
+# five batched arrays are assembled with an in-place Allreduce. Every slice's columns are written by
+# exactly one rank, so summing zero-initialized partials reproduces the full result — including
+# `scales` and `wavenumber`, which are per-slice views rather than shared vectors.
+function CGEF.Pipeline.mpi_coarse_grain_batch!(batch, u, v, w, grid, valR, ctx)
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+    nproc = MPI.Comm_size(comm)
+    _zero_batch!(batch)
+    for t in (rank + 1):nproc:length(batch.slices)
+        CGEF.Pipeline.coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, t, 1)
+    end
+    MPI.Allreduce!(batch.Π, +, comm)
+    MPI.Allreduce!(batch.scales, +, comm)
+    MPI.Allreduce!(batch.cumulative_energy, +, comm)
+    MPI.Allreduce!(batch.wavenumber, +, comm)
+    MPI.Allreduce!(batch.filtering_spectrum, +, comm)
+    return batch
+end
+
+# Ragged batch across ranks. Same round-robin split; each slice's own result is assembled separately
+# because the shapes differ.
+function CGEF.Pipeline.mpi_coarse_grain_slices!(results, us, vs, ws, grids, ctx)
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+    nproc = MPI.Comm_size(comm)
+    for r in results
+        _zero_result!(r)
+    end
+    for t in (rank + 1):nproc:length(results)
+        CGEF.Pipeline.coarse_grain_slice_serial!(results, us, vs, ws, grids, ctx, t)
+    end
+    for r in results
+        MPI.Allreduce!(r.Π, +, comm)
+        MPI.Allreduce!(r.scales, +, comm)
+        MPI.Allreduce!(r.cumulative_energy, +, comm)
+        MPI.Allreduce!(r.wavenumber, +, comm)
+        MPI.Allreduce!(r.filtering_spectrum, +, comm)
+    end
+    return results
+end
+
+function _zero_batch!(batch)
+    fill!(batch.Π, false)
+    fill!(batch.scales, false)
+    fill!(batch.cumulative_energy, false)
+    fill!(batch.wavenumber, false)
+    fill!(batch.filtering_spectrum, false)
+    return nothing
+end
+
+function _zero_result!(r)
+    fill!(r.Π, false)
+    fill!(r.scales, false)
+    fill!(r.cumulative_energy, false)
+    fill!(r.wavenumber, false)
+    fill!(r.filtering_spectrum, false)
+    return nothing
+end
+
 end # module

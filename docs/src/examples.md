@@ -202,9 +202,11 @@ grid = FG.Grids.StructuredGrid(geom, xs, xs)    # a 2D grid — z is a third arr
 
 u = randn(N, N, Nz); v = randn(N, N, Nz)                 # (x, y, z)
 scales = collect(5e3:5e3:30e3)
-result = CGEF.coarse_grain_profile(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel())
-result.Π[:, :, :, 3]              # flux profile at scales[3], all Nz levels
-result.cumulative_energy[:, 3]    # per-level cumulative energy at scales[3]
+batch = CGEF.coarse_grain_profile(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel())
+# The vertical axis is a batch axis, so it is TRAILING: Π is (x, y, scale, level).
+batch.Π[:, :, 3, :]                 # flux profile at scales[3], all Nz levels
+batch.cumulative_energy[3, :]       # per-level cumulative energy at scales[3]
+batch.slices[2].Π                   # level 2's own (x, y, scale) result, a zero-copy view
 ```
 
 ## Execution backends (real-space `RealSpace`)

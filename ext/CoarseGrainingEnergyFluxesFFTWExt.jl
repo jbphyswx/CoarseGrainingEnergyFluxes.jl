@@ -32,6 +32,7 @@ struct FFTWFilterPlan{
     CA<:AbstractMatrix{Complex{T}},
     M,
     R,
+    BT,
 } <: CGEF.Filtering.AbstractFilterPlan
     fwd::FP        # plan_rfft
     inv::IP        # plan_irfft
@@ -40,6 +41,52 @@ struct FFTWFilterPlan{
     mask::M        # BitMatrix, or nothing when fully active (no masking overhead at all)
     masked_input::A   # scratch buffer for `mask .* field`; unused (and unallocated-cost) when mask === nothing
     invrenorm::R   # precomputed 1/filter(mask) for Deformable, or nothing (ZeroFill / fully active)
+    # Transforms for a batch of fields, or nothing when the plan was not built for one. A transform is
+    # bound to one field shape, so the batch extent is a construction parameter rather than something
+    # discovered at apply time: a plan is shared across tasks by the batch drivers, so it must not
+    # acquire state while being applied.
+    batched::BT
+end
+
+function _make_batched_parts(masked_input::AbstractMatrix{T}, Nb::Integer) where {T<:AbstractFloat}
+    buf = similar(masked_input, size(masked_input)..., Int(Nb))
+    fwd = FFTW.plan_rfft(buf, (1, 2))
+    cbuf = fwd * buf
+    inv = FFTW.plan_irfft(cbuf, size(buf, 1), (1, 2))
+    return (fwd = fwd, inv = inv, cbuf = cbuf, masked_input = buf)
+end
+
+CGEF.Filtering._batched_fields(outs, plan::FFTWFilterPlan) =
+    plan.batched !== nothing && ndims(first(outs)) == ndims(plan.masked_input) + 1
+
+# The transform runs over the spatial region, so trailing axes ride along; the transfer function, the mask
+# and the renormalization are spatial-only and broadcast across the batch unchanged.
+function CGEF.Filtering.filter_apply_batched!(
+    out::AbstractArray{T,3}, field::AbstractArray{T,3}, plan::FFTWFilterPlan{T},
+) where {T<:AbstractFloat}
+    size(out) == size(field) || throw(DimensionMismatch(
+        "filter_apply_batched! got out $(size(out)) and field $(size(field))",
+    ))
+    (size(out, 1), size(out, 2)) == size(plan.masked_input) || throw(DimensionMismatch(
+        "field's leading axes $((size(out, 1), size(out, 2))) do not match the plan's $(size(plan.masked_input))",
+    ))
+    p = plan.batched
+    p === nothing && throw(ArgumentError(
+        "this spectral plan was not built for a batch; pass `batch = Nb` to `plan_filter`",
+    ))
+    size(p.masked_input, 3) == size(out, 3) || throw(DimensionMismatch(
+        "plan was built for a batch of $(size(p.masked_input, 3)), got $(size(out, 3))",
+    ))
+    if plan.mask === nothing
+        LA.mul!(p.cbuf, p.fwd, field)
+    else
+        @. p.masked_input = plan.mask * field
+        LA.mul!(p.cbuf, p.fwd, p.masked_input)
+    end
+    p.cbuf .*= plan.transfer
+    LA.mul!(out, p.inv, p.cbuf)
+    plan.invrenorm === nothing || (out .*= plan.invrenorm)
+    return out
 end
 
 function CGEF.Filtering.spectral_filter_plan(
@@ -49,6 +96,9 @@ function CGEF.Filtering.spectral_filter_plan(
     scale::T;
     mask_strategy = CGEF.Filtering.Deformable(),
     backend = CGEF.ComputationalBackends.AutoBackend(),
+    # Extent of the trailing batch axis this plan will be applied over, or `nothing` for single fields.
+    # A transform is bound to one field shape, so it is fixed here rather than discovered at apply time.
+    batch::Union{Nothing,Integer} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     (FlowGeometries.Grids.isperiodic(grid, 1) && FlowGeometries.Grids.isperiodic(grid, 2)) || throw(ArgumentError(
         "Spectral FFT filtering requires a doubly-periodic Cartesian grid; build it with " *
@@ -74,7 +124,10 @@ function CGEF.Filtering.spectral_filter_plan(
     fully_active = all(FlowGeometries.Grids.mask(grid))
     masked_input = zeros(T, Nx, Ny)   # allocated once regardless; only touched when mask !== nothing
     if fully_active
-        return FFTWFilterPlan(fwd, inv, transfer, cbuf, nothing, masked_input, nothing)
+        return FFTWFilterPlan(
+            fwd, inv, transfer, cbuf, nothing, masked_input, nothing,
+            batch === nothing ? nothing : _make_batched_parts(masked_input, batch),
+        )
     end
 
     mask = FlowGeometries.Grids.mask(grid)
@@ -93,7 +146,10 @@ function CGEF.Filtering.spectral_filter_plan(
     else
         nothing   # ZeroFill: already exactly `filter(mask .* field)`, no renormalization
     end
-    return FFTWFilterPlan(fwd, inv, transfer, cbuf, mask, masked_input, invrenorm)
+    return FFTWFilterPlan(
+        fwd, inv, transfer, cbuf, mask, masked_input, invrenorm,
+        batch === nothing ? nothing : _make_batched_parts(masked_input, batch),
+    )
 end
 
 function CGEF.Filtering.filter_apply!(

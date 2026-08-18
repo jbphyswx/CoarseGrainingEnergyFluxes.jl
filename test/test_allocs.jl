@@ -382,16 +382,20 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
         scales = collect(5e3:5e3:15e3)
         u = randn(N, N); v = randn(N, N)
 
-        # compute_Π_profile!: one plan per scale, reused across every depth level.
+        # coarse_grain_profile!: the vertical axis is a batch axis, so with a held result and one
+        # scratch set the whole level × scale sweep reuses them instead of rebuilding per level.
         Nz = 4
-        u3 = randn(N, N, Nz); v3 = randn(N, N, Nz); Π3 = zeros(N, N, Nz)
+        u3 = randn(N, N, Nz); v3 = randn(N, N, Nz)
         ws = CGEF.Diagnostics.ΠWorkspace(grid)
         dpg = CGEF.Derivatives.StencilPlan(grid)
-        plan = CGEF.Filtering.plan_filter(grid, ker, 10e3; backend = SERIAL)
-        CGEF.Diagnostics.compute_Π_profile!(Π3, u3, v3, nothing, grid, ker, 10e3; backend = SERIAL, workspace = ws, filter_plan = plan, deriv_plan = dpg)
-        CGEF.Diagnostics.compute_Π_profile!(Π3, u3, v3, nothing, grid, ker, 10e3; backend = SERIAL, workspace = ws, filter_plan = plan, deriv_plan = dpg)
-        a_profile = @allocated CGEF.Diagnostics.compute_Π_profile!(Π3, u3, v3, nothing, grid, ker, 10e3; backend = SERIAL, workspace = ws, filter_plan = plan, deriv_plan = dpg)
-        Test.@test a_profile == 0  # every level shares the one workspace, filter plan and stencil table
+        pplans = [CGEF.Filtering.plan_filter(grid, ker, s; backend = SERIAL) for s in scales]
+        pbatch = CGEF.Pipeline.CoarseGrainBatchResult(grid, length(scales), (Nz,))
+        pkw = (; scales = scales, kernel = ker, workspaces = [ws], filter_plans = [pplans],
+               deriv_plans = [dpg], backend = SERIAL)
+        CGEF.Pipeline.coarse_grain_profile!(pbatch, u3, v3, grid; pkw...)
+        CGEF.Pipeline.coarse_grain_profile!(pbatch, u3, v3, grid; pkw...)
+        a_profile = @allocated CGEF.Pipeline.coarse_grain_profile!(pbatch, u3, v3, grid; pkw...)
+        Test.@test a_profile == 0  # every level shares the one workspace, plan set and stencil table
 
         # coarse_grain!: workspace + filter_plans prebuilt and reused (the documented "repeated
         # timestep sweep" zero-allocation entry point).
@@ -408,13 +412,14 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
         a_cg_noplans = @allocated CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, deriv_plan = dpg)
         Test.@test a_cg_noplans > 10_000
 
-        # coarse_grain_profile: same "prebuilt workspace + filter_plans" zero-(re)allocation contract.
-        CGEF.Pipeline.coarse_grain_profile(u3, v3, grid; backend = SERIAL, scales = scales, workspace = ws, filter_plans = plans, deriv_plan = dpg)
-        CGEF.Pipeline.coarse_grain_profile(u3, v3, grid; backend = SERIAL, scales = scales, workspace = ws, filter_plans = plans, deriv_plan = dpg)
-        a_cgp = @allocated CGEF.Pipeline.coarse_grain_profile(u3, v3, grid; backend = SERIAL, scales = scales, workspace = ws, filter_plans = plans, deriv_plan = dpg)
-        # This allocates the `Π`/`cumE`/`spec`/`CoarseGrainResult` output arrays every call (it has no
-        # in-place `!` counterpart, unlike `coarse_grain!`) — bounded relative to the OUTPUT size, not
-        # asserted small in absolute terms.
+        # coarse_grain_profile (allocating) sizes and fills a fresh batch result every call, so it is
+        # bounded by the OUTPUT size rather than asserted small. The zero-allocation contract belongs to
+        # `coarse_grain_profile!` above, which refills a held batch.
+        ppool = (; scales = scales, kernel = ker, workspaces = [ws], filter_plans = [plans],
+                 deriv_plans = [dpg], backend = SERIAL)
+        CGEF.Pipeline.coarse_grain_profile(u3, v3, grid; ppool...)
+        CGEF.Pipeline.coarse_grain_profile(u3, v3, grid; ppool...)
+        a_cgp = @allocated CGEF.Pipeline.coarse_grain_profile(u3, v3, grid; ppool...)
         Test.@test a_cgp < sizeof(Float64) * (N * N * Nz * length(scales)) * 2
 
         # cumulative_energy!/spectral_density! with prebuilt plans.

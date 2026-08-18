@@ -170,10 +170,10 @@ flow, where vertical shear is genuinely subdominant to horizontal gradients. The
 structure via coarse-graining" literature (Aluie, Hecht & Vallis 2018; the
 Buzzicotti/Storer/Khatri/Griffies/Aluie line of work) does not compute a coupled vertical-derivative
 tensor either — it runs this same 2D/2.5D method **independently at each vertical level** of a
-multi-level model and compares/stacks the resulting profiles. `coarse_grain_profile` /
-`compute_Π_profile!` implement exactly this: given 3D `(x, y, z)` arrays, they loop the
-existing 2D/2.5D `compute_Π!`/`coarse_grain` independently over each level and return the stacked
-profile — no new tensor math, a convenience wrapper over an already-correct 2D method.
+multi-level model and compares/stacks the resulting profiles. `coarse_grain_profile` implements exactly
+this: given 3D `(x, y, z)` arrays it treats the vertical axis as a batch over the shared horizontal
+grid, sweeping the existing 2D/2.5D `coarse_grain!` independently per level and returning the stacked
+profile — no new tensor math, and the level axis parallelizes like any other batch axis.
 
 Separately, and not to be conflated with the above, `compute_Π!` also has a genuinely **coupled true
 3D** method (`StructuredGrid{...,3}`, Cartesian or spherical-volumetric): all nine strain/stress

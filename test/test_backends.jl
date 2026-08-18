@@ -378,3 +378,325 @@ Test.@testset "GPU backend (KernelAbstractions CPU)" begin
     end
 
 end
+
+# Measured through a top-level, fully-qualified helper rather than inline in the testset: inside a testset
+# the arguments and the `P` module alias are captured locals, and `@allocated` then charges that capture to
+# the call (~464 B here) rather than to the function under test.
+_alloc_coarse_grain_batch!(batch, u, v, grid, kw) =
+    @allocated CGEF.Pipeline.coarse_grain_batch!(batch, u, v, grid; kw...)
+_alloc_energy_from_filtered!(out, ws, grid, has_w, area) =
+    @allocated CGEF.Diagnostics.energy_from_filtered!(out, ws, grid, has_w, area)
+
+# The pipeline batch axis. A batch is either shared-grid (one grid, batch on trailing array axes) or
+# ragged (a grid per slice); they are separate entry points because the containers differ, and both must
+# reproduce a serial per-slice `coarse_grain!` loop exactly.
+Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profile" begin
+    P = CGEF.Pipeline
+    CB = CGEF.ComputationalBackends
+    SER = CB.SerialBackend()
+    geom = FG.Geometry.CartesianGeometry()
+    N = 32
+    xs = range(0.0, (N - 1) * 1000.0; length = N)
+    g = FG.Grids.StructuredGrid(geom, xs, xs)
+    scales = [4e3, 8e3]
+    Ns = length(scales)
+
+    same(a, b) = a.Π == b.Π && a.cumulative_energy == b.cumulative_energy &&
+                 a.filtering_spectrum == b.filtering_spectrum && a.scales == b.scales
+
+    Nt = 4
+    u = randn(N, N, Nt)
+    v = randn(N, N, Nt)
+    refs = [P._allocate_result(g, Ns) for _ in 1:Nt]
+    for t in 1:Nt
+        P.coarse_grain!(refs[t], view(u, :, :, t), view(v, :, :, t), g; scales = scales, backend = SER)
+    end
+    for be in (SER, CB.ThreadedBackend(), CB.AutoBackend())
+        b = P.CoarseGrainBatchResult(g, Ns, (Nt,))
+        P.coarse_grain_batch!(b, u, v, g; scales = scales, backend = be)
+        for t in 1:Nt
+            Test.@test same(b.slices[t], refs[t])
+        end
+    end
+
+    # Per-slice results alias the batched storage rather than copying out of it.
+    let b = P.CoarseGrainBatchResult(g, Ns, (Nt,))
+        Test.@test size(b.Π) == (N, N, Ns, Nt)
+        Test.@test size(b.cumulative_energy) == (Ns, Nt)
+        b.Π[1, 1, 1, 3] = 12345.0
+        Test.@test b.slices[3].Π[1, 1, 1] == 12345.0
+    end
+
+    # More than one trailing batch axis, with no reshape by the caller.
+    Nz, Nt2 = 3, 2
+    u4 = randn(N, N, Nz, Nt2)
+    v4 = randn(N, N, Nz, Nt2)
+    b4 = P.CoarseGrainBatchResult(g, Ns, (Nz, Nt2))
+    P.coarse_grain_batch!(b4, u4, v4, g; scales = scales, backend = CB.ThreadedBackend())
+    Test.@test size(b4.Π) == (N, N, Ns, Nz, Nt2)
+    for (i, J) in enumerate(CartesianIndices((Nz, Nt2)))
+        r = P._allocate_result(g, Ns)
+        P.coarse_grain!(r, view(u4, :, :, J[1], J[2]), view(v4, :, :, J[1], J[2]), g;
+                        scales = scales, backend = SER)
+        Test.@test same(b4.slices[i], r)
+    end
+
+    let npool = max(1, min(Nt, Threads.nthreads()))
+        wss = [CGEF.Diagnostics.ΠWorkspace(g) for _ in 1:npool]
+        fps = [[CGEF.Filtering.plan_filter(g, CGEF.TopHatKernel(), s;
+                                           backend = SER, mask_strategy = CGEF.Filtering.Deformable())
+                for s in scales] for _ in 1:npool]
+        dps = [CGEF.Derivatives.StencilPlan(g) for _ in 1:npool]
+        kw = (; scales = scales, workspaces = wss, filter_plans = fps, deriv_plans = dps, backend = SER)
+        b = P.CoarseGrainBatchResult(g, Ns, (Nt,))
+        P.coarse_grain_batch!(b, u, v, g; kw...)
+        Test.@test _alloc_coarse_grain_batch!(b, u, v, g, kw) == 0
+        for t in 1:Nt
+            Test.@test same(b.slices[t], refs[t])
+        end
+        # Pools are indexed by worker, so unequal lengths must error rather than alias scratch.
+        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(
+            b, u, v, g; scales = scales, workspaces = wss, deriv_plans = dps[1:1], backend = SER,
+        )
+    end
+
+    # The grid fixes the spatial rank; everything past it is batch, and a mismatch is an error.
+    let b = P.CoarseGrainBatchResult(g, Ns, (Nt,))
+        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N, N, Nt + 1), v, g; scales = scales)
+        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N + 1, N, Nt), v, g; scales = scales)
+        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N, N), randn(N, N), g; scales = scales)
+    end
+
+    # Ragged batch: a grid per slice, so results cannot be views into one shared tensor.
+    g1 = FG.Grids.StructuredGrid(geom, range(0.0, 1.6e4; length = 16), range(0.0, 1.6e4; length = 16))
+    g2 = FG.Grids.StructuredGrid(geom, range(0.0, 2.4e4; length = 24), range(0.0, 2.4e4; length = 24))
+    grids = [g1, g2, g1]
+    us = [randn(16, 16), randn(24, 24), randn(16, 16)]
+    vs = [randn(16, 16), randn(24, 24), randn(16, 16)]
+    Test.@test_throws DimensionMismatch P.coarse_grain_slices!(
+        [P._allocate_result(gg, Ns) for gg in grids], us, vs[1:2], grids; scales = scales,
+    )
+    # Longest-first scheduling reads this ordering: points x scales, largest slice dispatched first.
+    Test.@test P.slice_pipeline_costs(grids, Ns) == [16 * 16 * Ns, 24 * 24 * Ns, 16 * 16 * Ns]
+    for be in (SER, CB.ThreadedBackend())
+        rr = [P._allocate_result(gg, Ns) for gg in grids]
+        P.coarse_grain_slices!(rr, us, vs, grids; scales = scales, backend = be)
+        for t in eachindex(grids)
+            r = P._allocate_result(grids[t], Ns)
+            P.coarse_grain!(r, us[t], vs[t], grids[t]; scales = scales, backend = SER)
+            Test.@test same(rr[t], r)
+        end
+    end
+
+    # The two containers must mean the same thing where they overlap.
+    let gg = [g, g, g],
+        uu = [u[:, :, 1], u[:, :, 2], u[:, :, 3]],
+        vv = [v[:, :, 1], v[:, :, 2], v[:, :, 3]]
+        rr = [P._allocate_result(g, Ns) for _ in 1:3]
+        P.coarse_grain_slices!(rr, uu, vv, gg; scales = scales, backend = SER)
+        bb = P.CoarseGrainBatchResult(g, Ns, (3,))
+        P.coarse_grain_batch!(bb, u[:, :, 1:3], v[:, :, 1:3], g; scales = scales, backend = SER)
+        for t in 1:3
+            Test.@test same(rr[t], bb.slices[t])
+        end
+    end
+
+    # The vertical profile is a shared-grid batch whose axis happens to be the vertical one.
+    Nlev = 4
+    u3 = randn(N, N, Nlev)
+    v3 = randn(N, N, Nlev)
+    bp = P.coarse_grain_profile(u3, v3, g; scales = scales, backend = SER)
+    Test.@test size(bp.Π) == (N, N, Ns, Nlev)
+    Test.@test size(bp.cumulative_energy) == (Ns, Nlev)
+    for k in 1:Nlev
+        # Independent reference: the plain 2D pipeline on that level's slice. Equality is what shows
+        # E(ℓ) is read out of the workspace during the flux pass instead of by filtering u,v again.
+        r = P.coarse_grain(view(u3, :, :, k), view(v3, :, :, k), g; scales = scales, backend = SER)
+        Test.@test bp.slices[k].Π == r.Π
+        Test.@test bp.slices[k].cumulative_energy == r.cumulative_energy
+        Test.@test bp.slices[k].filtering_spectrum == r.filtering_spectrum
+    end
+    let bt = P.CoarseGrainBatchResult(g, Ns, (Nlev,))
+        P.coarse_grain_profile!(bt, u3, v3, g; scales = scales, backend = CB.ThreadedBackend())
+        Test.@test bt.Π == bp.Π
+        Test.@test bt.cumulative_energy == bp.cumulative_energy
+    end
+    # The level loop lives in the batch primitive now; a second implementation must not come back.
+    Test.@test !isdefined(CGEF.Diagnostics, :compute_Π_profile!)
+end
+
+# Filtering across a trailing batch axis. On a device the banded engine folds the batch into ONE launch;
+# every other engine takes the slice loop rather than a kernel that would ignore the batch index.
+Test.@testset "filter_apply_batched!: fused device batch and exact slice-loop fallback" begin
+    CB = CGEF.ComputationalBackends
+    F = CGEF.Filtering
+    Nb = 3
+    Rearth = 6.371e6
+    nlon, nlat = 64, 32
+    lon = range(0.0, 2π * (nlon - 1) / nlon; length = nlon)
+    lat = range(-1.0, 1.0; length = nlat)
+    msk = trues(nlon, nlat)
+    msk[:, 1:4] .= false
+    msk[20:26, :] .= false
+    cart = FG.Geometry.CartesianGeometry()
+    gcart = FG.Grids.StructuredGrid(cart, range(0.0, 6.4e4; length = 64), range(0.0, 3.2e4; length = 32))
+
+    # Every engine with a per-point device kernel must fold the batch into ONE launch. The only engine
+    # exempt is the prefix-sum top-hat, whose running scan along an axis is not a per-point kernel and
+    # runs on the host by design (a device version needs a parallel Blelloch scan).
+    for (grid, kern, sc) in (
+        (FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(Rearth), lon, lat), CGEF.GaussianKernel(), 400e3),
+        (FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(Rearth), lon, lat, msk), CGEF.GaussianKernel(), 400e3),
+        (gcart, CGEF.GaussianKernel(), 8e3),
+        (gcart, CGEF.TopHatKernel(), 8e3),
+    )
+        dims = FG.Grids.size_tuple(grid)
+        f = randn(dims..., Nb)
+        ps = F.plan_filter(grid, kern, sc; backend = CB.SerialBackend(), mask_strategy = F.Deformable())
+        pg = F.plan_filter(grid, kern, sc; backend = CB.GPUBackend(KA.CPU()), mask_strategy = F.Deformable())
+        Test.@test F._gpu_batched_supported(pg) || pg.footprint isa CGEF.Filtering.PrefixSumTopHatPlan
+
+        loop = zeros(dims..., Nb)
+        for b in 1:Nb
+            F.filter_apply!(selectdim(loop, ndims(loop), b), selectdim(f, ndims(f), b), ps)
+        end
+        # Both the fused launch and the host batched entry must be EXACT against the per-slice loop: the
+        # batch index changes which points a thread handles, never the arithmetic at any one point.
+        Test.@test F.filter_apply_batched!(zeros(dims..., Nb), f, pg) == loop
+        Test.@test F.filter_apply_batched!(zeros(dims..., Nb), f, ps) == loop
+    end
+
+    let p = F.plan_filter(gcart, CGEF.TopHatKernel(), 8e3; backend = CB.SerialBackend())
+        Test.@test_throws DimensionMismatch F.filter_apply_batched!(zeros(8, 8, 2), randn(8, 8, 2), p)
+        Test.@test_throws DimensionMismatch F.filter_apply_batched!(zeros(64, 32), randn(64, 32), p)
+    end
+
+    # Spectral batches too: the transform runs over the spatial region so trailing axes ride along, and
+    # the transfer function, mask and renormalization are spatial-only. The batch extent is fixed at
+    # construction because a transform is bound to one field shape — a plan is shared across tasks by the
+    # batch drivers, so it must not acquire state while being applied.
+    let N = 64, Nb = 3,
+        xs = range(0.0, (N - 1) * 1000.0; length = N),
+        msk2 = (m = trues(N, N); m[:, 1:6] .= false; m[20:26, :] .= false; m)
+        for mk in (trues(N, N), msk2), st in (F.Deformable(), F.ZeroFill())
+            gp = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs, mk; periodic = (true, true))
+            ps = F.plan_filter(gp, CGEF.GaussianKernel(), 8e3; method = F.Spectral(), mask_strategy = st)
+            pb = F.plan_filter(gp, CGEF.GaussianKernel(), 8e3; method = F.Spectral(), mask_strategy = st, batch = Nb)
+            f = randn(N, N, Nb)
+            loop = zeros(N, N, Nb)
+            for b in 1:Nb
+                F.filter_apply!(view(loop, :, :, b), view(f, :, :, b), ps)
+            end
+            Test.@test F.filter_apply_batched!(zeros(N, N, Nb), f, pb) == loop
+            Test.@test F._batched_fields((zeros(N, N, Nb),), pb)
+            # A plan built without a batch must refuse one rather than silently doing something else,
+            # and one built for a different extent must refuse too.
+            Test.@test !F._batched_fields((zeros(N, N, Nb),), ps)
+            Test.@test_throws ArgumentError F.filter_apply_batched!(zeros(N, N, Nb), f, ps)
+            Test.@test_throws DimensionMismatch F.filter_apply_batched!(
+                zeros(N, N, Nb + 1), randn(N, N, Nb + 1), pb,
+            )
+        end
+    end
+end
+
+# The flux path itself over a batch. `compute_Π!` pins the GRID's rank and leaves the arrays' free, so a
+# `(Nx, Ny, Nb)` field is a batch of 2-D slices while the same shape against a rank-3 grid stays
+# volumetric. Everything under it is rank-agnostic — filters route to a fused pass, the tensor algebra
+# broadcasts, stencil derivatives carry the axes through — so the whole batch must equal a per-slice loop.
+Test.@testset "Batch-native flux path: compute_Π!, energy_from_filtered!, GPU driver" begin
+    CB = CGEF.ComputationalBackends
+    F = CGEF.Filtering
+    D = CGEF.Diagnostics
+    P = CGEF.Pipeline
+    cart = FG.Geometry.CartesianGeometry()
+    N, Nb = 24, 3
+    xs = range(0.0, (N - 1) * 1000.0; length = N)
+    msk = trues(N, N)
+    msk[:, 1:3] .= false
+    msk[10:14, :] .= false
+    grids = (("unmasked", FG.Grids.StructuredGrid(cart, xs, xs)),
+             ("masked", FG.Grids.StructuredGrid(cart, xs, xs, msk)))
+
+    for (gname, g) in grids, kern in (CGEF.GaussianKernel(), CGEF.TopHatKernel())
+        sc = 4e3
+        dp = CGEF.Derivatives.StencilPlan(g)
+        area = D.active_area(g)
+        u = randn(N, N, Nb)
+        v = randn(N, N, Nb)
+
+        for be in (CB.SerialBackend(), CB.GPUBackend(KA.CPU()))
+            plan = F.plan_filter(g, kern, sc; backend = be, mask_strategy = F.Deformable())
+            kw = (; filter_plan = plan, backend = be, mask_strategy = F.Deformable(), deriv_plan = dp)
+
+            # per-slice reference, unbatched workspace
+            ref = zeros(N, N, Nb)
+            refE = zeros(Nb)
+            ws1 = D.ΠWorkspace(g)
+            for b in 1:Nb
+                D.compute_Π!(view(ref, :, :, b), view(u, :, :, b), view(v, :, :, b), nothing,
+                             g, kern, sc; workspace = ws1, kw...)
+                refE[b] = D.energy_from_filtered(ws1, g, false, area)
+            end
+
+            # one batched call, one batch-sized workspace
+            got = zeros(N, N, Nb)
+            gotE = zeros(Nb)
+            wsb = D.ΠWorkspace(g, (Nb,))
+            Test.@test size(wsb.u_filt) == (N, N, Nb)
+            D.compute_Π!(got, u, v, nothing, g, kern, sc; workspace = wsb, kw...)
+            D.energy_from_filtered!(gotE, wsb, g, false, area)
+            Test.@test got == ref
+            Test.@test gotE == refE
+        end
+
+        # E(ℓ) collapses the spatial axes and keeps the batch axes, so it is the one reduction on this
+        # path; with the workspace already filled it must not allocate.
+        let wsb = D.ΠWorkspace(g, (Nb,)), gotE = zeros(Nb),
+            plan = F.plan_filter(g, kern, sc; backend = CB.SerialBackend(), mask_strategy = F.Deformable())
+            D.compute_Π!(zeros(N, N, Nb), u, v, nothing, g, kern, sc;
+                         workspace = wsb, filter_plan = plan, backend = CB.SerialBackend(),
+                         mask_strategy = F.Deformable(), deriv_plan = dp)
+            D.energy_from_filtered!(gotE, wsb, g, false, area)
+            Test.@test _alloc_energy_from_filtered!(gotE, wsb, g, false, area) == 0
+        end
+    end
+
+    # A batch is only well-posed if every field agrees on it: matching the leading axes alone would let a
+    # 3-slice u pair with a 5-slice v and silently truncate against the shorter one.
+    let g = FG.Grids.StructuredGrid(cart, xs, xs),
+        plan = F.plan_filter(g, CGEF.TopHatKernel(), 4e3; backend = CB.SerialBackend()),
+        ws = D.ΠWorkspace(g, (Nb,))
+        Test.@test_throws DimensionMismatch D.compute_Π!(
+            zeros(N, N, Nb), randn(N, N, Nb), randn(N, N, Nb + 2), nothing, g,
+            CGEF.TopHatKernel(), 4e3; workspace = ws, filter_plan = plan, backend = CB.SerialBackend(),
+        )
+        Test.@test_throws DimensionMismatch D.compute_Π!(
+            zeros(N, N, Nb), randn(N + 1, N, Nb), randn(N + 1, N, Nb), nothing, g,
+            CGEF.TopHatKernel(), 4e3; workspace = ws, filter_plan = plan, backend = CB.SerialBackend(),
+        )
+        Test.@test_throws DimensionMismatch D.energy_from_filtered!(
+            zeros(Nb + 1), ws, g, false, D.active_area(g),
+        )
+    end
+
+    # The GPU driver takes the batch-native route (one fused pass per scale over the whole batch) while the
+    # host backends keep the slice loop; both must reproduce the same serial per-slice sweep.
+    let g = FG.Grids.StructuredGrid(cart, xs, xs), scales = [4e3, 8e3], Ns = 2
+        u = randn(N, N, Nb)
+        v = randn(N, N, Nb)
+        refs = [P._allocate_result(g, Ns) for _ in 1:Nb]
+        for t in 1:Nb
+            P.coarse_grain!(refs[t], view(u, :, :, t), view(v, :, :, t), g;
+                            scales = scales, backend = CB.SerialBackend())
+        end
+        b = P.CoarseGrainBatchResult(g, Ns, (Nb,))
+        P.coarse_grain_batch!(b, u, v, g; scales = scales, backend = CB.GPUBackend(KA.CPU()))
+        for t in 1:Nb
+            Test.@test b.slices[t].Π == refs[t].Π
+            Test.@test b.slices[t].cumulative_energy == refs[t].cumulative_energy
+            Test.@test b.slices[t].filtering_spectrum == refs[t].filtering_spectrum
+            Test.@test b.slices[t].wavenumber == refs[t].wavenumber
+        end
+    end
+end

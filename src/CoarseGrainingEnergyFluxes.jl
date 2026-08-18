@@ -26,11 +26,13 @@ using .Visualization: Visualization
 # `ddx!`/`ddy!`/`ddz!`, `compute_Π!`, `plan_filter`, `ΠWorkspace`, `spectral_transfer`, … — is reached
 # qualified (`CoarseGrainingEnergyFluxes.Diagnostics.compute_Π!(...)`). Each additional export is a
 # name-clash risk in the user's namespace.
-using .Pipeline: coarse_grain, coarse_grain!, coarse_grain_profile, CoarseGrainResult
+using .Pipeline: coarse_grain, coarse_grain!, coarse_grain_profile, coarse_grain_profile!, CoarseGrainResult
+using .Pipeline: coarse_grain_batch!, coarse_grain_slices!, CoarseGrainBatchResult
 using .Kernels: TopHatKernel, GaussianKernel, SharpSpectralKernel
 using .Visualization: plot_Π_map, plot_spectrum
 
-export coarse_grain, coarse_grain!, coarse_grain_profile, CoarseGrainResult
+export coarse_grain, coarse_grain!, coarse_grain_profile, coarse_grain_profile!, CoarseGrainResult
+export coarse_grain_batch!, coarse_grain_slices!, CoarseGrainBatchResult
 export TopHatKernel, GaussianKernel, SharpSpectralKernel
 export plot_Π_map, plot_spectrum
 
