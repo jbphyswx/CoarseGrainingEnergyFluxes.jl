@@ -490,7 +490,7 @@ Whether `d|Ĝ(k)|²/dk ≤ 0` holds on `(0, ∞)`.
 
 Sadek & Aluie (2018) eq. (21): this is the condition under which the filtering spectral density
 `Ẽ(k_ℓ)` is guaranteed non-negative. A kernel that fails it can produce a spectrum with negative
-values, which is why [`filtering_spectrum`](@ref) refuses one.
+values, which is why `Diagnostics.filtering_spectrum` refuses one.
 
 | kernel | monotone | why |
 |---|---|---|
@@ -501,7 +501,7 @@ values, which is why [`filtering_spectrum`](@ref) refuses one.
 The condition is sufficient, not necessary — Sadek & Aluie's own fallback argument concedes it is
 "not a rigorous proof" — so `false` means "not guaranteed", not "certainly negative". It is also
 narrower than it looks: it says nothing about the `k^{-(p+2)}` slope ceiling, which binds the
-Gaussian just as hard as the top-hat (see [`filtering_spectrum`](@ref)).
+Gaussian just as hard as the top-hat (see `Diagnostics.filtering_spectrum`).
 
 There is deliberately **no fallback method**. A new kernel gets a `MethodError` here rather than a
 guessed answer, so its author has to establish which way it goes.

@@ -1,3 +1,7 @@
+```@meta
+CurrentModule = CoarseGrainingEnergyFluxes
+```
+
 # Examples
 
 All examples follow the package import policy: bring each module in under a stable alias and qualify

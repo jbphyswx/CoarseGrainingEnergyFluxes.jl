@@ -1,3 +1,7 @@
+```@meta
+CurrentModule = CoarseGrainingEnergyFluxes
+```
+
 # CoarseGrainingEnergyFluxes.jl
 
 Spatial coarse-graining analysis of energy fluxes in geophysical fluid dynamics.

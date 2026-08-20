@@ -1155,7 +1155,7 @@ end
 Cumulative coarse-grained kinetic energy `E(ℓ) = 0.5 ⟨|ū_ℓ|²⟩` at each filter scale
 (Sadek & Aluie 2018, PRF, Eq. 15). This is the CUMULATIVE quantity; the filtering spectral DENSITY
 (comparable to a Fourier energy spectrum) is its derivative w.r.t. filtering wavenumber — see
-[`filtering_spectrum`](@ref). Allocates a fresh `spectrum` vector each call; for a repeated sweep
+[`Diagnostics.filtering_spectrum`](@ref). Allocates a fresh `spectrum` vector each call; for a repeated sweep
 (e.g. inside `coarse_grain!`), call [`cumulative_energy!`](@ref) directly with a reused buffer.
 
 # Examples

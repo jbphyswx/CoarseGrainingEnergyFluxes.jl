@@ -1145,7 +1145,7 @@ end
 # becomes a row pass then a column pass: O(N·r) against O(N·r²), up to the truncation-shape difference
 # noted below. The factorization needs a rectilinear grid, not a uniform one — a stretched axis makes
 # `Gx` depend on position as well as offset, which is a wider weight table (see
-# [`_separable_axis_weights`](@ref)) rather than a different algorithm.
+# `_separable_axis_weights`) rather than a different algorithm.
 #
 # Cartesian only: great-circle distance does not factor, so a spherical grid takes the per-latitude-band
 # path instead.
@@ -1544,7 +1544,7 @@ end
 
 Separability does not require constant spacing: `exp(-α(Δx²+Δy²)/ℓ²)` factorizes on any rectilinear
 grid, and a stretched axis only makes the per-axis weight depend on position as well as offset — see
-[`_separable_axis_weights`](@ref). So a stretched Cartesian grid gets the same two-pass `O(N·(wx+wy))`
+`_separable_axis_weights`. So a stretched Cartesian grid gets the same two-pass `O(N·(wx+wy))`
 convolution rather than falling to the `O(N·wx·wy)` scattered engine, which for a Gaussian at `w = 20`
 is a factor `(2w+1)/2` in operations and a much larger one in per-operation cost.
 
@@ -2123,7 +2123,7 @@ end
 # A Gaussian on a 1-D or true-3-D Cartesian grid is separable exactly as it is in 2-D, so it takes the
 # `N`-pass engine rather than `FilterFootprintND`'s full-box enumeration. More specific than the
 # generic-kernel methods below (constrained on the kernel too), and unconstrained in the axis types
-# because separability does not require uniform spacing — see [`_separable_axis_weights`](@ref).
+# because separability does not require uniform spacing — see `_separable_axis_weights`.
 build_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{G,T,1},
     kernel::SeparableKernel, scale::T; kwargs...,
@@ -3343,6 +3343,20 @@ function gpu_filter_field_batched!(args...; kwargs...)
     throw(ArgumentError("GPUBackend is unavailable — run `using KernelAbstractions` (or use SerialBackend())."))
 end
 
+"""
+    filter_apply_batch!(outs, fields, plan) -> outs
+
+Apply one prebuilt `plan` to SEVERAL separate fields sharing its grid, writing `outs[i]` from
+`fields[i]`. Equivalent to calling [`filter_apply!`](@ref) per field and asserted bit-identical to it,
+but the engines that derive per-point geometry — the scattered/node footprints — derive each target
+point's neighbourhood once for the whole batch instead of once per field, which is where the saving is.
+
+`compute_Π!` filters five to nine fields per scale, so this is the shape its inner loop uses.
+
+Distinct from [`filter_slices!`](@ref), which takes independent fields on DIFFERENT grids, one plan
+each; here there is one grid and one plan. For a single array carrying a trailing batch axis, this
+dispatches on to the fused-launch path.
+"""
 function filter_apply_batch!(outs, fields, plan::PhysicalFilterPlan)
     _batched_fields(outs, plan) && return filter_apply_batch_trailing!(outs, fields, plan)
     if plan.backend isa ComputationalBackends.SerialBackend
