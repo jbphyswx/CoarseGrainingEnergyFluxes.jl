@@ -21,11 +21,20 @@ stress τ_ℓ = (u⊗u)̄_ℓ − ū_ℓ⊗ū_ℓ, the cross-scale kinetic-energ
 Π(x, ℓ) = −ρ₀ τ_ℓ : S̄_ℓ
 ```
 
-(Π > 0 forward cascade, Π < 0 inverse cascade). The package also computes the **filtering spectrum**
-(Sadek & Aluie 2018), a corrected **rotational/divergent (Helmholtz) three-way split** of Π
-(rotational→rotational, divergent→divergent, and the interaction/"stimulated cascade" channel), the
-**Leonard/Cross/Reynolds** stress decomposition (Cartesian and spherical), and the **tracer/buoyancy
-variance flux** — on masked, regional, or global domains, with real-space (direct-sum) or spectral
+(Π > 0 forward cascade, Π < 0 inverse cascade). Alongside Π the package computes:
+
+| Diagnostic | Function |
+|---|---|
+| Filtering spectrum and cumulative coarse energy (Sadek & Aluie 2018) | `filtering_spectrum`, `cumulative_energy` |
+| Strain/convergence split of Π (Srinivasan, Barkan & McWilliams 2023) | `compute_Π_strain_convergence` |
+| Rotational/divergent (Helmholtz) three-way split, including the interaction "stimulated cascade" channel | `compute_Π_decomposed` |
+| Leonard/Cross/Reynolds stress decomposition (Cartesian and spherical) | `tau_decomposition` |
+| Tracer / buoyancy-variance flux | `tracer_variance_flux` |
+| Enstrophy flux, in the same deformation gauge as Π | `enstrophy_flux` |
+| Energy per scale band, via the repeated-filter Germano identity | `band_energies` |
+| Variable-density (Favre) budget: Π, baropycnal work Λ, and pressure dilatation | `compressible_flux` |
+
+— on masked, regional, or global domains, with real-space (direct-sum) or spectral
 (FFTW / FINUFFT / spherical-harmonic / NUFSHT) backends and serial/threaded/GPU/distributed/MPI
 execution.
 
@@ -56,6 +65,18 @@ Cumulative coarse KE E(ℓ) and the spectral density Ẽ(k_ℓ); the sharp-spect
 Π splits exactly into rotational→rotational, divergent→divergent, and interaction ("stimulated cascade") channels.
 
 ![Helmholtz decomposition](docs/src/assets/helmholtz_decomposition.png)
+
+### Strain / convergence split of Π
+![Strain / convergence split of Π](docs/src/assets/strain_convergence.png)
+
+### Enstrophy flux (the 2-D companion to Π)
+![Enstrophy flux (the 2-D companion to Π)](docs/src/assets/enstrophy_flux.png)
+
+### Energy by scale band
+![Energy by scale band](docs/src/assets/band_energies.png)
+
+### Variable-density (Favre) budget: Π, baropycnal work Λ
+![Variable-density (Favre) budget: Π, baropycnal work Λ](docs/src/assets/compressible_flux.png)
 
 ### Cross-scale tracer / buoyancy-variance flux
 The scalar analogue of Π (buoyancy ⇒ available-potential-energy transfer).
@@ -153,9 +174,11 @@ src/
   Derivatives.jl  — ddx!/ddy!/ddz! + StencilPlan, over FlowGeometries' discretization
                     (least-squares gradients on CurvilinearGrid/UnstructuredGrid come from
                     Connectivity.gradient_plan there)
-  Diagnostics.jl  — compute_Π!, compute_Π_profile!, compute_Π_decomposed, tau_decomposition,
-                    tracer_variance_flux, cumulative_energy, filtering_spectrum
-  Pipeline.jl     — coarse_grain / coarse_grain! / coarse_grain_profile (high-level orchestration)
+  Diagnostics.jl  — compute_Π!, compute_Π_decomposed, compute_Π_strain_convergence,
+                    tau_decomposition, tracer_variance_flux, enstrophy_flux, band_energies,
+                    compressible_flux, cumulative_energy, filtering_spectrum
+  Pipeline.jl     — coarse_grain / coarse_grain! / coarse_grain_profile / coarse_grain_batch!,
+                    check_setup (high-level orchestration)
   Visualization.jl — plot_Π_map / plot_spectrum stubs (methods provided by the CairoMakie ext)
 ext/
   FFTWExt                       — FFT spectral filtering (uniform periodic Cartesian StructuredGrid)
@@ -201,6 +224,14 @@ ug = FlowGeometries.Grids.UnstructuredGrid(geom, x, y, mask; k = 8)  # k-nearest
 | `TopHatKernel()` | Uniform weight within radius ℓ/2 | Standard, most common (spectral transfer needs `using SpecialFunctions`) |
 | `GaussianKernel(; α = 6)` | Gaussian, variance-matched to a box of width ℓ (`σ² = ℓ²/12`) | Smooth, differentiable, has an exact spectral transfer |
 | `SharpSpectralKernel()` | Ideal low-pass in spectral space | Perfect scale separation for spectral filtering |
+| `SmoothHatKernel(; steepness = 10)` | Tanh-tapered top-hat (Storer et al.) | A box without the discontinuity; real space only |
+| `HyperGaussianKernel(; α = 1)` | Super-Gaussian, `exp(-α(2d/ℓ)⁴)` | Flatter core, steeper skirt than a Gaussian; real space only |
+| `HighOrderKernel{P}(; b_over_ℓ = 1/8)` | `P` vanishing moments, `P ∈ (3, 5)` (Sadek & Aluie `M^I`/`M^II`) | Lifts the filtering spectrum's `k⁻³` slope ceiling. **Separable, not radial**, and signed — needs axes, `ℓ ≥ 8Δx`, and is not for Π |
+
+Only `TopHatKernel`, `GaussianKernel` and `SharpSpectralKernel` have an isotropic spectral transfer
+function, so only they can be used with `method = Spectral()`. And only `GaussianKernel` and
+`SharpSpectralKernel` have a monotone `|Ĝ|²`, which is what `filtering_spectrum` requires — see
+`Kernels.transfer_monotone`, or just ask `check_setup`.
 
 Real-space filtering cost is **not** `O(N · window²)` for every kernel — two kernels have exact fast
 paths that make cost grow linearly, rather than quadratically, with the filter width in grid cells:

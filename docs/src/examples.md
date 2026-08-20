@@ -99,6 +99,18 @@ Two conventions worth stating outright, because getting either wrong changes the
 ### Rotational / divergent (Helmholtz) decomposition of Π
 ![Helmholtz decomposition](assets/helmholtz_decomposition.png)
 
+### Strain / convergence split of Π
+![Strain / convergence split of Π](assets/strain_convergence.png)
+
+### Enstrophy flux (the 2-D companion to Π)
+![Enstrophy flux (the 2-D companion to Π)](assets/enstrophy_flux.png)
+
+### Energy by scale band
+![Energy by scale band](assets/band_energies.png)
+
+### Variable-density (Favre) budget: Π, baropycnal work Λ
+![Variable-density (Favre) budget: Π, baropycnal work Λ](assets/compressible_flux.png)
+
 ### Cross-scale tracer / buoyancy-variance flux
 ![Tracer flux](assets/tracer_flux.png)
 

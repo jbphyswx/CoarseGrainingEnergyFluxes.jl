@@ -8,12 +8,26 @@ Spatial coarse-graining analysis of energy fluxes in geophysical fluid dynamics.
 
 ## Overview
 
-This package implements the coarse-graining (spatial filtering) framework for computing:
+This package implements the coarse-graining (spatial filtering) framework. The core quantity is the
+**cross-scale energy flux** Π(x, ℓ), the local rate of kinetic-energy transfer across scale ℓ. Around it:
 
-- **Cross-scale energy flux** Π(x, ℓ) — the local rate of kinetic energy transfer across scale ℓ
-- **Cumulative coarse-grained energy** ½⟨|ū_ℓ|²⟩ (`cumulative_energy`) and the **filtering spectral density** Ẽ(k_ℓ) (`filtering_spectrum`) — the spectrum extracted by filtering (Sadek & Aluie 2018)
+| | Function |
+|---|---|
+| Cumulative coarse energy and the filtering spectral density Ẽ(k_ℓ) | [`Diagnostics.cumulative_energy`](@ref), [`Diagnostics.filtering_spectrum`](@ref) |
+| Strain/convergence split of Π | [`Diagnostics.compute_Π_strain_convergence`](@ref) |
+| Rotational/divergent (Helmholtz) split, with the interaction channel | [`Diagnostics.compute_Π_decomposed`](@ref) |
+| Leonard/Cross/Reynolds stress decomposition | [`Diagnostics.tau_decomposition`](@ref) |
+| Tracer / buoyancy-variance flux | [`Diagnostics.tracer_variance_flux`](@ref) |
+| Enstrophy flux, in the same gauge as Π | [`Diagnostics.enstrophy_flux`](@ref) |
+| Energy per scale band | [`Diagnostics.band_energies`](@ref) |
+| Variable-density (Favre) budget: Π, baropycnal work Λ, pressure dilatation | [`Diagnostics.compressible_flux`](@ref) |
 
-The approach follows Aluie (2011, 2019) and Aluie, Hecht, & Vallis (2018), using real-space convolution kernels (top-hat, Gaussian) to separate large-scale (ū) and sub-scale (u') motions at each point in space.
+Six filter kernels are available — top-hat, Gaussian, sharp-spectral, smooth-hat, hyper-Gaussian and
+the high-order `M^I`/`M^II` pair — and they are **not** interchangeable: only some have a spectral
+transfer function, only some can carry a filtering spectrum, and only some are valid for Π.
+[`check_setup`](@ref) reports which, for your grid and scale, without running anything.
+
+The approach follows Aluie (2011, 2019) and Aluie, Hecht, & Vallis (2018), using real-space convolution kernels to separate large-scale (ū) and sub-scale (u') motions at each point in space.
 
 Every diagnostic works across the full grid×dimensionality matrix — `StructuredGrid` (1D, 2D, and
 true 3D Cartesian or spherical-volumetric), `CurvilinearGrid` (model-native orthogonal curvilinear meshes), and
