@@ -143,11 +143,15 @@ Test.@testset "CurvilinearGrid (WLSQ / areas / pipeline)" begin
     Test.@test maximum(abs.(Πc[2:end-1, 2:end-1] .- Πs[2:end-1, 2:end-1])) <
                1e-9 * maximum(abs.(Πs)) + 1e-12
 
-    res = CGEF.coarse_grain(uu, vv, cgrid; scales=[8.0, 12.0], kernel=CGEF.TopHatKernel())
+    res = CGEF.coarse_grain(uu, vv, cgrid; scales=[8.0, 12.0], kernel=CGEF.TopHatKernel(),
+                            spectrum = false)
     Test.@test size(res.Π, 3) == 2
     Test.@test res.Π[:, :, 1] ≈ Πc
     Test.@test !any(isnan, res.cumulative_energy)
-    Test.@test !any(isnan, res.filtering_spectrum)
+    # The top-hat cannot carry a filtering spectral density, so the finiteness of the density is
+    # checked on the same pipeline with a kernel that can.
+    Test.@test !any(isnan, CGEF.coarse_grain(uu, vv, cgrid; scales=[8.0, 12.0],
+                                             kernel=CGEF.GaussianKernel()).filtering_spectrum)
 
     # --- Spherical curvilinear sanity: solid-body rotation u = U cos φ, v = 0 gives Π ≈ 0
     # (filtering is done in planetary-Cartesian coordinates, so rigid rotation commutes with the

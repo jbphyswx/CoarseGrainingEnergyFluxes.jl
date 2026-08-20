@@ -28,11 +28,13 @@ using .Visualization: Visualization
 # name-clash risk in the user's namespace.
 using .Pipeline: coarse_grain, coarse_grain!, coarse_grain_profile, coarse_grain_profile!, CoarseGrainResult
 using .Pipeline: coarse_grain_batch!, coarse_grain_slices!, CoarseGrainBatchResult
+using .Pipeline: check_setup, SetupReport
 using .Kernels: TopHatKernel, GaussianKernel, SharpSpectralKernel
 using .Visualization: plot_Π_map, plot_spectrum
 
 export coarse_grain, coarse_grain!, coarse_grain_profile, coarse_grain_profile!, CoarseGrainResult
 export coarse_grain_batch!, coarse_grain_slices!, CoarseGrainBatchResult
+export check_setup, SetupReport
 export TopHatKernel, GaussianKernel, SharpSpectralKernel
 export plot_Π_map, plot_spectrum
 

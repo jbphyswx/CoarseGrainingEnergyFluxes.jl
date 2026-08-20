@@ -20,7 +20,8 @@ grid = FG.Grids.StructuredGrid(geom, x, x, x)
 
 u = randn(N, N, N); v = randn(N, N, N); w = randn(N, N, N)
 scales = collect(2_000.0:2_000.0:8_000.0)
-result = CGEF.coarse_grain(u, v, w, grid; scales = scales, kernel = CGEF.TopHatKernel())
+result = CGEF.coarse_grain(u, v, w, grid; scales = scales, kernel = CGEF.TopHatKernel(),
+                           spectrum = false)
 
 println("True 3D Cartesian volumetric flux")
 println("scale [m]   coarse-KE         mean|Π|")
@@ -49,7 +50,8 @@ sgrid = FG.Grids.StructuredGrid(sgeom, lon, lat, r)
 Nx, Ny, Nz = length(lon), length(lat), length(r)
 su = randn(Nx, Ny, Nz); sv = randn(Nx, Ny, Nz); sw = randn(Nx, Ny, Nz)
 sscales = collect(40e3:40e3:160e3)
-sresult = CGEF.coarse_grain(su, sv, sw, sgrid; scales = sscales, kernel = CGEF.TopHatKernel())
+sresult = CGEF.coarse_grain(su, sv, sw, sgrid; scales = sscales, kernel = CGEF.TopHatKernel(),
+                            spectrum = false)
 
 println("\nTrue 3D spherical-volumetric flux")
 println("scale [km]   coarse-KE         mean|Π|")

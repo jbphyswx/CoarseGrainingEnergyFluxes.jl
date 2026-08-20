@@ -23,7 +23,7 @@ Test.@testset "Diagnostics & Pipeline" begin
     Test.@test Π[11, 11] ≈ 0.0 atol=1e-12
 
     # Test Pipeline integration with unicode Π
-    res = CGEF.coarse_grain(u, v, grid; scales=[10000.0], kernel=CGEF.TopHatKernel())
+    res = CGEF.coarse_grain(u, v, grid; scales=[10000.0], kernel=CGEF.TopHatKernel(), spectrum = false)
     Test.@test res.Π[:, :, 1] ≈ Π
 
     # Test Spherical projections and coarse graining with mixed types
@@ -50,7 +50,7 @@ Test.@testset "Diagnostics & Pipeline" begin
     # Test coarse_grain on sphere with Float32 inputs (matching PythonCall runtime environment)
     su = fill(Float32(1.0), length(slon), length(slat))
     sv = fill(Float32(0.5), length(slon), length(slat))
-    sres = CGEF.coarse_grain(su, sv, sgrid; scales=[50000.0], kernel=CGEF.TopHatKernel())
+    sres = CGEF.coarse_grain(su, sv, sgrid; scales=[50000.0], kernel=CGEF.GaussianKernel())
     Test.@test !any(isnan, @view sres.Π[:, :, 1])
     Test.@test !any(isnan, sres.cumulative_energy)
     Test.@test !any(isnan, sres.filtering_spectrum)
@@ -587,4 +587,92 @@ Test.@testset "Tracer variance flux: spherical" begin
     τx_local = flt(u .* θ) .- flt(u) .* θb
     τy_local = flt(v .* θ) .- flt(v) .* θb
     Test.@test !isapprox(Πθ, .-(τx_local .* gx .+ τy_local .* gy); rtol = 1e-6)
+end
+
+# ---------------------------------------------------------------------------
+# The filtering spectral DENSITY is only guaranteed non-negative for a kernel whose |Ĝ(k)|² is
+# monotone decreasing (Sadek & Aluie 2018 eq. 21). A kernel that fails it is refused rather than
+# quietly handed back a spectrum that may go negative.
+# ---------------------------------------------------------------------------
+Test.@testset "filtering spectrum: only kernels with monotone |Ĝ|² are admitted" begin
+    K = CGEF.Kernels
+    Test.@test K.transfer_monotone(CGEF.GaussianKernel())
+    Test.@test K.transfer_monotone(CGEF.GaussianKernel(; α = 4))
+    Test.@test K.transfer_monotone(CGEF.SharpSpectralKernel())
+    Test.@test !K.transfer_monotone(CGEF.TopHatKernel())
+    # No fallback method: a new kernel must state which way it goes rather than inherit a guess.
+    Test.@test_throws MethodError K.transfer_monotone(nothing)
+
+    # The top-hat's |Ĝ|² really is non-monotone — the trait is measured, not asserted. The lobe is at
+    # kℓ ≈ 8.8, so sample past it. (`spectral_transfer` for the top-hat lives in the SpecialFunctions
+    # extension, which the suite loads.)
+    let ℓ = 1.0, ks = range(0.1, 12.0; length = 4000)
+        g2(kern) = [K.spectral_transfer(kern, k, ℓ)^2 for k in ks]
+        rises(v) = maximum(diff(v))
+        Test.@test rises(g2(CGEF.TopHatKernel())) > 1e-6      # genuinely increases somewhere
+        Test.@test rises(g2(CGEF.GaussianKernel())) <= 0      # never increases
+        Test.@test rises(g2(CGEF.SharpSpectralKernel())) <= 0
+    end
+
+    geom = FG.Geometry.CartesianGeometry()
+    N = 40
+    xs = 0.0:1000.0:(N - 1) * 1000.0
+    grid = FG.Grids.StructuredGrid(geom, xs, xs)
+    # A field with real structure across the sweep, so the density is not trivially flat.
+    u = [sin(2π * 3 * i / N) * cos(2π * 2 * j / N) + 0.4sin(2π * 7 * i / N) for i in 1:N, j in 1:N]
+    v = [cos(2π * 2 * i / N) * sin(2π * 5 * j / N) + 0.3cos(2π * 6 * j / N) for i in 1:N, j in 1:N]
+    scales = collect(4e3:2e3:16e3)
+
+    # Refused, with a message that names the condition and the way out.
+    err = try
+        CGEF.Diagnostics.filtering_spectrum(u, v, nothing, grid, CGEF.TopHatKernel(), scales)
+        nothing
+    catch e
+        e
+    end
+    Test.@test err isa ArgumentError
+    Test.@test occursin("TopHatKernel", err.msg)
+    Test.@test occursin("monotone", err.msg)
+    Test.@test occursin("GaussianKernel", err.msg)
+
+    # Admitted, and the density it returns is non-negative — the property the gate exists to protect.
+    for kern in (CGEF.GaussianKernel(), CGEF.GaussianKernel(; α = 4))
+        kℓ, Ẽ = CGEF.Diagnostics.filtering_spectrum(u, v, nothing, grid, kern, scales)
+        Test.@test kℓ ≈ 1.0 ./ scales
+        Test.@test all(isfinite, Ẽ)
+        Test.@test all(>=(0), Ẽ)
+    end
+
+    # The convention is a plain rescaling: k_ℓ = L/ℓ scales the abscissa by L and the density by 1/L,
+    # so a comparison against a Fourier spectrum is only meaningful once the two agree on it.
+    let kern = CGEF.GaussianKernel(), Lbox = N * 1000.0
+        k1, E1 = CGEF.Diagnostics.filtering_spectrum(u, v, nothing, grid, kern, scales)
+        kL, EL = CGEF.Diagnostics.filtering_spectrum(u, v, nothing, grid, kern, scales; L = Lbox)
+        Test.@test kL ≈ Lbox .* k1
+        Test.@test EL ≈ E1 ./ Lbox
+    end
+
+    # The pipeline is gated the same way, so the headline entry point cannot bypass it.
+    Test.@test_throws ArgumentError CGEF.coarse_grain(u, v, grid; scales = scales)
+    Test.@test_throws ArgumentError CGEF.coarse_grain(u, v, grid; scales = scales,
+                                                      kernel = CGEF.TopHatKernel())
+    let b = CGEF.Pipeline.CoarseGrainBatchResult(grid, length(scales), (2,))
+        Test.@test_throws ArgumentError CGEF.Pipeline.coarse_grain_batch!(
+            b, randn(N, N, 2), randn(N, N, 2), grid; scales = scales,
+        )
+        Test.@test_throws ArgumentError CGEF.Pipeline.coarse_grain_slices!(
+            [CGEF.Pipeline._allocate_result(grid, length(scales))], [u], [v], [grid]; scales = scales,
+        )
+    end
+
+    # `spectrum = false` is the explicit opt-out: Π and the cumulative energy are computed as usual and
+    # the density is left as NaN, which cannot be mistaken for a number that was computed.
+    rf = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = false)
+    Test.@test all(isfinite, rf.Π)
+    Test.@test all(isfinite, rf.cumulative_energy)
+    Test.@test all(isnan, rf.filtering_spectrum)
+    # ... and it changes nothing else: Π matches an admissible-kernel-free reference at the same kernel.
+    rg = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel())
+    Test.@test all(isfinite, rg.filtering_spectrum)
+    Test.@test size(rg.Π) == size(rf.Π)
 end

@@ -270,7 +270,7 @@ Test.@testset "Doubly-periodic Cartesian grid: axis-2 (y) wrap matches axis-1 (x
     # The axis type is what selects the engine, so this pair is the only place the two are compared
     # on identical coordinates.
     Test.@test CGEF.Filtering.plan_filter(gridR, CGEF.GaussianKernel(), scale).footprint isa
-               CGEF.Filtering.SeparableGaussianFootprint
+               CGEF.Filtering.SeparableFootprint
 
     outs = map((gridR, gridV)) do grid
         Test.@test FG.Grids.isperiodic(grid, 1) && FG.Grids.isperiodic(grid, 2)

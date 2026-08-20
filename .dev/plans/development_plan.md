@@ -12,6 +12,64 @@ capability, which come before speed.
 
 ---
 
+## Status
+
+Stages 0–3 are implemented and test-gated. Stage 4's three carried-over items are open.
+
+| stage | state | evidence |
+|---|---|---|
+| 0.1 masking default | done | `ZeroFill` default; commutation exact (5e-16) for it and asserted to FAIL for `Deformable` (1.3e-2); coast artifacts measured and in the docstring |
+| 0.2 spectrum kernel gate | done | `Kernels.transfer_monotone` + refusal in `filtering_spectrum`/`coarse_grain`, `spectrum = false` opt-out |
+| 0.3 wavenumber convention | done | `k_ℓ = L/ℓ`, `1/C` amplitude caveat, `k⁻³` ceiling — docstring + `theory.md` |
+| 1.1 validation ladder | done | all six; slope ceiling, `filter∘div`, linear-field exactness, kernel moments |
+| 1.2 stated limits | done | kernel requirements, `ℓ`-is-a-diameter, dimension-dependent variance matching, `Π`-only omissions, spherical metric floor |
+| 1.3 both forms of `Π` agree | done | `compute_Π_strain_convergence` == `−S̄:τ̄` to round-off, masked and unmasked, both kernels and strategies |
+| 2.1 kernels | done | `SmoothHatKernel`, `HyperGaussianKernel`, `HighOrderKernel{3,5}` |
+| 2.2 Favre / compressible | done | `compressible_flux`: `Π`, baropycnal `Λ`, `P̄∇·ū`; `Λ ≡ 0` at constant `ρ`, and `P̄∇·ũ` shown to differ |
+| 2.3 enstrophy flux | done | `enstrophy_flux` in the deformation gauge, asserted distinct from the unsubtracted one |
+| 2.4 band-pass | done | `band_energies` via the repeated-filter identity; exact on a periodic unmasked grid |
+| 3 usability | done | `check_setup`, shape/convention table, per-entry-point examples |
+| 4 performance | carried over | see Stage 4 |
+
+### Results that differ from what the plan assumed
+
+1. **`HighOrderKernel{3}` delivers; `{5}`'s slope is not testable in this box.** `{3}` recovers `k⁻⁴`
+   (−4.00) where a `p = 1` kernel saturates at −2.83. `{5}` does not reach `k⁻⁷`, and the reason is
+   analytic. With `𝓔(ℓ) = ∫E(k)|Ĝ(kℓ)|²dk` and `x = kℓ`,
+
+   ```
+   Ẽ(k_ℓ) ∝ k_ℓ^{-α} · I ,    I = -∫₀^∞ x^{1-α}(|Ĝ|²)'(x) dx ,   1-|Ĝ|² ∝ x^{p+1}
+   ```
+
+   the slope is `-α` unless `I` diverges, and it diverges at **small `x = kℓ`** iff `α ≥ p+2`. The
+   saturation is an infrared effect set by scales larger than the filter, so it needs many decades of
+   spectrum below `1/ℓ`, and the integrand sharpens with `p`. A `256²` box with the fit at
+   `ℓ = 8–32Δx` gives ~1.5 decades: enough for `p = 1`, marginal for `p = 3`, not enough for `p = 5`.
+
+   Consistent with that: refining `Δx` at fixed `ℓ/L` makes the slope worse, not better
+   (−0.76 → −0.59 → −0.22 for `N` = 128/256/512), since refinement adds modes above `1/ℓ` that `I`
+   does not see; and rolling the spectrum off above the sidelobe changes nothing to three significant
+   figures. Also measured: `|Ĝ|²` reaches 1.0125 past its first zero, and `E(ℓ)` is not monotone.
+
+   Testing `{5}` needs a domain with several decades below the filter scale, not a finer grid. Keep
+   the whole sweep — not just the fit window — above `ℓ = 8Δx`, or the kernel is outside its own
+   validity threshold and the finite differences carry that into the fit.
+2. **Point-sampling a signed kernel is not viable off a uniform grid.** The order-5 normalization
+   denominator went *negative* (−1.77e3) on a ±3% jittered axis, returning a sign-flipped field.
+   Fixed by integrating the kernel over each cell instead: the discrete `m₂` residual then falls as
+   `O(Δx²)` rather than `O(Δx)`, 100× smaller at `ℓ = 128Δx`.
+3. **Mask conservation runs the other way from the plan's assumption.** On a *masked* domain
+   `Deformable` tracks the active-cell integral better than `ZeroFill` (4.8e-4 vs 1.1e-2): `ZeroFill`
+   smears energy onto masked cells, which then report zero. `ZeroFill` stays the default for the
+   commutation property, which is what the budget rests on.
+
+Separately, `FINUFFT` plans are now pinned to `nthreads = 1`: unpinned they inherit FFTW's
+process-global thread count and spawn a Julia `Task` per FFTW work chunk, measured at 216 tasks and
+~120 kB **per execution** (~1.2 MB per `compute_Π!`). Pinned is also 110× faster at small transforms;
+`finufft_nthreads` opts back in for large single transforms, where unpinned is 1.66× faster.
+
+---
+
 ## Stage 0 — Convention changes
 
 These change results, so they are listed first and separately. They do **not** block anything: the tests

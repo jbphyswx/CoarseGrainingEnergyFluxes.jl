@@ -99,7 +99,7 @@ Test.@testset "Nonuniform axes" begin
     # what distinguishes the two — a vector when the spacing is constant, a row per position here
     # (the table is position-major so that a row pass reads it along the contiguous axis).
     fp_g = CGEF.Filtering.build_footprint(grid_nu, CGEF.GaussianKernel(), 2.0)
-    Test.@test fp_g isa CGEF.Filtering.SeparableGaussianFootprint
+    Test.@test fp_g isa CGEF.Filtering.SeparableFootprint
     Test.@test fp_g.gx isa AbstractMatrix
     Test.@test size(fp_g.gx, 1) == Nx_nu
     # A kernel with no separable form still takes the general scattered engine, which is what proves
@@ -195,7 +195,8 @@ Test.@testset "1D and singleton-dimension StructuredGrid" begin
     CGEF.Diagnostics.compute_Π!(Π1, u1, grid1d, CGEF.TopHatKernel(), 3000.0)
     Test.@test all(isfinite, Π1)
 
-    res1 = CGEF.coarse_grain(u1, grid1d; scales = [2000.0, 3000.0], kernel = CGEF.TopHatKernel())
+    res1 = CGEF.coarse_grain(u1, grid1d; scales = [2000.0, 3000.0], kernel = CGEF.TopHatKernel(),
+                             spectrum = false)
     Test.@test size(res1.Π) == (length(x1), 2)
     Test.@test !any(isnan, res1.cumulative_energy)
 
@@ -216,7 +217,7 @@ Test.@testset "1D and singleton-dimension StructuredGrid" begin
 
     # Before the fix this silently produced NaN (0/0 from a zero total area) — now finite.
     uz = rand(length(λc), 1); vz = rand(length(λc), 1)
-    res_zonal = CGEF.coarse_grain(uz, vz, sgrid_zonal; scales = [5e5, 1e6], kernel = CGEF.TopHatKernel())
+    res_zonal = CGEF.coarse_grain(uz, vz, sgrid_zonal; scales = [5e5, 1e6], kernel = CGEF.GaussianKernel())
     Test.@test !any(isnan, res_zonal.cumulative_energy)
     Test.@test !any(isnan, res_zonal.filtering_spectrum)
 

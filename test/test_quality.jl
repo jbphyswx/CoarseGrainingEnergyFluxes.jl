@@ -99,7 +99,7 @@ Test.@testset "JET type stability (hot path)" begin
         JET.@test_opt target_modules = jet_targets CGEF.Filtering.filter_apply_batch!(outs_nu, fields_nu, plan_stream)
 
         gplan = CGEF.Filtering.plan_filter(grid, CGEF.GaussianKernel(), scale)
-        Test.@test gplan.footprint isa CGEF.Filtering.SeparableGaussianFootprint
+        Test.@test gplan.footprint isa CGEF.Filtering.SeparableFootprint
         JET.@test_opt target_modules = jet_targets CGEF.Filtering.build_footprint(grid, CGEF.GaussianKernel(), scale)
         JET.@test_opt target_modules = jet_targets CGEF.Filtering.filter_apply!(out, field, gplan)
         JET.@test_opt target_modules = jet_targets CGEF.Filtering.filter_apply_batch!(outs_nu, fields_nu, gplan)

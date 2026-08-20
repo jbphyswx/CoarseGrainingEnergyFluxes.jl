@@ -10,6 +10,228 @@ using ComputationalBackends: ComputationalBackends
 export CoarseGrainResult, coarse_grain, coarse_grain!
 export CoarseGrainBatchResult, coarse_grain_batch!, coarse_grain_slices!
 export coarse_grain_profile, coarse_grain_profile!
+export check_setup, SetupReport
+
+# ---------------------------------------------------------------------------
+# check_setup — what will actually run, and what this (grid, kernel, ℓ) can support
+# ---------------------------------------------------------------------------
+
+"""
+    SetupReport
+
+What [`check_setup`](@ref) found. Printed as a readable report, and every field is also readable
+programmatically so a script can gate on it.
+
+# Fields
+- `grid_kind::String`, `grid_size::Tuple`, `spacing::Tuple`: the grid, and the SMALLEST spacing per
+  axis (the one that sets stencil widths)
+- `scale::Float64`, `cells_per_scale::Tuple`: `ℓ`, and `ℓ / Δx` per axis
+- `kernel::String`, `mask_strategy::String`, `method::String`
+- `backend_requested::String`, `backend_resolved::String`: what was asked for, and what will run
+- `engine::String`: which real-space engine class the filter will take
+- `resolvable::Bool`: `ℓ` is wide enough to mean anything on this grid (`> 2Δx` on every axis)
+- `supports_flux::Bool`: the kernel is non-negative, so `τ` is realizable and `Π` is a pointwise
+  transfer
+- `supports_spectrum::Bool`: [`Kernels.transfer_monotone`](@ref) — whether
+  [`Diagnostics.filtering_spectrum`](@ref) will accept this kernel
+- `supports_spectral_method::Bool`: the kernel has an isotropic transfer function, so
+  `method = Spectral()` is available
+- `boundary_buffer_cells::Tuple`: how many cells in from a coast or domain edge are contaminated —
+  the kernel radius in cells. Results inside this band are not trustworthy under any mask strategy.
+- `notes::Vector{String}`: everything above that needs acting on, in words
+"""
+struct SetupReport
+    grid_kind::String
+    grid_size::Tuple
+    spacing::Tuple
+    scale::Float64
+    cells_per_scale::Tuple
+    kernel::String
+    mask_strategy::String
+    method::String
+    backend_requested::String
+    backend_resolved::String
+    engine::String
+    resolvable::Bool
+    supports_flux::Bool
+    supports_spectrum::Bool
+    supports_spectral_method::Bool
+    boundary_buffer_cells::Tuple
+    notes::Vector{String}
+end
+
+function Base.show(io::IO, ::MIME"text/plain", r::SetupReport)
+    yn(b) = b ? "yes" : "NO"
+    println(io, "CoarseGrainingEnergyFluxes setup check")
+    println(io, "  grid            : ", r.grid_kind, " ", r.grid_size,
+                "   min spacing ", map(x -> round(x; sigdigits = 4), r.spacing))
+    println(io, "  scale ℓ         : ", r.scale, "  = ",
+                map(x -> round(x; digits = 2), r.cells_per_scale), " cells per axis")
+    println(io, "  kernel          : ", r.kernel)
+    println(io, "  masking         : ", r.mask_strategy)
+    println(io, "  method          : ", r.method)
+    println(io, "  backend         : ", r.backend_requested, " -> ", r.backend_resolved)
+    println(io, "  real-space engine: ", r.engine)
+    println(io, "  ℓ resolvable    : ", yn(r.resolvable))
+    println(io, "  supports Π      : ", yn(r.supports_flux))
+    println(io, "  supports spectrum: ", yn(r.supports_spectrum))
+    println(io, "  supports Spectral(): ", yn(r.supports_spectral_method))
+    println(io, "  boundary buffer : ", r.boundary_buffer_cells, " cells (contaminated)")
+    if isempty(r.notes)
+        print(io, "  nothing to flag.")
+    else
+        println(io, "  notes:")
+        for (i, n) in enumerate(r.notes)
+            print(io, "    ", i, ". ", n, i == length(r.notes) ? "" : "\n")
+        end
+    end
+    return nothing
+end
+
+Base.show(io::IO, r::SetupReport) =
+    print(io, "SetupReport(", r.grid_kind, " ", r.grid_size, ", ", r.kernel,
+          ", ℓ=", r.scale, ", ", length(r.notes), " note(s))")
+
+# Unqualified, with the parameters that actually change the kernel — `show` on the struct prints the
+# full module path, which is noise in a report.
+_kname(k::Kernels.AbstractFilterKernel) = string(nameof(typeof(k)))
+_kname(k::Kernels.GaussianKernel) = "GaussianKernel(α = $(k.α))"
+_kname(k::Kernels.HyperGaussianKernel) = "HyperGaussianKernel(α = $(k.α))"
+_kname(k::Kernels.SmoothHatKernel) = "SmoothHatKernel(steepness = $(k.steepness))"
+_kname(k::Kernels.HighOrderKernel{P}) where {P} = "HighOrderKernel{$P}(b_over_ℓ = $(k.b_over_ℓ))"
+
+_grid_kind(::FlowGeometries.Grids.StructuredGrid{G,T,N}) where {G,T,N} = "StructuredGrid{$(nameof(G)),$N}"
+_grid_kind(::FlowGeometries.Grids.CurvilinearGrid{T,G}) where {T,G} = "CurvilinearGrid{$(nameof(G))}"
+_grid_kind(::FlowGeometries.Grids.UnstructuredGrid{T,G}) where {T,G} = "UnstructuredGrid{$(nameof(G))}"
+_grid_kind(g) = string(nameof(typeof(g)))
+
+# Smallest spacing per axis. A node set has no axes, so its "spacing" is reported as the mean nearest
+# neighbour distance would have to be — left empty rather than guessed.
+_axis_spacings(grid::FlowGeometries.Grids.StructuredGrid{G,T,N}) where {G,T,N} =
+    ntuple(d -> FlowGeometries.Grids.minimum_spacing(grid, d), Val(N))
+_axis_spacings(::FlowGeometries.Grids.AbstractGrid) = ()
+
+# Which real-space engine class the filter will take, from the same predicates the builder dispatches
+# on. Derived rather than read off a built plan: a scattered plan at a wide radius can be gigabytes.
+function _engine_class(grid, kernel)
+    Kernels.is_separable(kernel) && grid isa FlowGeometries.Grids.StructuredGrid &&
+        FlowGeometries.Grids.measure_factors(grid) !== nothing &&
+        return "separable, two-pass O(N·Σw) per axis"
+    kernel isa Kernels.TopHatKernel && grid isa FlowGeometries.Grids.StructuredGrid{<:Any,<:Any,2} &&
+        FlowGeometries.Grids.measure_factors(grid) !== nothing &&
+        return "prefix-sum top-hat, exact O(N)"
+    grid isa FlowGeometries.Grids.StructuredGrid{<:Any,<:Any,2} &&
+        return "banded footprint, O(N·w²)"
+    return "scattered per-point footprint, O(N·w²) with a neighbour cache"
+end
+
+"""
+    check_setup(grid, kernel, scale; backend, mask_strategy, method) -> SetupReport
+
+Report what a filter/flux call on this `(grid, kernel, scale)` will actually do, and what it can
+support, **without running or even planning it**. Cheap: it consults the same dispatch predicates the
+builders use rather than constructing a plan, so it is safe on a configuration whose plan would be
+enormous.
+
+It answers the questions that otherwise need reading `src/`:
+
+- which real-space engine will run, and which backend the request resolves to;
+- whether `ℓ` is meaningful on this grid at all (`ℓ > 2Δx`), and how many cells it spans;
+- whether this kernel can carry `Π` (is it non-negative?) and a filtering spectrum
+  (is `|Ĝ|²` monotone?), and whether `method = Spectral()` exists for it;
+- how wide the contaminated band along a coast or domain edge is.
+
+# Examples
+```julia
+julia> CGEF.check_setup(grid, CGEF.TopHatKernel(), 5000.0)
+```
+"""
+function check_setup(
+    grid::FlowGeometries.Grids.AbstractGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::Real;
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    ℓ = T(scale)
+    ℓ > 0 || throw(ArgumentError("check_setup needs a positive scale, got $scale"))
+    notes = String[]
+    sp = _axis_spacings(grid)
+    cps = map(s -> (isfinite(s) && s > 0) ? ℓ / s : T(NaN), sp)
+    resolvable = isempty(cps) ? true : all(c -> !isnan(c) && c > 2, cps)
+    resolvable || push!(notes,
+        "ℓ spans $(map(x -> round(x; digits = 2), cps)) cells; below ~2 cells on an axis the filter " *
+        "is a no-op on that axis. Increase ℓ or coarsen the grid.")
+
+    rad = Kernels.kernel_radius(kernel, ℓ)
+    buf = map(s -> (isfinite(s) && s > 0) ? ceil(Int, rad / s) : 0, sp)
+    isempty(buf) || push!(notes,
+        "points within $(buf) cells of a coast or domain edge are contaminated by footprint " *
+        "truncation, under either mask strategy — exclude them before averaging.")
+
+    resolved = try
+        string(nameof(typeof(Filtering._resolve_backend(backend, grid))))
+    catch e
+        push!(notes, "backend $(nameof(typeof(backend))) is not available for this grid: " *
+                     first(sprint(showerror, e), 200))
+        "UNAVAILABLE"
+    end
+
+    flux_ok = Kernels.is_radial(kernel) ?
+        all(r -> Kernels.kernel_weight(kernel, T(r), ℓ) >= 0, range(zero(T), rad; length = 512)) :
+        all(>=(0), Kernels.limb_amplitudes(kernel, T))
+    flux_ok || push!(notes,
+        "$(_kname(kernel)) takes NEGATIVE values, so τ is not realizable and Π is not a pointwise " *
+        "energy transfer. Use TopHatKernel or GaussianKernel for a flux.")
+
+    spec_ok = Kernels.transfer_monotone(kernel)
+    spec_ok || push!(notes,
+        "$(_kname(kernel))'s |Ĝ|² is not monotone, so `filtering_spectrum` will refuse it and " *
+        "`coarse_grain` needs `kernel = GaussianKernel()` or `spectrum = false`.")
+
+    # Two different reasons `Spectral()` can be unavailable, and they need different actions: a
+    # `MethodError` means the transfer function lives in an extension that is not loaded (fixable by
+    # loading it), an `ArgumentError` means the kernel genuinely has no isotropic transfer function.
+    spectral_ok, spectral_note = try
+        Kernels.spectral_transfer(kernel, one(T) / ℓ, ℓ)
+        true, nothing
+    catch e
+        if e isa MethodError
+            false, "$(_kname(kernel))'s spectral transfer function is provided by a weak dependency " *
+                   "that is not loaded, so `method = Spectral()` is unavailable in this session — run " *
+                   "`using SpecialFunctions`. Real-space filtering is unaffected."
+        else
+            false, "$(_kname(kernel)) has no isotropic transfer function, so `method = Spectral()` " *
+                   "does not exist for it — it is a real-space kernel by construction."
+        end
+    end
+    spectral_note === nothing || push!(notes, spectral_note)
+
+    if kernel isa Kernels.HighOrderKernel && !isempty(sp)
+        b = kernel.b_over_ℓ * ℓ
+        mn = minimum(sp)
+        b < mn && push!(notes,
+            "each limb is $(round(b / mn; digits = 2)) cells wide; below 1 the vanishing moments do " *
+            "not survive discretization. This kernel needs ℓ ≥ $(round(mn / kernel.b_over_ℓ)).")
+    end
+    # A node set has no axes, so resolvability and the boundary buffer could not be checked at all —
+    # say so rather than report a clean bill of health.
+    if isempty(sp)
+        push!(notes,
+            "this grid has no axes, so ℓ-resolvability and the boundary buffer could not be checked " *
+            "here; compare ℓ against the typical nearest-neighbour distance yourself " *
+            "(the kernel radius is $(round(rad; sigdigits = 4))).")
+    end
+
+    return SetupReport(
+        _grid_kind(grid), FlowGeometries.Grids.size_tuple(grid), sp, Float64(ℓ), cps,
+        _kname(kernel), string(nameof(typeof(mask_strategy))),
+        method === nothing ? "default for this grid" : string(nameof(typeof(method))),
+        string(nameof(typeof(backend))), resolved, _engine_class(grid, kernel),
+        resolvable, flux_ok, spec_ok, spectral_ok, buf, notes,
+    )
+end
 
 """
     CoarseGrainResult(scales, Π, cumulative_energy, wavenumber, filtering_spectrum)
@@ -62,7 +284,7 @@ CoarseGrainResult(scales::AbstractVector{T}, Π::AbstractArray{T,N}, cumE::Abstr
 # ---------------------------------------------------------------------------
 
 """
-    coarse_grain(u, v, w, grid; scales, kernel=TopHatKernel(), backend=AutoBackend(), mask_strategy=Deformable(), method=nothing, L=1)
+    coarse_grain(u, v, w, grid; scales, kernel=TopHatKernel(), backend=AutoBackend(), mask_strategy=ZeroFill(), method=nothing, L=1, spectrum=true)
     coarse_grain(u, v, grid; scales, ...)  # 2D convenience wrapper
 
 Perform complete coarse-graining analysis across multiple filter scales, allocating a fresh
@@ -80,10 +302,20 @@ and call `coarse_grain!` directly to reuse its buffers.
 - `scales::AbstractVector`: Vector of filter scales ℓ in meters (e.g., `10e3:10e3:100e3`)
 - `kernel::AbstractFilterKernel=TopHatKernel()`: Filter kernel
 - `backend::AbstractExecutionBackend=AutoBackend()`: Execution backend
-- `mask_strategy::AbstractMaskStrategy=Deformable()`: Masking strategy (`ZeroFill()` or `Deformable()`)
+- `mask_strategy::AbstractMaskStrategy=ZeroFill()`: Masking strategy (`ZeroFill()` or `Deformable()`).
+  `ZeroFill` is the default because it keeps the kernel position-independent, so filtering commutes
+  with spatial derivatives — the property the flux budget is derived by. See
+  [`Filtering.filter_field!`](@ref) for the boundary artifacts of both choices.
 - `method::Union{Nothing,AbstractFilterMethod}=nothing`: filtering engine; `nothing` takes
   `plan_filter`'s per-grid default (real space where a grid has that engine)
-- `L::Real=1`: reference length setting the wavenumber normalization `k_ℓ = L/ℓ`
+- `L::Real=1`: reference length setting the wavenumber normalization `k_ℓ = L/ℓ`. The choice rescales
+  the spectral density by `1/L` — see [`Diagnostics.filtering_spectrum`](@ref).
+- `spectrum::Bool=true`: also fill `filtering_spectrum`. The spectral density is guaranteed
+  non-negative only for a kernel whose `|Ĝ|²` is monotone decreasing
+  ([`Kernels.transfer_monotone`](@ref)), which the default `TopHatKernel` is **not** — so
+  `coarse_grain(u, v, grid; scales)` throws, and the two ways forward are `kernel = GaussianKernel()`
+  or `spectrum = false`. With `spectrum = false` the density is filled with `NaN`; `Π` and
+  `cumulative_energy` are unaffected, since neither depends on that condition.
 
 # Returns
 - `CoarseGrainResult`: Container with scales, Π maps, and spectrum
@@ -106,16 +338,17 @@ function coarse_grain(
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
     return coarse_grain!(
         result, u, v, w, grid;
         scales = scales, kernel = kernel, workspace = workspace,
-        backend = backend, mask_strategy = mask_strategy, method = method, L = L,
+        backend = backend, mask_strategy = mask_strategy, method = method, L = L, spectrum = spectrum,
     )
 end
 
@@ -143,8 +376,20 @@ end
         workspace = ws, filter_plan = plan, backend = backend, mask_strategy = strat,
         deriv_plan = dplan, analyzed = analyzed)
 
+# The filtering spectral DENSITY is only guaranteed non-negative for a kernel whose |Ĝ|² is monotone
+# decreasing, which the default `TopHatKernel` is not — see `Kernels.transfer_monotone`. `Π` and the
+# cumulative energy carry no such condition, so `spectrum = false` is the way to keep a non-conforming
+# kernel: the density is then filled with `NaN` rather than a number that would read as computed.
+@inline function _check_spectrum(kernel, spectrum::Bool)
+    spectrum && Kernels.check_spectrum_kernel(kernel)
+    return spectrum
+end
+
+@inline _fill_spectrum!(g, C, k, spectrum::Bool) =
+    spectrum ? Diagnostics.spectral_density!(g, C, k) : fill!(g, convert(eltype(g), NaN))
+
 """
-    coarse_grain!(result, u, v, w, grid; scales, kernel, workspace, filter_plans, deriv_plan, backend, mask_strategy, method, L)
+    coarse_grain!(result, u, v, w, grid; scales, kernel, workspace, filter_plans, deriv_plan, backend, mask_strategy, method, L, spectrum)
     coarse_grain!(result, u, v, grid; scales, ...)  # 2D convenience wrapper
 
 In-place [`coarse_grain`](@ref): refills an existing [`CoarseGrainResult`](@ref)'s buffers — scales,
@@ -170,13 +415,15 @@ function coarse_grain!(
     filter_plans::Union{Nothing, AbstractVector} = nothing,
     deriv_plan = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     # `nothing` leaves the choice to `plan_filter`, whose default differs by grid: real space where a
     # grid has that engine, spectral for a node set.
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     _check_result_shape(result, grid, scales)
+    _check_spectrum(kernel, spectrum)
     ws = workspace === nothing ? Diagnostics.ΠWorkspace(grid) : workspace
     dplan = _deriv_plan(grid, deriv_plan)
     # Each scale's plan is shared by `compute_Π!` and `cumulative_energy!`. A sweep repeated over many
@@ -210,7 +457,7 @@ function coarse_grain!(
             Diagnostics.energy_from_filtered(ws, grid, w !== nothing, total_area)
     end
     result.wavenumber .= T(L) ./ result.scales
-    Diagnostics.spectral_density!(result.filtering_spectrum, result.cumulative_energy, result.wavenumber)
+    _fill_spectrum!(result.filtering_spectrum, result.cumulative_energy, result.wavenumber, spectrum)
     return result
 end
 
@@ -299,10 +546,11 @@ function _batch_driver!(
     end
     batch.wavenumber .= T(ctx.L) ./ batch.scales
     for J in CartesianIndices(batch.batch_size)
-        Diagnostics.spectral_density!(
+        _fill_spectrum!(
             view(batch.filtering_spectrum, :, Tuple(J)...),
             view(batch.cumulative_energy, :, Tuple(J)...),
             view(batch.wavenumber, :, Tuple(J)...),
+            ctx.spectrum,
         )
     end
     return batch
@@ -403,7 +651,7 @@ end
 @inline _slice_view(::Nothing, ::Val, ::CartesianIndex) = nothing
 
 """
-    coarse_grain_batch!(batch, u, v, w, grid; scales, kernel, workspaces, filter_plans, deriv_plans, backend, mask_strategy, method, L) -> batch
+    coarse_grain_batch!(batch, u, v, w, grid; scales, kernel, workspaces, filter_plans, deriv_plans, backend, mask_strategy, method, L, spectrum) -> batch
     coarse_grain_batch!(batch, u, v, grid; scales, ...)  # no vertical component
 
 Run a full [`coarse_grain!`](@ref) sweep per slice over a batch that **shares one grid**.
@@ -424,6 +672,9 @@ vectors of length ≥ the concurrency actually used (`Threads.nthreads()` is alw
 repeated batch is allocation-free. Leaving them `nothing` builds one set per worker.
 
 For a batch whose slices do NOT share a grid, use [`coarse_grain_slices!`](@ref) instead.
+
+The `spectrum` flag behaves exactly as in [`coarse_grain`](@ref): the default `TopHatKernel` cannot
+produce a filtering spectral density, so pass `kernel = GaussianKernel()` or `spectrum = false`.
 """
 function coarse_grain_batch!(
     batch::CoarseGrainBatchResult{T,NB},
@@ -437,9 +688,10 @@ function coarse_grain_batch!(
     filter_plans::Union{Nothing, AbstractVector} = nothing,
     deriv_plans::Union{Nothing, AbstractVector} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat, NB, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     spatial = FlowGeometries.Grids.size_tuple(grid)
     valR = Val(length(spatial))
@@ -450,9 +702,10 @@ function coarse_grain_batch!(
         "batch holds $(length(batch.slices)) slice views for batch size $(batch.batch_size)",
     ))
     _check_pools(workspaces, filter_plans, deriv_plans)
+    _check_spectrum(kernel, spectrum)
     resolved = Filtering._resolve_slice_backend(backend)
     inner = _batch_inner_backend(resolved)
-    ctx = (; scales, kernel, workspaces, filter_plans, deriv_plans, mask_strategy, method, L, inner)
+    ctx = (; scales, kernel, workspaces, filter_plans, deriv_plans, mask_strategy, method, L, spectrum, inner)
     return _batch_driver!(resolved, batch, u, v, w, grid, valR, ctx)
 end
 
@@ -503,6 +756,7 @@ function coarse_grain_batch_slice!(
         mask_strategy = ctx.mask_strategy,
         method = ctx.method,
         L = ctx.L,
+        spectrum = ctx.spectrum,
     )
 end
 
@@ -576,7 +830,7 @@ slice_pipeline_costs(grids::AbstractVector, Nscales::Integer) =
     [prod(FlowGeometries.Grids.size_tuple(g)) * Nscales for g in grids]
 
 """
-    coarse_grain_slices!(results, us, vs, ws, grids; scales, kernel, workspaces, filter_plans, deriv_plans, backend, mask_strategy, method, L) -> results
+    coarse_grain_slices!(results, us, vs, ws, grids; scales, kernel, workspaces, filter_plans, deriv_plans, backend, mask_strategy, method, L, spectrum) -> results
     coarse_grain_slices!(results, us, vs, grids; scales, ...)  # no vertical component
 
 Run a full [`coarse_grain!`](@ref) sweep per slice over a batch whose slices each carry **their own
@@ -597,6 +851,9 @@ cannot be reused across slices of different shape. Where many slices do share a 
 call this once per group to keep pool memory bounded by thread count instead of batch length.
 
 Each slice runs serially inside, the same non-nesting rule as [`coarse_grain_batch!`](@ref).
+
+The `spectrum` flag behaves exactly as in [`coarse_grain`](@ref): the default `TopHatKernel` cannot
+produce a filtering spectral density, so pass `kernel = GaussianKernel()` or `spectrum = false`.
 """
 function coarse_grain_slices!(
     results::AbstractVector,
@@ -610,9 +867,10 @@ function coarse_grain_slices!(
     filter_plans::Union{Nothing, AbstractVector} = nothing,
     deriv_plans::Union{Nothing, AbstractVector} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = 1,
+    spectrum::Bool = true,
 )
     n = length(results)
     (length(us) == n && length(vs) == n && length(grids) == n) || throw(DimensionMismatch(
@@ -630,9 +888,10 @@ function coarse_grain_slices!(
     deriv_plans === nothing || length(deriv_plans) == n || throw(DimensionMismatch(
         "coarse_grain_slices! got $n results and $(length(deriv_plans)) deriv_plans entries — ragged scratch is per slice",
     ))
+    _check_spectrum(kernel, spectrum)
     resolved = Filtering._resolve_slice_backend(backend)
     inner = _batch_inner_backend(resolved)
-    ctx = (; scales, kernel, workspaces, filter_plans, deriv_plans, mask_strategy, method, L, inner)
+    ctx = (; scales, kernel, workspaces, filter_plans, deriv_plans, mask_strategy, method, L, spectrum, inner)
     return _slices_driver!(resolved, results, us, vs, ws, grids, ctx)
 end
 
@@ -660,6 +919,7 @@ function coarse_grain_slice_serial!(results, us, vs, ws, grids, ctx, t::Integer)
         mask_strategy = ctx.mask_strategy,
         method = ctx.method,
         L = ctx.L,
+        spectrum = ctx.spectrum,
     )
 end
 
@@ -671,11 +931,12 @@ function coarse_grain(
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, backend=backend, mask_strategy=mask_strategy, method=method, L=L)
+    return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, backend=backend, mask_strategy=mask_strategy, method=method, L=L, spectrum=spectrum)
 end
 
 function coarse_grain!(
@@ -689,15 +950,16 @@ function coarse_grain!(
     filter_plans::Union{Nothing, AbstractVector} = nothing,
     deriv_plan = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    return coarse_grain!(result, u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, filter_plans=filter_plans, deriv_plan=deriv_plan, backend=backend, mask_strategy=mask_strategy, method=method, L=L)
+    return coarse_grain!(result, u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, filter_plans=filter_plans, deriv_plan=deriv_plan, backend=backend, mask_strategy=mask_strategy, method=method, L=L, spectrum=spectrum)
 end
 
 """
-    coarse_grain_profile!(batch, u, v, w, grid; scales, kernel, workspaces, filter_plans, deriv_plans, backend, mask_strategy, method, L) -> batch
+    coarse_grain_profile!(batch, u, v, w, grid; scales, kernel, workspaces, filter_plans, deriv_plans, backend, mask_strategy, method, L, spectrum) -> batch
     coarse_grain_profile!(batch, u, v, grid; scales, ...)  # no vertical component
 
 Vertical-profile sweep, in place: the literature-standard independent-per-level 2D/2.5D method (see
@@ -713,6 +975,9 @@ the workspace in the same pass as the flux, so `u` and `v` are not filtered a se
 `(Nx, Ny, Nscales, Nlevels)` and `cumulative_energy`/`filtering_spectrum` are `(Nscales, Nlevels)` — the
 level axis trailing, which is what makes each level's result a contiguous view. Per-level energies are
 deliberately not summed across levels; that needs thickness weighting this function is not given.
+
+The `spectrum` flag behaves exactly as in [`coarse_grain`](@ref): the default `TopHatKernel` cannot
+produce a filtering spectral density, so pass `kernel = GaussianKernel()` or `spectrum = false`.
 """
 function coarse_grain_profile!(
     batch::CoarseGrainBatchResult,
@@ -733,7 +998,7 @@ function coarse_grain_profile!(
 end
 
 """
-    coarse_grain_profile(u, v, w, grid; scales, kernel=TopHatKernel(), backend=AutoBackend(), mask_strategy=Deformable(), method=nothing, L=1)
+    coarse_grain_profile(u, v, w, grid; scales, kernel=TopHatKernel(), backend=AutoBackend(), mask_strategy=ZeroFill(), method=nothing, L=1, spectrum=true)
 
 Allocating [`coarse_grain_profile!`](@ref): sizes a [`CoarseGrainBatchResult`](@ref) for `size(u, 3)`
 levels and fills it. Pass a prebuilt `batch` to `coarse_grain_profile!` to sweep timesteps without
@@ -772,16 +1037,17 @@ function coarse_grain(
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     filter_plans::Union{Nothing, AbstractVector} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
     return coarse_grain!(
         result, u, grid;
         scales = scales, kernel = kernel, workspace = workspace, filter_plans = filter_plans,
-        backend = backend, mask_strategy = mask_strategy, method = method, L = L,
+        backend = backend, mask_strategy = mask_strategy, method = method, L = L, spectrum = spectrum,
     )
 end
 
@@ -794,11 +1060,13 @@ function coarse_grain!(
     workspace::Union{Nothing, Diagnostics.ΠWorkspace} = nothing,
     filter_plans::Union{Nothing, AbstractVector} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _check_result_shape(result, grid, scales)
+    _check_spectrum(kernel, spectrum)
     ws = workspace === nothing ? Diagnostics.ΠWorkspace(grid) : workspace
 # Built as a comprehension so the element type is the plans' own concrete type. An
 # `AbstractFilterPlan` element type makes every `plans[s_idx]` a dynamic dispatch: measured at 3.1% of
@@ -828,7 +1096,7 @@ function coarse_grain!(
     end
 
     result.wavenumber .= T(L) ./ result.scales
-    Diagnostics.spectral_density!(result.filtering_spectrum, result.cumulative_energy, result.wavenumber)
+    _fill_spectrum!(result.filtering_spectrum, result.cumulative_energy, result.wavenumber, spectrum)
     return result
 end
 
@@ -846,16 +1114,17 @@ function coarse_grain(
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
     return coarse_grain!(
         result, u, v, w, grid;
         scales = scales, kernel = kernel, workspace = workspace,
-        backend = backend, mask_strategy = mask_strategy, method = method, L = L,
+        backend = backend, mask_strategy = mask_strategy, method = method, L = L, spectrum = spectrum,
     )
 end
 
@@ -872,9 +1141,10 @@ function coarse_grain(
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
@@ -882,7 +1152,7 @@ function coarse_grain(
     return coarse_grain!(
         result, u, v, w, grid;
         scales = scales, kernel = kernel, workspace = workspace, deriv_plan = deriv_plan,
-        backend = backend, mask_strategy = mask_strategy, method = method, L = L,
+        backend = backend, mask_strategy = mask_strategy, method = method, L = L, spectrum = spectrum,
     )
 end
 
@@ -895,11 +1165,12 @@ function coarse_grain(
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, backend=backend, mask_strategy=mask_strategy, method=method, L=L)
+    return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, backend=backend, mask_strategy=mask_strategy, method=method, L=L, spectrum=spectrum)
 end
 
 function coarse_grain!(
@@ -913,11 +1184,12 @@ function coarse_grain!(
     deriv_plan::Union{Nothing, FlowGeometries.Discretization.GradientPlan} = nothing,
     filter_plans::Union{Nothing, AbstractVector} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    return coarse_grain!(result, u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, deriv_plan=deriv_plan, filter_plans=filter_plans, backend=backend, mask_strategy=mask_strategy, method=method, L=L)
+    return coarse_grain!(result, u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, deriv_plan=deriv_plan, filter_plans=filter_plans, backend=backend, mask_strategy=mask_strategy, method=method, L=L, spectrum=spectrum)
 end
 
 # ---------------------------------------------------------------------------
@@ -933,9 +1205,10 @@ function coarse_grain(
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Filtering.AbstractFilterMethod = Filtering.Spectral(),
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
@@ -943,7 +1216,7 @@ function coarse_grain(
     return coarse_grain!(
         result, u, v, w, grid;
         scales = scales, kernel = kernel, workspace = workspace, deriv_plan = deriv_plan,
-        backend = backend, mask_strategy = mask_strategy, method = method, L = L,
+        backend = backend, mask_strategy = mask_strategy, method = method, L = L, spectrum = spectrum,
     )
 end
 
@@ -956,11 +1229,12 @@ function coarse_grain(
     scales::AbstractVector,
     kernel::Kernels.AbstractFilterKernel = Kernels.TopHatKernel(),
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Filtering.AbstractFilterMethod = Filtering.Spectral(),
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat}
-    return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, backend=backend, mask_strategy=mask_strategy, method=method, L=L)
+    return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, backend=backend, mask_strategy=mask_strategy, method=method, L=L, spectrum=spectrum)
 end
 
 function coarse_grain!(
@@ -974,11 +1248,12 @@ function coarse_grain!(
     deriv_plan::Union{Nothing, FlowGeometries.Discretization.GradientPlan} = nothing,
     filter_plans::Union{Nothing, AbstractVector} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Filtering.AbstractFilterMethod = Filtering.Spectral(),
     L::Real = one(T),
+    spectrum::Bool = true,
 ) where {T<:AbstractFloat}
-    return coarse_grain!(result, u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, deriv_plan=deriv_plan, filter_plans=filter_plans, backend=backend, mask_strategy=mask_strategy, method=method, L=L)
+    return coarse_grain!(result, u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, deriv_plan=deriv_plan, filter_plans=filter_plans, backend=backend, mask_strategy=mask_strategy, method=method, L=L, spectrum=spectrum)
 end
 
 # ---------------------------------------------------------------------------

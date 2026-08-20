@@ -29,7 +29,8 @@ u = [sin(2π * 2 * xi / L) * cos(2π * 2 * yi / L) for xi in x, yi in y] .+ 0.2 
 v = [-cos(2π * 2 * xi / L) * sin(2π * 2 * yi / L) for xi in x, yi in y] .+ 0.2 .* randn(N, N)
 
 scales = collect(5_000.0:5_000.0:40_000.0)
-result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel())
+result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel(),
+                           spectrum = false)
 
 println("scale [km]   coarse-KE         mean|Π|")
 for (i, ℓ) in enumerate(scales)

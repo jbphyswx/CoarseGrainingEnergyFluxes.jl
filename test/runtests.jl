@@ -1,6 +1,7 @@
 module CoarseGrainingEnergyFluxesTests
 
 using Test: Test
+using Logging: Logging  # `@test_logs min_level = Logging.Warn`, for asserting the ABSENCE of a warning
 using StaticArrays: StaticArrays as SA
 using Aqua: Aqua
 using ExplicitImports: ExplicitImports as EI
@@ -34,6 +35,7 @@ using FlowGeometries: FlowGeometries as FG
 include("test_quality.jl")
 include("test_geometry.jl")
 include("test_kernels.jl")
+include("test_highorder.jl")
 include("test_grids.jl")
 include("test_filtering.jl")
 include("test_spectral.jl")
@@ -44,6 +46,7 @@ include("test_curvilinear.jl")
 include("test_unstructured.jl")
 include("test_nd.jl")
 include("test_diagnostics.jl")
+include("test_validation.jl")
 include("test_visualization.jl")
 include("test_allocs.jl")
 

@@ -12,8 +12,14 @@ The coarse-grained (filtered) field at scale ℓ is a convolution with a normali
 ū_ℓ(x) = ∫ G_ℓ(x, x') u(x') dA(x')
 ```
 
-Over an unmasked domain the kernel is renormalized by its running mass, so a constant field filters
-to itself even next to a mask boundary (the `Deformable` mask strategy).
+`G_ℓ` is normalized to unit mass, so a constant field filters to itself. On a masked domain the
+integral runs over active cells only, and the default `ZeroFill` strategy keeps `G_ℓ` unchanged —
+excluded cells simply contribute nothing. That preserves the property the rest of this page depends
+on: a position-independent kernel **commutes with spatial derivatives**, which is the step that turns
+the pointwise momentum equation into the filtered energy budget below. The alternative `Deformable`
+strategy renormalizes over the locally-active area, recovering constants exactly next to a boundary at
+the cost of that commutation. Under either strategy, points within `≈ℓ` of a mask boundary are
+contaminated; see [`Filtering.filter_field!`](@ref).
 
 ### Sub-Scale Stress Tensor
 
@@ -41,10 +47,53 @@ flux
 In 2D the contraction is `S_xx τ_xx + 2 S_xy τ_xy + S_yy τ_yy`; in 3D it gains
 `+ S_zz τ_zz + 2 S_xz τ_xz + 2 S_yz τ_yz` (see [`Diagnostics.compute_Π!`](@ref)).
 
+### What a `Π`-only diagnostic does not tell you
+
+`Π` is the cross-scale transfer term of the filtered kinetic-energy budget — not the budget. Under
+exact homogeneity the transport term `⟨∇·J⟩` averages to zero, and **that is the only term `Π` alone
+gets for free.** Baroclinic conversion and forcing/injection are not divergences and do not vanish
+under averaging.
+
+The size of the gap is not marginal. Loose et al. (2023) report cross-scale KE transfer as 35–40% of
+baroclinic EKE production in the eddy-permitting regime, 70–100% at some latitudes, and >100% locally
+— i.e. **the omitted baroclinic term is typically 2.5–3.5× larger than `Π`**. So `Π` supports
+statements like "at this scale and place, energy moves upscale", and does *not* support "the mesoscale
+energy came from upscale transfer rather than from baroclinic instability". Attribution needs the
+other terms, which this package does not compute.
+
+Relatedly, the correct large-scale energy is `E(ℓ) = ½⟨|ū_ℓ|²⟩` — the energy *of the filtered flow* —
+and not the filtered energy `½⟨(|u|²)‾_ℓ⟩`, which is a different quantity that does not obey the
+cascade budget. [`Diagnostics.cumulative_energy`](@ref) computes the former.
+
 ## Filter Kernels
 
-The filter scale `ℓ` is the **full filter width** (Pope 2000 convention). Real-space weights are
-unnormalized — the filtering routines divide by the running area/volume-weighted sum.
+### What the framework requires of a kernel
+
+The results above are not valid for an arbitrary weighting. A kernel must be:
+
+1. **Normalized**, `∫G dA = 1`, so a constant filters to itself and `ū` is a genuine local mean.
+2. **Even** (`G(-x) = G(x)`), so `∫xG = 0` and filtering does not displace the field — a non-zero
+   first moment would advect while smoothing, and every linear field would acquire a spurious `τ`.
+3. **Position-independent**, so filtering commutes with `∇`. This is the step that turns the
+   pointwise momentum equation into the filtered budget, and it is why `ZeroFill` is the default
+   masking strategy; see [`Filtering.filter_field!`](@ref).
+4. **Non-negative and of non-vanishing second moment**, if `Π` is to be interpreted as a local energy
+   transfer. A kernel engineered to have `∫x²G = 0` (a "high-order" kernel) buys spectrum fidelity at
+   the cost of taking negative values, which breaks realizability of `τ` — the flux framework and the
+   spectrum framework want opposite things here.
+
+Requirements 1 and 2 are gated in `runtests.jl` against closed forms; 3 is gated by the
+`filter ∘ ∇ == ∇ ∘ filter` test. `TopHatKernel` and `GaussianKernel` satisfy all four.
+`SharpSpectralKernel` satisfies 1–3 but its real-space `sinc` form takes negative values, so it fails
+4 — usable for the spectrum, questionable for a pointwise `Π`.
+
+### Scale convention
+
+The filter scale `ℓ` is the **full filter width — a diameter, not a radius** (Pope 2000). The top-hat
+spans the disk/ball of radius `ℓ/2`; the sharp-spectral cutoff sits at `k_c = π/ℓ`. FlowSieve uses the
+same convention, so an `ℓ` is directly comparable; a source that reports a *radius* or a Gaussian
+*standard deviation* is not, and needs converting first. Real-space weights are unnormalized — the
+filtering routines divide by the running area/volume-weighted sum.
 
 ### Top-Hat (box) — `TopHatKernel`
 
@@ -58,10 +107,22 @@ the exact planar transfer function (Bessel `J₁`); see below.
 G_ℓ(r) ∝ exp(−α (r/ℓ)²)
 ```
 
-- `α = 6` (default) is the Pope/turbulence convention: the Gaussian's second moment matches the
-  top-hat box of width ℓ (`σ² = ℓ²/12`).
+- `α = 6` (default) is the Pope/turbulence convention: per-component variance `σ² = ℓ²/(2α) = ℓ²/12`,
+  the second moment of a top-hat of width `ℓ` **in one dimension**.
 - `α = 4` reproduces FlowSieve's Gaussian, so `GaussianKernel(; α = 4)` is directly comparable to
   FlowSieve output.
+
+Variance matching is dimension-dependent, and it is easy to get wrong: the Gaussian is separable so its
+per-component variance is `ℓ²/(2α)` in every dimension, but the top-hat here is the **disk/ball** of
+radius `ℓ/2`, not a separable box, so its per-component variance shrinks with dimension. Measured:
+
+| | 1-D | 2-D (disk) | 3-D (ball) |
+|---|---|---|---|
+| top-hat `⟨x²⟩` | `ℓ²/12` | `ℓ²/16` | `ℓ²/20` |
+| `α` matching it | 6 | 8 | 10 |
+
+So the default `α = 6` is 15% wider in RMS than a 2-D top-hat at the same nominal `ℓ`. For a
+like-for-like kernel comparison use `GaussianKernel(; α = 8)` in 2-D and `α = 10` in 3-D.
 
 ### Sharp Spectral — `SharpSpectralKernel`
 
@@ -104,6 +165,34 @@ wavenumber `k_ℓ = L/ℓ`:
 
 `L` is the region length (`L = 1` gives the FlowSieve convention `k_ℓ = 1/ℓ`).
 
+### The `k_ℓ = C/ℓ` convention is not standardized
+
+Three mappings are all in use, and they are not interchangeable:
+
+| source | mapping | reached here by |
+|---|---|---|
+| Sadek & Aluie (2018) | `k_ℓ = L/ℓ`, `L` the domain size | `L = domain size` |
+| Storer et al. (2022, 2023), FlowSieve | `k_ℓ = 1/ℓ` | `L = 1` (the default) |
+| Rivera, Aluie & Ecke (2014) | `k_ℓ = 2π/ℓ` | `L = 2π` |
+
+Under `k_ℓ = C/ℓ` the Jacobian is `dℓ/dk_ℓ = -ℓ²/C`, so **`k_ℓ` scales as `C` and the density `Ẽ`
+scales as `1/C`.** Comparing amplitudes — or peak locations — against a Fourier spectrum or against
+another code therefore means nothing unless the conventions have been matched first. The cumulative
+`E(ℓ)` is convention-free; only the density is not.
+
+### Two limits on the density
+
+- **Slope ceiling.** Sadek & Aluie's Eq. 18: a kernel with `p` vanishing moments recovers a true
+  `k^{-α}` spectrum only while `α < p + 2`, and otherwise saturates at `k^{-(p+2)}`. `TopHatKernel`
+  and `GaussianKernel` both have `p = 1`, so the recovered slope **locks at `k⁻³`** — which is
+  precisely the 2-D enstrophy-range target slope, so this bites hardest in QG work. `Π` is unaffected;
+  the ceiling is a property of the spectrum diagnostic alone.
+- **Positive-definiteness.** `Ẽ(k_ℓ) ≥ 0` is guaranteed (their Eq. 21) only when `d|Ĝ(k)|²/dk ≤ 0` on
+  `(0, ∞)`. The Gaussian and sharp-spectral kernels satisfy it; the top-hat does not — its `|Ĝ|²`
+  rises again by `+0.0026` near `kℓ ≈ 8.8`. [`Diagnostics.filtering_spectrum`](@ref) and
+  [`coarse_grain`](@ref) therefore refuse a non-conforming kernel rather than return a density that
+  may go negative; see [`Kernels.transfer_monotone`](@ref).
+
 ## Decompositions
 
 ### Leonard / Cross / Reynolds — `tau_decomposition`
@@ -142,6 +231,27 @@ cross .+ divergent`; the three channels hold `Π_RR`, `Π_X`, and `Π_DD` respec
 "stimulated cascade" / interaction channel of Barkan, Srinivasan & McWilliams (2024) — energy
 exchanged *between* the rotational and divergent parts of the flow, which the one-sided
 (stress-only) split cannot represent at all.
+
+### Strain / convergence — `compute_Π_strain_convergence`
+
+Srinivasan, Barkan & McWilliams (2023) eq. (10) splits the same `Π` a different way, by diagonalizing
+the filtered strain tensor rather than by decomposing the velocity. With the rotation invariants
+`δ̄ = ū_x + v̄_y` (divergence) and `ᾱ = √(σ̄_n² + σ̄_s²)` (strain magnitude), built from the normal and
+shear strains `σ̄_n = ū_x − v̄_y` and `σ̄_s = ū_y + v̄_x`,
+
+```
+Π = Π_α − Π_δ ,   Π_α = (τ_vv − τ_uu) σ̄_n/2 − τ_uv σ̄_s ,   Π_δ = (τ_vv + τ_uu) δ̄/2
+```
+
+`Π_α` is **deformation/shear production** — present in non-divergent flow, and the only term when
+`δ̄ = 0`, which recovers Polzin (2010). `Π_δ` is **convergence production**, the frontogenetic term
+that paper adds; it vanishes identically for a non-divergent field.
+
+Unlike the Helmholtz split, this is not new information: expanding eq. (10) collapses exactly to
+`−τ_uu ū_x − τ_uv(ū_y + v̄_x) − τ_vv v̄_y`, the direct `−S̄:τ̄`. Its value is (a) the physical reading —
+`Π` binned against `δ̄` and `ᾱ`, which the function also returns — and (b) that the two forms contract
+different combinations of the same derivatives, so agreeing to round-off is a real check on both. The
+suite asserts that agreement on masked and unmasked grids, for both kernels and both mask strategies.
 
 ### Tracer / buoyancy variance flux — `tracer_variance_flux`
 
@@ -211,6 +321,24 @@ afterward (`Geometry.vector_to_cartesian` / `Geometry.vector_from_cartesian`), w
 flow (Storer et al. 2022). For strongly divergent flow, decompose first (HelmholtzDecomposition.jl)
 and use [`Diagnostics.compute_Π_decomposed`](@ref).
 
+There is a second, separate loss of commutativity that no choice of vector convention removes: a
+great-circle kernel is homogeneous in *distance*, while `∂/∂x` is taken along `λ` whose metric factor
+`h_λ = R cos φ` varies across the footprint. So even for a scalar, on an unmasked grid, with a
+position-independent kernel, `filter ∘ ∂/∂x ≠ ∂/∂x ∘ filter` on the sphere. Measured on a 1° grid with
+a top-hat, as a relative error against `max|∂(ū)/∂x|`:
+
+| `ℓ` | at 0°N | at 40°N | at 65°N |
+|---|---|---|---|
+| 222 km (footprint ≈ 1 cell) | 1.7e-13 | 8.0e-14 | 6.0e-14 |
+| 444 km | 1.2e-4 | 2.2e-3 | 6.3e-3 |
+| 888 km | 7.2e-4 | 1.3e-2 | 3.2e-2 |
+
+The error is round-off while the footprint spans a single latitude row and grows with both `ℓ/R` and
+`|φ|`, reaching **3% at 65° for `ℓ = 888 km`**. That is a floor on how exactly the `Π` budget can close
+on a sphere at large `ℓ` and high latitude, independent of masking or of the flat-metric commutation
+that [`Filtering.filter_field!`](@ref)'s `mask_strategy` note is about. The full remedy is Aluie
+(2019)'s spectrally shifted kernels, which this package does not implement.
+
 ## Curvilinear & unstructured grids: WLSQ gradients
 
 `CurvilinearGrid` and `UnstructuredGrid` have no fixed axis spacing to difference against, so the
@@ -233,7 +361,9 @@ adversarial-stencil test.
 - Aluie, H., Hecht, M., & Vallis, G. K. (2018). Mapping the energy cascade in the North Atlantic Ocean. *J. Phys. Oceanogr.* 48(8). doi:10.1175/JPO-D-17-0100.1
 - Barkan, R., Srinivasan, K., & McWilliams, J. C. (2024). Eddy–internal wave interactions: stimulated cascades in cross-scale kinetic energy and enstrophy fluxes. *J. Phys. Oceanogr.* 54(6), 1309–1326. doi:10.1175/JPO-D-23-0191.1
 - Germano, M. (1992). Turbulence: the filtering approach. *J. Fluid Mech.* 238. doi:10.1017/S0022112092001733
+- Loose, N., Bachman, S., Grooms, I., & Jansen, M. (2023). Diagnosing scale-dependent energy cycles in a high-resolution isopycnal ocean model. *J. Phys. Oceanogr.* 53, 157.
 - Pedlosky, J. (1987). *Geophysical Fluid Dynamics* (2nd ed.). Springer.
 - Sadek, M., & Aluie, H. (2018). Extracting the spectrum of a flow by spatial filtering. *Phys. Rev. Fluids* 3, 124610. doi:10.1103/PhysRevFluids.3.124610
+- Srinivasan, K., Barkan, R., & McWilliams, J. C. (2023). A forward energy flux at submesoscales driven by frontogenesis. *J. Phys. Oceanogr.* 53(1), 287–305. doi:10.1175/JPO-D-22-0001.1
 - Storer, B. A. et al. (2022). Global energy spectrum of the general oceanic circulation. *Nat. Commun.* 13, 5314. doi:10.1038/s41467-022-33031-3
 - Vallis, G. K. (2017). *Atmospheric and Oceanic Fluid Dynamics* (2nd ed.). Cambridge University Press.

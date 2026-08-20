@@ -12,6 +12,13 @@ export AbstractCacheStrategy, AutoCache, AlwaysCache, NeverCache
 export filter_field!, filter_fields!, filter_slices!
 export AbstractFilterPlan, plan_filter, filter_apply!, filter_apply_batch!
 
+# Kernels that factor per axis, `G(x₁,…,x_N) = ∏ G(x_d)`, and so take the two-pass `O(N·Σwᵈ)` engine
+# instead of the `O(N·∏wᵈ)` footprint one. A `Union` rather than an abstract supertype because
+# `GaussianKernel` is separable *incidentally* (its radial form factors) while `HighOrderKernel` is
+# separable *by definition* and has no radial form at all — they share no useful supertype, only this
+# property. `Kernels.is_separable` is the trait; this is the dispatch handle.
+const SeparableKernel = Union{Kernels.GaussianKernel, Kernels.HighOrderKernel}
+
 # ---------------------------------------------------------------------------
 # Masking strategy (singleton types — specializable, unlike Symbol dispatch)
 # ---------------------------------------------------------------------------
@@ -214,15 +221,38 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    filter_field!(out, field, grid, kernel, scale; mask_strategy=Deformable(), filter_plan=nothing, backend=AutoBackend())
+    filter_field!(out, field, grid, kernel, scale; mask_strategy=ZeroFill(), filter_plan=nothing, backend=AutoBackend())
 
 Filter a field on a grid using `kernel` at characteristic full width `scale` (ℓ), writing the
 result to `out` (returned).
 
 # Keyword Arguments
-- `mask_strategy::AbstractMaskStrategy=Deformable()`: masking strategy — `ZeroFill()` (excluded cells count
-  in the denominator as zero; homogeneous kernel) or `Deformable()` (excluded cells dropped from
-  numerator and denominator; renormalized over the locally-included area).
+- `mask_strategy::AbstractMaskStrategy=ZeroFill()`: masking strategy — `ZeroFill()` (excluded cells count
+  in the denominator as zero; the kernel stays homogeneous) or `Deformable()` (excluded cells dropped
+  from numerator and denominator; renormalized over the locally-included area).
+
+  Near a boundary the footprint is truncated, and both strategies inherit the same shape distortion
+  from that: measured on a straight coast, Gaussian at `ℓ = 16` cells, one cell inshore the footprint's
+  centroid sits 0.21ℓ offshore and its width is 62% of the interior value (75% at `ℓ/4` inshore, 90% at
+  `ℓ/2`, 100% at `ℓ`). Points within `≈ℓ` of a boundary are contaminated either way.
+
+  They differ on the footprint's **mass**:
+
+  - `ZeroFill` leaves it at the truncated value, so the kernel is position-independent and filtering
+    **commutes with spatial derivatives** — the step the flux budget is derived by. A uniform field
+    ≡ 1 then filters to 0.543 one cell from the coast, 0.948 at `ℓ/2`, 0.9996 at `ℓ`.
+  - `Deformable` divides it out, so a constant filters to 1.000 everywhere, at the cost of a
+    position-dependent kernel that no longer commutes with derivatives.
+
+  `ZeroFill` is the default because the flux budget is a statement about commuting operators; prefer
+  `Deformable` when a locally unbiased amplitude near a coast matters more than a budget that closes.
+
+  Neither conserves the ACTIVE-cell integral on a masked domain, and they fail differently. `ZeroFill`
+  conserves it over the whole domain exactly (7e-18 relative, unmasked periodic) but smears part of it
+  onto masked cells, which report zero; `Deformable` renormalizes that away and tracks the active-cell
+  integral better — 4.8e-4 relative drift against `ZeroFill`'s 1.1e-2 on a masked periodic grid. On a
+  bounded grid the domain edge costs both about 1e-2 at `ℓ = 6Δx`. A closed energy budget wants a
+  periodic unmasked domain; otherwise expect an `O(ℓ/L)` boundary residual.
 - `filter_plan::Union{Nothing,AbstractFilterPlan}=nothing`: a prebuilt [`plan_filter`](@ref) result to
   reuse instead of building one from scratch — the zero-(re)allocation entry point for a repeated
   sweep (many timesteps/fields over the same grid/kernel/scale). When supplied, `mask_strategy`/
@@ -248,7 +278,7 @@ function filter_field!(
     grid::FlowGeometries.Grids.AbstractGrid,
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy::AbstractMaskStrategy = Deformable(),
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
     filter_plan::Union{Nothing,AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     method::AbstractFilterMethod = RealSpace(),
@@ -267,7 +297,7 @@ function filter_field!(
     grid::FlowGeometries.Grids.StructuredGrid{<:FlowGeometries.Geometry.AbstractGeometry,T,2},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy::AbstractMaskStrategy = Deformable(),
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
     filter_plan::Union{Nothing,AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     method::AbstractFilterMethod = RealSpace(),
@@ -744,7 +774,7 @@ coordinate array the two-pointer sweep walks (tripled when axis 1 is periodic, s
 interval is still one contiguous run), and preallocated scratch so `filter_apply!` allocates nothing.
 
 `prefix_den` (Deformable masking) is the prefix sum of `mask·wx` — mask-only, so it is built ONCE at
-plan-build time, mirroring `SeparableGaussianFootprint`/`FFTWFilterPlan`'s `invrenorm` convention.
+plan-build time, mirroring `SeparableFootprint`/`FFTWFilterPlan`'s `invrenorm` convention.
 `ZeroFill`'s denominator is mask-independent and needs only the 1-D `prefix_wx`.
 """
 struct PrefixSumTopHatPlan{
@@ -795,7 +825,7 @@ function _rectilinear_measure_factors(
 end
 
 """
-    _build_prefixsum_tophat(grid, kernel::TopHatKernel, scale; mask_strategy=Deformable(), kwargs...)
+    _build_prefixsum_tophat(grid, kernel::TopHatKernel, scale; mask_strategy=ZeroFill(), kwargs...)
 
 Build the exact `O(N·dj_lim)` prefix-sum top-hat plan. `kwargs...` absorbs (and ignores)
 `cache_strategy`/`cache_byte_budget` — there is no per-point neighbour list here to cache at all.
@@ -804,7 +834,7 @@ function _build_prefixsum_tophat(
     grid::FlowGeometries.Grids.StructuredGrid{G,T,2},
     kernel::Kernels.TopHatKernel,
     scale::T;
-    mask_strategy::AbstractMaskStrategy = Deformable(),
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
@@ -1122,7 +1152,7 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    SeparableGaussianFootprint{T}
+    SeparableFootprint{T}
 
 Precomputed 1D Gaussian weight vectors (`gx`,`gy`) plus preallocated scratch buffers for the
 row-pass/column-pass separable convolution. `invrenorm` (Deformable masking only) is the precomputed
@@ -1139,7 +1169,7 @@ independently at the SAME per-axis `rad` (the Gaussian's own 1D marginal decays 
 support (only a numerical truncation tolerance), so this is an equally valid truncation, just a
 different shape — matched against `RealSpace` within a measured tolerance, not asserted bit-identical.
 """
-struct SeparableGaussianFootprint{
+struct SeparableFootprint{
     T<:AbstractFloat,
     VT<:AbstractVecOrMat{T},
     PVT<:Union{Nothing,AbstractVector{T}},
@@ -1251,10 +1281,10 @@ end
 
 # Row-pass (over axis 1) then column-pass (over axis 2) of `src` into `dst`, using `fp`'s scratch
 # `row_pass` buffer — the single shared primitive both the plan-build-time `invrenorm` computation
-# and every serial `apply_separable_gaussian!` call use, so they can never drift out of sync with
+# and every serial `apply_separable!` call use, so they can never drift out of sync with
 # each other. The ThreadedBackend extension calls `_separable_row_pass_at!`/`_separable_column_pass_at!`
 # directly (parallelized over `j`) instead of this serial driver.
-function _separable_convolve!(dst::AbstractMatrix{T}, src::AbstractMatrix{T}, fp::SeparableGaussianFootprint{T}, Nx::Int, Ny::Int) where {T<:AbstractFloat}
+function _separable_convolve!(dst::AbstractMatrix{T}, src::AbstractMatrix{T}, fp::SeparableFootprint{T}, Nx::Int, Ny::Int) where {T<:AbstractFloat}
     gx, gy = fp.gx, fp.gy
     di_lim, dj_lim = fp.di_lim, fp.dj_lim
     periodic_x, periodic_y = fp.periodic_x, fp.periodic_y
@@ -1269,10 +1299,12 @@ function _separable_convolve!(dst::AbstractMatrix{T}, src::AbstractMatrix{T}, fp
 end
 
 """
-    _separable_axis_weights(x, lim, periodic, period, α, scale) -> AbstractVecOrMat
+    _separable_axis_weights(x, lim, periodic, period, kernel, scale, wfac) -> AbstractVecOrMat
 
-The Gaussian's per-axis weight table: `exp(-α·(Δx/ℓ)²)` over the stencil, in the layout [`_sepw`](@ref)
-reads.
+A separable kernel's per-axis weight table: `Kernels.kernel_profile(kernel, Δx, ℓ)` over the stencil,
+in the layout [`_sepw`](@ref) reads. Any kernel with a 1-D profile takes this path — the Gaussian,
+whose radial form happens to factor, and [`Kernels.HighOrderKernel`](@ref), which is separable by
+definition and has no radial form at all.
 
 Uniform axis: the displacement is `ddi·Δ` wherever the stencil sits, so one vector serves every
 position. Stretched axis: the displacement depends on the position too, so the table gains a position
@@ -1284,16 +1316,41 @@ wider than it needs to be; those slots hold exact zeros rather than being trimme
 inner loop's bounds static. A periodic displacement carries the image offset, matching the tiling
 convention the scattered engine uses.
 """
-function _separable_axis_weights(
-    x::AbstractRange{T}, lim::Int, ::Bool, ::T, α::T, scale::T, ::AbstractVector{T},
-) where {T<:AbstractFloat}
-    Δ = T(step(x))
-    return [exp(-α * (T(ddi) * Δ / scale)^2) for ddi in -lim:lim]
+# Cell-averaged weights keep a discontinuous kernel's MASS exact on any grid, but they cannot recover
+# the vanishing MOMENTS if a limb is thinner than a cell — there is simply no resolution there to
+# distinguish it from a box. That is a warning rather than an error: the filter is still a valid
+# normalized low-pass, it just is not the high-order one that was asked for.
+_warn_unresolved_limbs(::Kernels.AbstractFilterKernel, _, ::Int, _) = nothing
+
+function _warn_unresolved_limbs(
+    kernel::Kernels.HighOrderKernel, x::AbstractVector, d::Int, scale::Real,
+)
+    length(x) < 2 && return nothing
+    Δ = minimum(abs(x[i] - x[i - 1]) for i in (firstindex(x) + 1):lastindex(x))
+    b = kernel.b_over_ℓ * scale
+    (isfinite(Δ) && Δ > 0 && b < Δ) && @warn(
+        "$(nameof(typeof(kernel))) at ℓ = $scale has limb width b = $b, below axis $d's spacing " *
+        "$Δ — under one cell per limb, so the vanishing moments it is built for do not survive " *
+        "discretization and the result is effectively a box. At b_over_ℓ = $(kernel.b_over_ℓ) this " *
+        "needs ℓ ≥ $(Δ / kernel.b_over_ℓ).",
+        maxlog = 1,
+    )
+    return nothing
 end
 
 function _separable_axis_weights(
-    x::AbstractVector{T}, lim::Int, periodic::Bool, period::T, α::T, scale::T,
-    wfac::AbstractVector{T},
+    x::AbstractRange{T}, lim::Int, ::Bool, ::T, kernel::Kernels.AbstractFilterKernel, scale::T,
+    ::AbstractVector{T},
+) where {T<:AbstractFloat}
+    Δ = T(step(x))
+    # `profile_cell_average` is the point sample for every smooth kernel and the exact cell integral
+    # for a discontinuous one — see `Kernels.profile_cell_average`.
+    return [Kernels.profile_cell_average(kernel, T(ddi) * Δ, Δ, scale) for ddi in -lim:lim]
+end
+
+function _separable_axis_weights(
+    x::AbstractVector{T}, lim::Int, periodic::Bool, period::T,
+    kernel::Kernels.AbstractFilterKernel, scale::T, wfac::AbstractVector{T},
 ) where {T<:AbstractFloat}
     n = length(x)
     # POSITION-major, `(n, 2·lim+1)`: the passes hold a tap fixed and sweep position, so position must
@@ -1313,26 +1370,33 @@ function _separable_axis_weights(
         # A rectilinear measure is itself a product of per-axis factors, so it splits over the passes
         # exactly as the kernel does. On a uniform axis it is a constant that cancels in the
         # normalization, which is why the vector method above can leave it out.
-        g[i, ddi + lim + 1] = exp(-α * ((x[ii] + shift - x[i]) / scale)^2) * wfac[ii]
+        # `wfac[ii]` is the neighbour cell's width, so it doubles as the averaging window: the weight
+        # is the kernel's INTEGRAL over that cell, not its value at the node. Identical to the point
+        # sample for a smooth kernel (`profile_cell_average`'s default), and the difference between
+        # working and not for a discontinuous one on a stretched axis.
+        g[i, ddi + lim + 1] =
+            Kernels.profile_cell_average(kernel, x[ii] + shift - x[i], wfac[ii], scale) * wfac[ii]
     end
     return g
 end
 
 """
-    _build_separable_gaussian_footprint(grid, kernel::GaussianKernel, scale; mask_strategy=Deformable(), kwargs...) -> SeparableGaussianFootprint
+    _build_separable_footprint(grid, kernel::GaussianKernel, scale; mask_strategy=ZeroFill(), kwargs...) -> SeparableFootprint
 
 Build the per-axis weight tables, the mask-dependent normalization data for `mask_strategy`, and the
-preallocated scratch buffers for the separable Gaussian path. `kwargs...` absorbs (and ignores)
+preallocated scratch buffers for the separable path. `kwargs...` absorbs (and ignores)
 `cache_strategy`/`cache_byte_budget` — there is no per-point neighbour list to cache here at all, so
 those knobs (which only govern the scattered path) don't apply.
 """
-function _build_separable_gaussian_footprint(
+function _build_separable_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{G,T,2},
-    kernel::Kernels.GaussianKernel,
+    kernel::SeparableKernel,
     scale::T;
-    mask_strategy::AbstractMaskStrategy = Deformable(),
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    _warn_unresolved_limbs(kernel, FlowGeometries.Grids.coordinates(grid, 1), 1, scale)
+    _warn_unresolved_limbs(kernel, FlowGeometries.Grids.coordinates(grid, 2), 2, scale)
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     rad = Kernels.kernel_radius(kernel, scale)
     # The smallest gap on each axis, so the stencil never under-covers: a coarser region's slots then
@@ -1341,7 +1405,6 @@ function _build_separable_gaussian_footprint(
     dy = FlowGeometries.Grids.minimum_spacing(grid, 2)
     di_lim = (isfinite(dx) && dx > 0) ? ceil(Int, rad / dx) : 0
     dj_lim = (isfinite(dy) && dy > 0) ? ceil(Int, rad / dy) : 0
-    α = T(kernel.α)
     periodic_x = FlowGeometries.Grids.isperiodic(grid, 1)
     periodic_y = FlowGeometries.Grids.isperiodic(grid, 2)
     # The cell measure enters the weights, so the two passes together form `kernel · area` — the same
@@ -1349,28 +1412,28 @@ function _build_separable_gaussian_footprint(
     # construction, so it splits over the passes; anything else cannot take this path at all.
     mf = FlowGeometries.Grids.measure_factors(grid)
     mf === nothing && throw(ArgumentError(
-        "the separable Gaussian path needs a separable cell measure, but this grid's measure is dense",
+        "the separable path needs a separable cell measure, but this grid's measure is dense",
     ))
     gx = _separable_axis_weights(
         FlowGeometries.Grids.coordinates(grid, 1), di_lim, periodic_x,
-        T(FlowGeometries.Grids.period(grid, 1)), α, scale, convert(AbstractVector{T}, mf[1]),
+        T(FlowGeometries.Grids.period(grid, 1)), kernel, scale, convert(AbstractVector{T}, mf[1]),
     )
     gy = _separable_axis_weights(
         FlowGeometries.Grids.coordinates(grid, 2), dj_lim, periodic_y,
-        T(FlowGeometries.Grids.period(grid, 2)), α, scale, convert(AbstractVector{T}, mf[2]),
+        T(FlowGeometries.Grids.period(grid, 2)), kernel, scale, convert(AbstractVector{T}, mf[2]),
     )
 
     masked_input = zeros(T, Nx, Ny)
     row_pass = zeros(T, Nx, Ny)
     fully_active = all(FlowGeometries.Grids.mask(grid))
-    fp_partial = SeparableGaussianFootprint(gx, gy, di_lim, dj_lim, periodic_x, periodic_y, nothing, nothing, nothing, !fully_active, masked_input, row_pass)
+    fp_partial = SeparableFootprint(gx, gy, di_lim, dj_lim, periodic_x, periodic_y, nothing, nothing, nothing, !fully_active, masked_input, row_pass)
 
     if fully_active || mask_strategy isa ZeroFill
         # `ZeroFill`'s denominator is the mask-independent geometric profile. A fully-active grid takes
         # the same branch whatever its strategy: with nothing excluded, `Deformable` coincides with it.
         Nx_profile = _separable_profile(di_lim, gx, Nx, periodic_x)
         Ny_profile = _separable_profile(dj_lim, gy, Ny, periodic_y)
-        return SeparableGaussianFootprint(gx, gy, di_lim, dj_lim, periodic_x, periodic_y, Nx_profile, Ny_profile, nothing, !fully_active, masked_input, row_pass)
+        return SeparableFootprint(gx, gy, di_lim, dj_lim, periodic_x, periodic_y, Nx_profile, Ny_profile, nothing, !fully_active, masked_input, row_pass)
     else
         # Deformable: precompute invrenorm = 1/separable_convolve(Float.(mask)) ONCE — the mask never
         # changes across repeated `filter_apply!` calls on a fixed plan.
@@ -1379,7 +1442,7 @@ function _build_separable_gaussian_footprint(
         _separable_convolve!(denom, maskf, fp_partial, Nx, Ny)
         invrenorm = similar(denom)
         @. invrenorm = ifelse(denom > T(1e-15), one(T) / denom, zero(T))
-        return SeparableGaussianFootprint(gx, gy, di_lim, dj_lim, periodic_x, periodic_y, nothing, nothing, invrenorm, !fully_active, masked_input, row_pass)
+        return SeparableFootprint(gx, gy, di_lim, dj_lim, periodic_x, periodic_y, nothing, nothing, invrenorm, !fully_active, masked_input, row_pass)
     end
 end
 
@@ -1400,14 +1463,14 @@ function _separable_profile(lim::Int, g::AbstractVecOrMat{T}, N::Int, periodic::
 end
 
 """
-    apply_separable_gaussian!(out, field, grid, fp::SeparableGaussianFootprint, strategy) -> out
+    apply_separable!(out, field, grid, fp::SeparableFootprint, strategy) -> out
 
-Apply the separable Gaussian fast path: `masked_input = mask .* field` (the SAME numerator input for
+Apply the separable fast path: `masked_input = mask .* field` (the SAME numerator input for
 both mask strategies — see the struct docstring), one shared row-pass/column-pass convolution, then
 divide by whichever mask-strategy-specific denominator `fp` holds.
 """
-function apply_separable_gaussian!(
-    out::AbstractMatrix{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid, fp::SeparableGaussianFootprint{T}, strategy::AbstractMaskStrategy,
+function apply_separable!(
+    out::AbstractMatrix{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid, fp::SeparableFootprint{T}, strategy::AbstractMaskStrategy,
 ) where {T<:AbstractFloat}
     _separable_check_strategy(fp, strategy)
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
@@ -1420,7 +1483,7 @@ end
 
 @noinline function _separable_strategy_mismatch()
     throw(ArgumentError(
-        "SeparableGaussianFootprint was built for ZeroFill masking, so it holds only the rank-1 " *
+        "SeparableFootprint was built for ZeroFill masking, so it holds only the rank-1 " *
         "profiles and no renormalization field, but is being applied with a renormalizing " *
         "(non-ZeroFill) mask strategy on a masked grid. Rebuild the plan with the same " *
         "`mask_strategy` you intend to apply with.",
@@ -1432,7 +1495,7 @@ end
 #
 # `invrenorm === nothing` does not by itself mean ZeroFill: on a fully-active grid both strategies
 # coincide and take the profiles. Hence the stored `masked` flag, rather than an `all(mask)` scan.
-@inline function _separable_check_strategy(fp::SeparableGaussianFootprint, strategy::AbstractMaskStrategy)
+@inline function _separable_check_strategy(fp::SeparableFootprint, strategy::AbstractMaskStrategy)
     if !(strategy isa ZeroFill) && fp.masked && fp.invrenorm === nothing
         _separable_strategy_mismatch()
     end
@@ -1443,7 +1506,7 @@ end
 # the ThreadedBackend extension's parallel-row-pass/column-pass path — kept in one place so they can
 # never drift out of sync (mirrors `_separable_convolve!`'s own "single shared primitive" role).
 function _separable_normalize_and_mask!(
-    out::AbstractMatrix{T}, fp::SeparableGaussianFootprint{T}, mask::AbstractMatrix{Bool}, Nx::Int, Ny::Int,
+    out::AbstractMatrix{T}, fp::SeparableFootprint{T}, mask::AbstractMatrix{Bool}, Nx::Int, Ny::Int,
 ) where {T<:AbstractFloat}
     if fp.invrenorm !== nothing
         @. out *= fp.invrenorm
@@ -1461,7 +1524,7 @@ function _separable_normalize_and_mask!(
 end
 
 """
-    build_footprint(grid::StructuredGrid{Cartesian,T,2,TP,<:Tuple{AbstractRange,AbstractRange}}, kernel::GaussianKernel, scale; kwargs...) -> SeparableGaussianFootprint
+    build_footprint(grid::StructuredGrid{Cartesian,T,2,TP,<:Tuple{AbstractRange,AbstractRange}}, kernel::GaussianKernel, scale; kwargs...) -> SeparableFootprint
 
 Fast path for a `GaussianKernel` on a uniform (`Range`-axis) Cartesian grid — see the "Separable
 Gaussian fast path" section above. More specific than the generic Range-axis method (constrained on
@@ -1469,15 +1532,15 @@ kernel type too), so Julia picks this one whenever `kernel isa GaussianKernel`.
 """
 function build_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{G,T,2,TP,<:Tuple{AbstractRange,AbstractRange}},
-    kernel::Kernels.GaussianKernel,
+    kernel::SeparableKernel,
     scale::T;
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, TP<:NTuple{2,FlowGeometries.Grids.AbstractTopology}}
-    return _build_separable_gaussian_footprint(grid, kernel, scale; kwargs...)
+    return _build_separable_footprint(grid, kernel, scale; kwargs...)
 end
 
 """
-    build_footprint(grid::StructuredGrid{Cartesian,T,2}, kernel::GaussianKernel, scale; kwargs...) -> SeparableGaussianFootprint
+    build_footprint(grid::StructuredGrid{Cartesian,T,2}, kernel::GaussianKernel, scale; kwargs...) -> SeparableFootprint
 
 Separability does not require constant spacing: `exp(-α(Δx²+Δy²)/ℓ²)` factorizes on any rectilinear
 grid, and a stretched axis only makes the per-axis weight depend on position as well as offset — see
@@ -1490,11 +1553,11 @@ ambiguity with the generic Range-axis method; both build the same footprint.
 """
 function build_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{G,T,2},
-    kernel::Kernels.GaussianKernel,
+    kernel::SeparableKernel,
     scale::T;
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    return _build_separable_gaussian_footprint(grid, kernel, scale; kwargs...)
+    return _build_separable_footprint(grid, kernel, scale; kwargs...)
 end
 
 """
@@ -1793,9 +1856,9 @@ end
 # a position-independent metric. A spherical metric is position-dependent — arc length varies with
 # latitude, and in 3D with radius — so a spherical 1D/3D grid takes the general path below.
 """
-    SeparableGaussianFootprintND{N,T}
+    SeparableFootprintND{N,T}
 
-The separable Gaussian in `N` dimensions: one weight table per axis, applied as `N` successive 1-D
+A separable kernel in `N` dimensions: one weight table per axis, applied as `N` successive 1-D
 passes.
 
 This is the same factorization the 2-D path uses, and the reason it matters grows with `N`. A
@@ -1805,7 +1868,7 @@ This is the same factorization the 2-D path uses, and the reason it matters grow
 Weight tables follow [`_sepw`](@ref): a vector where the axis is uniform, an `Nᵈ × (2wᵈ+1)` matrix where
 it is stretched.
 """
-struct SeparableGaussianFootprintND{
+struct SeparableFootprintND{
     N, T<:AbstractFloat,
     GT<:NTuple{N,AbstractVecOrMat{T}},
     PVT<:Union{Nothing,NTuple{N,AbstractVector{T}}},
@@ -1949,16 +2012,15 @@ end
 @inline _sep_pass_chain!(dst, src, fp, dims, vn::Val, vd::Val, driver::D = _sep_serial) where {D} =
     _sep_pass_chain!(dst, src, fp, dims, vn, vd, driver, fp.scratch, fp.masked_input)
 
-function _build_separable_gaussian_nd(
+function _build_separable_nd(
     grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
-    kernel::Kernels.GaussianKernel,
+    kernel::SeparableKernel,
     scale::T;
-    mask_strategy::AbstractMaskStrategy = Deformable(),
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
     kwargs...,
 ) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     dims = FlowGeometries.Grids.size_tuple(grid)
     rad = Kernels.kernel_radius(kernel, scale)
-    α = T(kernel.α)
     periodic = FlowGeometries.Grids.periodic_flags(grid)
     lim = ntuple(Val(N)) do d
         s = FlowGeometries.Grids.minimum_spacing(grid, d)
@@ -1966,26 +2028,26 @@ function _build_separable_gaussian_nd(
     end
     mf = FlowGeometries.Grids.measure_factors(grid)
     mf === nothing && throw(ArgumentError(
-        "the separable Gaussian path needs a separable cell measure, but this grid's measure is dense",
+        "the separable path needs a separable cell measure, but this grid's measure is dense",
     ))
     g = ntuple(Val(N)) do d
         _separable_axis_weights(
             FlowGeometries.Grids.coordinates(grid, d), lim[d], periodic[d],
-            T(FlowGeometries.Grids.period(grid, d)), α, scale, convert(AbstractVector{T}, mf[d]),
+            T(FlowGeometries.Grids.period(grid, d)), kernel, scale, convert(AbstractVector{T}, mf[d]),
         )
     end
 
     masked_input = zeros(T, dims)
     scratch = zeros(T, dims)
     fully_active = all(FlowGeometries.Grids.mask(grid))
-    fp_partial = SeparableGaussianFootprintND(
+    fp_partial = SeparableFootprintND(
         g, lim, periodic, nothing, nothing, !fully_active, masked_input, scratch,
     )
     if fully_active || mask_strategy isa ZeroFill
         # Mask-independent denominator: `Σ w` over geometrically valid offsets, which depends only on
         # the index and the wrapping, so it stays a product of one factor per axis.
         profiles = ntuple(d -> _separable_profile(lim[d], g[d], dims[d], periodic[d]), Val(N))
-        return SeparableGaussianFootprintND(
+        return SeparableFootprintND(
             g, lim, periodic, profiles, nothing, !fully_active, masked_input, scratch,
         )
     end
@@ -1995,13 +2057,13 @@ function _build_separable_gaussian_nd(
     _sep_pass_chain!(denom, masked_input, fp_partial, dims, Val(N), Val(1))
     invrenorm = similar(denom)
     @. invrenorm = ifelse(denom > T(1e-15), one(T) / denom, zero(T))
-    return SeparableGaussianFootprintND(
+    return SeparableFootprintND(
         g, lim, periodic, nothing, invrenorm, !fully_active, masked_input, scratch,
     )
 end
 
 @inline function _separable_check_strategy(
-    fp::SeparableGaussianFootprintND, strategy::AbstractMaskStrategy,
+    fp::SeparableFootprintND, strategy::AbstractMaskStrategy,
 )
     if !(strategy isa ZeroFill) && fp.masked && fp.invrenorm === nothing
         _separable_strategy_mismatch()
@@ -2010,7 +2072,7 @@ end
 end
 
 """
-    apply_separable_gaussian_nd!(out, field, grid, fp, strategy, driver = _sep_serial)
+    apply_separable_nd!(out, field, grid, fp, strategy, driver = _sep_serial)
 
 Run the `N` separable passes and the pointwise normalization. `driver` supplies the per-pass index
 sweep — see [`_sep_serial`](@ref); a threaded backend passes its own and gets the same answer, since
@@ -2024,9 +2086,9 @@ every point within a pass is independent and the passes themselves stay ordered.
 #
 # The profile tables, the renormalization array and the mask are all spatial-only, so they are indexed with
 # the leading `R` components of the driven index rather than the index itself.
-function apply_separable_gaussian_nd!(
+function apply_separable_nd!(
     out::AbstractArray{T}, field::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid,
-    fp::SeparableGaussianFootprintND{R,T}, strategy::AbstractMaskStrategy, driver::D = _sep_serial,
+    fp::SeparableFootprintND{R,T}, strategy::AbstractMaskStrategy, driver::D = _sep_serial,
 ) where {T<:AbstractFloat, R, D}
     _separable_check_strategy(fp, strategy)
     dims = size(out)
@@ -2064,15 +2126,15 @@ end
 # because separability does not require uniform spacing — see [`_separable_axis_weights`](@ref).
 build_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{G,T,1},
-    kernel::Kernels.GaussianKernel, scale::T; kwargs...,
+    kernel::SeparableKernel, scale::T; kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
-    _build_separable_gaussian_nd(grid, kernel, scale; kwargs...)
+    _build_separable_nd(grid, kernel, scale; kwargs...)
 
 build_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{G,T,3},
-    kernel::Kernels.GaussianKernel, scale::T; kwargs...,
+    kernel::SeparableKernel, scale::T; kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
-    _build_separable_gaussian_nd(grid, kernel, scale; kwargs...)
+    _build_separable_nd(grid, kernel, scale; kwargs...)
 
 # Range axes AND a Gaussian is more specific than either of the two methods that would otherwise both
 # apply (kernel-specific with free axes, axis-specific with a free kernel), so these resolve that pair.
@@ -2080,15 +2142,15 @@ build_footprint(
 # of matrices, not a different algorithm.
 build_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{G,T,1,TP,<:Tuple{AbstractRange}},
-    kernel::Kernels.GaussianKernel, scale::T; kwargs...,
+    kernel::SeparableKernel, scale::T; kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, TP<:NTuple{1,FlowGeometries.Grids.AbstractTopology}} =
-    _build_separable_gaussian_nd(grid, kernel, scale; kwargs...)
+    _build_separable_nd(grid, kernel, scale; kwargs...)
 
 build_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{G,T,3,TP,<:Tuple{AbstractRange,AbstractRange,AbstractRange}},
-    kernel::Kernels.GaussianKernel, scale::T; kwargs...,
+    kernel::SeparableKernel, scale::T; kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, TP<:NTuple{3,FlowGeometries.Grids.AbstractTopology}} =
-    _build_separable_gaussian_nd(grid, kernel, scale; kwargs...)
+    _build_separable_nd(grid, kernel, scale; kwargs...)
 
 build_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{G,T,1,TP,<:Tuple{AbstractRange}},
@@ -2426,12 +2488,12 @@ _apply_serial!(out, field, grid, fp::NDScatteredFilterPlan, strategy) =
     apply_footprint_nd!(out, field, grid, fp, strategy)
 _apply_serial!(out, field, grid, fp::PrefixSumTopHatPlan, strategy) =
     apply_prefixsum_tophat!(out, field, grid, fp, strategy)
-_apply_serial!(out, field, grid, fp::SeparableGaussianFootprintND, strategy) =
-    apply_separable_gaussian_nd!(out, field, grid, fp, strategy)
+_apply_serial!(out, field, grid, fp::SeparableFootprintND, strategy) =
+    apply_separable_nd!(out, field, grid, fp, strategy)
 _apply_serial!(out, field, grid, fp::NodeFilterPlan, strategy) =
     apply_footprint!(out, field, grid, fp, strategy)
-_apply_serial!(out, field, grid, fp::SeparableGaussianFootprint, strategy) =
-    apply_separable_gaussian!(out, field, grid, fp, strategy)
+_apply_serial!(out, field, grid, fp::SeparableFootprint, strategy) =
+    apply_separable!(out, field, grid, fp, strategy)
 
 # ---------------------------------------------------------------------------
 # Batched apply: derive each target point's neighbours and weights once and apply them to every field
@@ -2462,7 +2524,7 @@ _apply_serial_batch!(outs, fields, grid, fp::NDScatteredFilterPlan, strategy) =
 # The only per-field work left really is per-field data, so a batch here IS the per-field loop.
 function _apply_serial_batch!(
     outs, fields, grid,
-    fp::Union{SeparableGaussianFootprint, SeparableGaussianFootprintND, PrefixSumTopHatPlan, NodeFilterPlan},
+    fp::Union{SeparableFootprint, SeparableFootprintND, PrefixSumTopHatPlan, NodeFilterPlan},
     strategy,
 )
     for k in eachindex(outs)
@@ -2860,7 +2922,7 @@ prepare_workspace(
 end
 
 """
-    plan_filter(grid, kernel, scale; mask_strategy=Deformable(), backend=AutoBackend()) -> AbstractFilterPlan
+    plan_filter(grid, kernel, scale; mask_strategy=ZeroFill(), backend=AutoBackend()) -> AbstractFilterPlan
 
 Build a reusable filter plan: the footprint is precomputed ONCE regardless of backend (serial,
 threaded, distributed, GPU, or MPI) and reused across every subsequent `filter_apply!` call — no
@@ -2870,7 +2932,7 @@ function plan_filter(
     grid::FlowGeometries.Grids.StructuredGrid{G,T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy::AbstractMaskStrategy = Deformable(),
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     method::AbstractFilterMethod = RealSpace(),
     spectral_backend::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
@@ -2959,7 +3021,7 @@ end
 # Which kernels have a factored real-space engine. A `SharpSpectralKernel` has none — its radial `sinc`
 # does not separate — so it falls to the banded disk sum at O(N·w²) with a 10ℓ radius.
 _has_fast_real_space_engine(::Kernels.TopHatKernel) = true       # O(N) prefix sum
-_has_fast_real_space_engine(::Kernels.GaussianKernel) = true     # O(N·(wx+wy)) separable
+_has_fast_real_space_engine(::SeparableKernel) = true            # O(N·(wx+wy)) separable
 _has_fast_real_space_engine(::Kernels.AbstractFilterKernel) = false
 
 # `AutoMethod` may evaluate a real-space filter by padded transform: it is the SAME linear convolution,
@@ -3098,7 +3160,7 @@ function plan_filter(
     grid::FlowGeometries.Grids.AbstractGrid,
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy::AbstractMaskStrategy = Deformable(),
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     method::AbstractFilterMethod = Spectral(),
     spectral_backend::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
@@ -3126,7 +3188,7 @@ function plan_filter(
     grid::FlowGeometries.Grids.UnstructuredGrid{T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy::AbstractMaskStrategy = Deformable(),
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     method::AbstractFilterMethod = Spectral(),
     spectral_backend::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
@@ -3150,7 +3212,7 @@ function plan_filter(
     grid::FlowGeometries.Grids.CurvilinearGrid{T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy::AbstractMaskStrategy = Deformable(),
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     method::AbstractFilterMethod = RealSpace(),
     spectral_backend::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
@@ -3329,7 +3391,7 @@ function filter_apply_batch_trailing!(outs, fields, plan::AbstractFilterPlan)
 end
 
 """
-    filter_fields!(outs, fields, grid, kernel, scale; mask_strategy=Deformable(), backend=AutoBackend())
+    filter_fields!(outs, fields, grid, kernel, scale; mask_strategy=ZeroFill(), backend=AutoBackend())
 
 Filter several fields that share the same grid/kernel/scale, building the footprint/plan ONCE and
 applying it through [`filter_apply_batch!`](@ref), so each target point's neighbours are enumerated
@@ -3342,7 +3404,7 @@ function filter_fields!(
     grid::FlowGeometries.Grids.StructuredGrid{G,T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy::AbstractMaskStrategy = Deformable(),
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
     filter_plan::Union{Nothing,AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
 ) where {G<:FlowGeometries.Geometry.AbstractGeometry{T}} where {T<:AbstractFloat}

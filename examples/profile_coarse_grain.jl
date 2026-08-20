@@ -31,7 +31,8 @@ for k in 1:Nz, (xi, x) in enumerate(xs), (yi, y) in enumerate(xs)
 end
 
 scales = collect(5e3:5e3:30e3)
-result = CGEF.coarse_grain_profile(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel())
+result = CGEF.coarse_grain_profile(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel(),
+                                   spectrum = false)
 
 println("mean|Π| by level and scale (rows = level 1..$Nz, cols = scales):")
 for k in 1:Nz

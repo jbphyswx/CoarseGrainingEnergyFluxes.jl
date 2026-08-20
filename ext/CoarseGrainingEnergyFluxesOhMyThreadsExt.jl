@@ -27,8 +27,8 @@ function CGEF.Filtering.threaded_filter_field!(
     workspace,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
-    if fp isa CGEF.Filtering.SeparableGaussianFootprint
-        return _threaded_apply_separable_gaussian!(out, field, grid, fp, mask_strategy)
+    if fp isa CGEF.Filtering.SeparableFootprint
+        return _threaded_apply_separable!(out, field, grid, fp, mask_strategy)
     elseif fp isa CGEF.Filtering.PrefixSumTopHatPlan
         return _threaded_apply_prefixsum_tophat!(out, field, grid, fp, mask_strategy)
     end
@@ -46,8 +46,8 @@ end
 # single fused row-parallel loop: two `tforeach` sweeps instead, one per pass, relying on `tforeach`'s
 # implicit barrier to complete the whole `row_pass` before the column pass reads it. Calls the same
 # per-row/per-column bodies and epilogue as serial, so results are bit-identical.
-function _threaded_apply_separable_gaussian!(
-    out::AbstractMatrix{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid, fp::CGEF.Filtering.SeparableGaussianFootprint{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
+function _threaded_apply_separable!(
+    out::AbstractMatrix{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid, fp::CGEF.Filtering.SeparableFootprint{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
 ) where {T<:AbstractFloat}
     # Same contract as the serial path: the footprint's denominator is fixed at build time, so a
     # strategy it was not built for cannot be honoured and must not be silently ignored.
@@ -91,7 +91,7 @@ end
 # Batched 2D apply: rows in parallel, and within a row the whole batch shares one enumeration of each
 # point's neighbours. A per-field loop over the single-field hook would thread just as well but pay
 # that enumeration `K` times, which for a streaming scattered footprint is the dominant cost.
-# `SeparableGaussianFootprint` and `PrefixSumTopHatPlan` have no such shared derivation — their weight
+# `SeparableFootprint` and `PrefixSumTopHatPlan` have no such shared derivation — their weight
 # tables and support intervals are already computed once at plan-build time — so for them a per-field
 # threaded apply is the whole of what batching would buy, and is what runs.
 function CGEF.Filtering.threaded_filter_fields!(
@@ -104,7 +104,7 @@ function CGEF.Filtering.threaded_filter_fields!(
     workspace,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
-    if fp isa CGEF.Filtering.SeparableGaussianFootprint || fp isa CGEF.Filtering.PrefixSumTopHatPlan
+    if fp isa CGEF.Filtering.SeparableFootprint || fp isa CGEF.Filtering.PrefixSumTopHatPlan
         for k in eachindex(outs)
             CGEF.Filtering.threaded_filter_field!(outs[k], fields[k], grid, kernel, scale, mask_strategy, fp)
         end
@@ -135,7 +135,7 @@ function CGEF.Filtering.threaded_filter_fields!(
     workspace,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
-    if fp isa CGEF.Filtering.SeparableGaussianFootprintND
+    if fp isa CGEF.Filtering.SeparableFootprintND
         for k in eachindex(outs)
             CGEF.Filtering.threaded_filter_field!(outs[k], fields[k], grid, kernel, scale, mask_strategy, fp)
         end
@@ -170,11 +170,11 @@ function CGEF.Filtering.threaded_filter_field!(
     # then captured by a closure is boxed, which OhMyThreads rejects outright.
     dims = FlowGeometries.Grids.size_tuple(grid)
     fill!(out, zero(T))
-    if fp isa CGEF.Filtering.SeparableGaussianFootprintND
+    if fp isa CGEF.Filtering.SeparableFootprintND
         # The passes are ordered in `d` — each reads across its predecessor's whole output — but every
         # point WITHIN a pass is independent, so the sweep is threaded and `tforeach`'s implicit
         # barrier separates the passes.
-        return CGEF.Filtering.apply_separable_gaussian_nd!(out, field, grid, fp, mask_strategy, _omt_driver)
+        return CGEF.Filtering.apply_separable_nd!(out, field, grid, fp, mask_strategy, _omt_driver)
     elseif fp isa CGEF.Filtering.FilterFootprintND
         periodic = FlowGeometries.Grids.periodic_flags(grid)
         OhMyThreads.tforeach(CartesianIndices(out); scheduler = _sched()) do I

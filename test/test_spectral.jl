@@ -80,8 +80,27 @@ Test.@testset "Spectral FFTW filtering" begin
     # Constant field over active cells stays constant under Deformable (mask mass cancels exactly).
     cfield_m = fill(1.7, N, N)
     cout_m = zeros(N, N)
-    CGEF.Filtering.filter_field!(cout_m, cfield_m, mgrid, g, ℓ; method = CGEF.Filtering.Spectral())
+    CGEF.Filtering.filter_field!(cout_m, cfield_m, mgrid, g, ℓ; method = CGEF.Filtering.Spectral(),
+                                 mask_strategy = CGEF.Filtering.Deformable())
     Test.@test all(x -> isapprox(x, 1.7; atol = 1e-6), cout_m)
+
+    # Under the default, ZeroFill, the excluded cells stay in the denominator, so the same constant
+    # comes back scaled by the locally-included mass — identically `1.7 · filter(mask)`, which is the
+    # normalized-convolution numerator with the renormalization left off.
+    cz = zeros(N, N); mz = zeros(N, N)
+    CGEF.Filtering.filter_field!(cz, cfield_m, mgrid, g, ℓ; method = CGEF.Filtering.Spectral())
+    CGEF.Filtering.filter_field!(mz, Float64.(mask), mgrid, g, ℓ; method = CGEF.Filtering.Spectral())
+    Test.@test cz ≈ 1.7 .* mz rtol = 1e-12
+    Test.@test minimum(cz) < 1.7 - 1e-3
+
+    # The filtered mask slightly EXCEEDS 1 next to the hole (measured +3.3e-5 here). That is the
+    # spectral engine, not the strategy: `Ĝ` is sampled on the discrete mode grid, so the real-space
+    # kernel it implies is not exactly non-negative and a step overshoots. The real-space engine sums
+    # non-negative weights directly and cannot. Both are pinned so a change to either is visible.
+    mr = zeros(N, N)
+    CGEF.Filtering.filter_field!(mr, Float64.(mask), mgrid, g, ℓ; method = CGEF.Filtering.RealSpace())
+    Test.@test 0 < maximum(mz) - 1 < 1e-4
+    Test.@test maximum(mr) <= 1 + 1e-12
 end
 
 
@@ -327,10 +346,14 @@ Test.@testset "Filtering spectrum" begin
     end
 
     # Since the cumulative energy is constant in ℓ, the filtering spectral DENSITY (its
-    # k_ℓ-derivative, Eq. 14) must be ≈ 0 everywhere — NOT equal to the energy.
-    kℓ, Ẽ = CGEF.Diagnostics.filtering_spectrum(u, v, nothing, grid, CGEF.TopHatKernel(), scales; L=1.0)
+    # k_ℓ-derivative, Eq. 14) must be ≈ 0 everywhere — NOT equal to the energy. The cumulative
+    # quantity above is defined for any kernel; the density needs one with a monotone `|Ĝ|²`, and a
+    # constant field is reproduced by either, so the assertion is unchanged by the switch.
+    kℓ, Ẽ = CGEF.Diagnostics.filtering_spectrum(u, v, nothing, grid, CGEF.GaussianKernel(), scales; L=1.0)
     Test.@test length(kℓ) == length(scales)
     Test.@test all(abs.(Ẽ) .< 1e-6 * expected_energy)
+    Test.@test all(E -> isapprox(E, expected_energy; rtol = 1e-6),
+                   CGEF.Diagnostics.cumulative_energy(u, v, nothing, grid, CGEF.GaussianKernel(), scales))
 
     # spectral_density reproduces a known derivative: C(k)=k² ⇒ dC/dk = 2k (central differences
     # are exact for a quadratic on a uniform grid).
