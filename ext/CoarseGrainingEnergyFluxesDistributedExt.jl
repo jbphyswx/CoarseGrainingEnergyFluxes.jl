@@ -19,9 +19,9 @@ function CGEF.Filtering.distributed_filter_field!(
     workspace,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
-    if fp isa CGEF.Filtering.SeparableGaussianFootprint
+    if fp isa CGEF.Filtering.SeparableFootprint
         CGEF.Filtering._separable_check_strategy(fp, mask_strategy)
-        return _distributed_apply_separable_gaussian!(out, field, grid, fp)
+        return _distributed_apply_separable!(out, field, grid, fp)
     elseif fp isa CGEF.Filtering.PrefixSumTopHatPlan
         # The prefix table lives in the plan (ordinary process-local arrays, not a SharedArray), so a
         # `@distributed` loop over rows would build it in the workers' own address spaces and the
@@ -45,8 +45,8 @@ end
 # row pass needs no communication — each worker's rows read only their own column. The column pass is
 # then row-parallel against the completed `row_pass` SharedArray. Both call the same per-row/per-column
 # bodies as serial, so results are bit-identical.
-function _distributed_apply_separable_gaussian!(
-    out::AbstractMatrix{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid, fp::CGEF.Filtering.SeparableGaussianFootprint{T},
+function _distributed_apply_separable!(
+    out::AbstractMatrix{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid, fp::CGEF.Filtering.SeparableFootprint{T},
 ) where {T<:AbstractFloat}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     mask = FlowGeometries.Grids.mask(grid)
@@ -72,7 +72,7 @@ end
 
 
 # Distributed analogue of the driver the serial and threaded backends pass to
-# `apply_separable_gaussian_nd!`, so the `N`-pass engine has one implementation across all three.
+# `apply_separable_nd!`, so the `N`-pass engine has one implementation across all three.
 @inline function _dist_driver(f::F, indices) where {F}
     @sync Distributed.@distributed for i in eachindex(indices)
         f(indices[i])
@@ -84,7 +84,7 @@ _shared_like(a::AbstractArray{T}) where {T} =
     (sh = SharedArrays.SharedArray{T}(size(a)); copyto!(sh, a); sh)
 
 # 1-D and true-3-D grids. `N` is unconstrained, so the 2-D method above is more specific and still wins
-# for N=2. Point-indexed footprints decompose over linear indices; the separable Gaussian instead has
+# for N=2. Point-indexed footprints decompose over linear indices; the separable engine instead has
 # its plan-local pass buffers REBUILT as SharedArrays, because a `@distributed` loop writing the plan's
 # own arrays would write them in the workers' address spaces and the caller would see nothing.
 function CGEF.Filtering.distributed_filter_field!(
@@ -100,14 +100,14 @@ function CGEF.Filtering.distributed_filter_field!(
     dims = FlowGeometries.Grids.size_tuple(grid)
     mask = FlowGeometries.Grids.mask(grid)
 
-    if fp isa CGEF.Filtering.SeparableGaussianFootprintND
+    if fp isa CGEF.Filtering.SeparableFootprintND
         CGEF.Filtering._separable_check_strategy(fp, mask_strategy)
-        sfp = CGEF.Filtering.SeparableGaussianFootprintND(
+        sfp = CGEF.Filtering.SeparableFootprintND(
             fp.g, fp.lim, fp.periodic, fp.profiles, fp.invrenorm, fp.masked,
             _shared_like(fp.masked_input), _shared_like(fp.scratch),
         )
         s_out = SharedArrays.SharedArray{T}(dims)
-        CGEF.Filtering.apply_separable_gaussian_nd!(s_out, field, grid, sfp, mask_strategy, _dist_driver)
+        CGEF.Filtering.apply_separable_nd!(s_out, field, grid, sfp, mask_strategy, _dist_driver)
         copyto!(out, s_out)
         return out
     end

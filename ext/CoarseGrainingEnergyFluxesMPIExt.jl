@@ -29,9 +29,9 @@ function CGEF.Filtering.mpi_filter_field!(
     # `workspace`, when supplied by a cached `PhysicalFilterPlan`, IS the already-built footprint —
     # reused instead of rebuilding it on every call (and every rank, in this backend's case).
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
-    if fp isa CGEF.Filtering.SeparableGaussianFootprint
+    if fp isa CGEF.Filtering.SeparableFootprint
         CGEF.Filtering._separable_check_strategy(fp, mask_strategy)
-        return _mpi_apply_separable_gaussian!(out, field, grid, fp, rank, nproc, comm)
+        return _mpi_apply_separable!(out, field, grid, fp, rank, nproc, comm)
     elseif fp isa CGEF.Filtering.PrefixSumTopHatPlan
         return _mpi_apply_prefixsum_tophat!(out, field, grid, fp, mask_strategy, rank, nproc, comm)
     end
@@ -52,8 +52,8 @@ end
 # no communication — redundant work, zero messages. Each rank then column-passes only its own stride,
 # and the `Allreduce!` assembles the un-normalized result. Normalization is pointwise in the assembled
 # `out`, so it runs on every rank afterwards.
-function _mpi_apply_separable_gaussian!(
-    out::AbstractMatrix{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid, fp::CGEF.Filtering.SeparableGaussianFootprint{T},
+function _mpi_apply_separable!(
+    out::AbstractMatrix{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid, fp::CGEF.Filtering.SeparableFootprint{T},
     rank::Integer, nproc::Integer, comm,
 ) where {T<:AbstractFloat}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
@@ -101,7 +101,7 @@ end
 # take a round-robin stride of linear indices and recombine with `Allreduce!`; strides are disjoint, so
 # the sum reassembles the field exactly as the row partition does.
 #
-# The separable Gaussian is run WHOLE on every rank rather than partitioned: its `N` passes each read
+# The separable engine is run WHOLE on every rank rather than partitioned: its `N` passes each read
 # across the previous pass's entire output, so a strided partition would need an Allreduce between
 # passes, and the passes write buffers held inside the plan. Replicating it costs one rank's work and
 # keeps the result exact; partitioning it needs a halo exchange per pass, which is a real design, not a
@@ -122,8 +122,8 @@ function CGEF.Filtering.mpi_filter_field!(
     dims = FlowGeometries.Grids.size_tuple(grid)
     mask = FlowGeometries.Grids.mask(grid)
 
-    if fp isa CGEF.Filtering.SeparableGaussianFootprintND
-        return CGEF.Filtering.apply_separable_gaussian_nd!(out, field, grid, fp, mask_strategy)
+    if fp isa CGEF.Filtering.SeparableFootprintND
+        return CGEF.Filtering.apply_separable_nd!(out, field, grid, fp, mask_strategy)
     end
 
     fill!(out, zero(T))

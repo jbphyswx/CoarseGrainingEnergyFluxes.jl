@@ -1,18 +1,86 @@
+```@meta
+CurrentModule = CoarseGrainingEnergyFluxes
+```
+
 # Examples
 
 All examples follow the package import policy: bring each module in under a stable alias and qualify
-every call. Only a minimal set of names is exported at the top level (`coarse_grain`,
-`coarse_grain!`, `coarse_grain_profile`, `CoarseGrainResult`, the three kernels,
-`plot_Π_map`/`plot_spectrum`); everything else — `filter_field!`, `compute_Π!`,
-`compute_Π_decomposed`, `tau_decomposition`, `tracer_variance_flux`, backends, mask strategies,
+every call. Only a minimal set of names is exported at the top level — the sweep entry points
+(`coarse_grain`, `coarse_grain!`, `coarse_grain_profile`, `coarse_grain_batch!`,
+`coarse_grain_slices!`), their result types, `check_setup`, the three headline kernels, and
+`plot_Π_map`/`plot_spectrum`. Everything else — `filter_field!`, `compute_Π!`,
+`compute_Π_strain_convergence`, `compute_Π_decomposed`, `tau_decomposition`, `tracer_variance_flux`,
+`enstrophy_flux`, `band_energies`, the remaining kernels, backends, mask strategies,
 `Spectral()`/`RealSpace()` — is reached through its submodule (`CGEF.Filtering...`,
-`CGEF.Diagnostics...`, `CGEF.ComputationalBackends...`), never a flattened top-level re-export.
-Geometries and grid types come from FlowGeometries.jl.
+`CGEF.Diagnostics...`, `CGEF.Kernels...`, `CGEF.ComputationalBackends...`), never a flattened
+top-level re-export. Geometries and grid types come from FlowGeometries.jl.
 
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries as FG
 ```
+
+## Start here: `check_setup`
+
+Before running anything, ask what will actually happen. [`check_setup`](@ref) reports the engine, the
+backend, what the kernel can and cannot support, and how wide the contaminated band along a coast is —
+without building a plan, so it is safe even on a configuration whose plan would be enormous.
+
+```julia
+julia> CGEF.check_setup(grid, CGEF.TopHatKernel(), 6_000.0)
+CoarseGrainingEnergyFluxes setup check
+  grid            : StructuredGrid{CartesianGeometry,2} (48, 48)   min spacing (1000.0, 1000.0)
+  scale ℓ         : 6000.0  = (6.0, 6.0) cells per axis
+  kernel          : TopHatKernel
+  masking         : ZeroFill
+  method          : default for this grid
+  backend         : AutoBackend -> SerialBackend
+  real-space engine: prefix-sum top-hat, exact O(N)
+  ℓ resolvable    : yes
+  supports Π      : yes
+  supports spectrum: NO
+  supports Spectral(): NO
+  boundary buffer : (3, 3) cells (contaminated)
+  notes:
+    1. points within (3, 3) cells of a coast or domain edge are contaminated by footprint
+       truncation, under either mask strategy — exclude them before averaging.
+    2. TopHatKernel's |Ĝ|² is not monotone, so `filtering_spectrum` will refuse it and
+       `coarse_grain` needs `kernel = GaussianKernel()` or `spectrum = false`.
+    3. TopHatKernel's spectral transfer function is provided by a weak dependency that is not
+       loaded, so `method = Spectral()` is unavailable in this session — run
+       `using SpecialFunctions`. Real-space filtering is unaffected.
+```
+
+Every field is readable programmatically too (`r.supports_spectrum`, `r.boundary_buffer_cells`, …), so
+a script can gate on it rather than parse the text.
+
+## Result shapes and conventions
+
+What every result field's axes mean. `Ns = length(scales)`; the spatial rank `R` is whatever the
+**grid** claims, and any array axis beyond that is a batch axis.
+
+| entry point | field | shape | notes |
+|---|---|---|---|
+| `coarse_grain`/`coarse_grain!` | `Π` | `(spatial…, Ns)` | one contiguous array, not a vector of maps; `Π[…, i]` is `scales[i]` |
+| | `scales`, `wavenumber` | `(Ns,)` | `wavenumber = L/ℓ` |
+| | `cumulative_energy`, `filtering_spectrum` | `(Ns,)` | `NaN` when `spectrum = false` |
+| `coarse_grain_batch!` | `Π` | `(spatial…, Ns, batch…)` | batch axes **trailing**, so each slice is a contiguous view |
+| | `cumulative_energy`, `filtering_spectrum`, `wavenumber` | `(Ns, batch…)` | |
+| | `slices[t]` | `CoarseGrainResult` | a zero-copy view into the batched storage |
+| `coarse_grain_profile` | `Π` | `(Nx, Ny, Ns, Nlevels)` | the vertical is just a batch axis; per-level energies are **not** summed |
+| `coarse_grain_slices!` | `results[t]` | `CoarseGrainResult` | ragged: one per slice, shapes differ, so no shared storage |
+| `compute_Π!` | `Π` | `(spatial…)` or `(spatial…, batch…)` | the grid's rank fixes the split |
+| `compute_Π_strain_convergence` | `total`, `strain`, `convergence`, `divergence`, `strain_magnitude` | `(spatial…)` | `total = strain − convergence` |
+| `compute_Π_decomposed` | `total`, `rotational`, `cross`, `divergent` | `(spatial…)` | `total` is the sum of the other three |
+| `tau_decomposition` | `L`, `C`, `R`, each `(; xx, xy, yy)` | `(spatial…)` | `L + C + R = τ` exactly |
+| `band_energies` | `bands` | `(Ns,)` | domain means; `band_maps[n]` is the pointwise map |
+| `enstrophy_flux` | `Z` | `(spatial…)` | same gauge as `Π` |
+
+Two conventions worth stating outright, because getting either wrong changes the numbers:
+
+- **`ℓ` is a diameter, not a radius.** The top-hat spans the disk of radius `ℓ/2`.
+- **Masked cells are zero in every output**, never `NaN` and never left uninitialized. Points within
+  the `boundary_buffer_cells` reported above are computed but contaminated.
 
 ## Visual Results
 
@@ -75,12 +143,22 @@ CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, grid, CGEF.TopHatKernel(), 10_00
 
 # Multi-scale sweep (plan reuse handled internally).
 scales = collect(5e3:5e3:50e3)
-result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel())
+result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel(),
+                           spectrum = false)
 @view result.Π[:, :, 3]      # flux map at scales[3] — result.Π is a stacked (Nx,Ny,Nscales) array
 result.cumulative_energy     # ½ρ₀⟨|ū_ℓ|²⟩ per scale (Sadek–Aluie Eq. 15)
 result.wavenumber            # k_ℓ = L/ℓ
-result.filtering_spectrum    # Ẽ(k_ℓ) density (Eq. 14)
+
+# The spectral density needs a kernel whose |Ĝ|² is monotone — see the note below.
+spec = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel())
+spec.filtering_spectrum      # Ẽ(k_ℓ) density (Eq. 14)
 ```
+
+!!! note "The top-hat cannot carry a filtering spectrum"
+    `TopHatKernel`'s `|Ĝ|²` is not monotone decreasing, so the spectral density is not guaranteed
+    non-negative (Sadek & Aluie 2018 eq. 21) and `coarse_grain` refuses to produce one for it. Use
+    `kernel = CGEF.GaussianKernel()` when you want `filtering_spectrum`, or `spectrum = false` when
+    you only want `Π` and `cumulative_energy`. See [`Kernels.transfer_monotone`](@ref).
 
 ## Spherical domain with a mask
 
@@ -95,11 +173,17 @@ grid = FG.Grids.StructuredGrid(geom, lon, lat)   # full-circle lon ⇒ periodic 
 # u, v = load_velocity(...)
 
 scales = collect(10e3:10e3:300e3)
-result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel())
+result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel(),
+                           spectrum = false)
 ```
 
-The `Deformable` mask strategy (default) renormalizes the kernel over active points near the mask
-boundary; pass `mask_strategy = CGEF.Filtering.ZeroFill()` to treat excluded cells as zeros instead.
+The `ZeroFill` mask strategy (default) treats excluded cells as zeros, keeping the kernel
+position-independent so that filtering commutes with spatial derivatives — the property the Π budget
+is derived by. Pass `mask_strategy = CGEF.Filtering.Deformable()` to renormalize the kernel over
+active points near the boundary instead: that reproduces a constant field exactly there, but the
+kernel changes shape, so it neither commutes with derivatives nor conserves the domain average.
+Either way, points within `≈ℓ` of a mask boundary are contaminated — see
+[`Filtering.filter_field!`](@ref) for the measured artifacts.
 
 ## Curvilinear (model-native) grids
 
@@ -122,7 +206,8 @@ y = [dx * (ii * sin(θ) + jj * (1 + shear * cos(θ))) for ii in i, jj in j]
 grid = FG.Grids.CurvilinearGrid(geom, x, y)     # exact corner-based cell areas, auto-reconstructed
 
 u = randn(N, N); v = randn(N, N)
-result = CGEF.coarse_grain(u, v, grid; scales = collect(10e3:10e3:60e3), kernel = CGEF.TopHatKernel())
+result = CGEF.coarse_grain(u, v, grid; scales = collect(10e3:10e3:60e3),
+                           kernel = CGEF.TopHatKernel(), spectrum = false)
 ```
 
 ## Scattered / unstructured point clouds
@@ -202,7 +287,8 @@ grid = FG.Grids.StructuredGrid(geom, xs, xs)    # a 2D grid — z is a third arr
 
 u = randn(N, N, Nz); v = randn(N, N, Nz)                 # (x, y, z)
 scales = collect(5e3:5e3:30e3)
-batch = CGEF.coarse_grain_profile(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel())
+batch = CGEF.coarse_grain_profile(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel(),
+                                  spectrum = false)
 # The vertical axis is a batch axis, so it is TRAILING: Π is (x, y, scale, level).
 batch.Π[:, :, 3, :]                 # flux profile at scales[3], all Nz levels
 batch.cumulative_energy[3, :]       # per-level cumulative energy at scales[3]
@@ -216,15 +302,15 @@ Every backend reuses a footprint/plan built once per `(grid, kernel, scale)`, no
 
 ```julia
 using OhMyThreads: OhMyThreads          # enables ThreadedBackend (2D row-parallel + 1D/3D point-parallel)
-result = CGEF.coarse_grain(u, v, grid; scales = scales, backend = CGEF.ComputationalBackends.ThreadedBackend())
+result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = false, backend = CGEF.ComputationalBackends.ThreadedBackend())
 
 using KernelAbstractions: KernelAbstractions   # enables GPUBackend (2D grids only)
 # Takes the device to run on — `KernelAbstractions.CPU()` here, `CUDABackend()`/`ROCBackend()` on a GPU.
-result = CGEF.coarse_grain(u, v, grid; scales = scales,
+result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = false,
                            backend = CGEF.ComputationalBackends.GPUBackend(KernelAbstractions.CPU()))
 
 using MPI: MPI                          # enables MPIBackend (2D grids; requires MPI.Init() first)
-result = CGEF.coarse_grain(u, v, grid; scales = scales, backend = CGEF.ComputationalBackends.MPIBackend())
+result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = false, backend = CGEF.ComputationalBackends.MPIBackend())
 
 # AutoBackend (default) picks ThreadedBackend when Threads.nthreads() > 1, else SerialBackend.
 ```
@@ -299,11 +385,63 @@ d.L.xx; d.C.xy; d.R.yy        # d.L + d.C + d.R == τ exactly
 On a spherical grid, `xx`/`xy`/`yy` are local east/north components (the moments are taken in
 planetary-Cartesian coordinates, then rotated back — see [Theory](theory.md)).
 
+## Strain / convergence decomposition of Π
+
+The same flux split by diagonalizing the filtered strain instead of decomposing the velocity
+(Srinivasan, Barkan & McWilliams 2023). `Π_α` is deformation production, `Π_δ` the frontogenetic
+convergence term that vanishes for a non-divergent field.
+
+```julia
+d = CGEF.Diagnostics.compute_Π_strain_convergence(u, v, grid, CGEF.TopHatKernel(), 20_000.0)
+d.total                       # == compute_Π! to round-off; the suite asserts it
+d.strain                      # Π_α — deformation / shear production
+d.convergence                 # Π_δ — convergence production (zero if ∇·u = 0)
+d.divergence                  # δ̄, a rotation invariant: the natural axis to bin the flux against
+d.strain_magnitude            # ᾱ, likewise
+
+# Reuse across timesteps or scales without reallocating:
+ws = CGEF.Diagnostics.PiStrainWorkspace(grid)
+CGEF.Diagnostics.compute_Π_strain_convergence!(ws, u, v, grid, ker, ℓ;
+                                               filter_plan = plan, deriv_plan = dplan)
+```
+
+## Enstrophy flux
+
+The enstrophy analogue of `Π`, in the same (deformation) gauge — in 2-D turbulence this cascades
+forward while `Π` cascades inverse, so the two are read together.
+
+```julia
+ω = CGEF.Diagnostics.vorticity(u, v, grid)            # ∂v/∂x − ∂u/∂y
+Z = CGEF.Diagnostics.enstrophy_flux(u, v, grid, CGEF.GaussianKernel(), 20_000.0)
+
+ws = CGEF.Diagnostics.EnstrophyFluxWorkspace(grid)    # zero-allocation repeat
+CGEF.Diagnostics.enstrophy_flux!(Z, ws, u, v, grid, ker, ℓ; filter_plan = plan, deriv_plan = dplan)
+```
+
+## Energy by scale band
+
+The repeated-filter Germano identity, which splits the kinetic energy into bands that **sum to the
+total** — unlike band-passing the velocity, whose cross terms have indefinite sign.
+
+```julia
+# `scales` ASCENDING: band n is what the n-th, progressively coarser, filter removes.
+r = CGEF.Diagnostics.band_energies(u, v, grid, CGEF.GaussianKernel(), [3e3, 6e3, 12e3])
+r.bands                       # domain-mean energy per band
+r.resolved                    # what is left above the coarsest scale
+r.total                       # == ½⟨|u|²⟩ exactly on a periodic, unmasked grid
+r.band_maps[2]                # the pointwise map for band 2
+```
+
+Use a **non-negative** kernel here: band energies are variances, and they are pointwise positive only
+if the kernel is. The identity is exact on a periodic unmasked domain and carries an `O(ℓ/L)` residual
+wherever the footprint truncates — see [`Diagnostics.band_energies`](@ref) for the measured numbers.
+
 ## Visualization (CairoMakie extension)
 
 ```julia
 using CairoMakie: CairoMakie               # provides plot_Π_map / plot_spectrum methods
-result = CGEF.coarse_grain(u, v, grid; scales = collect(10e3:10e3:100e3))
+result = CGEF.coarse_grain(u, v, grid; scales = collect(10e3:10e3:100e3),
+                           kernel = CGEF.GaussianKernel())   # a spectrum-admissible kernel
 
 fig1 = CGEF.plot_Π_map(result, 3, grid)               # flux map at scales[3]
 fig2 = CGEF.plot_spectrum(result; which = :density)   # filtering spectral density Ẽ(k_ℓ)

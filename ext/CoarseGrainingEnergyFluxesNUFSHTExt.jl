@@ -46,7 +46,7 @@ function CGEF.Filtering.spectral_filter_plan(
     grid::FlowGeometries.Grids.UnstructuredGrid{T,G},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy = CGEF.Filtering.Deformable(),
+    mask_strategy = CGEF.Filtering.ZeroFill(),
     backend = CGEF.ComputationalBackends.AutoBackend(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     npts = length(FlowGeometries.Grids.coordinates(grid, 1))

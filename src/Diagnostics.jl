@@ -8,6 +8,10 @@ using ComputationalBackends: ComputationalBackends
 
 export ΠWorkspace, compute_Π!, cumulative_energy, cumulative_energy!, filtering_spectrum, spectral_density, spectral_density!
 export tau_decomposition, compute_Π_decomposed, tracer_variance_flux
+export compute_Π_strain_convergence, compute_Π_strain_convergence!, PiStrainWorkspace
+export vorticity, vorticity!, enstrophy_flux, enstrophy_flux!, EnstrophyFluxWorkspace
+export band_energies
+export compressible_flux, compressible_flux!, FavreWorkspace, favre_filter!
 
 """
     ΠWorkspace{T, A}
@@ -230,7 +234,7 @@ function analyze_sweep(u, v, w, grid, ws::ΠWorkspace, plan::Filtering.AbstractF
 end
 
 """
-    compute_Π!(Π, u, v, w, grid, kernel, scale; workspace=nothing, backend=AutoBackend(), mask_strategy=Deformable())
+    compute_Π!(Π, u, v, w, grid, kernel, scale; workspace=nothing, backend=AutoBackend(), mask_strategy=ZeroFill())
 
 Compute the cross-scale kinetic energy flux Π = -S̄_ij τ_ij at filter scale ℓ.
 
@@ -250,7 +254,10 @@ energy transfer across scales in turbulent flows. Positive Π indicates forward 
 # Keyword Arguments
 - `workspace=nothing`: Pre-allocated ΠWorkspace for intermediate arrays
 - `backend::AbstractExecutionBackend=AutoBackend()`: Execution backend
-- `mask_strategy::AbstractMaskStrategy=Deformable()`: Masking strategy (`ZeroFill()` or `Deformable()`)
+- `mask_strategy::AbstractMaskStrategy=ZeroFill()`: Masking strategy (`ZeroFill()` or `Deformable()`).
+  `ZeroFill` is the default because it keeps the kernel position-independent, so filtering commutes
+  with spatial derivatives — the property the flux budget is derived by. See
+  [`Filtering.filter_field!`](@ref) for the boundary artifacts of both choices.
 
 # Physics
 The cross-scale energy flux is computed as:
@@ -323,7 +330,7 @@ function compute_Π!(
     workspace::Union{Nothing, ΠWorkspace} = nothing,
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
     # Spectra of the raw inputs from [`analyze_sweep`](@ref), when a sweep has hoisted the
     # scale-independent forward transform out of its scale loop.
@@ -629,7 +636,7 @@ end
 
 
 """
-    compute_Π!(Π, u, v, w, grid::UnstructuredGrid, kernel, scale; workspace=nothing, deriv_plan=nothing, backend=AutoBackend(), mask_strategy=Deformable(), method=Spectral())
+    compute_Π!(Π, u, v, w, grid::UnstructuredGrid, kernel, scale; workspace=nothing, deriv_plan=nothing, backend=AutoBackend(), mask_strategy=ZeroFill(), method=Spectral())
 
 Cross-scale kinetic energy flux Π = -S̄_ij τ_ij on a `FlowGeometries.Grids.UnstructuredGrid` (scattered
 points, node-indexed) — the same physics as the 2D methods (planetary-Cartesian rotation for
@@ -651,7 +658,7 @@ function compute_Π!(
     deriv_plan::Union{Nothing, FlowGeometries.Discretization.GradientPlan} = nothing,
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Filtering.AbstractFilterMethod = Filtering.Spectral(),
     analyzed = nothing,
 ) where {T<:AbstractFloat}
@@ -664,7 +671,7 @@ function compute_Π!(
 end
 
 """
-    compute_Π!(Π, u, v, w, grid::CurvilinearGrid, kernel, scale; workspace=nothing, deriv_plan=nothing, backend=AutoBackend(), mask_strategy=Deformable())
+    compute_Π!(Π, u, v, w, grid::CurvilinearGrid, kernel, scale; workspace=nothing, deriv_plan=nothing, backend=AutoBackend(), mask_strategy=ZeroFill())
 
 Cross-scale kinetic energy flux Π = -S̄_ij τ_ij on a `FlowGeometries.Grids.CurvilinearGrid`. Identical
 physics to the `StructuredGrid` 2D method — it shares the same `_compute_Π!` tensor kernel
@@ -686,7 +693,7 @@ function compute_Π!(
     deriv_plan::Union{Nothing, FlowGeometries.Discretization.GradientPlan} = nothing,
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     analyzed = nothing,
 ) where {T<:AbstractFloat}
     _validate_field_sizes(grid, Π, u, v, w)
@@ -698,7 +705,7 @@ function compute_Π!(
 end
 
 """
-    compute_Π!(Π::AbstractArray{T,3}, u, v, w, grid::StructuredGrid{Cartesian,T,3}, kernel, scale; mask_strategy=Deformable(), backend=AutoBackend())
+    compute_Π!(Π::AbstractArray{T,3}, u, v, w, grid::StructuredGrid{Cartesian,T,3}, kernel, scale; mask_strategy=ZeroFill(), backend=AutoBackend())
 
 Full **three-dimensional** Cartesian cross-scale energy flux Π = -S̄_ij τ_ij with all nine strain
 components (the diagonal `S_zz = ∂w̄/∂z` and the off-diagonals `S_xz, S_yz` carry genuine vertical
@@ -726,7 +733,7 @@ function compute_Π!(
     workspace::Union{Nothing, ΠWorkspace} = nothing,
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _validate_field_sizes(grid, Π, u, v, w)
@@ -783,7 +790,7 @@ function compute_Π!(
 end
 
 """
-    compute_Π!(Π::AbstractArray{T,3}, u, v, w, grid::StructuredGrid{Spherical,T,3}, kernel, scale; workspace=nothing, backend=AutoBackend(), mask_strategy=Deformable())
+    compute_Π!(Π::AbstractArray{T,3}, u, v, w, grid::StructuredGrid{Spherical,T,3}, kernel, scale; workspace=nothing, backend=AutoBackend(), mask_strategy=ZeroFill())
 
 Full **three-dimensional spherical** cross-scale energy flux Π = -S̄_ij τ_ij: a genuine radius axis
 `r[k]` (absolute distance from the planet center — see `FlowGeometries.Grids.StructuredGrid`'s 3D
@@ -820,7 +827,7 @@ function compute_Π!(
     workspace::Union{Nothing, ΠWorkspace} = nothing,
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     _validate_field_sizes(grid, Π, u, v, w)
@@ -929,7 +936,7 @@ function compute_Π!(
 end
 
 """
-    compute_Π!(Π::AbstractVector, u, grid::StructuredGrid{Cartesian,T,1}, kernel, scale; workspace=nothing, backend=AutoBackend(), mask_strategy=Deformable())
+    compute_Π!(Π::AbstractVector, u, grid::StructuredGrid{Cartesian,T,1}, kernel, scale; workspace=nothing, backend=AutoBackend(), mask_strategy=ZeroFill())
 
 1D cross-scale energy flux Π = -S̄_xx τ_xx on a genuinely 1D `StructuredGrid` (a single scalar
 velocity component `u` along one axis — the 1D analog of the 2D tensor contraction, which reduces to
@@ -945,7 +952,7 @@ function compute_Π!(
     workspace::Union{Nothing, ΠWorkspace} = nothing,
     filter_plan::Union{Nothing, Filtering.AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _validate_field_sizes(grid, Π, u)
@@ -982,6 +989,24 @@ function active_area(grid::FlowGeometries.Grids.AbstractGrid{G,T}) where {G, T<:
     end
     total > zero(T) || throw(ArgumentError("grid has no active cells (all masked out)"))
     return total
+end
+
+"""
+    _area_mean(field, grid, total_area) -> T
+
+Area-weighted mean of `field` over the ACTIVE cells, sharing `active_area`'s denominator so every
+spatial average in this module is normalized the same way.
+"""
+function _area_mean(
+    field::AbstractArray{T}, grid::FlowGeometries.Grids.AbstractGrid, total_area::T,
+) where {T<:AbstractFloat}
+    acc = zero(T)
+    @inbounds for I in CartesianIndices(FlowGeometries.Grids.size_tuple(grid))
+        t = Tuple(I)
+        FlowGeometries.Grids.isactive(grid, t...) || continue
+        acc += field[I] * FlowGeometries.Grids.area(grid, t...)
+    end
+    return acc / total_area
 end
 
 """
@@ -1042,7 +1067,7 @@ end
 end
 
 """
-    cumulative_energy!(spectrum, u, v, w, grid, kernel, scales; workspace=nothing, backend=AutoBackend(), mask_strategy=Deformable())
+    cumulative_energy!(spectrum, u, v, w, grid, kernel, scales; workspace=nothing, backend=AutoBackend(), mask_strategy=ZeroFill())
 
 In-place [`cumulative_energy`](@ref): writes into the caller-supplied `spectrum` vector and, when
 `workspace` (a [`ΠWorkspace`](@ref)) is supplied, reuses its `u_filt`/`v_filt`/`w_filt` scratch arrays
@@ -1060,7 +1085,7 @@ function cumulative_energy!(
     workspace::Union{Nothing, ΠWorkspace} = nothing,
     filter_plans::Union{Nothing, AbstractVector} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     gsz = FlowGeometries.Grids.size_tuple(grid)
@@ -1125,12 +1150,12 @@ function cumulative_energy!(
 end
 
 """
-    cumulative_energy(u, v, w, grid, kernel, scales; backend=AutoBackend(), mask_strategy=Deformable())
+    cumulative_energy(u, v, w, grid, kernel, scales; backend=AutoBackend(), mask_strategy=ZeroFill())
 
 Cumulative coarse-grained kinetic energy `E(ℓ) = 0.5 ⟨|ū_ℓ|²⟩` at each filter scale
 (Sadek & Aluie 2018, PRF, Eq. 15). This is the CUMULATIVE quantity; the filtering spectral DENSITY
 (comparable to a Fourier energy spectrum) is its derivative w.r.t. filtering wavenumber — see
-[`filtering_spectrum`](@ref). Allocates a fresh `spectrum` vector each call; for a repeated sweep
+[`Diagnostics.filtering_spectrum`](@ref). Allocates a fresh `spectrum` vector each call; for a repeated sweep
 (e.g. inside `coarse_grain!`), call [`cumulative_energy!`](@ref) directly with a reused buffer.
 
 # Examples
@@ -1151,7 +1176,7 @@ function cumulative_energy(
     kernel::Kernels.AbstractFilterKernel,
     scales::AbstractVector;
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     spectrum = zeros(T, length(scales))
@@ -1159,7 +1184,7 @@ function cumulative_energy(
 end
 
 """
-    filtering_spectrum(u, v, w, grid, kernel, scales; L=1, backend=AutoBackend(), mask_strategy=Deformable())
+    filtering_spectrum(u, v, w, grid, kernel, scales; L=1, backend=AutoBackend(), mask_strategy=ZeroFill())
         -> (k_ℓ, Ẽ)
 
 Filtering spectral DENSITY (Sadek & Aluie 2018, PRF, Eq. 14): the derivative of the cumulative
@@ -1168,9 +1193,30 @@ coarse-grained KE w.r.t. the filtering wavenumber `k_ℓ = L/ℓ`,
     Ẽ(k_ℓ) = d/dk_ℓ [ ½⟨|ū_ℓ|²⟩ ] = -(ℓ²/L) d/dℓ[ ½⟨|ū_ℓ|²⟩ ].
 
 Unlike [`cumulative_energy`](@ref) (the cumulative quantity, Eq. 15), this is the spectral density
-comparable to a Fourier energy spectrum. `L` is the region length: pass the domain size for the
-Sadek–Aluie convention `k_ℓ = L/ℓ`; the default `L = 1` gives the FlowSieve convention `k_ℓ = 1/ℓ`.
-`scales` need not be uniform. Returns the filtering wavenumbers `k_ℓ` and the density `Ẽ` per scale.
+comparable to a Fourier energy spectrum. `scales` need not be uniform. Returns the filtering
+wavenumbers `k_ℓ` and the density `Ẽ` per scale.
+
+# The `k_ℓ = C/ℓ` convention, and why it must be stated
+
+`L` is the region length, and `k_ℓ = L/ℓ` is the Sadek–Aluie convention: with their Fourier series
+`f(x) = Σ_k f̂(k) e^{i(2π/L)k·x}`, `k` is a dimensionless index, so `L` is the domain size. The default
+`L = 1` instead gives `k_ℓ = 1/ℓ`, matching Storer et al. (2022, 2023) and FlowSieve. A third
+convention, `k_ℓ = 2π/ℓ` (Rivera, Aluie & Ecke 2014), is `L = 2π`.
+
+**The choice rescales the answer.** Under `k_ℓ = C/ℓ` the density carries a Jacobian `dℓ/dk_ℓ =
+-ℓ²/C`, so `Ẽ` scales as `1/C` while `k_ℓ` scales as `C`. Comparing amplitudes — or peak locations —
+against a Fourier spectrum or against another code is meaningless unless the conventions match. The
+cumulative energy [`cumulative_energy`](@ref) is convention-free; only the density is not.
+
+# Limits
+
+- **Slope ceiling.** Sadek & Aluie eq. (18): a kernel with `p` vanishing moments recovers a true
+  `k^{-α}` spectrum only for `α < p + 2`, and otherwise saturates at `k^{-(p+2)}`. Both
+  `TopHatKernel` and `GaussianKernel` have `p = 1`, so **the measured slope locks at `k⁻³`**. This
+  bites hardest in 2-D and QG work, where the enstrophy-range target slope *is* ≈ `k⁻³`. The flux
+  `Π` is unaffected — this is a limitation of the spectrum diagnostic alone.
+- **Kernel admissibility.** `Ẽ(k_ℓ) ≥ 0` is guaranteed only when `d|Ĝ(k)|²/dk ≤ 0`; this function
+  throws for a kernel that fails it. See [`Kernels.transfer_monotone`](@ref).
 
 # References
 - Sadek & Aluie (2018), *Phys. Rev. Fluids* 3, 124610.
@@ -1184,9 +1230,10 @@ function filtering_spectrum(
     scales::AbstractVector;
     L::Real = one(T),
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    Kernels.check_spectrum_kernel(kernel)
     cum = cumulative_energy(u, v, w, grid, kernel, scales; backend=backend, mask_strategy=mask_strategy, method=method)
     kℓ = T(L) ./ T.(scales)
     return kℓ, spectral_density(cum, kℓ)
@@ -1230,7 +1277,7 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    tau_decomposition(u, v, grid, kernel, scale; backend=AutoBackend(), mask_strategy=Deformable())
+    tau_decomposition(u, v, grid, kernel, scale; backend=AutoBackend(), mask_strategy=ZeroFill())
         -> (; L, C, R)
 
 Split the 2D subfilter-scale stress `τ_ij = ⟨u_i u_j⟩ - ū_i ū_j` into Leonard, Cross, and Reynolds
@@ -1252,7 +1299,7 @@ function tau_decomposition(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     return tau_decomposition!(TauWorkspace(grid), u, v, grid, kernel, scale;
         backend = backend, mask_strategy = mask_strategy)
@@ -1307,7 +1354,7 @@ function tau_decomposition!(
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
@@ -1371,7 +1418,7 @@ function tau_decomposition(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
     flt(f) = (o = zeros(T, size(f)); Filtering.filter_apply!(o, f, plan); o)
@@ -1429,7 +1476,7 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    compute_Π_decomposed(u, v, u_rot, v_rot, grid, kernel, scale; backend=AutoBackend(), mask_strategy=Deformable())
+    compute_Π_decomposed(u, v, u_rot, v_rot, grid, kernel, scale; backend=AutoBackend(), mask_strategy=ZeroFill())
         -> (; total, rotational, cross, divergent)
 
 Split the 2D Cartesian cross-scale KE flux Π = -S̄_ij τ_ij into rotational-rotational (Π_RR),
@@ -1455,9 +1502,8 @@ terms into three physically named channels:
 
 so the channels sum **exactly** to the total flux, Π = Π_RR + Π_X + Π_DD — each piece constructed
 directly (not as a residual), yet the identity holds by the same bilinearity/linearity argument.
-An earlier version of this function computed all three channels by contracting the split stress
-against the *full*, undecomposed strain S̄ (a one-sided split); that's only correct in the special
-case S̄ᵈ ≡ 0, and silently wrong whenever the divergent part itself has nonzero strain.
+Contracting the split stress against the *full*, undecomposed strain S̄ — a one-sided split — is only
+correct when S̄ᵈ ≡ 0, and silently wrong whenever the divergent part carries strain of its own.
 
 Returns a named tuple of flux maps (W m⁻³): `rotational` = Π_RR, `divergent` = Π_DD, `cross` = Π_X.
 """
@@ -1470,7 +1516,7 @@ function compute_Π_decomposed(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     # One stencil table for every derivative below; they differ only in direction and field.
     dplan = Derivatives.StencilPlan(grid)
@@ -1540,7 +1586,7 @@ function compute_Π_decomposed!(
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
     deriv_plan::Union{Nothing,Derivatives.StencilPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
@@ -1594,8 +1640,139 @@ function compute_Π_decomposed!(
     return (; total = ws.total, rotational = ws.Πrr, cross = ws.Πx, divergent = ws.Πdd)
 end
 
+# ---------------------------------------------------------------------------
+# Strain / convergence decomposition of Π (Srinivasan, Barkan & McWilliams 2023, eq. 10)
+# ---------------------------------------------------------------------------
+
 """
-    compute_Π_decomposed(u, v, w, u_rot, v_rot, w_rot, grid::StructuredGrid{Cartesian,T,3}, kernel, scale; backend=AutoBackend(), mask_strategy=Deformable())
+    PiStrainWorkspace(grid)
+
+Scratch for [`compute_Π_strain_convergence!`](@ref): the two filtered velocities, the three stress
+components, the four velocity-gradient components, the two rotation invariants and the three flux
+fields, plus the two shared product buffers.
+"""
+struct PiStrainWorkspace{T<:AbstractFloat, M<:AbstractMatrix{T}}
+    ū::M; v̄::M
+    prod::M; fbuf::M
+    τuu::M; τuv::M; τvv::M
+    ux::M; uy::M; vx::M; vy::M
+    δ::M; α::M
+    Πα::M; Πδ::M; total::M
+end
+
+function PiStrainWorkspace(grid::FlowGeometries.Grids.StructuredGrid{G,T}) where {T<:AbstractFloat, G}
+    gsz = FlowGeometries.Grids.size_tuple(grid)
+    return PiStrainWorkspace(ntuple(_ -> zeros(T, gsz), 16)...)
+end
+
+"""
+    compute_Π_strain_convergence!(ws, u, v, grid, kernel, scale; filter_plan=nothing, deriv_plan=nothing, ...)
+        -> (; total, strain, convergence, divergence, strain_magnitude)
+
+In-place [`compute_Π_strain_convergence`](@ref). Returns views of `ws`'s buffers, valid until the next
+call on the same workspace. With `ws` and both plans supplied, a repeated evaluation allocates nothing.
+"""
+function compute_Π_strain_convergence!(
+    ws::PiStrainWorkspace{T},
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
+    deriv_plan::Union{Nothing,Derivatives.StencilPlan} = nothing,
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    plan = filter_plan === nothing ?
+        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
+        filter_plan
+    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
+
+    Filtering.filter_apply_batch!((ws.ū, ws.v̄), (u, v), plan)
+    _second_moment!(ws.τuu, u, u, ws.ū, ws.ū, ws.prod, ws.fbuf, plan)
+    _second_moment!(ws.τuv, u, v, ws.ū, ws.v̄, ws.prod, ws.fbuf, plan)
+    _second_moment!(ws.τvv, v, v, ws.v̄, ws.v̄, ws.prod, ws.fbuf, plan)
+
+    Derivatives.ddx!(ws.ux, ws.ū, grid, dplan)
+    Derivatives.ddy!(ws.uy, ws.ū, grid, dplan)
+    Derivatives.ddx!(ws.vx, ws.v̄, grid, dplan)
+    Derivatives.ddy!(ws.vy, ws.v̄, grid, dplan)
+
+    mask = FlowGeometries.Grids.mask(grid)
+    # δ̄ = ū_x + v̄_y and ᾱ² = σ̄_n² + σ̄_s² are the two rotation invariants of the filtered gradient;
+    # σ̄_n = ū_x − v̄_y (normal strain) and σ̄_s = ū_y + v̄_x (shear strain) are not, so they are
+    # consumed inline rather than returned.
+    @. ws.δ = ifelse(mask, ws.ux + ws.vy, zero(T))
+    @. ws.α = ifelse(mask, sqrt((ws.ux - ws.vy)^2 + (ws.uy + ws.vx)^2), zero(T))
+    @. ws.Πα = ifelse(mask,
+        (ws.τvv - ws.τuu) * (ws.ux - ws.vy) / T(2) - ws.τuv * (ws.uy + ws.vx), zero(T))
+    @. ws.Πδ = ifelse(mask, (ws.τvv + ws.τuu) * (ws.ux + ws.vy) / T(2), zero(T))
+    @. ws.total = ws.Πα - ws.Πδ
+    return (; total = ws.total, strain = ws.Πα, convergence = ws.Πδ,
+            divergence = ws.δ, strain_magnitude = ws.α)
+end
+
+"""
+    compute_Π_strain_convergence(u, v, grid, kernel, scale; backend=AutoBackend(), mask_strategy=ZeroFill())
+        -> (; total, strain, convergence, divergence, strain_magnitude)
+
+Split the 2D cross-scale flux into the two production terms of Srinivasan, Barkan & McWilliams (2023),
+eq. (10), by diagonalizing the filtered strain tensor. With
+
+```
+δ̄   = ū_x + v̄_y            divergence         (rotation invariant)
+σ̄_n = ū_x − v̄_y            normal strain
+σ̄_s = ū_y + v̄_x            shear strain
+ᾱ   = √(σ̄_n² + σ̄_s²)       strain magnitude   (rotation invariant)
+```
+
+the flux separates into
+
+```
+Π = Π_α − Π_δ ,   Π_α = (τ_vv − τ_uu) σ̄_n/2 − τ_uv σ̄_s ,   Π_δ = (τ_vv + τ_uu) δ̄/2 ,
+```
+
+with `Π_α` the **deformation/shear production** — energy transferred by straining, present even in
+non-divergent flow — and `Π_δ` the **convergence production**, which vanishes identically for a
+non-divergent field and is the term that paper adds. Setting `δ̄ = 0` recovers Polzin (2010); the
+equivalent `Π = E′(γᵖ ᾱ − δ̄)` form with `E′ = (τ_vv + τ_uu)/2` recovers Jing et al. (2017), and
+`|γᵖ| ≤ 1` gives the bound `|Π_α| ≤ ᾱ E′`.
+
+`Π_α − Π_δ` is **algebraically identical** to the direct `Π = −S̄:τ̄` that [`compute_Π!`](@ref)
+computes — expanding eq. (10) collapses to `−τ_uu ū_x − τ_uv(ū_y + v̄_x) − τ_vv v̄_y`. The two are
+therefore a genuine cross-check rather than a tautology: they contract different combinations of the
+same four derivatives, so a sign or an ordering error in either shows up as a disagreement. The suite
+asserts they match to round-off on masked and unmasked grids.
+
+Returns flux maps in W m⁻³, plus the two rotation invariants, which are the natural axes to bin the
+flux against (`divergence` = δ̄, `strain_magnitude` = ᾱ).
+
+# References
+- Srinivasan, K., Barkan, R., & McWilliams, J. C. (2023). A forward energy flux at submesoscales
+  driven by frontogenesis. *J. Phys. Oceanogr.* 53(1), 287–305. doi:10.1175/JPO-D-22-0001.1
+"""
+function compute_Π_strain_convergence(
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    gsz = FlowGeometries.Grids.size_tuple(grid)
+    size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
+    size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
+    return compute_Π_strain_convergence!(
+        PiStrainWorkspace(grid), u, v, grid, kernel, scale;
+        filter_plan = plan, deriv_plan = Derivatives.StencilPlan(grid),
+    )
+end
+
+"""
+    compute_Π_decomposed(u, v, w, u_rot, v_rot, w_rot, grid::StructuredGrid{Cartesian,T,3}, kernel, scale; backend=AutoBackend(), mask_strategy=ZeroFill())
         -> (; total, rotational, cross, divergent)
 
 True three-dimensional analog of the 2D [`compute_Π_decomposed`](@ref) above: the same both-sides
@@ -1614,7 +1791,7 @@ function compute_Π_decomposed(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     # One stencil table for every derivative below; they differ only in direction and field.
     dplan = Derivatives.StencilPlan(grid)
@@ -1692,7 +1869,7 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    tracer_variance_flux(u, v, θ, grid, kernel, scale; backend=AutoBackend(), mask_strategy=Deformable())
+    tracer_variance_flux(u, v, θ, grid, kernel, scale; backend=AutoBackend(), mask_strategy=ZeroFill())
         -> Πθ
 
 Cross-scale flux of the tracer variance ½⟨θ'²⟩ at filter scale ℓ (the scalar analog of the kinetic
@@ -1718,7 +1895,7 @@ function tracer_variance_flux(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     # One stencil table for every derivative below; they differ only in direction and field.
     dplan = Derivatives.StencilPlan(grid)
@@ -1771,7 +1948,7 @@ function tracer_variance_flux!(
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
     deriv_plan::Union{Nothing,Derivatives.StencilPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
@@ -1797,6 +1974,458 @@ function tracer_variance_flux!(
     return Πθ
 end
 
+# ---------------------------------------------------------------------------
+# Favre (density-weighted) coarse-graining — Aluie 2013
+# ---------------------------------------------------------------------------
+
+"""
+    FavreWorkspace(grid)
+
+Scratch for [`compressible_flux!`](@ref): the filtered density and pressure, the Favre velocities, the
+unweighted velocities, the three Favre stress components, the two unweighted mass-flux components, the
+four velocity gradients, the two pressure gradients, and the three output fields.
+"""
+struct FavreWorkspace{T<:AbstractFloat, M<:AbstractMatrix{T}}
+    ρ̄::M; P̄::M
+    ũ::M; ṽ::M
+    ū::M; v̄::M
+    τxx::M; τxy::M; τyy::M
+    mx::M; my::M          # τ̄(ρ, u_j): the UNWEIGHTED subscale mass flux
+    ux::M; uy::M; vx::M; vy::M
+    Px::M; Py::M
+    prod::M; fbuf::M
+    Π::M; Λ::M; PD::M
+end
+
+function FavreWorkspace(grid::FlowGeometries.Grids.StructuredGrid{G,T}) where {T<:AbstractFloat, G}
+    gsz = FlowGeometries.Grids.size_tuple(grid)
+    return FavreWorkspace(ntuple(_ -> zeros(T, gsz), 22)...)
+end
+
+"""
+    compressible_flux!(ws, u, v, ρ, P, grid, kernel, scale; filter_plan=nothing, deriv_plan=nothing, ...)
+        -> (; Π, Λ, pressure_dilatation, ρ̄, P̄, ũ, ṽ)
+
+In-place [`compressible_flux`](@ref). Returns views of `ws`'s buffers, valid until the next call on the
+same workspace. With `ws` and both plans supplied, a repeated evaluation allocates nothing.
+"""
+function compressible_flux!(
+    ws::FavreWorkspace{T},
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    ρ::AbstractMatrix,
+    P::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
+    deriv_plan::Union{Nothing,Derivatives.StencilPlan} = nothing,
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    plan = filter_plan === nothing ?
+        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
+        filter_plan
+    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
+
+    # ρ̄, P̄ and the UNWEIGHTED velocities. `ū`/`v̄` are not a convenience: the budget's pressure term is
+    # `P̄ ∇·ū`, with the unweighted divergence, and `τ̄(ρ,u_j)` needs `ū_j` too.
+    Filtering.filter_apply_batch!((ws.ρ̄, ws.P̄, ws.ū, ws.v̄), (ρ, P, u, v), plan)
+
+    # Favre velocities ũ_i = (ρu_i)‾/ρ̄. `mx`/`my` hold (ρu_i)‾ first, then become the unweighted
+    # subscale mass flux τ̄(ρ,u_i) = (ρu_i)‾ − ρ̄ū_i, which is what baropycnal work contracts against.
+    @. ws.prod = ρ * u
+    Filtering.filter_apply!(ws.mx, ws.prod, plan)
+    @. ws.prod = ρ * v
+    Filtering.filter_apply!(ws.my, ws.prod, plan)
+    @. ws.ũ = ws.mx / ws.ρ̄
+    @. ws.ṽ = ws.my / ws.ρ̄
+    @. ws.mx -= ws.ρ̄ * ws.ū
+    @. ws.my -= ws.ρ̄ * ws.v̄
+
+    # Favre stress τ̃(u_i,u_j) = (ρu_iu_j)‾/ρ̄ − ũ_iũ_j.
+    @. ws.prod = ρ * u * u
+    Filtering.filter_apply!(ws.fbuf, ws.prod, plan)
+    @. ws.τxx = ws.fbuf / ws.ρ̄ - ws.ũ * ws.ũ
+    @. ws.prod = ρ * u * v
+    Filtering.filter_apply!(ws.fbuf, ws.prod, plan)
+    @. ws.τxy = ws.fbuf / ws.ρ̄ - ws.ũ * ws.ṽ
+    @. ws.prod = ρ * v * v
+    Filtering.filter_apply!(ws.fbuf, ws.prod, plan)
+    @. ws.τyy = ws.fbuf / ws.ρ̄ - ws.ṽ * ws.ṽ
+
+    # Deformation work uses the FAVRE velocity gradient; pressure dilatation uses the unweighted one.
+    Derivatives.ddx!(ws.ux, ws.ũ, grid, dplan)
+    Derivatives.ddy!(ws.uy, ws.ũ, grid, dplan)
+    Derivatives.ddx!(ws.vx, ws.ṽ, grid, dplan)
+    Derivatives.ddy!(ws.vy, ws.ṽ, grid, dplan)
+    Derivatives.ddx!(ws.Px, ws.P̄, grid, dplan)
+    Derivatives.ddy!(ws.Py, ws.P̄, grid, dplan)
+
+    mask = FlowGeometries.Grids.mask(grid)
+    # Π = −ρ̄ ∂_j ũ_i τ̃(u_i,u_j), summed over i,j; τ̃ is symmetric so the two off-diagonals combine.
+    @. ws.Π = ifelse(mask,
+        -ws.ρ̄ * (ws.ux * ws.τxx + (ws.uy + ws.vx) * ws.τxy + ws.vy * ws.τyy), zero(T))
+    # Λ = (1/ρ̄) ∂_j P̄ · τ̄(ρ,u_j) — baropycnal work.
+    @. ws.Λ = ifelse(mask, (ws.Px * ws.mx + ws.Py * ws.my) / ws.ρ̄, zero(T))
+    # P̄ ∇·ū, with the UNWEIGHTED divergence. `ws.prod`/`ws.fbuf` are free again here.
+    Derivatives.ddx!(ws.prod, ws.ū, grid, dplan)
+    Derivatives.ddy!(ws.fbuf, ws.v̄, grid, dplan)
+    @. ws.PD = ifelse(mask, ws.P̄ * (ws.prod + ws.fbuf), zero(T))
+
+    return (; Π = ws.Π, Λ = ws.Λ, pressure_dilatation = ws.PD,
+            ρ̄ = ws.ρ̄, P̄ = ws.P̄, ũ = ws.ũ, ṽ = ws.ṽ)
+end
+
+"""
+    compressible_flux(u, v, ρ, P, grid, kernel, scale; backend=AutoBackend(), mask_strategy=ZeroFill())
+        -> (; Π, Λ, pressure_dilatation, ρ̄, P̄, ũ, ṽ)
+
+The variable-density (Favre) cross-scale energy budget of Aluie (2013). Returns the three terms of that
+budget which act on the large-scale kinetic energy `ρ̄|ũ|²/2`, plus the filtered fields they are built
+from.
+
+# Favre filtering
+
+`f̃ ≡ (ρf)‾/ρ̄` is the density-weighted filter. It exists because it is the one that makes the filtered
+continuity equation close exactly, `∂_tρ̄ + ∂_i(ρ̄ũ_i) = 0`; the unweighted filter does not. It is linear
+but **does not commute with derivatives**, so the two filters are not interchangeable and the budget
+genuinely needs both — which is the source of the trap below.
+
+# The three terms
+
+```
+Π = −ρ̄ ∂_j ũ_i τ̃(u_i,u_j) ,   τ̃(u_i,u_j) = (ρu_iu_j)‾/ρ̄ − ũ_iũ_j        deformation work
+Λ = (1/ρ̄) ∂_j P̄ · τ̄(ρ,u_j) ,  τ̄(ρ,u_j)   = (ρu_j)‾ − ρ̄ū_j              baropycnal work
+                                                                        (τ̄ is UNWEIGHTED)
+P̄ ∇·ū                                                                   pressure dilatation
+```
+
+`Π` and `Λ` both pit a large-scale field against small-scale fluctuations, so **both transfer energy
+across scales**. `P̄∇·ū` involves only large scales and cannot — it is a conversion between kinetic and
+internal energy at the resolved scale, not a cascade term.
+
+# The trap
+
+`Λ` is frequently absorbed into the pressure term by writing it as `P̄∇·ũ` (plus a transport term) and
+then dismissed as "large-scale pressure dilatation that needs no modelling". That is wrong: the budget
+term is `P̄∇·ū` with the **unweighted** divergence, and writing `∇·ũ` silently destroys `Λ` — a genuine
+cross-scale transfer. This implementation keeps them separate and uses `ū` for the dilatation; the
+suite asserts that `Λ` is non-zero for a baroclinic configuration, so it cannot be quietly dropped.
+
+# Asymptotics
+
+For a smooth field, Lees & Aluie (2019) give `Λ ≈ (C₂ℓ²/ρ̄)·c_d·[∇P̄·S̄·∇ρ̄ + ½ ω̄·(∇ρ̄ × ∇P̄)]` with
+`C₂` the kernel's second moment — a strain-generation part plus a **baroclinic** part that survives
+even in pure solenoidal flow. That `C₂ ≠ 0` requirement is another reason the flux framework wants a
+kernel with a NON-vanishing second moment; see [`Kernels.HighOrderKernel`](@ref) for the kernels that
+deliberately give it up.
+
+# References
+- Aluie, H. (2013). Scale decomposition in compressible turbulence. *Physica D* 247, 54–65.
+- Lees, A., & Aluie, H. (2019). Baropycnal work: a mechanism for energy transfer across scales.
+  *Fluids* 4, 92. doi:10.3390/fluids4020092
+"""
+function compressible_flux(
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    ρ::AbstractMatrix,
+    P::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    gsz = FlowGeometries.Grids.size_tuple(grid)
+    for (nm, a) in (("u", u), ("v", v), ("ρ", ρ), ("P", P))
+        size(a) == gsz || throw(DimensionMismatch("$nm has size $(size(a)), grid expects $gsz"))
+    end
+    all(>(0), ρ) || throw(ArgumentError(
+        "Favre filtering divides by the filtered density, so ρ must be strictly positive everywhere; " *
+        "got a minimum of $(minimum(ρ)).",
+    ))
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
+    return compressible_flux!(
+        FavreWorkspace(grid), u, v, ρ, P, grid, kernel, scale;
+        filter_plan = plan, deriv_plan = Derivatives.StencilPlan(grid),
+    )
+end
+
+"""
+    favre_filter!(out, tmp, f, ρ, ρ̄, plan) -> out
+
+`f̃ = (ρf)‾/ρ̄`, given an already-filtered `ρ̄` and a scratch array `tmp`. The building block of
+[`compressible_flux`](@ref), exposed because a caller filtering their own tracer Favre-style should not
+have to reimplement it (and get the weighting backwards).
+"""
+function favre_filter!(
+    out::AbstractArray{T}, tmp::AbstractArray{T}, f::AbstractArray, ρ::AbstractArray,
+    ρ̄::AbstractArray{T}, plan::Filtering.AbstractFilterPlan,
+) where {T<:AbstractFloat}
+    @. tmp = ρ * f
+    Filtering.filter_apply!(out, tmp, plan)
+    @. out = out / ρ̄
+    return out
+end
+
+# ---------------------------------------------------------------------------
+# Scale-band energy decomposition (Aluie & Eyink 2009 App. 2; Germano 1992 eq. 33)
+# ---------------------------------------------------------------------------
+
+"""
+    band_energies(u, v, w, grid, kernel, scales; backend=AutoBackend(), mask_strategy=ZeroFill())
+        -> (; bands, resolved, total, band_maps, resolved_map)
+
+Split the kinetic energy into contributions from each scale band, using the **repeated-filter**
+generalization of the Germano identity rather than by band-passing the velocity.
+
+With `scales` in ASCENDING order `ℓ₁ < ℓ₂ < … < ℓ_N`, define the repeatedly filtered fields
+
+```
+f₀ = u ,   f_n = G_{ℓ_n} * f_{n-1} ,
+```
+
+so `f_n` has had every scale below `ℓ_n` removed, successively. Band `n` holds the energy the `n`-th
+application removed, which is the generalized second moment at that level:
+
+```
+k_n = ½ τ_{ℓ_n}(f_{n-1}; f_{n-1}) = ½[ (|f_{n-1}|²)‾_{ℓ_n} − |f_n|² ] ,
+```
+
+and the decomposition is exact:
+
+```
+½⟨|u|²⟩ = Σ_{n=1}^N ⟨k_n⟩ + ½⟨|f_N|²⟩ .
+```
+
+The sum telescopes because each `⟨G * x⟩ = ⟨x⟩` — i.e. **because the filter conserves the domain
+mean**. Measured, that holds to round-off on a periodic, unmasked grid (relative error 5e-16 for the
+top-hat, 2e-15 for the Gaussian) and the identity is exact there.
+
+Anywhere the footprint is truncated, it is not, and the identity carries a residual of order `ℓ/L`:
+measured on the same field, **1.1e-2 relative on a BOUNDED grid** (the footprint runs off the domain
+edge) and **1.1e-2 on a masked periodic grid under `ZeroFill`** (energy is smeared onto masked cells,
+which report zero). `Deformable` renormalizes that leakage away and does better on a masked domain —
+4.8e-4 — at the cost of the commutation property `ZeroFill` is the default for. So: read the bands as
+exact on a periodic unmasked domain, and as carrying an `O(ℓ/L)` boundary residual otherwise.
+
+# Why not band-pass the velocity
+
+The obvious alternative, `u = ū₀ + Σ(ū_n − ū_{n-1})`, gives
+`½⟨|u|²⟩ = ½⟨|ū₀|²⟩ + ½Σ_{n,m}⟨ū_n · ū_m⟩` — cross terms of indefinite sign, so there is no
+well-defined energy at a given scale at all (Aluie & Eyink 2009). The second-moment form above has no
+cross terms by construction, and `k_n ≥ 0` pointwise **iff the kernel is non-negative** — so use a
+positive kernel here (`TopHatKernel`, `GaussianKernel`, `SmoothHatKernel`, `HyperGaussianKernel`); a
+signed one such as [`Kernels.HighOrderKernel`](@ref) can give negative band energies.
+
+Returns the per-band domain-averaged energies `bands` (length `N`), the energy left in `f_N`
+(`resolved`), their sum `total`, and the corresponding pointwise maps.
+
+# References
+- Germano, M. (1992). *J. Fluid Mech.* 238, eq. (33).
+- Aluie, H., & Eyink, G. L. (2009). Localness of energy cascade in hydrodynamic turbulence.
+  *Phys. Fluids* 21, 115108, Appendix 2.
+"""
+function band_energies(
+    u::AbstractArray,
+    v::AbstractArray,
+    w::Union{Nothing, AbstractArray},
+    grid::FlowGeometries.Grids.AbstractGrid{G,T},
+    kernel::Kernels.AbstractFilterKernel,
+    scales::AbstractVector;
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+    method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    isempty(scales) && throw(ArgumentError("band_energies needs at least one scale"))
+    issorted(scales) || throw(ArgumentError(
+        "band_energies needs `scales` in ascending order (finest first): band n is the energy the " *
+        "n-th, progressively coarser, filter application removes. Got $scales.",
+    ))
+    gsz = FlowGeometries.Grids.size_tuple(grid)
+    has_w = w !== nothing
+    total_area = active_area(grid)
+
+    plans = [method === nothing ?
+             Filtering.plan_filter(grid, kernel, T(s); mask_strategy = mask_strategy, backend = backend) :
+             Filtering.plan_filter(grid, kernel, T(s); mask_strategy = mask_strategy, backend = backend,
+                                   method = method)
+             for s in scales]
+
+    # `f` is the running repeatedly-filtered field; `nxt` receives each next application. `sq`/`fsq`
+    # carry `|f|²` and its filtered image, which is what makes this a second moment and not a
+    # band-passed velocity.
+    f = (copy(u), copy(v), has_w ? copy(w) : nothing)
+    nxt = (zeros(T, gsz), zeros(T, gsz), has_w ? zeros(T, gsz) : nothing)
+    sq = zeros(T, gsz); fsq = zeros(T, gsz)
+
+    band_maps = [zeros(T, gsz) for _ in eachindex(scales)]
+    bands = zeros(T, length(scales))
+
+    for n in eachindex(scales)
+        km = band_maps[n]
+        fill!(km, zero(T))
+        for c in 1:(has_w ? 3 : 2)
+            fc = f[c]
+            Filtering.filter_apply!(nxt[c], fc, plans[n])
+            @. sq = fc * fc
+            Filtering.filter_apply!(fsq, sq, plans[n])
+            # τ(f;f) = (f²)‾ − (f̄)², summed over components; the ½ is applied once at the end.
+            @. km += fsq - nxt[c] * nxt[c]
+        end
+        mask = FlowGeometries.Grids.mask(grid)
+        @. km = ifelse(mask, T(0.5) * km, zero(T))
+        bands[n] = _area_mean(km, grid, total_area)
+        for c in 1:(has_w ? 3 : 2)
+            copyto!(f[c], nxt[c])
+        end
+    end
+
+    resolved_map = zeros(T, gsz)
+    let mask = FlowGeometries.Grids.mask(grid)
+        for c in 1:(has_w ? 3 : 2)
+            fc = f[c]
+            @. resolved_map += fc * fc
+        end
+        @. resolved_map = ifelse(mask, T(0.5) * resolved_map, zero(T))
+    end
+    resolved = _area_mean(resolved_map, grid, total_area)
+    return (; bands, resolved, total = sum(bands) + resolved, band_maps, resolved_map)
+end
+
+band_energies(u, v, grid::FlowGeometries.Grids.AbstractGrid, kernel, scales; kwargs...) =
+    band_energies(u, v, nothing, grid, kernel, scales; kwargs...)
+
+# ---------------------------------------------------------------------------
+# Enstrophy flux (Rivera, Aluie & Ecke 2014, eq. 16)
+# ---------------------------------------------------------------------------
+
+"""
+    vorticity!(ω, u, v, grid[, deriv_plan]) -> ω
+
+Vertical component of the relative vorticity, `ω = ∂v/∂x − ∂u/∂y`, on a 2-D grid. Masked cells are
+zeroed, as everywhere else. Uses the same `ddx!`/`ddy!` the flux diagnostics do, so `ω` and the
+gradients it is later contracted against are consistent to the last bit.
+"""
+function vorticity!(
+    ω::AbstractMatrix{T},
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,2},
+    deriv_plan::Union{Nothing,Derivatives.StencilPlan} = nothing,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
+    tmp = similar(ω)
+    Derivatives.ddx!(ω, v, grid, dplan)
+    Derivatives.ddy!(tmp, u, grid, dplan)
+    mask = FlowGeometries.Grids.mask(grid)
+    @. ω = ifelse(mask, ω - tmp, zero(T))
+    return ω
+end
+
+"""
+    vorticity(u, v, grid[, deriv_plan]) -> ω
+
+Allocating [`vorticity!`](@ref).
+"""
+function vorticity(
+    u::AbstractMatrix, v::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,2},
+    deriv_plan::Union{Nothing,Derivatives.StencilPlan} = nothing,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    return vorticity!(zeros(T, FlowGeometries.Grids.size_tuple(grid)), u, v, grid, deriv_plan)
+end
+
+"""
+    enstrophy_flux(u, v, grid, kernel, scale; backend=AutoBackend(), mask_strategy=ZeroFill()) -> Z
+
+Cross-scale enstrophy flux (Rivera, Aluie & Ecke 2014, eq. 16),
+
+```
+Z_ℓ = −∂_j ω̄_ℓ · τ_ℓ(u_j, ω) ,   τ_j = (u_j ω)‾ − ū_j ω̄ ,   ω = ∂v/∂x − ∂u/∂y ,
+```
+
+the enstrophy analogue of [`compute_Π!`](@ref): positive means enstrophy moving to smaller scales. In
+2-D turbulence this is the quantity with a forward cascade while `Π` cascades inverse, so the two are
+usually read together.
+
+# Gauge
+
+This is the **deformation (subtracted) form**, the same gauge `Π` uses: the resolved product `ū_j ω̄` is
+subtracted, which is what makes it pointwise Galilean-invariant. The unsubtracted alternative
+`−∂_j ω̄ (u_j ω)‾` differs from it by a transport divergence, and while the two share a spatial mean on
+a homogeneous domain they "differ qualitatively as well as quantitatively" on an inhomogeneous or
+masked one (Aluie 2011; Aluie, Hecht & Vallis 2018). Mixing gauges between `Π` and `Z` would make the
+pair internally inconsistent, so only this one is provided.
+
+Structurally `Z` is [`tracer_variance_flux`](@ref) with `θ = ω`, and that is how it is computed — the
+enstrophy is the "variance" of the vorticity. The separate entry point exists because the caller should
+not have to know to form `ω` with the matching derivative operator.
+
+# References
+- Rivera, M. K., Aluie, H., & Ecke, R. E. (2014). The direct enstrophy cascade of two-dimensional
+  soap film flows. *Phys. Fluids* 26, 055105. doi:10.1063/1.4873579
+"""
+function enstrophy_flux(
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,2},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    dplan = Derivatives.StencilPlan(grid)
+    ω = vorticity(u, v, grid, dplan)
+    return tracer_variance_flux(u, v, ω, grid, kernel, scale;
+                                backend = backend, mask_strategy = mask_strategy)
+end
+
+"""
+    EnstrophyFluxWorkspace(grid)
+
+Scratch for [`enstrophy_flux!`](@ref): the vorticity plus the tracer-flux scratch it is fed into.
+"""
+struct EnstrophyFluxWorkspace{T<:AbstractFloat, M<:AbstractMatrix{T}}
+    ω::M
+    tracer::TracerFluxWorkspace{T,M}
+end
+
+EnstrophyFluxWorkspace(grid::FlowGeometries.Grids.StructuredGrid{G,T}) where {T<:AbstractFloat, G} =
+    EnstrophyFluxWorkspace(zeros(T, FlowGeometries.Grids.size_tuple(grid)), TracerFluxWorkspace(grid))
+
+"""
+    enstrophy_flux!(Z, ws, u, v, grid, kernel, scale; filter_plan=nothing, deriv_plan=nothing, ...) -> Z
+
+In-place [`enstrophy_flux`](@ref). With `ws` and both plans supplied, a repeated evaluation allocates
+nothing.
+"""
+function enstrophy_flux!(
+    Z::AbstractMatrix{T},
+    ws::EnstrophyFluxWorkspace{T},
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{G,T,2},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
+    deriv_plan::Union{Nothing,Derivatives.StencilPlan} = nothing,
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
+    # `ws.tracer.uθ` is free at this point (it is only written inside `tracer_variance_flux!`), so it
+    # serves as the `∂u/∂y` scratch the curl needs — no extra buffer in the workspace for it.
+    Derivatives.ddx!(ws.ω, v, grid, dplan)
+    Derivatives.ddy!(ws.tracer.uθ, u, grid, dplan)
+    mask = FlowGeometries.Grids.mask(grid)
+    @. ws.ω = ifelse(mask, ws.ω - ws.tracer.uθ, zero(T))
+    return tracer_variance_flux!(Z, ws.tracer, u, v, ws.ω, grid, kernel, scale;
+                                 filter_plan = filter_plan, deriv_plan = dplan,
+                                 backend = backend, mask_strategy = mask_strategy)
+end
+
 """
     tracer_variance_flux(u, v, θ, grid::StructuredGrid{<:SphericalGeometry}, kernel, scale; ...) -> Πθ
 
@@ -1815,7 +2444,7 @@ function tracer_variance_flux(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     # One stencil table for every derivative below; they differ only in direction and field.
     dplan = Derivatives.StencilPlan(grid)
@@ -1866,7 +2495,7 @@ function tracer_variance_flux(
 end
 
 """
-    tracer_variance_flux(u, v, w, θ, grid::StructuredGrid{Cartesian,T,3}, kernel, scale; backend=AutoBackend(), mask_strategy=Deformable())
+    tracer_variance_flux(u, v, w, θ, grid::StructuredGrid{Cartesian,T,3}, kernel, scale; backend=AutoBackend(), mask_strategy=ZeroFill())
         -> Πθ
 
 True three-dimensional analog of the 2D [`tracer_variance_flux`](@ref) above: the subfilter tracer
@@ -1882,7 +2511,7 @@ function tracer_variance_flux(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     # One stencil table for every derivative below; they differ only in direction and field.
     dplan = Derivatives.StencilPlan(grid)
@@ -1929,7 +2558,7 @@ function tracer_variance_flux(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.Deformable(),
+    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     # One stencil table for every derivative below; they differ only in direction and field.
     dplan = Derivatives.StencilPlan(grid)

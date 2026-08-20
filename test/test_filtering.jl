@@ -411,7 +411,7 @@ Test.@testset "filter_apply_batch! is bit-identical to per-field filter_apply! (
     grid_fast = FG.Grids.StructuredGrid(geom, xsR, xsR, mask)
     _check_batch(grid_fast, CGEF.TopHatKernel(), 5000.0, N, N)
 
-    # Separable Gaussian fast path (SeparableGaussianFootprint).
+    # Separable Gaussian fast path (SeparableFootprint).
     _check_batch(grid_fast, CGEF.GaussianKernel(), 5000.0, N, N)
 
     # Nonuniform-axis (ScatteredFilterPlan) — cached and streaming.
@@ -431,11 +431,11 @@ Test.@testset "filter_apply_batch! is bit-identical to per-field filter_apply! (
     _check_batch(grid1, CGEF.TopHatKernel(), 5000.0, N; cache_strategy = CGEF.Filtering.AlwaysCache())
     _check_batch(grid1, CGEF.TopHatKernel(), 5000.0, N; cache_strategy = CGEF.Filtering.NeverCache())
 
-    # 1D uniform Gaussian (SeparableGaussianFootprintND).
+    # 1D uniform Gaussian (SeparableFootprintND).
     _check_batch(FG.Grids.StructuredGrid(geom, xsR, trues(N)), CGEF.GaussianKernel(), 5000.0, N)
 
     # True-3D nonuniform (NDScatteredFilterPlan) and true-3D uniform (FilterFootprintND,
-    # SeparableGaussianFootprintND).
+    # SeparableFootprintND).
     N3 = 12
     x3R = 0.0:1000.0:(N3 - 1) * 1000.0
     x3_nu = collect(x3R) .+ [iseven(i) ? 3.0 : -2.0 for i in 1:N3]
@@ -469,7 +469,7 @@ Test.@testset "filter_apply_batch! is bit-identical to per-field filter_apply! (
 end
 
 
-Test.@testset "separable Gaussian fast path — dispatch and correctness against an independent brute-force square-truncated reference" begin
+Test.@testset "separable fast path — dispatch and correctness against an independent brute-force square-truncated reference" begin
     geom = FG.Geometry.CartesianGeometry()  # deliberately anisotropic dx/dy
     N = 24
     xsR = 0.0:1000.0:(N - 1) * 1000.0
@@ -477,24 +477,24 @@ Test.@testset "separable Gaussian fast path — dispatch and correctness against
     ker = CGEF.GaussianKernel()
     scale = 4000.0
 
-    # Dispatch: Range axes -> SeparableGaussianFootprint.
+    # Dispatch: Range axes -> SeparableFootprint.
     grid_range = FG.Grids.StructuredGrid(geom, xsR, ysR, trues(N, N))
     fp_range = CGEF.Filtering.build_footprint(grid_range, ker, scale)
-    Test.@test fp_range isa CGEF.Filtering.SeparableGaussianFootprint
+    Test.@test fp_range isa CGEF.Filtering.SeparableFootprint
 
     # Dispatch: separability is a property of the KERNEL, so a `Vector` axis takes the same engine.
     # What the axis type decides is the weight table's rank — a vector when the spacing is constant
     # and known from the type, a row per position otherwise — not which algorithm runs.
     grid_uniform_vec = FG.Grids.StructuredGrid(geom, collect(xsR), collect(ysR), trues(N, N))
     fp_uniform_vec = CGEF.Filtering.build_footprint(grid_uniform_vec, ker, scale)
-    Test.@test fp_uniform_vec isa CGEF.Filtering.SeparableGaussianFootprint
+    Test.@test fp_uniform_vec isa CGEF.Filtering.SeparableFootprint
     Test.@test fp_uniform_vec.gx isa AbstractMatrix
     Test.@test fp_range.gx isa AbstractVector
 
     x_nu = collect(xsR) .+ [iseven(i) ? 5.0 : -5.0 for i in 1:N]
     grid_nonuniform = FG.Grids.StructuredGrid(geom, x_nu, collect(ysR), trues(N, N))
     fp_nonuniform = CGEF.Filtering.build_footprint(grid_nonuniform, ker, scale)
-    Test.@test fp_nonuniform isa CGEF.Filtering.SeparableGaussianFootprint
+    Test.@test fp_nonuniform isa CGEF.Filtering.SeparableFootprint
     Test.@test size(fp_nonuniform.gx, 1) == N
 
     # Dispatch: Spherical + Gaussian never takes the Cartesian-only separable path, even with
@@ -504,22 +504,22 @@ Test.@testset "separable Gaussian fast path — dispatch and correctness against
     slatR = range(deg2rad(-40.0); step = deg2rad(4.0), length = N)
     sgrid = FG.Grids.StructuredGrid(sgeom, slonR, slatR, trues(N, N))
     fp_sph = CGEF.Filtering.build_footprint(sgrid, ker, deg2rad(6.0) * 6.371e6)
-    Test.@test !(fp_sph isa CGEF.Filtering.SeparableGaussianFootprint)
+    Test.@test !(fp_sph isa CGEF.Filtering.SeparableFootprint)
 
     # Correctness: cross-check against an INDEPENDENT brute-force square-truncated reference
     # (written fresh here, not reusing any of the package's own engines) — this validates the
     # actual mathematical claim (row-pass-then-column-pass == the full 2D square-truncated sum),
     # not just "close to the disk-truncated RealSpace engine" (a genuinely different truncation
-    # shape — see `SeparableGaussianFootprint`'s own docstring).
+    # shape — see `SeparableFootprint`'s own docstring).
     for strategy in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
         mask = trues(N, N); mask[8:11, 8:11] .= false; mask[1, :] .= false
         grid_m = FG.Grids.StructuredGrid(geom, xsR, ysR, mask)
         fp_m = CGEF.Filtering.build_footprint(grid_m, ker, scale; mask_strategy = strategy)
-        Test.@test fp_m isa CGEF.Filtering.SeparableGaussianFootprint
+        Test.@test fp_m isa CGEF.Filtering.SeparableFootprint
 
         field = [sin(i / 3.0) * cos(j / 4.0) for i in 1:N, j in 1:N]
         out_fast = zeros(N, N)
-        CGEF.Filtering.apply_separable_gaussian!(out_fast, field, grid_m, fp_m, strategy)
+        CGEF.Filtering.apply_separable!(out_fast, field, grid_m, fp_m, strategy)
 
         di_lim, dj_lim = fp_m.di_lim, fp_m.dj_lim
         gx, gy = fp_m.gx, fp_m.gy
@@ -564,8 +564,8 @@ Test.@testset "Separable Gaussian on a stretched Cartesian grid" begin
     ps = CGEF.Filtering.plan_filter(gs, K, ℓ)
 
     # Both take the separable engine; only the weight table's shape differs.
-    Test.@test pr.footprint isa CGEF.Filtering.SeparableGaussianFootprint
-    Test.@test ps.footprint isa CGEF.Filtering.SeparableGaussianFootprint
+    Test.@test pr.footprint isa CGEF.Filtering.SeparableFootprint
+    Test.@test ps.footprint isa CGEF.Filtering.SeparableFootprint
     Test.@test pr.footprint.gx isa AbstractVector          # shared across positions
     Test.@test ps.footprint.gx isa AbstractMatrix          # one row per position
     Test.@test size(ps.footprint.gx, 1) == n
@@ -612,7 +612,7 @@ Test.@testset "Separable Gaussian in 1D and 3D" begin
         g3 = FG.Grids.StructuredGrid(geom, x, x, x, trues(n, n, n))
         f = [sin(a / 5000) * cos(b / 6000) * sin(c / 7000) for a in x, b in x, c in x]
         p = CGEF.Filtering.plan_filter(g3, K, ℓ)
-        Test.@test p.footprint isa CGEF.Filtering.SeparableGaussianFootprintND
+        Test.@test p.footprint isa CGEF.Filtering.SeparableFootprintND
         Test.@test length(p.footprint.lim) == 3
 
         sep = zeros(n, n, n)
@@ -637,9 +637,24 @@ Test.@testset "Separable Gaussian in 1D and 3D" begin
         m[3:5, 3:5, 3:5] .= false
         gm = FG.Grids.StructuredGrid(geom, x, x, x, m)
         cm = zeros(n, n, n)
-        CGEF.Filtering.filter_field!(cm, fill(2.5, n, n, n), gm, K, ℓ)
+        CGEF.Filtering.filter_field!(cm, fill(2.5, n, n, n), gm, K, ℓ;
+                                     mask_strategy = CGEF.Filtering.Deformable())
         Test.@test all(I -> m[I] ? isapprox(cm[I], 2.5; atol = 1e-12) : cm[I] == 0.0,
                        CartesianIndices(cm))
+
+        # The default, ZeroFill, keeps the excluded cells in the denominator, so the same constant is
+        # DAMPED wherever the footprint overlaps the hole and exact everywhere else. The separable ND
+        # engine's footprint is a per-axis BOX of half-width `lim`, not a ball, so the split between
+        # the two halves is taken from the plan's own limits rather than from the kernel radius.
+        cz = zeros(n, n, n)
+        CGEF.Filtering.filter_field!(cz, fill(2.5, n, n, n), gm, K, ℓ)
+        lim = CGEF.Filtering.plan_filter(gm, K, ℓ).footprint.lim
+        holes = filter(J -> !m[J], collect(CartesianIndices(m)))
+        overlaps(I) = any(J -> all(d -> abs(I[d] - J[d]) <= lim[d], 1:3), holes)
+        Test.@test all(iszero, @view cz[.!m])
+        Test.@test all(I -> !m[I] || overlaps(I) || isapprox(cz[I], 2.5; atol = 1e-12),
+                       CartesianIndices(cz))
+        Test.@test any(I -> m[I] && cz[I] < 2.5 - 1e-6, CartesianIndices(cz))
     end
 
     Test.@testset "1D" begin
@@ -648,7 +663,7 @@ Test.@testset "Separable Gaussian in 1D and 3D" begin
         g1 = FG.Grids.StructuredGrid(geom, x, trues(n))
         f = [sin(a / 5000) for a in x]
         p = CGEF.Filtering.plan_filter(g1, K, ℓ)
-        Test.@test p.footprint isa CGEF.Filtering.SeparableGaussianFootprintND
+        Test.@test p.footprint isa CGEF.Filtering.SeparableFootprintND
 
         sep = zeros(n)
         CGEF.Filtering.filter_field!(sep, f, g1, K, ℓ)
@@ -808,5 +823,139 @@ Test.@testset "Real-space engine fast paths" begin
         CGEF.Filtering.filter_apply!(oN, u, CGEF.Filtering.plan_filter(gN, CGEF.GaussianKernel(), 8000.0;
             backend = CGEF.ComputationalBackends.SerialBackend()))
         Test.@test oP ≈ oN rtol = 1e-12
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Why `ZeroFill` is the default mask strategy.
+#
+# The cross-scale flux budget is derived by commuting the filter with the spatial derivative, so the
+# kernel must not depend on position. `ZeroFill` keeps the full kernel mass in the denominator and so
+# stays position-independent; `Deformable` divides by the locally-included mass, which varies within ℓ
+# of a mask boundary. These testsets pin that difference numerically instead of leaving it as prose.
+# ---------------------------------------------------------------------------
+
+# A compactly-supported C³ bump, EXACTLY zero outside `rad` — so `mask ⊙ f == f` and
+# `mask ⊙ ∂f == ∂f` hold to the bit, and the identity under test is not contaminated by a tail
+# leaking onto the mask.
+function _cgef_test_bump(N, ic, jc, rad)
+    f = zeros(N, N)
+    for j in 1:N, i in 1:N
+        r2 = ((i - ic)^2 + (j - jc)^2) / rad^2
+        r2 < 1 && (f[i, j] = (1 - r2)^4)
+    end
+    return f
+end
+
+Test.@testset "mask_strategy: ZeroFill commutes with ∂/∂x, Deformable does not" begin
+    geom = FG.Geometry.CartesianGeometry()
+    N = 96
+    dx = 1000.0
+    xs = 0.0:dx:(N - 1) * dx
+    icoast = 61                                   # first LAND column
+    mask = trues(N, N); mask[icoast:end, :] .= false
+    grid = FG.Grids.StructuredGrid(geom, xs, xs, mask)
+    ker = CGEF.TopHatKernel()
+    ℓ = 8000.0                                    # footprint radius ℓ/2 = 4 cells
+
+    f = _cgef_test_bump(N, 49, 48, 8)
+    df = zeros(N, N)
+    CGEF.Derivatives.ddx!(df, f, grid)
+
+    # Preconditions. Without these the comparison measures the mask cutting into the field rather
+    # than the filter operator, and neither strategy would commute.
+    Test.@test all(iszero, @view f[icoast:end, :])
+    Test.@test all(iszero, @view df[icoast:end, :])
+
+    lhs = zeros(N, N); rhs = zeros(N, N); ff = zeros(N, N)
+    rel = Dict{Any,Float64}(); edge = Dict{Any,Float64}(); drift = Dict{Any,Float64}()
+    for strat in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
+        CGEF.Filtering.filter_field!(lhs, df, grid, ker, ℓ; mask_strategy = strat)
+        CGEF.Filtering.filter_field!(ff, f, grid, ker, ℓ; mask_strategy = strat)
+        CGEF.Derivatives.ddx!(rhs, ff, grid)
+        # `ddx!` runs the `ReduceInRun` policy, which degrades to a one-sided stencil at the domain
+        # edge and at the land boundary. Those two columns test the DERIVATIVE's edge treatment, not
+        # the filter, so they are excluded here and asserted separately below.
+        ii = 2:(icoast - 2)
+        s = maximum(abs, @view rhs[ii, :])
+        rel[strat] = maximum(abs, @view(lhs[ii, :]) .- @view(rhs[ii, :])) / s
+        edge[strat] = maximum(abs, @view(lhs[icoast - 1, :]) .- @view(rhs[icoast - 1, :])) / s
+        drift[strat] = (sum(ff) - sum(f)) / sum(f)
+    end
+
+    # `ZeroFill`: the identity holds to round-off. `Deformable`: it fails by ~13 orders of magnitude
+    # more, and the failure is the whole point of the default — it is asserted, not tolerated.
+    Test.@test rel[CGEF.Filtering.ZeroFill()] < 1e-13
+    Test.@test rel[CGEF.Filtering.Deformable()] > 1e-3
+    Test.@test rel[CGEF.Filtering.Deformable()] > 1e9 * rel[CGEF.Filtering.ZeroFill()]
+
+    # The excluded column is excluded for a reason that is itself checked: there `ZeroFill` fails too,
+    # at the same order as `Deformable`, because the one-sided stencil is not the operator the identity
+    # is stated for.
+    Test.@test edge[CGEF.Filtering.ZeroFill()] > 1e-3
+
+    # A position-independent kernel with the full mass in the denominator conserves the domain
+    # integral; a renormalized one does not.
+    Test.@test abs(drift[CGEF.Filtering.ZeroFill()]) < 1e-13
+    Test.@test abs(drift[CGEF.Filtering.Deformable()]) > 1e-6
+
+    # Unmasked reference: with nothing excluded the two strategies coincide and both commute, for a
+    # compact footprint (top-hat) and a truncated-tail one (Gaussian) alike.
+    let gfull = FG.Grids.StructuredGrid(geom, xs, xs, trues(N, N)),
+        fu = _cgef_test_bump(N, 48, 48, 10), dfu = zeros(N, N)
+        CGEF.Derivatives.ddx!(dfu, fu, gfull)
+        for k in (CGEF.TopHatKernel(), CGEF.GaussianKernel())
+            CGEF.Filtering.filter_field!(lhs, dfu, gfull, k, ℓ)
+            CGEF.Filtering.filter_field!(ff, fu, gfull, k, ℓ)
+            CGEF.Derivatives.ddx!(rhs, ff, gfull)
+            ii = 2:(N - 1)
+            Test.@test maximum(abs, @view(lhs[ii, :]) .- @view(rhs[ii, :])) <
+                       1e-13 * maximum(abs, @view rhs[ii, :])
+        end
+    end
+end
+
+Test.@testset "mask_strategy: the coast artifacts quoted in the filter_field! docstring" begin
+    geom = FG.Geometry.CartesianGeometry()
+    N = 200
+    xs = 0.0:1.0:(N - 1)                          # unit cells, so ℓ is in cells
+    icoast = 101
+    mask = trues(N, N); mask[icoast:end, :] .= false
+    grid = FG.Grids.StructuredGrid(geom, xs, xs, mask)
+    ker = CGEF.GaussianKernel(); ℓ = 16.0
+    jm = N ÷ 2
+
+    # Footprint moments AT a point without building an impulse response: filtering is linear, so
+    # filter(x)/filter(1) is the footprint-weighted mean of x there, and filter(1) is its mass. Both
+    # ratios divide the strategy's normalization out, which is exactly why they come out equal below.
+    xc = [xs[i] - xs[icoast] for i in 1:N, _ in 1:N]
+    f1 = zeros(N, N); fx = zeros(N, N); fx2 = zeros(N, N)
+    ds = (1, 4, 8, 16)
+    mass = Dict{Any,Vector{Float64}}(); cent = Dict{Any,Vector{Float64}}(); wid = Dict{Any,Vector{Float64}}()
+    for strat in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
+        plan = CGEF.Filtering.plan_filter(grid, ker, ℓ; mask_strategy = strat)
+        CGEF.Filtering.filter_apply!(f1, ones(N, N), plan)
+        CGEF.Filtering.filter_apply!(fx, xc, plan)
+        CGEF.Filtering.filter_apply!(fx2, xc .^ 2, plan)
+        σint = sqrt(fx2[50, jm] / f1[50, jm] - (fx[50, jm] / f1[50, jm])^2)
+        mass[strat] = [f1[icoast - d, jm] for d in ds]
+        cent[strat] = [fx[icoast - d, jm] / f1[icoast - d, jm] - xc[icoast - d, jm] for d in ds]
+        wid[strat] = [sqrt(fx2[icoast - d, jm] / f1[icoast - d, jm] -
+                           (fx[icoast - d, jm] / f1[icoast - d, jm])^2) / σint for d in ds]
+    end
+
+    # The shape distortion is the truncated footprint's, so it is IDENTICAL under both strategies —
+    # it is not something `Deformable` buys its way out of.
+    Test.@test cent[CGEF.Filtering.ZeroFill()] ≈ cent[CGEF.Filtering.Deformable()] rtol = 1e-12
+    Test.@test wid[CGEF.Filtering.ZeroFill()] ≈ wid[CGEF.Filtering.Deformable()] rtol = 1e-12
+    Test.@test cent[CGEF.Filtering.ZeroFill()] ./ ℓ ≈ [-0.211, -0.111, -0.032, 0.0] atol = 5e-3
+    Test.@test wid[CGEF.Filtering.ZeroFill()] ≈ [0.621, 0.747, 0.897, 0.998] atol = 5e-3
+
+    # Only the mass differs, and it is exactly the value a uniform field filters to.
+    Test.@test mass[CGEF.Filtering.ZeroFill()] ≈ [0.543, 0.776, 0.948, 0.9996] atol = 5e-3
+    Test.@test all(≈(1.0; atol = 1e-12), mass[CGEF.Filtering.Deformable()])
+    let uni = zeros(N, N)
+        CGEF.Filtering.filter_field!(uni, ones(N, N), grid, ker, ℓ)   # default ⇒ ZeroFill
+        Test.@test [uni[icoast - d, jm] for d in ds] ≈ mass[CGEF.Filtering.ZeroFill()] rtol = 1e-12
     end
 end

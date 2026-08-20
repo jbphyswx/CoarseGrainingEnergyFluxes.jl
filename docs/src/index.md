@@ -1,3 +1,7 @@
+```@meta
+CurrentModule = CoarseGrainingEnergyFluxes
+```
+
 # CoarseGrainingEnergyFluxes.jl
 
 Spatial coarse-graining analysis of energy fluxes in geophysical fluid dynamics.
@@ -72,3 +76,9 @@ with respect to the filtering wavenumber `k_ℓ = L/ℓ`:
 
 `coarse_grain` returns both (`result.cumulative_energy`, `result.filtering_spectrum`,
 `result.wavenumber`).
+
+`Ẽ(k_ℓ) ≥ 0` is guaranteed only for a kernel whose `|Ĝ(k)|²` is monotone decreasing, which the
+default `TopHatKernel` is not. `coarse_grain` therefore throws rather than return a density it cannot
+vouch for: pass `kernel = GaussianKernel()` for a spectrum, or `spectrum = false` for `Π` and the
+cumulative energy alone. Note also that a `p = 1` kernel — top-hat and Gaussian both — saturates the
+recovered slope at `k⁻³`; see [`Diagnostics.filtering_spectrum`](@ref).

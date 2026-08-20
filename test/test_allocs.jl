@@ -391,7 +391,7 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
         pplans = [CGEF.Filtering.plan_filter(grid, ker, s; backend = SERIAL) for s in scales]
         pbatch = CGEF.Pipeline.CoarseGrainBatchResult(grid, length(scales), (Nz,))
         pkw = (; scales = scales, kernel = ker, workspaces = [ws], filter_plans = [pplans],
-               deriv_plans = [dpg], backend = SERIAL)
+               deriv_plans = [dpg], backend = SERIAL, spectrum = false)
         CGEF.Pipeline.coarse_grain_profile!(pbatch, u3, v3, grid; pkw...)
         CGEF.Pipeline.coarse_grain_profile!(pbatch, u3, v3, grid; pkw...)
         a_profile = @allocated CGEF.Pipeline.coarse_grain_profile!(pbatch, u3, v3, grid; pkw...)
@@ -399,24 +399,24 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
 
         # coarse_grain!: workspace + filter_plans prebuilt and reused (the documented "repeated
         # timestep sweep" zero-allocation entry point).
-        result = CGEF.coarse_grain(u, v, grid; backend = SERIAL, scales = scales, kernel = ker)
+        result = CGEF.coarse_grain(u, v, grid; backend = SERIAL, scales = scales, kernel = ker, spectrum = false)
         plans = [CGEF.Filtering.plan_filter(grid, ker, Float64(s); backend = SERIAL) for s in scales]
-        CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, filter_plans = plans, deriv_plan = dpg)
-        CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, filter_plans = plans, deriv_plan = dpg)
-        a_cg = @allocated CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, filter_plans = plans, deriv_plan = dpg)
+        CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, filter_plans = plans, deriv_plan = dpg, spectrum = false)
+        CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, filter_plans = plans, deriv_plan = dpg, spectrum = false)
+        a_cg = @allocated CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, filter_plans = plans, deriv_plan = dpg, spectrum = false)
         Test.@test a_cg == 0
 
         # Sanity: zero is a real result, not a vacuous one — WITHOUT prebuilt filter_plans the same
         # call rebuilds `Nscales` footprints and allocates. (A ratio against `a_cg` would say nothing
         # now that it is zero.)
-        a_cg_noplans = @allocated CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, deriv_plan = dpg)
+        a_cg_noplans = @allocated CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, deriv_plan = dpg, spectrum = false)
         Test.@test a_cg_noplans > 10_000
 
         # coarse_grain_profile (allocating) sizes and fills a fresh batch result every call, so it is
-        # bounded by the OUTPUT size rather than asserted small. The zero-allocation contract belongs to
+        # bounded by the OUTPUT size, not asserted small. The zero-allocation contract belongs to
         # `coarse_grain_profile!` above, which refills a held batch.
         ppool = (; scales = scales, kernel = ker, workspaces = [ws], filter_plans = [plans],
-                 deriv_plans = [dpg], backend = SERIAL)
+                 deriv_plans = [dpg], backend = SERIAL, spectrum = false)
         CGEF.Pipeline.coarse_grain_profile(u3, v3, grid; ppool...)
         CGEF.Pipeline.coarse_grain_profile(u3, v3, grid; ppool...)
         a_cgp = @allocated CGEF.Pipeline.coarse_grain_profile(u3, v3, grid; ppool...)
@@ -782,7 +782,7 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
     end
 
     # -----------------------------------------------------------------------
-    # separable Gaussian fast path — empirical speedup, not just analytical (O(N·r) vs O(N·r²)).
+    # separable fast path — empirical speedup, not just analytical (O(N·r) vs O(N·r²)).
     # Compared against a `CurvilinearGrid` built from the SAME physical points: `CurvilinearGrid`
     # always uses the general (disk-truncated) `ScatteredFilterPlan` real-space engine, so it is a
     # genuine same-kernel/same-scale reference for "the non-separable direct-sum cost on this grid,"
@@ -799,7 +799,7 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
 
         grid_fast = FG.Grids.StructuredGrid(geom, xsR, xsR, trues(N, N))
         plan_fast = CGEF.Filtering.plan_filter(grid_fast, ker, scale; backend = SERIAL)
-        Test.@test plan_fast.footprint isa CGEF.Filtering.SeparableGaussianFootprint
+        Test.@test plan_fast.footprint isa CGEF.Filtering.SeparableFootprint
 
         ic = collect(0.0:(N - 1)); jc = collect(0.0:(N - 1))
         clon = [1000.0 * ii for ii in ic, jj in jc]

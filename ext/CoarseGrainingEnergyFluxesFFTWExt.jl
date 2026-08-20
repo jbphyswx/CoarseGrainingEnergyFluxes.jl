@@ -123,7 +123,7 @@ function CGEF.Filtering.spectral_filter_plan(
     grid::FlowGeometries.Grids.StructuredGrid{G,T},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy = CGEF.Filtering.Deformable(),
+    mask_strategy = CGEF.Filtering.ZeroFill(),
     backend = CGEF.ComputationalBackends.AutoBackend(),
     # Extent of the trailing batch axis this plan will be applied over, or `nothing` for single fields.
     # A transform is bound to one field shape, so it is fixed here rather than discovered at apply time.
@@ -226,7 +226,7 @@ function CGEF.Filtering.padded_fft_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{G,T,2},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy::CGEF.Filtering.AbstractMaskStrategy = CGEF.Filtering.Deformable(),
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy = CGEF.Filtering.ZeroFill(),
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)

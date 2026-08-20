@@ -49,7 +49,9 @@ for j in 1:Nlat, i in 1:Nlon
 end
 
 scales = collect(20e3:20e3:200e3)              # 20–200 km
-result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel())
+# A Gaussian, not a top-hat: this script prints the filtering spectral density below, and the
+# top-hat's |Ĝ|² is not monotone so `coarse_grain` refuses to produce one for it.
+result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel())
 
 println("scale [km]   cumulative-KE     mean|Π| [W/m³]")
 for (i, ℓ) in enumerate(scales)

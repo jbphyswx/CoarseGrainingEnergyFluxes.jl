@@ -58,14 +58,44 @@ struct FINUFFTFilterPlan{
     invrenorm::R        # precomputed 1/filter(mask) for Deformable, or nothing (ZeroFill / fully active)
 end
 
+"""
+    spectral_filter_plan(...; finufft_nthreads = 1)
+
+`finufft_nthreads` is FINUFFT's INTERNAL thread count — its spreader and its own FFTW plan. Not the
+batch axis: that is `ntrans`, which is 1 here, with batching in the slice/batch drivers.
+
+It defaults to 1 because FFTW's thread count is process-global and other packages raise it (loading
+FastSphericalHarmonics does, via FastTransforms). An unpinned plan then builds a multi-threaded
+internal FFTW plan, and FFTW.jl's threading provider spawns a Julia `Task` per work chunk on every
+`finufft_execute` — measured 216 tasks and ~120 kB per execution on an 18×18 mode grid, ~1.2 MB per
+`compute_Π!`, which breaks the zero-allocation-on-reuse contract.
+
+Measured, one type-1 transform (2 Julia threads, FFTW at 4):
+
+| points | modes | `nthreads = 1` | FINUFFT default |
+|---|---|---|---|
+| 300 | 18² | 0.031 ms, 0 B | 3.416 ms, 119 808 B |
+| 10 000 | 100² | 1.207 ms, 0 B | 1.061 ms, 4 032 B |
+| 200 000 | 448² | 67.5 ms, 0 B | 40.7 ms, 4 032 B |
+| 1 000 000 | 1000² | 373.6 ms, 0 B | 329.7 ms, 6 336 B |
+
+Pinning is 110× faster at 300 points and 1.66× slower at 200 000. Pass `finufft_nthreads = 0` (all
+threads) for a large single transform where that is worth ~4 kB per apply; do not combine it with a
+threaded slice/batch loop, which would nest two levels of threading.
+"""
 function CGEF.Filtering.spectral_filter_plan(
     ::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractNUFFTSpectralBackend},
     grid::FlowGeometries.Grids.UnstructuredGrid{T,G},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy = CGEF.Filtering.Deformable(),
+    mask_strategy = CGEF.Filtering.ZeroFill(),
     backend = CGEF.ComputationalBackends.AutoBackend(),
+    finufft_nthreads::Integer = 1,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    nth = Int(finufft_nthreads)
+    nth >= 0 || throw(ArgumentError(
+        "finufft_nthreads must be >= 0 (0 means FINUFFT's own default of all threads), got $nth",
+    ))
     x = FlowGeometries.Grids.coordinates(grid, 1)
     y = FlowGeometries.Grids.coordinates(grid, 2)
     npts = length(x)
@@ -106,8 +136,12 @@ function CGEF.Filtering.spectral_filter_plan(
     # Persistent guru plans: `finufft_setpts!` does the point sort, spreader tables and FFTW planning
     # once here, rather than per `filter_apply!` — `compute_Π!` makes ~9 of those per scale. The
     # one-shot `nufft2d1`/`nufft2d2` wrappers redo all of it on every call.
-    plan1 = FINUFFT.finufft_makeplan(1, [M, N], -1, 1, ϵ; dtype = T)
-    plan2 = FINUFFT.finufft_makeplan(2, [M, N], 1, 1, ϵ; dtype = T)
+    #
+    # `ntrans = 1`: the batch axis lives ABOVE this, in the slice/batch drivers, not in FINUFFT.
+    # `nthreads` is therefore FINUFFT's INTERNAL parallelism (spreader + its own FFTW plan) — see the
+    # `finufft_nthreads` note on this method for why it defaults to 1.
+    plan1 = FINUFFT.finufft_makeplan(1, [M, N], -1, 1, ϵ; dtype = T, nthreads = nth)
+    plan2 = FINUFFT.finufft_makeplan(2, [M, N], 1, 1, ϵ; dtype = T, nthreads = nth)
     FINUFFT.finufft_setpts!(plan1, X, Y)
     FINUFFT.finufft_setpts!(plan2, X, Y)
     finalizer(FINUFFT.finufft_destroy!, plan1)

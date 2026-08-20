@@ -113,18 +113,29 @@ grid = FG.Grids.StructuredGrid(geom, lon_rad, lat_rad, mask)
 
 # Run multi-scale analysis
 scales = collect(10e3:10e3:300e3)  # 10 km to 300 km
-result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel())
+result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel(),
+                           spectrum = false)
 
 # result.Π                 — (Nlon, Nlat, Nscales) stacked flux array; result.Π[:, :, i] at scales[i]
 # result.cumulative_energy — ½ρ₀⟨|ū_ℓ|²⟩ per scale (Sadek–Aluie Eq. 15)
 # result.wavenumber        — k_ℓ = L/ℓ
-# result.filtering_spectrum — Ẽ(k_ℓ) spectral density (Eq. 14)
+
+# The top-hat's |Ĝ|² is not monotone, so it cannot carry a filtering spectral density (Sadek & Aluie
+# 2018 eq. 21) and `coarse_grain` refuses to produce one. Ask a kernel that can:
+spec = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel())
+# spec.filtering_spectrum  — Ẽ(k_ℓ) spectral density (Eq. 14)
 ```
 
-Only a minimal set of names is exported at the top level (`coarse_grain`, `coarse_grain!`,
-`coarse_grain_profile`, `CoarseGrainResult`, the three kernels, `plot_Π_map`/`plot_spectrum`);
-grids and geometries come from FlowGeometries.jl, and everything else — `filter_field!`, `compute_Π!`,
-`compute_Π_decomposed`, `tau_decomposition`, `tracer_variance_flux`, backends, mask strategies,
+Not sure what a given `(grid, kernel, ℓ)` will actually do? `CGEF.check_setup(grid, kernel, ℓ)` reports
+the engine, the resolved backend, whether the kernel can carry `Π` and a spectrum, whether `ℓ` is
+resolvable on that grid, and how wide the contaminated band along a coast is — without building a plan.
+
+Only a minimal set of names is exported at the top level: the sweep entry points (`coarse_grain`,
+`coarse_grain!`, `coarse_grain_profile`, `coarse_grain_batch!`, `coarse_grain_slices!`), their result
+types, `check_setup`, the three headline kernels, and `plot_Π_map`/`plot_spectrum`. Grids and
+geometries come from FlowGeometries.jl, and everything else — `filter_field!`, `compute_Π!`,
+`compute_Π_strain_convergence`, `compute_Π_decomposed`, `tau_decomposition`, `tracer_variance_flux`,
+`enstrophy_flux`, `band_energies`, the remaining kernels, backends, mask strategies,
 `ddx!`/`ddy!`/`ddz!`, `plan_filter`, `ΠWorkspace`, `spectral_transfer`, … — is reached through the
 qualified submodule path shown in [Architecture](#architecture) below, e.g.
 `CGEF.Diagnostics.compute_Π!(...)`, `CGEF.Filtering.filter_field!(...)`.

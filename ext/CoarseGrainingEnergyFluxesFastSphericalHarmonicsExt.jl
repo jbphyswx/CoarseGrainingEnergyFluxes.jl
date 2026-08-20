@@ -48,7 +48,7 @@ function CGEF.Filtering.spectral_filter_plan(
     grid::FlowGeometries.Grids.StructuredGrid{G,T},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy = CGEF.Filtering.Deformable(),
+    mask_strategy = CGEF.Filtering.ZeroFill(),
     backend = CGEF.ComputationalBackends.AutoBackend(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     M, N = size(FlowGeometries.Grids.mask(grid))   # CGEF layout is [x, y] = [longitude, latitude] = [M, N]

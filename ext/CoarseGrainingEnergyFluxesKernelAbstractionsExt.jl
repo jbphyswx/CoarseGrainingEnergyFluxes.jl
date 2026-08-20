@@ -145,7 +145,7 @@ end
 end
 
 # Device analogue of the threaded ext's `_omt_driver`: apply a caller-supplied closure once per index.
-# `apply_separable_gaussian_nd!` is written against this driver abstraction, so the separable `N`-pass
+# `apply_separable_nd!` is written against this driver abstraction, so the separable `N`-pass
 # engine runs on the device with no separate implementation — the passes stay ordered because each
 # kernel launch is synchronized before the next.
 @kernel function _cgef_driver_kernel!(f, indices)
@@ -499,10 +499,10 @@ end
 
 function CGEF.Filtering.prepare_workspace(
     b::CGEF.ComputationalBackends.GPUBackend, grid::FlowGeometries.Grids.AbstractGrid,
-    fp::CGEF.Filtering.SeparableGaussianFootprintND{N,T},
+    fp::CGEF.Filtering.SeparableFootprintND{N,T},
 ) where {N, T<:AbstractFloat}
     dev = b.backend
-    return GPUSeparableND(CGEF.Filtering.SeparableGaussianFootprintND(
+    return GPUSeparableND(CGEF.Filtering.SeparableFootprintND(
         map(g -> move(dev, g), fp.g), fp.lim, fp.periodic,
         fp.profiles === nothing ? nothing : map(pv -> move(dev, pv), fp.profiles),
         fp.invrenorm === nothing ? nothing : move(dev, fp.invrenorm),
@@ -549,7 +549,7 @@ end
 
 function CGEF.Filtering.prepare_workspace(
     b::CGEF.ComputationalBackends.GPUBackend, grid::FlowGeometries.Grids.AbstractGrid,
-    fp::CGEF.Filtering.SeparableGaussianFootprint{T},
+    fp::CGEF.Filtering.SeparableFootprint{T},
 ) where {T<:AbstractFloat}
     dev = b.backend
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
@@ -652,7 +652,7 @@ end
 
 function _run_gpu_kernel!(dev, out, field, ws::GPUSeparableND, grid, periodic_x::Bool, periodic_y::Bool, is_zerofill::Bool)
     strategy = is_zerofill ? CGEF.Filtering.ZeroFill() : CGEF.Filtering.Deformable()
-    CGEF.Filtering.apply_separable_gaussian_nd!(out, field, grid, ws.fp, strategy, GPUDriver(dev))
+    CGEF.Filtering.apply_separable_nd!(out, field, grid, ws.fp, strategy, GPUDriver(dev))
 end
 
 function _run_gpu_kernel!(dev, out, field, ws::GPUFootprintND, grid, periodic_x::Bool, periodic_y::Bool, is_zerofill::Bool)

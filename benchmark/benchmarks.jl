@@ -41,7 +41,7 @@ let
 
     scales = collect(6_000.0:2_000.0:12_000.0)
     plans = [CGEF.Filtering.plan_filter(grid, ker, s) for s in scales]
-    result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = ker)
+    result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = ker, spectrum = false)
     SUITE["coarse_grain!/tophat/128x128/4-scales/plans-held"] =
         BenchmarkTools.@benchmarkable CGEF.Pipeline.coarse_grain!(
             $result, $u, $v, $grid; scales = $scales, kernel = $ker,

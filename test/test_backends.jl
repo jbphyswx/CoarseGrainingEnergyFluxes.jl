@@ -173,13 +173,13 @@ Test.@testset "Backends" begin
     CGEF.Filtering.filter_field!(out_mpi, field, grid, CGEF.TopHatKernel(), 5000.0; backend = CGEF.ComputationalBackends.MPIBackend())
     Test.@test out_mpi ≈ out_serial
 
-    # SeparableGaussianFootprint's own native two-phase MPI implementation (redundant
+    # SeparableFootprint's own native two-phase MPI implementation (redundant
     # zero-communication row-pass + round-robin column-pass + Allreduce) — a single rank still
     # exercises the real code path (not a serial fallback), unlike the plain TopHat case above
     # which never reaches the separable-Gaussian branch at all.
     grid_range = FG.Grids.StructuredGrid(geom, 0.0:1000.0:20e3, 0.0:1000.0:20e3, trues(length(x), length(y)))
     gplan_check = CGEF.Filtering.build_footprint(grid_range, CGEF.GaussianKernel(), 5000.0)
-    Test.@test gplan_check isa CGEF.Filtering.SeparableGaussianFootprint
+    Test.@test gplan_check isa CGEF.Filtering.SeparableFootprint
     mask_g = trues(length(x), length(y)); mask_g[5:8, 5:8] .= false
     grid_g = FG.Grids.StructuredGrid(geom, 0.0:1000.0:20e3, 0.0:1000.0:20e3, mask_g)
     field_g = rand(length(x), length(y))
@@ -294,10 +294,10 @@ Test.@testset "Distributed backend" begin
     CGEF.Filtering.filter_field!(od, u, grid, CGEF.TopHatKernel(), 5000.0; backend = CGEF.ComputationalBackends.DistributedBackend())
     Test.@test od ≈ os
 
-    # SeparableGaussianFootprint's own native two-phase Distributed implementation
+    # SeparableFootprint's own native two-phase Distributed implementation
     # (SharedArray-backed row-pass then column-pass, zero extra communication).
     gplan_check = CGEF.Filtering.build_footprint(FG.Grids.StructuredGrid(geom, 0.0:1000.0:30e3, 0.0:1000.0:30e3, trues(length(x), length(y))), CGEF.GaussianKernel(), 5000.0)
-    Test.@test gplan_check isa CGEF.Filtering.SeparableGaussianFootprint
+    Test.@test gplan_check isa CGEF.Filtering.SeparableFootprint
     for strat in (CGEF.Filtering.Deformable(), CGEF.Filtering.ZeroFill())
         os_g = zeros(size(u)); od_g = zeros(size(u))
         CGEF.Filtering.filter_field!(os_g, u, grid, CGEF.GaussianKernel(), 5000.0; backend = CGEF.ComputationalBackends.SerialBackend(), mask_strategy = strat)
@@ -325,10 +325,10 @@ Test.@testset "GPU backend (KernelAbstractions CPU)" begin
         Test.@test og ≈ os
     end
 
-    # SeparableGaussianFootprint's own native two-phase GPU implementation (row-pass kernel,
+    # SeparableFootprint's own native two-phase GPU implementation (row-pass kernel,
     # then column-pass kernel, with a device-resident intermediate buffer between them).
     gplan_check = CGEF.Filtering.build_footprint(FG.Grids.StructuredGrid(geom, 0.0:1000.0:20e3, 0.0:1000.0:20e3, trues(length(x), length(y))), CGEF.GaussianKernel(), 5000.0)
-    Test.@test gplan_check isa CGEF.Filtering.SeparableGaussianFootprint
+    Test.@test gplan_check isa CGEF.Filtering.SeparableFootprint
     for strat in (CGEF.Filtering.Deformable(), CGEF.Filtering.ZeroFill())
         os_g = zeros(size(u)); og_g = zeros(size(u))
         CGEF.Filtering.filter_field!(os_g, u, grid, CGEF.GaussianKernel(), 5000.0; backend = CGEF.ComputationalBackends.SerialBackend(), mask_strategy = strat)
@@ -401,19 +401,21 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
     scales = [4e3, 8e3]
     Ns = length(scales)
 
-    same(a, b) = a.Π == b.Π && a.cumulative_energy == b.cumulative_energy &&
-                 a.filtering_spectrum == b.filtering_spectrum && a.scales == b.scales
+    # `isequal`, not `==`: with `spectrum = false` (below) `filtering_spectrum` is all `NaN`, and
+    # `NaN == NaN` is false while `isequal(NaN, NaN)` is true. Every other field compares identically.
+    same(a, b) = isequal(a.Π, b.Π) && isequal(a.cumulative_energy, b.cumulative_energy) &&
+                 isequal(a.filtering_spectrum, b.filtering_spectrum) && isequal(a.scales, b.scales)
 
     Nt = 4
     u = randn(N, N, Nt)
     v = randn(N, N, Nt)
     refs = [P._allocate_result(g, Ns) for _ in 1:Nt]
     for t in 1:Nt
-        P.coarse_grain!(refs[t], view(u, :, :, t), view(v, :, :, t), g; scales = scales, backend = SER)
+        P.coarse_grain!(refs[t], view(u, :, :, t), view(v, :, :, t), g; scales = scales, spectrum = false, backend = SER)
     end
     for be in (SER, CB.ThreadedBackend(), CB.AutoBackend())
         b = P.CoarseGrainBatchResult(g, Ns, (Nt,))
-        P.coarse_grain_batch!(b, u, v, g; scales = scales, backend = be)
+        P.coarse_grain_batch!(b, u, v, g; scales = scales, spectrum = false, backend = be)
         for t in 1:Nt
             Test.@test same(b.slices[t], refs[t])
         end
@@ -432,39 +434,49 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
     u4 = randn(N, N, Nz, Nt2)
     v4 = randn(N, N, Nz, Nt2)
     b4 = P.CoarseGrainBatchResult(g, Ns, (Nz, Nt2))
-    P.coarse_grain_batch!(b4, u4, v4, g; scales = scales, backend = CB.ThreadedBackend())
+    P.coarse_grain_batch!(b4, u4, v4, g; scales = scales, spectrum = false, backend = CB.ThreadedBackend())
     Test.@test size(b4.Π) == (N, N, Ns, Nz, Nt2)
     for (i, J) in enumerate(CartesianIndices((Nz, Nt2)))
         r = P._allocate_result(g, Ns)
         P.coarse_grain!(r, view(u4, :, :, J[1], J[2]), view(v4, :, :, J[1], J[2]), g;
-                        scales = scales, backend = SER)
+                        scales = scales, spectrum = false, backend = SER)
         Test.@test same(b4.slices[i], r)
     end
 
     let npool = max(1, min(Nt, Threads.nthreads()))
         wss = [CGEF.Diagnostics.ΠWorkspace(g) for _ in 1:npool]
         fps = [[CGEF.Filtering.plan_filter(g, CGEF.TopHatKernel(), s;
-                                           backend = SER, mask_strategy = CGEF.Filtering.Deformable())
+                                           backend = SER, mask_strategy = CGEF.Filtering.ZeroFill())
                 for s in scales] for _ in 1:npool]
         dps = [CGEF.Derivatives.StencilPlan(g) for _ in 1:npool]
-        kw = (; scales = scales, workspaces = wss, filter_plans = fps, deriv_plans = dps, backend = SER)
+        kw = (; scales = scales, workspaces = wss, filter_plans = fps, deriv_plans = dps, backend = SER,
+              spectrum = false)
         b = P.CoarseGrainBatchResult(g, Ns, (Nt,))
         P.coarse_grain_batch!(b, u, v, g; kw...)
         Test.@test _alloc_coarse_grain_batch!(b, u, v, g, kw) == 0
         for t in 1:Nt
             Test.@test same(b.slices[t], refs[t])
         end
-        # Pools are indexed by worker, so unequal lengths must error rather than alias scratch.
+        # Pools are indexed by worker, so unequal lengths must error rather than alias scratch. The
+        # two lengths are made to differ by construction — deriving one from `Threads.nthreads()`
+        # makes the assertion vacuous whenever the pool is a single entry.
         Test.@test_throws DimensionMismatch P.coarse_grain_batch!(
-            b, u, v, g; scales = scales, workspaces = wss, deriv_plans = dps[1:1], backend = SER,
+            b, u, v, g; scales = scales, spectrum = false, backend = SER,
+            workspaces = [CGEF.Diagnostics.ΠWorkspace(g), CGEF.Diagnostics.ΠWorkspace(g)],
+            deriv_plans = [CGEF.Derivatives.StencilPlan(g)],
+        )
+        # An empty pool is a distinct error, and it too must not depend on the thread count.
+        Test.@test_throws ArgumentError P.coarse_grain_batch!(
+            b, u, v, g; scales = scales, spectrum = false, backend = SER,
+            workspaces = typeof(CGEF.Diagnostics.ΠWorkspace(g))[],
         )
     end
 
     # The grid fixes the spatial rank; everything past it is batch, and a mismatch is an error.
     let b = P.CoarseGrainBatchResult(g, Ns, (Nt,))
-        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N, N, Nt + 1), v, g; scales = scales)
-        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N + 1, N, Nt), v, g; scales = scales)
-        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N, N), randn(N, N), g; scales = scales)
+        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N, N, Nt + 1), v, g; scales = scales, spectrum = false)
+        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N + 1, N, Nt), v, g; scales = scales, spectrum = false)
+        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N, N), randn(N, N), g; scales = scales, spectrum = false)
     end
 
     # Ragged batch: a grid per slice, so results cannot be views into one shared tensor.
@@ -474,16 +486,16 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
     us = [randn(16, 16), randn(24, 24), randn(16, 16)]
     vs = [randn(16, 16), randn(24, 24), randn(16, 16)]
     Test.@test_throws DimensionMismatch P.coarse_grain_slices!(
-        [P._allocate_result(gg, Ns) for gg in grids], us, vs[1:2], grids; scales = scales,
+        [P._allocate_result(gg, Ns) for gg in grids], us, vs[1:2], grids; scales = scales, spectrum = false,
     )
     # Longest-first scheduling reads this ordering: points x scales, largest slice dispatched first.
     Test.@test P.slice_pipeline_costs(grids, Ns) == [16 * 16 * Ns, 24 * 24 * Ns, 16 * 16 * Ns]
     for be in (SER, CB.ThreadedBackend())
         rr = [P._allocate_result(gg, Ns) for gg in grids]
-        P.coarse_grain_slices!(rr, us, vs, grids; scales = scales, backend = be)
+        P.coarse_grain_slices!(rr, us, vs, grids; scales = scales, spectrum = false, backend = be)
         for t in eachindex(grids)
             r = P._allocate_result(grids[t], Ns)
-            P.coarse_grain!(r, us[t], vs[t], grids[t]; scales = scales, backend = SER)
+            P.coarse_grain!(r, us[t], vs[t], grids[t]; scales = scales, spectrum = false, backend = SER)
             Test.@test same(rr[t], r)
         end
     end
@@ -493,9 +505,9 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
         uu = [u[:, :, 1], u[:, :, 2], u[:, :, 3]],
         vv = [v[:, :, 1], v[:, :, 2], v[:, :, 3]]
         rr = [P._allocate_result(g, Ns) for _ in 1:3]
-        P.coarse_grain_slices!(rr, uu, vv, gg; scales = scales, backend = SER)
+        P.coarse_grain_slices!(rr, uu, vv, gg; scales = scales, spectrum = false, backend = SER)
         bb = P.CoarseGrainBatchResult(g, Ns, (3,))
-        P.coarse_grain_batch!(bb, u[:, :, 1:3], v[:, :, 1:3], g; scales = scales, backend = SER)
+        P.coarse_grain_batch!(bb, u[:, :, 1:3], v[:, :, 1:3], g; scales = scales, spectrum = false, backend = SER)
         for t in 1:3
             Test.@test same(rr[t], bb.slices[t])
         end
@@ -505,19 +517,32 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
     Nlev = 4
     u3 = randn(N, N, Nlev)
     v3 = randn(N, N, Nlev)
-    bp = P.coarse_grain_profile(u3, v3, g; scales = scales, backend = SER)
+    bp = P.coarse_grain_profile(u3, v3, g; scales = scales, spectrum = false, backend = SER)
     Test.@test size(bp.Π) == (N, N, Ns, Nlev)
     Test.@test size(bp.cumulative_energy) == (Ns, Nlev)
     for k in 1:Nlev
         # Independent reference: the plain 2D pipeline on that level's slice. Equality is what shows
         # E(ℓ) is read out of the workspace during the flux pass instead of by filtering u,v again.
-        r = P.coarse_grain(view(u3, :, :, k), view(v3, :, :, k), g; scales = scales, backend = SER)
+        r = P.coarse_grain(view(u3, :, :, k), view(v3, :, :, k), g; scales = scales, spectrum = false, backend = SER)
         Test.@test bp.slices[k].Π == r.Π
         Test.@test bp.slices[k].cumulative_energy == r.cumulative_energy
-        Test.@test bp.slices[k].filtering_spectrum == r.filtering_spectrum
+        Test.@test isequal(bp.slices[k].filtering_spectrum, r.filtering_spectrum)
+    end
+
+    # The spectral density itself, through the batch path, on a kernel that can carry one. This is the
+    # `spectrum = false` runs above with the flag flipped, so it gates the density fill per slice — the
+    # one part of the result those runs deliberately leave as NaN.
+    let kg = CGEF.GaussianKernel()
+        bg = P.coarse_grain_profile(u3, v3, g; scales = scales, kernel = kg, backend = SER)
+        for k in 1:Nlev
+            r = P.coarse_grain(view(u3, :, :, k), view(v3, :, :, k), g;
+                               scales = scales, kernel = kg, backend = SER)
+            Test.@test bg.slices[k].filtering_spectrum == r.filtering_spectrum
+            Test.@test all(isfinite, r.filtering_spectrum)
+        end
     end
     let bt = P.CoarseGrainBatchResult(g, Ns, (Nlev,))
-        P.coarse_grain_profile!(bt, u3, v3, g; scales = scales, backend = CB.ThreadedBackend())
+        P.coarse_grain_profile!(bt, u3, v3, g; scales = scales, spectrum = false, backend = CB.ThreadedBackend())
         Test.@test bt.Π == bp.Π
         Test.@test bt.cumulative_energy == bp.cumulative_energy
     end
@@ -748,12 +773,16 @@ Test.@testset "Batch-native flux path: compute_Π!, energy_from_filtered!, GPU d
         u = randn(N, N, Nb)
         v = randn(N, N, Nb)
         refs = [P._allocate_result(g, Ns) for _ in 1:Nb]
+        # A Gaussian, so the density is genuinely filled and the batch-native driver's own
+        # per-slice spectrum loop is compared rather than skipped.
+        kg = CGEF.GaussianKernel()
         for t in 1:Nb
             P.coarse_grain!(refs[t], view(u, :, :, t), view(v, :, :, t), g;
-                            scales = scales, backend = CB.SerialBackend())
+                            scales = scales, kernel = kg, backend = CB.SerialBackend())
         end
         b = P.CoarseGrainBatchResult(g, Ns, (Nb,))
-        P.coarse_grain_batch!(b, u, v, g; scales = scales, backend = CB.GPUBackend(KA.CPU()))
+        P.coarse_grain_batch!(b, u, v, g; scales = scales, kernel = kg,
+                              backend = CB.GPUBackend(KA.CPU()))
         for t in 1:Nb
             Test.@test b.slices[t].Π == refs[t].Π
             Test.@test b.slices[t].cumulative_energy == refs[t].cumulative_energy
