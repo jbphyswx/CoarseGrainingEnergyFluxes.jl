@@ -33,7 +33,7 @@ u = randn(N, N); v = randn(N, N)
 
 scales = collect(10e3:10e3:60e3)
 result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel(),
-                           spectrum = false)
+                           spectrum = CGEF.Diagnostics.NoSpectrum())
 
 println("\nscale [km]   coarse-KE         mean|Π|")
 for (k, ℓ) in enumerate(scales)
