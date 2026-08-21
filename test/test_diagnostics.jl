@@ -23,7 +23,7 @@ Test.@testset "Diagnostics & Pipeline" begin
     Test.@test Π[11, 11] ≈ 0.0 atol=1e-12
 
     # Test Pipeline integration with unicode Π
-    res = CGEF.coarse_grain(u, v, grid; scales=[10000.0], kernel=CGEF.TopHatKernel(), spectrum = false)
+    res = CGEF.coarse_grain(u, v, grid; scales=[10000.0], kernel=CGEF.TopHatKernel(), spectrum = CGEF.Diagnostics.NoSpectrum())
     Test.@test res.Π[:, :, 1] ≈ Π
 
     # Test Spherical projections and coarse graining with mixed types
@@ -603,15 +603,30 @@ Test.@testset "filtering spectrum: only kernels with monotone |Ĝ|² are admitte
     # No fallback method: a new kernel must state which way it goes rather than inherit a guess.
     Test.@test_throws MethodError K.transfer_monotone(nothing)
 
-    # The top-hat's |Ĝ|² really is non-monotone — the trait is measured, not asserted. The lobe is at
-    # kℓ ≈ 8.8, so sample past it. (`spectral_transfer` for the top-hat lives in the SpecialFunctions
-    # extension, which the suite loads.)
+    # The top-hat's |Ĝ|² really is non-monotone — the trait is measured, not asserted.
+    # (`spectral_transfer` for the top-hat lives in the SpecialFunctions extension, which the suite
+    # loads.)
     let ℓ = 1.0, ks = range(0.1, 12.0; length = 4000)
         g2(kern) = [K.spectral_transfer(kern, k, ℓ)^2 for k in ks]
         rises(v) = maximum(diff(v))
         Test.@test rises(g2(CGEF.TopHatKernel())) > 1e-6      # genuinely increases somewhere
         Test.@test rises(g2(CGEF.GaussianKernel())) <= 0      # never increases
         Test.@test rises(g2(CGEF.SharpSpectralKernel())) <= 0
+    end
+
+    # HOW non-monotone, in sampling-independent terms — this is what justifies offering `ForceSpectrum`
+    # at all, so it is gated rather than asserted in prose. A per-step `diff` scales with the sampling
+    # and cannot stand in for it: the climb from the first zero of Ĝ = 2J₁(kR)/(kR) up to the first
+    # Airy sidelobe is the physical quantity, and it is under 2% of the DC value.
+    let ℓ = 1.0, ks = range(0.1, 12.0; length = 40_000)
+        g2 = [K.spectral_transfer(CGEF.TopHatKernel(), k, ℓ)^2 for k in ks]
+        izero = argmin(g2)                              # first zero of Ĝ
+        ipeak = izero - 1 + argmax(@view g2[izero:end]) # first sidelobe past it
+        Test.@test 7.5 < ks[izero] < 7.8                # measured 7.663
+        Test.@test 10.1 < ks[ipeak] < 10.4              # measured 10.271
+        Test.@test 0.017 < g2[ipeak] < 0.018            # measured 0.01750
+        # and it never exceeds the DC value, unlike HighOrderKernel's |Ĝ|², which reaches 1.0124
+        Test.@test maximum(g2) <= 1.0
     end
 
     geom = FG.Geometry.CartesianGeometry()
@@ -665,9 +680,9 @@ Test.@testset "filtering spectrum: only kernels with monotone |Ĝ|² are admitte
         )
     end
 
-    # `spectrum = false` is the explicit opt-out: Π and the cumulative energy are computed as usual and
+    # `NoSpectrum()` is the explicit opt-out: Π and the cumulative energy are computed as usual and
     # the density is left as NaN, which cannot be mistaken for a number that was computed.
-    rf = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = false)
+    rf = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum())
     Test.@test all(isfinite, rf.Π)
     Test.@test all(isfinite, rf.cumulative_energy)
     Test.@test all(isnan, rf.filtering_spectrum)
@@ -675,4 +690,106 @@ Test.@testset "filtering spectrum: only kernels with monotone |Ĝ|² are admitte
     rg = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel())
     Test.@test all(isfinite, rg.filtering_spectrum)
     Test.@test size(rg.Π) == size(rf.Π)
+end
+
+# ---------------------------------------------------------------------------
+# The monotonicity condition is SUFFICIENT, not necessary, so the strict reading is the default rather
+# than the only one. `ForceSpectrum` must produce exactly the density the gate was withholding — not a
+# different or regularized one — and must warn without changing any other field.
+# ---------------------------------------------------------------------------
+Test.@testset "spectrum policy: strict / force / off" begin
+    D = CGEF.Diagnostics
+    geom = FG.Geometry.CartesianGeometry()
+    N = 40
+    xs = 0.0:1000.0:(N - 1) * 1000.0
+    grid = FG.Grids.StructuredGrid(geom, xs, xs)
+    u = [sin(2π * 3 * i / N) * cos(2π * 2 * j / N) + 0.4sin(2π * 7 * i / N) for i in 1:N, j in 1:N]
+    v = [cos(2π * 2 * i / N) * sin(2π * 5 * j / N) + 0.3cos(2π * 6 * j / N) for i in 1:N, j in 1:N]
+    scales = collect(4e3:2e3:16e3)
+    th = CGEF.TopHatKernel()
+    ga = CGEF.GaussianKernel()
+
+    # The policy is a singleton-type lattice, the same idiom as AbstractMaskStrategy — not a Symbol and
+    # not a Bool, so a typo is a MethodError at the call rather than a silently wrong mode.
+    Test.@test D.StrictSpectrum() isa D.AbstractSpectrumPolicy
+    Test.@test D.ForceSpectrum() isa D.AbstractSpectrumPolicy
+    Test.@test D.NoSpectrum() isa D.AbstractSpectrumPolicy
+    Test.@test_throws TypeError CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = false)
+    Test.@test_throws TypeError CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = :force)
+
+    # `gate_spectrum` is the whole decision: throw / warn-and-compute / skip.
+    Test.@test D.gate_spectrum(ga, D.StrictSpectrum())
+    Test.@test_throws ArgumentError D.gate_spectrum(th, D.StrictSpectrum())
+    Test.@test !D.gate_spectrum(th, D.NoSpectrum())
+    Test.@test !D.gate_spectrum(ga, D.NoSpectrum())
+    Test.@test D.gate_spectrum(th, D.ForceSpectrum())
+
+    # The strict error has to name every way forward, or it is the veto the policy exists to remove.
+    err = try
+        D.filtering_spectrum(u, v, nothing, grid, th, scales)
+        nothing
+    catch e
+        e
+    end
+    Test.@test err isa ArgumentError
+    for recourse in ("ForceSpectrum", "NoSpectrum", "GaussianKernel", "cumulative_energy")
+        Test.@test occursin(recourse, err.msg)
+    end
+
+    # THE substantive assertion: forcing yields exactly the density the strict gate was withholding.
+    # `spectral_density` is ungated, so the reference is computable independently of the policy — if
+    # `ForceSpectrum` ever became a different computation, this catches it.
+    cum = D.cumulative_energy(u, v, nothing, grid, th, scales)
+    kℓ = 1.0 ./ scales
+    ref = D.spectral_density(cum, kℓ)
+    kf, Ẽf = Test.@test_logs (:warn, r"not monotone decreasing") match_mode = :any D.filtering_spectrum(
+        u, v, nothing, grid, th, scales; policy = D.ForceSpectrum())
+    Test.@test kf == kℓ
+    Test.@test Ẽf == ref
+    Test.@test all(isfinite, Ẽf)
+
+    # For this field and scale range the forced density is in fact positive throughout — the concrete
+    # case the strict default would have refused outright.
+    Test.@test all(>(0), Ẽf)
+
+    # A monotone kernel takes the identical path under `ForceSpectrum` and must NOT warn: the warning
+    # is about the kernel, not about having asked to force.
+    kg, Ẽg = Test.@test_logs min_level = Logging.Warn D.filtering_spectrum(
+        u, v, nothing, grid, ga, scales; policy = D.ForceSpectrum())
+    kd, Ẽd = D.filtering_spectrum(u, v, nothing, grid, ga, scales)
+    Test.@test kg == kd && Ẽg == Ẽd
+
+    # `NoSpectrum` returns the right shape rather than a short vector, so a caller indexing per scale
+    # still works and simply sees NaN.
+    kn, Ẽn = D.filtering_spectrum(u, v, nothing, grid, th, scales; policy = D.NoSpectrum())
+    Test.@test kn == kℓ
+    Test.@test length(Ẽn) == length(scales) && all(isnan, Ẽn)
+
+    # The pipeline agrees with the diagnostic under every policy, and only `filtering_spectrum` moves:
+    # Π and the cumulative energy are bit-identical across all three.
+    rF = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = th, spectrum = D.ForceSpectrum())
+    rN = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = th, spectrum = D.NoSpectrum())
+    Test.@test rF.filtering_spectrum == ref
+    Test.@test rF.Π == rN.Π
+    Test.@test rF.cumulative_energy == rN.cumulative_energy
+    Test.@test all(isnan, rN.filtering_spectrum)
+
+    # Every batch entry point honours the policy too — the strict gate is not a property of the
+    # single-slice driver, and neither is the escape from it.
+    let Nt = 2, ub = repeat(u, 1, 1, Nt), vb = repeat(v, 1, 1, Nt)
+        b = CGEF.Pipeline.CoarseGrainBatchResult(grid, length(scales), (Nt,))
+        CGEF.Pipeline.coarse_grain_batch!(b, ub, vb, grid; scales = scales, kernel = th,
+                                          spectrum = D.ForceSpectrum())
+        for t in 1:Nt
+            Test.@test b.slices[t].filtering_spectrum == ref
+        end
+        CGEF.Pipeline.coarse_grain_batch!(b, ub, vb, grid; scales = scales, kernel = th,
+                                          spectrum = D.NoSpectrum())
+        Test.@test all(isnan, b.filtering_spectrum)
+
+        rs = [CGEF.Pipeline._allocate_result(grid, length(scales)) for _ in 1:Nt]
+        CGEF.Pipeline.coarse_grain_slices!(rs, [u, u], [v, v], [grid, grid]; scales = scales,
+                                           kernel = th, spectrum = D.ForceSpectrum())
+        Test.@test all(r -> r.filtering_spectrum == ref, rs)
+    end
 end

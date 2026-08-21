@@ -188,10 +188,14 @@ another code therefore means nothing unless the conventions have been matched fi
   precisely the 2-D enstrophy-range target slope, so this bites hardest in QG work. `Π` is unaffected;
   the ceiling is a property of the spectrum diagnostic alone.
 - **Positive-definiteness.** `Ẽ(k_ℓ) ≥ 0` is guaranteed (their Eq. 21) only when `d|Ĝ(k)|²/dk ≤ 0` on
-  `(0, ∞)`. The Gaussian and sharp-spectral kernels satisfy it; the top-hat does not — its `|Ĝ|²`
-  rises again by `+0.0026` near `kℓ ≈ 8.8`. [`Diagnostics.filtering_spectrum`](@ref) and
-  [`coarse_grain`](@ref) therefore refuse a non-conforming kernel rather than return a density that
-  may go negative; see [`Kernels.transfer_monotone`](@ref).
+  `(0, ∞)`. The Gaussian and sharp-spectral kernels satisfy it; the top-hat does not — `Ĝ = 2J₁(kR)/(kR)`
+  falls to zero at `kℓ ≈ 7.66` and its `|Ĝ|²` then climbs back to `0.0175` at `kℓ ≈ 10.27`, the first
+  Airy sidelobe, with later ones at `0.0042` and `0.0016`. The condition is **sufficient, not
+  necessary**, and the violation here is under 2% of the DC value and confined to the far sub-filter
+  tail, so [`Diagnostics.filtering_spectrum`](@ref) and [`coarse_grain`](@ref) default to refusing a
+  non-conforming kernel but do not make it unreachable: `Diagnostics.ForceSpectrum()` computes the
+  density anyway and leaves the sign check to the caller. See
+  [`Diagnostics.AbstractSpectrumPolicy`](@ref) and [`Kernels.transfer_monotone`](@ref).
 
 ## Decompositions
 

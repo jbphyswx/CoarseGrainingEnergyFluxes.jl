@@ -391,7 +391,7 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
         pplans = [CGEF.Filtering.plan_filter(grid, ker, s; backend = SERIAL) for s in scales]
         pbatch = CGEF.Pipeline.CoarseGrainBatchResult(grid, length(scales), (Nz,))
         pkw = (; scales = scales, kernel = ker, workspaces = [ws], filter_plans = [pplans],
-               deriv_plans = [dpg], backend = SERIAL, spectrum = false)
+               deriv_plans = [dpg], backend = SERIAL, spectrum = CGEF.Diagnostics.NoSpectrum())
         CGEF.Pipeline.coarse_grain_profile!(pbatch, u3, v3, grid; pkw...)
         CGEF.Pipeline.coarse_grain_profile!(pbatch, u3, v3, grid; pkw...)
         a_profile = @allocated CGEF.Pipeline.coarse_grain_profile!(pbatch, u3, v3, grid; pkw...)
@@ -399,24 +399,24 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
 
         # coarse_grain!: workspace + filter_plans prebuilt and reused (the documented "repeated
         # timestep sweep" zero-allocation entry point).
-        result = CGEF.coarse_grain(u, v, grid; backend = SERIAL, scales = scales, kernel = ker, spectrum = false)
+        result = CGEF.coarse_grain(u, v, grid; backend = SERIAL, scales = scales, kernel = ker, spectrum = CGEF.Diagnostics.NoSpectrum())
         plans = [CGEF.Filtering.plan_filter(grid, ker, Float64(s); backend = SERIAL) for s in scales]
-        CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, filter_plans = plans, deriv_plan = dpg, spectrum = false)
-        CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, filter_plans = plans, deriv_plan = dpg, spectrum = false)
-        a_cg = @allocated CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, filter_plans = plans, deriv_plan = dpg, spectrum = false)
+        CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, filter_plans = plans, deriv_plan = dpg, spectrum = CGEF.Diagnostics.NoSpectrum())
+        CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, filter_plans = plans, deriv_plan = dpg, spectrum = CGEF.Diagnostics.NoSpectrum())
+        a_cg = @allocated CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, filter_plans = plans, deriv_plan = dpg, spectrum = CGEF.Diagnostics.NoSpectrum())
         Test.@test a_cg == 0
 
         # Sanity: zero is a real result, not a vacuous one — WITHOUT prebuilt filter_plans the same
         # call rebuilds `Nscales` footprints and allocates. (A ratio against `a_cg` would say nothing
         # now that it is zero.)
-        a_cg_noplans = @allocated CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, deriv_plan = dpg, spectrum = false)
+        a_cg_noplans = @allocated CGEF.Pipeline.coarse_grain!(result, u, v, grid; backend = SERIAL, scales = scales, kernel = ker, workspace = ws, deriv_plan = dpg, spectrum = CGEF.Diagnostics.NoSpectrum())
         Test.@test a_cg_noplans > 10_000
 
         # coarse_grain_profile (allocating) sizes and fills a fresh batch result every call, so it is
         # bounded by the OUTPUT size, not asserted small. The zero-allocation contract belongs to
         # `coarse_grain_profile!` above, which refills a held batch.
         ppool = (; scales = scales, kernel = ker, workspaces = [ws], filter_plans = [plans],
-                 deriv_plans = [dpg], backend = SERIAL, spectrum = false)
+                 deriv_plans = [dpg], backend = SERIAL, spectrum = CGEF.Diagnostics.NoSpectrum())
         CGEF.Pipeline.coarse_grain_profile(u3, v3, grid; ppool...)
         CGEF.Pipeline.coarse_grain_profile(u3, v3, grid; ppool...)
         a_cgp = @allocated CGEF.Pipeline.coarse_grain_profile(u3, v3, grid; ppool...)

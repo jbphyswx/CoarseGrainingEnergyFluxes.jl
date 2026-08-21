@@ -144,7 +144,7 @@ Test.@testset "CurvilinearGrid (WLSQ / areas / pipeline)" begin
                1e-9 * maximum(abs.(Πs)) + 1e-12
 
     res = CGEF.coarse_grain(uu, vv, cgrid; scales=[8.0, 12.0], kernel=CGEF.TopHatKernel(),
-                            spectrum = false)
+                            spectrum = CGEF.Diagnostics.NoSpectrum())
     Test.@test size(res.Π, 3) == 2
     Test.@test res.Π[:, :, 1] ≈ Πc
     Test.@test !any(isnan, res.cumulative_energy)

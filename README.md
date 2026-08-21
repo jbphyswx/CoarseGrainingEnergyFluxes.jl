@@ -83,8 +83,8 @@ The scalar analogue of Π (buoyancy ⇒ available-potential-energy transfer).
 
 ![Tracer flux](docs/src/assets/tracer_flux.png)
 
-### Masking: deformable vs zero-fill
-The deformable kernel renormalizes over active cells; the difference between strategies is concentrated at the mask boundary.
+### Masking: zero-fill vs deformable
+`ZeroFill` is the default: masked cells contribute nothing and the kernel stays position-independent, so filtering commutes with spatial derivatives — the step the flux budget is derived by. `Deformable` renormalizes over the locally-active area instead, reproducing constants exactly next to a boundary at the cost of that commutation. The two differ only within ≈ℓ of the mask, where results are contaminated under either choice.
 
 ![Masking](docs/src/assets/masking.png)
 
@@ -135,7 +135,7 @@ grid = FG.Grids.StructuredGrid(geom, lon_rad, lat_rad, mask)
 # Run multi-scale analysis
 scales = collect(10e3:10e3:300e3)  # 10 km to 300 km
 result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel(),
-                           spectrum = false)
+                           spectrum = CGEF.Diagnostics.NoSpectrum())
 
 # result.Π                 — (Nlon, Nlat, Nscales) stacked flux array; result.Π[:, :, i] at scales[i]
 # result.cumulative_energy — ½ρ₀⟨|ū_ℓ|²⟩ per scale (Sadek–Aluie Eq. 15)

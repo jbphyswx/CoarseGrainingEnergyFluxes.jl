@@ -196,7 +196,7 @@ Test.@testset "1D and singleton-dimension StructuredGrid" begin
     Test.@test all(isfinite, Π1)
 
     res1 = CGEF.coarse_grain(u1, grid1d; scales = [2000.0, 3000.0], kernel = CGEF.TopHatKernel(),
-                             spectrum = false)
+                             spectrum = CGEF.Diagnostics.NoSpectrum())
     Test.@test size(res1.Π) == (length(x1), 2)
     Test.@test !any(isnan, res1.cumulative_energy)
 

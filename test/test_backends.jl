@@ -401,7 +401,7 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
     scales = [4e3, 8e3]
     Ns = length(scales)
 
-    # `isequal`, not `==`: with `spectrum = false` (below) `filtering_spectrum` is all `NaN`, and
+    # `isequal`, not `==`: under `NoSpectrum()` (below) `filtering_spectrum` is all `NaN`, and
     # `NaN == NaN` is false while `isequal(NaN, NaN)` is true. Every other field compares identically.
     same(a, b) = isequal(a.Π, b.Π) && isequal(a.cumulative_energy, b.cumulative_energy) &&
                  isequal(a.filtering_spectrum, b.filtering_spectrum) && isequal(a.scales, b.scales)
@@ -411,11 +411,11 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
     v = randn(N, N, Nt)
     refs = [P._allocate_result(g, Ns) for _ in 1:Nt]
     for t in 1:Nt
-        P.coarse_grain!(refs[t], view(u, :, :, t), view(v, :, :, t), g; scales = scales, spectrum = false, backend = SER)
+        P.coarse_grain!(refs[t], view(u, :, :, t), view(v, :, :, t), g; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = SER)
     end
     for be in (SER, CB.ThreadedBackend(), CB.AutoBackend())
         b = P.CoarseGrainBatchResult(g, Ns, (Nt,))
-        P.coarse_grain_batch!(b, u, v, g; scales = scales, spectrum = false, backend = be)
+        P.coarse_grain_batch!(b, u, v, g; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = be)
         for t in 1:Nt
             Test.@test same(b.slices[t], refs[t])
         end
@@ -434,12 +434,12 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
     u4 = randn(N, N, Nz, Nt2)
     v4 = randn(N, N, Nz, Nt2)
     b4 = P.CoarseGrainBatchResult(g, Ns, (Nz, Nt2))
-    P.coarse_grain_batch!(b4, u4, v4, g; scales = scales, spectrum = false, backend = CB.ThreadedBackend())
+    P.coarse_grain_batch!(b4, u4, v4, g; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = CB.ThreadedBackend())
     Test.@test size(b4.Π) == (N, N, Ns, Nz, Nt2)
     for (i, J) in enumerate(CartesianIndices((Nz, Nt2)))
         r = P._allocate_result(g, Ns)
         P.coarse_grain!(r, view(u4, :, :, J[1], J[2]), view(v4, :, :, J[1], J[2]), g;
-                        scales = scales, spectrum = false, backend = SER)
+                        scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = SER)
         Test.@test same(b4.slices[i], r)
     end
 
@@ -450,7 +450,7 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
                 for s in scales] for _ in 1:npool]
         dps = [CGEF.Derivatives.StencilPlan(g) for _ in 1:npool]
         kw = (; scales = scales, workspaces = wss, filter_plans = fps, deriv_plans = dps, backend = SER,
-              spectrum = false)
+              spectrum = CGEF.Diagnostics.NoSpectrum())
         b = P.CoarseGrainBatchResult(g, Ns, (Nt,))
         P.coarse_grain_batch!(b, u, v, g; kw...)
         Test.@test _alloc_coarse_grain_batch!(b, u, v, g, kw) == 0
@@ -461,22 +461,22 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
         # two lengths are made to differ by construction — deriving one from `Threads.nthreads()`
         # makes the assertion vacuous whenever the pool is a single entry.
         Test.@test_throws DimensionMismatch P.coarse_grain_batch!(
-            b, u, v, g; scales = scales, spectrum = false, backend = SER,
+            b, u, v, g; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = SER,
             workspaces = [CGEF.Diagnostics.ΠWorkspace(g), CGEF.Diagnostics.ΠWorkspace(g)],
             deriv_plans = [CGEF.Derivatives.StencilPlan(g)],
         )
         # An empty pool is a distinct error, and it too must not depend on the thread count.
         Test.@test_throws ArgumentError P.coarse_grain_batch!(
-            b, u, v, g; scales = scales, spectrum = false, backend = SER,
+            b, u, v, g; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = SER,
             workspaces = typeof(CGEF.Diagnostics.ΠWorkspace(g))[],
         )
     end
 
     # The grid fixes the spatial rank; everything past it is batch, and a mismatch is an error.
     let b = P.CoarseGrainBatchResult(g, Ns, (Nt,))
-        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N, N, Nt + 1), v, g; scales = scales, spectrum = false)
-        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N + 1, N, Nt), v, g; scales = scales, spectrum = false)
-        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N, N), randn(N, N), g; scales = scales, spectrum = false)
+        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N, N, Nt + 1), v, g; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum())
+        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N + 1, N, Nt), v, g; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum())
+        Test.@test_throws DimensionMismatch P.coarse_grain_batch!(b, randn(N, N), randn(N, N), g; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum())
     end
 
     # Ragged batch: a grid per slice, so results cannot be views into one shared tensor.
@@ -486,16 +486,16 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
     us = [randn(16, 16), randn(24, 24), randn(16, 16)]
     vs = [randn(16, 16), randn(24, 24), randn(16, 16)]
     Test.@test_throws DimensionMismatch P.coarse_grain_slices!(
-        [P._allocate_result(gg, Ns) for gg in grids], us, vs[1:2], grids; scales = scales, spectrum = false,
+        [P._allocate_result(gg, Ns) for gg in grids], us, vs[1:2], grids; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(),
     )
     # Longest-first scheduling reads this ordering: points x scales, largest slice dispatched first.
     Test.@test P.slice_pipeline_costs(grids, Ns) == [16 * 16 * Ns, 24 * 24 * Ns, 16 * 16 * Ns]
     for be in (SER, CB.ThreadedBackend())
         rr = [P._allocate_result(gg, Ns) for gg in grids]
-        P.coarse_grain_slices!(rr, us, vs, grids; scales = scales, spectrum = false, backend = be)
+        P.coarse_grain_slices!(rr, us, vs, grids; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = be)
         for t in eachindex(grids)
             r = P._allocate_result(grids[t], Ns)
-            P.coarse_grain!(r, us[t], vs[t], grids[t]; scales = scales, spectrum = false, backend = SER)
+            P.coarse_grain!(r, us[t], vs[t], grids[t]; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = SER)
             Test.@test same(rr[t], r)
         end
     end
@@ -505,9 +505,9 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
         uu = [u[:, :, 1], u[:, :, 2], u[:, :, 3]],
         vv = [v[:, :, 1], v[:, :, 2], v[:, :, 3]]
         rr = [P._allocate_result(g, Ns) for _ in 1:3]
-        P.coarse_grain_slices!(rr, uu, vv, gg; scales = scales, spectrum = false, backend = SER)
+        P.coarse_grain_slices!(rr, uu, vv, gg; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = SER)
         bb = P.CoarseGrainBatchResult(g, Ns, (3,))
-        P.coarse_grain_batch!(bb, u[:, :, 1:3], v[:, :, 1:3], g; scales = scales, spectrum = false, backend = SER)
+        P.coarse_grain_batch!(bb, u[:, :, 1:3], v[:, :, 1:3], g; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = SER)
         for t in 1:3
             Test.@test same(rr[t], bb.slices[t])
         end
@@ -517,21 +517,21 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
     Nlev = 4
     u3 = randn(N, N, Nlev)
     v3 = randn(N, N, Nlev)
-    bp = P.coarse_grain_profile(u3, v3, g; scales = scales, spectrum = false, backend = SER)
+    bp = P.coarse_grain_profile(u3, v3, g; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = SER)
     Test.@test size(bp.Π) == (N, N, Ns, Nlev)
     Test.@test size(bp.cumulative_energy) == (Ns, Nlev)
     for k in 1:Nlev
         # Independent reference: the plain 2D pipeline on that level's slice. Equality is what shows
         # E(ℓ) is read out of the workspace during the flux pass instead of by filtering u,v again.
-        r = P.coarse_grain(view(u3, :, :, k), view(v3, :, :, k), g; scales = scales, spectrum = false, backend = SER)
+        r = P.coarse_grain(view(u3, :, :, k), view(v3, :, :, k), g; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = SER)
         Test.@test bp.slices[k].Π == r.Π
         Test.@test bp.slices[k].cumulative_energy == r.cumulative_energy
         Test.@test isequal(bp.slices[k].filtering_spectrum, r.filtering_spectrum)
     end
 
     # The spectral density itself, through the batch path, on a kernel that can carry one. This is the
-    # `spectrum = false` runs above with the flag flipped, so it gates the density fill per slice — the
-    # one part of the result those runs deliberately leave as NaN.
+    # The runs above use `NoSpectrum()`, which gates the density fill per slice — the one part of the
+    # result they deliberately leave as NaN.
     let kg = CGEF.GaussianKernel()
         bg = P.coarse_grain_profile(u3, v3, g; scales = scales, kernel = kg, backend = SER)
         for k in 1:Nlev
@@ -542,7 +542,7 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
         end
     end
     let bt = P.CoarseGrainBatchResult(g, Ns, (Nlev,))
-        P.coarse_grain_profile!(bt, u3, v3, g; scales = scales, spectrum = false, backend = CB.ThreadedBackend())
+        P.coarse_grain_profile!(bt, u3, v3, g; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = CB.ThreadedBackend())
         Test.@test bt.Π == bp.Π
         Test.@test bt.cumulative_energy == bp.cumulative_energy
     end

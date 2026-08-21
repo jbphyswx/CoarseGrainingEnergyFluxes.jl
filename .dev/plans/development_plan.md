@@ -19,7 +19,7 @@ Stages 0–3 are implemented and test-gated. Stage 4's three carried-over items 
 | stage | state | evidence |
 |---|---|---|
 | 0.1 masking default | done | `ZeroFill` default; commutation exact (5e-16) for it and asserted to FAIL for `Deformable` (1.3e-2); coast artifacts measured and in the docstring |
-| 0.2 spectrum kernel gate | done | `Kernels.transfer_monotone` + refusal in `filtering_spectrum`/`coarse_grain`, `spectrum = false` opt-out |
+| 0.2 spectrum kernel gate | done | `Kernels.transfer_monotone` + `Diagnostics.AbstractSpectrumPolicy`: `StrictSpectrum` (default, refuses), `ForceSpectrum` (computes, warns once), `NoSpectrum` (fills NaN) |
 | 0.3 wavenumber convention | done | `k_ℓ = L/ℓ`, `1/C` amplitude caveat, `k⁻³` ceiling — docstring + `theory.md` |
 | 1.1 validation ladder | done | all six; slope ceiling, `filter∘div`, linear-field exactness, kernel moments |
 | 1.2 stated limits | done | kernel requirements, `ℓ`-is-a-diameter, dimension-dependent variance matching, `Π`-only omissions, spherical metric floor |

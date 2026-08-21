@@ -490,13 +490,13 @@ Whether `d|Ĝ(k)|²/dk ≤ 0` holds on `(0, ∞)`.
 
 Sadek & Aluie (2018) eq. (21): this is the condition under which the filtering spectral density
 `Ẽ(k_ℓ)` is guaranteed non-negative. A kernel that fails it can produce a spectrum with negative
-values, which is why `Diagnostics.filtering_spectrum` refuses one.
+values, which is why `Diagnostics.StrictSpectrum` — the default policy — refuses one.
 
 | kernel | monotone | why |
 |---|---|---|
 | `GaussianKernel` | `true` | `\\|Ĝ\\|² = exp(-k²ℓ²/2α)`, strictly decreasing |
 | `SharpSpectralKernel` | `true` | `1` then `0` — non-increasing |
-| `TopHatKernel` | `false` | `Ĝ = 2J₁(kR)/(kR)` oscillates; `\\|Ĝ\\|²` rises by `+0.0026` near `kℓ ≈ 8.8` |
+| `TopHatKernel` | `false` | `Ĝ = 2J₁(kR)/(kR)` oscillates; `\\|Ĝ\\|²` hits zero at `kℓ ≈ 7.66`, then climbs to `0.0175` at `kℓ ≈ 10.27` |
 
 The condition is sufficient, not necessary — Sadek & Aluie's own fallback argument concedes it is
 "not a rigorous proof" — so `false` means "not guaranteed", not "certainly negative". It is also
@@ -520,17 +520,25 @@ transfer_monotone(::HighOrderKernel) = false
 """
     check_spectrum_kernel(kernel::AbstractFilterKernel)
 
-Throw an `ArgumentError` unless `kernel` satisfies [`transfer_monotone`](@ref). Called wherever a
-filtering spectral DENSITY is produced; the cumulative energy needs no such check.
+Throw an `ArgumentError` unless `kernel` satisfies [`transfer_monotone`](@ref). This is the strict
+reading of the admissibility condition, selected by `Diagnostics.StrictSpectrum()`; the cumulative
+energy needs no such check.
 """
 function check_spectrum_kernel(kernel::AbstractFilterKernel)
     transfer_monotone(kernel) && return nothing
     throw(ArgumentError(
-        "$(nameof(typeof(kernel))) cannot produce a filtering spectral density: its |Ĝ(k)|² is not " *
-        "monotone decreasing, so Sadek & Aluie (2018) eq. (21) does not hold and Ẽ(k_ℓ) may come out " *
-        "negative. Use a kernel with `transfer_monotone(kernel) == true` (e.g. `GaussianKernel()`), " *
-        "or ask for `cumulative_energy`, which is well defined for any kernel. `$(nameof(typeof(kernel)))` " *
-        "remains a valid — and the default — choice for the flux Π, which this condition does not bear on.",
+        "$(nameof(typeof(kernel))) cannot produce a guaranteed non-negative filtering spectral " *
+        "density: its |Ĝ(k)|² is not monotone decreasing, so Sadek & Aluie (2018) eq. (21) does not " *
+        "hold and Ẽ(k_ℓ) may come out negative. Four ways forward:\n" *
+        "  • `spectrum = CoarseGrainingEnergyFluxes.Diagnostics.ForceSpectrum()` — compute it anyway " *
+        "and check its sign yourself. The condition is sufficient, not necessary, and often fails only " *
+        "in a narrow band.\n" *
+        "  • `spectrum = CoarseGrainingEnergyFluxes.Diagnostics.NoSpectrum()` — skip the density; the " *
+        "field comes back `NaN`.\n" *
+        "  • Use a kernel with `transfer_monotone(kernel) == true`, e.g. `GaussianKernel()`.\n" *
+        "  • Ask for `cumulative_energy`, which is well defined for any kernel.\n" *
+        "`$(nameof(typeof(kernel)))` remains a valid — and the default — choice for the flux Π, which " *
+        "this condition does not bear on.",
     ))
 end
 

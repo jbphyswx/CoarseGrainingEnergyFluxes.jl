@@ -533,21 +533,21 @@ function fig_masking()
     showmasked(A) = [mask[i, j] ? A[i, j] : NaN for i in 1:N, j in 1:N]
     maskoverlay = [mask[i, j] ? NaN : 1.0 for i in 1:N, j in 1:N]
     cl = symclim(fr.f)
-    diff = showmasked(od .- oz)
+    diff = showmasked(oz .- od)
     cld = symclim(filter(!isnan, diff) |> collect)
 
     fig = MK.Figure(; size = (1760, 430))
-    MK.Label(fig[0, 1:4], "Masking: the deformable kernel renormalizes over active cells (no bleed) — the difference is concentrated at the mask boundary";
-        fontsize = 18, font = :bold)
-    for (k, (ttl, A)) in enumerate((("field + mask", fr.f), ("Deformable (renormalized)", od),
-            ("ZeroFill (masked = 0)", oz)))
+    MK.Label(fig[0, 1:4], "Masking: ZeroFill (default) keeps the kernel position-independent, so filtering commutes with ∂ — Deformable renormalizes over active cells instead, trading that for exact constants at the boundary";
+        fontsize = 17, font = :bold)
+    for (k, (ttl, A)) in enumerate((("field + mask", fr.f), ("ZeroFill (default, masked = 0)", oz),
+            ("Deformable (renormalized)", od)))
         ax = MK.Axis(fig[1, k]; title = ttl, aspect = MK.DataAspect(),
             xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
         hm = MK.heatmap!(ax, km, km, showmasked(A); colormap = FIELDMAP, colorrange = (-cl, cl))
         MK.heatmap!(ax, km, km, maskoverlay; colormap = [:gray75, :gray75])
         k == 3 && MK.Colorbar(fig[1, k, MK.Right()], hm; width = 10)
     end
-    ax4 = MK.Axis(fig[1, 4]; title = "Deformable − ZeroFill", aspect = MK.DataAspect(),
+    ax4 = MK.Axis(fig[1, 4]; title = "ZeroFill − Deformable", aspect = MK.DataAspect(),
         xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
     hmd = MK.heatmap!(ax4, km, km, diff; colormap = :PuOr, colorrange = (-cld, cld))
     MK.heatmap!(ax4, km, km, maskoverlay; colormap = [:gray75, :gray75])
@@ -929,22 +929,34 @@ function fig_compressible()
     save_fig("compressible_flux.png", fig)
 end
 
-println("Generating CoarseGrainingEnergyFluxes.jl documentation assets …")
-fig_hero()
-fig_filtering_scales()
-fig_filtering_spectrum()
-fig_kernels()
-fig_rigid_rotation()
-fig_helmholtz()
-fig_tracer_flux()
-fig_masking()
-fig_spherical()
-fig_curvilinear()
-fig_unstructured()
-fig_volumetric_3d()
-fig_profile()
-fig_strain_convergence()
-fig_enstrophy()
-fig_band_energies()
-fig_compressible()
-println("done.")
+const FIGURES = (
+    "hero" => fig_hero,
+    "filtering_scales" => fig_filtering_scales,
+    "filtering_spectrum" => fig_filtering_spectrum,
+    "kernels" => fig_kernels,
+    "rigid_rotation" => fig_rigid_rotation,
+    "helmholtz" => fig_helmholtz,
+    "tracer_flux" => fig_tracer_flux,
+    "masking" => fig_masking,
+    "spherical" => fig_spherical,
+    "curvilinear" => fig_curvilinear,
+    "unstructured" => fig_unstructured,
+    "volumetric_3d" => fig_volumetric_3d,
+    "profile" => fig_profile,
+    "strain_convergence" => fig_strain_convergence,
+    "enstrophy" => fig_enstrophy,
+    "band_energies" => fig_band_energies,
+    "compressible" => fig_compressible,
+)
+
+# Name figures on the command line to regenerate a subset; no arguments regenerates all of them.
+let names = isempty(ARGS) ? first.(FIGURES) : ARGS
+    unknown = setdiff(names, first.(FIGURES))
+    isempty(unknown) || error("unknown figure(s) $(join(unknown, ", ")); available: " *
+                              join(first.(FIGURES), ", "))
+    println("Generating CoarseGrainingEnergyFluxes.jl documentation assets … ($(length(names)))")
+    for (name, f) in FIGURES
+        name in names && f()
+    end
+    println("done.")
+end
