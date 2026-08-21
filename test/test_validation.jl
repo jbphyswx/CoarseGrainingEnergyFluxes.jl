@@ -531,14 +531,24 @@ Test.@testset "check_setup reports what will run, and every capability it claims
                  CGEF.Kernels.SmoothHatKernel(), CGEF.Kernels.HyperGaussianKernel(),
                  CGEF.Kernels.HighOrderKernel(; order = 3))
         rr = CGEF.check_setup(grid, kern, 8 * dx)
-        # supports_spectrum ⇔ filtering_spectrum accepts it
+        # supports_spectrum ⇔ the default StrictSpectrum policy accepts it. `false` reports "not
+        # guaranteed non-negative", not "unreachable".
         Test.@test rr.supports_spectrum == CGEF.Kernels.transfer_monotone(kern)
         u = zeros(N, N); v = zeros(N, N)
         if rr.supports_spectrum
             Test.@test CGEF.Kernels.check_spectrum_kernel(kern) === nothing
+            Test.@test CGEF.Diagnostics.gate_spectrum(kern, CGEF.Diagnostics.StrictSpectrum())
         else
             Test.@test_throws ArgumentError CGEF.Kernels.check_spectrum_kernel(kern)
+            Test.@test_throws ArgumentError CGEF.Diagnostics.gate_spectrum(
+                kern, CGEF.Diagnostics.StrictSpectrum())
         end
+        # ForceSpectrum admits every kernel and NoSpectrum refuses every kernel, both unconditionally —
+        # that is what makes `supports_spectrum` a statement about the guarantee, not about reachability.
+        Test.@test Logging.with_logger(Logging.NullLogger()) do
+            CGEF.Diagnostics.gate_spectrum(kern, CGEF.Diagnostics.ForceSpectrum())
+        end
+        Test.@test !CGEF.Diagnostics.gate_spectrum(kern, CGEF.Diagnostics.NoSpectrum())
         # supports_spectral_method ⇔ spectral_transfer returns rather than throws
         got_spectral = try
             CGEF.Kernels.spectral_transfer(kern, 1 / (8 * dx), 8 * dx); true

@@ -32,8 +32,10 @@ programmatically so a script can gate on it.
 - `resolvable::Bool`: `ℓ` is wide enough to mean anything on this grid (`> 2Δx` on every axis)
 - `supports_flux::Bool`: the kernel is non-negative, so `τ` is realizable and `Π` is a pointwise
   transfer
-- `supports_spectrum::Bool`: [`Kernels.transfer_monotone`](@ref) — whether
-  [`Diagnostics.filtering_spectrum`](@ref) will accept this kernel
+- `supports_spectrum::Bool`: [`Kernels.transfer_monotone`](@ref) — whether this kernel's spectral
+  density is *guaranteed* non-negative, and so whether the default
+  [`Diagnostics.StrictSpectrum`](@ref) policy will accept it. `false` does not mean unreachable:
+  `Diagnostics.ForceSpectrum()` computes it regardless.
 - `supports_spectral_method::Bool`: the kernel has an isotropic transfer function, so
   `method = Spectral()` is available
 - `boundary_buffer_cells::Tuple`: how many cells in from a coast or domain edge are contaminated —
@@ -74,7 +76,7 @@ function Base.show(io::IO, ::MIME"text/plain", r::SetupReport)
     println(io, "  real-space engine: ", r.engine)
     println(io, "  ℓ resolvable    : ", yn(r.resolvable))
     println(io, "  supports Π      : ", yn(r.supports_flux))
-    println(io, "  supports spectrum: ", yn(r.supports_spectrum))
+    println(io, "  spectrum ≥ 0    : ", yn(r.supports_spectrum))
     println(io, "  supports Spectral(): ", yn(r.supports_spectral_method))
     println(io, "  boundary buffer : ", r.boundary_buffer_cells, " cells (contaminated)")
     if isempty(r.notes)
@@ -187,8 +189,10 @@ function check_setup(
 
     spec_ok = Kernels.transfer_monotone(kernel)
     spec_ok || push!(notes,
-        "$(_kname(kernel))'s |Ĝ|² is not monotone, so `filtering_spectrum` will refuse it and " *
-        "`coarse_grain` needs `kernel = GaussianKernel()` or `spectrum = false`.")
+        "$(_kname(kernel))'s |Ĝ|² is not monotone, so a spectral density is not guaranteed " *
+        "non-negative: `coarse_grain` needs `kernel = GaussianKernel()`, or " *
+        "`spectrum = Diagnostics.ForceSpectrum()` to compute it anyway, or " *
+        "`spectrum = Diagnostics.NoSpectrum()` to skip it.")
 
     # Two different reasons `Spectral()` can be unavailable, and they need different actions: a
     # `MethodError` means the transfer function lives in an extension that is not loaded (fixable by
@@ -284,7 +288,7 @@ CoarseGrainResult(scales::AbstractVector{T}, Π::AbstractArray{T,N}, cumE::Abstr
 # ---------------------------------------------------------------------------
 
 """
-    coarse_grain(u, v, w, grid; scales, kernel=TopHatKernel(), backend=AutoBackend(), mask_strategy=ZeroFill(), method=nothing, L=1, spectrum=true)
+    coarse_grain(u, v, w, grid; scales, kernel=TopHatKernel(), backend=AutoBackend(), mask_strategy=ZeroFill(), method=nothing, L=1, spectrum=StrictSpectrum())
     coarse_grain(u, v, grid; scales, ...)  # 2D convenience wrapper
 
 Perform complete coarse-graining analysis across multiple filter scales, allocating a fresh
@@ -310,12 +314,13 @@ and call `coarse_grain!` directly to reuse its buffers.
   `plan_filter`'s per-grid default (real space where a grid has that engine)
 - `L::Real=1`: reference length setting the wavenumber normalization `k_ℓ = L/ℓ`. The choice rescales
   the spectral density by `1/L` — see [`Diagnostics.filtering_spectrum`](@ref).
-- `spectrum::Bool=true`: also fill `filtering_spectrum`. The spectral density is guaranteed
-  non-negative only for a kernel whose `|Ĝ|²` is monotone decreasing
+- `spectrum::AbstractSpectrumPolicy=Diagnostics.StrictSpectrum()`: how to fill `filtering_spectrum`.
+  The spectral density is guaranteed non-negative only for a kernel whose `|Ĝ|²` is monotone decreasing
   ([`Kernels.transfer_monotone`](@ref)), which the default `TopHatKernel` is **not** — so
-  `coarse_grain(u, v, grid; scales)` throws, and the two ways forward are `kernel = GaussianKernel()`
-  or `spectrum = false`. With `spectrum = false` the density is filled with `NaN`; `Π` and
-  `cumulative_energy` are unaffected, since neither depends on that condition.
+  `coarse_grain(u, v, grid; scales)` throws under the default policy. The alternatives are
+  `Diagnostics.ForceSpectrum()` (compute it anyway, warning once — the condition is sufficient, not
+  necessary), `Diagnostics.NoSpectrum()` (fill `NaN`), or `kernel = GaussianKernel()`. `Π` and
+  `cumulative_energy` are unaffected under every policy, since neither depends on that condition.
 
 # Returns
 - `CoarseGrainResult`: Container with scales, Π maps, and spectrum
@@ -341,7 +346,7 @@ function coarse_grain(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
@@ -378,15 +383,16 @@ end
 
 # The filtering spectral DENSITY is only guaranteed non-negative for a kernel whose |Ĝ|² is monotone
 # decreasing, which the default `TopHatKernel` is not — see `Kernels.transfer_monotone`. `Π` and the
-# cumulative energy carry no such condition, so `spectrum = false` is the way to keep a non-conforming
-# kernel: the density is then filled with `NaN` rather than a number that would read as computed.
-@inline function _check_spectrum(kernel, spectrum::Bool)
-    spectrum && Kernels.check_spectrum_kernel(kernel)
+# cumulative energy carry no such condition, so which reading applies is the caller's to pick:
+# `Diagnostics.StrictSpectrum` (throw), `ForceSpectrum` (compute and warn) or `NoSpectrum` (fill NaN).
+@inline function _check_spectrum(kernel, spectrum::Diagnostics.AbstractSpectrumPolicy)
+    Diagnostics.gate_spectrum(kernel, spectrum)
     return spectrum
 end
 
-@inline _fill_spectrum!(g, C, k, spectrum::Bool) =
-    spectrum ? Diagnostics.spectral_density!(g, C, k) : fill!(g, convert(eltype(g), NaN))
+@inline _fill_spectrum!(g, C, k, ::Diagnostics.NoSpectrum) = fill!(g, convert(eltype(g), NaN))
+@inline _fill_spectrum!(g, C, k, ::Diagnostics.AbstractSpectrumPolicy) =
+    Diagnostics.spectral_density!(g, C, k)
 
 """
     coarse_grain!(result, u, v, w, grid; scales, kernel, workspace, filter_plans, deriv_plan, backend, mask_strategy, method, L, spectrum)
@@ -420,7 +426,7 @@ function coarse_grain!(
     # grid has that engine, spectral for a node set.
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     _check_result_shape(result, grid, scales)
     _check_spectrum(kernel, spectrum)
@@ -673,8 +679,9 @@ repeated batch is allocation-free. Leaving them `nothing` builds one set per wor
 
 For a batch whose slices do NOT share a grid, use [`coarse_grain_slices!`](@ref) instead.
 
-The `spectrum` flag behaves exactly as in [`coarse_grain`](@ref): the default `TopHatKernel` cannot
-produce a filtering spectral density, so pass `kernel = GaussianKernel()` or `spectrum = false`.
+The `spectrum` policy behaves exactly as in [`coarse_grain`](@ref): the default `TopHatKernel` cannot
+produce a guaranteed non-negative spectral density, so pass `kernel = GaussianKernel()`, or
+`spectrum = Diagnostics.ForceSpectrum()` to compute it anyway, or `spectrum = Diagnostics.NoSpectrum()`.
 """
 function coarse_grain_batch!(
     batch::CoarseGrainBatchResult{T,NB},
@@ -691,7 +698,7 @@ function coarse_grain_batch!(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat, NB, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     spatial = FlowGeometries.Grids.size_tuple(grid)
     valR = Val(length(spatial))
@@ -852,8 +859,9 @@ call this once per group to keep pool memory bounded by thread count instead of 
 
 Each slice runs serially inside, the same non-nesting rule as [`coarse_grain_batch!`](@ref).
 
-The `spectrum` flag behaves exactly as in [`coarse_grain`](@ref): the default `TopHatKernel` cannot
-produce a filtering spectral density, so pass `kernel = GaussianKernel()` or `spectrum = false`.
+The `spectrum` policy behaves exactly as in [`coarse_grain`](@ref): the default `TopHatKernel` cannot
+produce a guaranteed non-negative spectral density, so pass `kernel = GaussianKernel()`, or
+`spectrum = Diagnostics.ForceSpectrum()` to compute it anyway, or `spectrum = Diagnostics.NoSpectrum()`.
 """
 function coarse_grain_slices!(
     results::AbstractVector,
@@ -870,7 +878,7 @@ function coarse_grain_slices!(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = 1,
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 )
     n = length(results)
     (length(us) == n && length(vs) == n && length(grids) == n) || throw(DimensionMismatch(
@@ -934,7 +942,7 @@ function coarse_grain(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, backend=backend, mask_strategy=mask_strategy, method=method, L=L, spectrum=spectrum)
 end
@@ -953,7 +961,7 @@ function coarse_grain!(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     return coarse_grain!(result, u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, filter_plans=filter_plans, deriv_plan=deriv_plan, backend=backend, mask_strategy=mask_strategy, method=method, L=L, spectrum=spectrum)
 end
@@ -976,8 +984,9 @@ the workspace in the same pass as the flux, so `u` and `v` are not filtered a se
 level axis trailing, which is what makes each level's result a contiguous view. Per-level energies are
 deliberately not summed across levels; that needs thickness weighting this function is not given.
 
-The `spectrum` flag behaves exactly as in [`coarse_grain`](@ref): the default `TopHatKernel` cannot
-produce a filtering spectral density, so pass `kernel = GaussianKernel()` or `spectrum = false`.
+The `spectrum` policy behaves exactly as in [`coarse_grain`](@ref): the default `TopHatKernel` cannot
+produce a guaranteed non-negative spectral density, so pass `kernel = GaussianKernel()`, or
+`spectrum = Diagnostics.ForceSpectrum()` to compute it anyway, or `spectrum = Diagnostics.NoSpectrum()`.
 """
 function coarse_grain_profile!(
     batch::CoarseGrainBatchResult,
@@ -998,7 +1007,7 @@ function coarse_grain_profile!(
 end
 
 """
-    coarse_grain_profile(u, v, w, grid; scales, kernel=TopHatKernel(), backend=AutoBackend(), mask_strategy=ZeroFill(), method=nothing, L=1, spectrum=true)
+    coarse_grain_profile(u, v, w, grid; scales, kernel=TopHatKernel(), backend=AutoBackend(), mask_strategy=ZeroFill(), method=nothing, L=1, spectrum=StrictSpectrum())
 
 Allocating [`coarse_grain_profile!`](@ref): sizes a [`CoarseGrainBatchResult`](@ref) for `size(u, 3)`
 levels and fills it. Pass a prebuilt `batch` to `coarse_grain_profile!` to sweep timesteps without
@@ -1040,7 +1049,7 @@ function coarse_grain(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
@@ -1063,7 +1072,7 @@ function coarse_grain!(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _check_result_shape(result, grid, scales)
     _check_spectrum(kernel, spectrum)
@@ -1117,7 +1126,7 @@ function coarse_grain(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
@@ -1144,7 +1153,7 @@ function coarse_grain(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
@@ -1168,7 +1177,7 @@ function coarse_grain(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, backend=backend, mask_strategy=mask_strategy, method=method, L=L, spectrum=spectrum)
 end
@@ -1187,7 +1196,7 @@ function coarse_grain!(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Union{Nothing, Filtering.AbstractFilterMethod} = nothing,
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     return coarse_grain!(result, u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, deriv_plan=deriv_plan, filter_plans=filter_plans, backend=backend, mask_strategy=mask_strategy, method=method, L=L, spectrum=spectrum)
 end
@@ -1208,7 +1217,7 @@ function coarse_grain(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Filtering.AbstractFilterMethod = Filtering.Spectral(),
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid)
@@ -1232,7 +1241,7 @@ function coarse_grain(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Filtering.AbstractFilterMethod = Filtering.Spectral(),
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat}
     return coarse_grain(u, v, nothing, grid; scales=scales, kernel=kernel, backend=backend, mask_strategy=mask_strategy, method=method, L=L, spectrum=spectrum)
 end
@@ -1251,7 +1260,7 @@ function coarse_grain!(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Filtering.AbstractFilterMethod = Filtering.Spectral(),
     L::Real = one(T),
-    spectrum::Bool = true,
+    spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.StrictSpectrum(),
 ) where {T<:AbstractFloat}
     return coarse_grain!(result, u, v, nothing, grid; scales=scales, kernel=kernel, workspace=workspace, deriv_plan=deriv_plan, filter_plans=filter_plans, backend=backend, mask_strategy=mask_strategy, method=method, L=L, spectrum=spectrum)
 end

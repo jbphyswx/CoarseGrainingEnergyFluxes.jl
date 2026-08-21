@@ -84,7 +84,7 @@ Test.@testset "True-3D Cartesian coarse_grain pipeline" begin
     )
     u3 = rand(6, 6, 5); v3 = rand(6, 6, 5); w3 = rand(6, 6, 5)
     res3 = CGEF.coarse_grain(u3, v3, w3, grid3; scales = [2000.0, 3000.0], kernel = CGEF.TopHatKernel(),
-                             spectrum = false)
+                             spectrum = CGEF.Diagnostics.NoSpectrum())
     Test.@test size(res3.Π) == (6, 6, 5, 2)
     Test.@test !any(isnan, res3.cumulative_energy)
     # The top-hat cannot carry a filtering spectral density; the density is checked on the same
@@ -95,9 +95,9 @@ Test.@testset "True-3D Cartesian coarse_grain pipeline" begin
     # Cross-check: coarse_grain! (in-place, reusing a workspace) matches the fresh allocation.
     ws3 = CGEF.Diagnostics.ΠWorkspace(grid3)
     res3b = CGEF.coarse_grain(u3, v3, w3, grid3; scales = [2000.0, 3000.0], kernel = CGEF.TopHatKernel(),
-                              spectrum = false)
+                              spectrum = CGEF.Diagnostics.NoSpectrum())
     CGEF.coarse_grain!(res3b, u3, v3, w3, grid3; scales = [2000.0, 3000.0], kernel = CGEF.TopHatKernel(),
-                       workspace = ws3, spectrum = false)
+                       workspace = ws3, spectrum = CGEF.Diagnostics.NoSpectrum())
     Test.@test res3b.Π ≈ res3.Π
 end
 
@@ -142,7 +142,7 @@ Test.@testset "True-3D spherical volumetric grid + Π" begin
 
     # Full pipeline: shape + finiteness.
     res = CGEF.coarse_grain(u, v, w, grid; scales = [300e3, 500e3], kernel = CGEF.TopHatKernel(),
-                            spectrum = false)
+                            spectrum = CGEF.Diagnostics.NoSpectrum())
     Test.@test size(res.Π) == (length(lon), length(lat), length(r), 2)
     Test.@test !any(isnan, res.cumulative_energy)
     Test.@test !any(isnan, CGEF.coarse_grain(u, v, w, grid; scales = [300e3, 500e3],

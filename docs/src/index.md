@@ -92,7 +92,10 @@ with respect to the filtering wavenumber `k_ℓ = L/ℓ`:
 `result.wavenumber`).
 
 `Ẽ(k_ℓ) ≥ 0` is guaranteed only for a kernel whose `|Ĝ(k)|²` is monotone decreasing, which the
-default `TopHatKernel` is not. `coarse_grain` therefore throws rather than return a density it cannot
-vouch for: pass `kernel = GaussianKernel()` for a spectrum, or `spectrum = false` for `Π` and the
-cumulative energy alone. Note also that a `p = 1` kernel — top-hat and Gaussian both — saturates the
-recovered slope at `k⁻³`; see [`Diagnostics.filtering_spectrum`](@ref).
+default `TopHatKernel` is not. By default `coarse_grain` therefore throws rather than return a density
+it cannot vouch for — but the condition is sufficient, not necessary, so all three readings are
+reachable: `kernel = GaussianKernel()` for a guaranteed-non-negative spectrum,
+`spectrum = CGEF.Diagnostics.ForceSpectrum()` to compute the top-hat's anyway and check its sign
+yourself, or `spectrum = CGEF.Diagnostics.NoSpectrum()` for `Π` and the cumulative energy alone. Note
+also that a `p = 1` kernel — top-hat and Gaussian both — saturates the recovered slope at `k⁻³`; see
+[`Diagnostics.AbstractSpectrumPolicy`](@ref) and [`Diagnostics.filtering_spectrum`](@ref).

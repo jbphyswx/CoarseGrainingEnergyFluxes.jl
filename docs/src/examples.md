@@ -38,14 +38,16 @@ CoarseGrainingEnergyFluxes setup check
   real-space engine: prefix-sum top-hat, exact O(N)
   ℓ resolvable    : yes
   supports Π      : yes
-  supports spectrum: NO
+  spectrum ≥ 0    : NO
   supports Spectral(): NO
   boundary buffer : (3, 3) cells (contaminated)
   notes:
     1. points within (3, 3) cells of a coast or domain edge are contaminated by footprint
        truncation, under either mask strategy — exclude them before averaging.
-    2. TopHatKernel's |Ĝ|² is not monotone, so `filtering_spectrum` will refuse it and
-       `coarse_grain` needs `kernel = GaussianKernel()` or `spectrum = false`.
+    2. TopHatKernel's |Ĝ|² is not monotone, so a spectral density is not guaranteed
+       non-negative: `coarse_grain` needs `kernel = GaussianKernel()`, or
+       `spectrum = Diagnostics.ForceSpectrum()` to compute it anyway, or
+       `spectrum = Diagnostics.NoSpectrum()` to skip it.
     3. TopHatKernel's spectral transfer function is provided by a weak dependency that is not
        loaded, so `method = Spectral()` is unavailable in this session — run
        `using SpecialFunctions`. Real-space filtering is unaffected.
@@ -63,7 +65,7 @@ What every result field's axes mean. `Ns = length(scales)`; the spatial rank `R`
 |---|---|---|---|
 | `coarse_grain`/`coarse_grain!` | `Π` | `(spatial…, Ns)` | one contiguous array, not a vector of maps; `Π[…, i]` is `scales[i]` |
 | | `scales`, `wavenumber` | `(Ns,)` | `wavenumber = L/ℓ` |
-| | `cumulative_energy`, `filtering_spectrum` | `(Ns,)` | `NaN` when `spectrum = false` |
+| | `cumulative_energy`, `filtering_spectrum` | `(Ns,)` | `filtering_spectrum` is `NaN` under `NoSpectrum()` |
 | `coarse_grain_batch!` | `Π` | `(spatial…, Ns, batch…)` | batch axes **trailing**, so each slice is a contiguous view |
 | | `cumulative_energy`, `filtering_spectrum`, `wavenumber` | `(Ns, batch…)` | |
 | | `slices[t]` | `CoarseGrainResult` | a zero-copy view into the batched storage |
@@ -114,7 +116,13 @@ Two conventions worth stating outright, because getting either wrong changes the
 ### Cross-scale tracer / buoyancy-variance flux
 ![Tracer flux](assets/tracer_flux.png)
 
-### Masking: deformable vs zero-fill
+### Masking: zero-fill vs deformable
+`ZeroFill` is the default: masked cells contribute nothing and the kernel stays position-independent,
+so filtering commutes with spatial derivatives — the step the flux budget is derived by. `Deformable`
+renormalizes over the locally-active area, reproducing constants exactly next to a boundary at the cost
+of that commutation. On a masked domain `Deformable` conserves better (measured 4.8e-4 vs 1.1e-2
+relative imbalance); under either choice, points within ≈ℓ of the mask are contaminated.
+
 ![Masking](assets/masking.png)
 
 ### Spectral filtering on the sphere
@@ -156,7 +164,7 @@ CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, grid, CGEF.TopHatKernel(), 10_00
 # Multi-scale sweep (plan reuse handled internally).
 scales = collect(5e3:5e3:50e3)
 result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel(),
-                           spectrum = false)
+                           spectrum = CGEF.Diagnostics.NoSpectrum())
 @view result.Π[:, :, 3]      # flux map at scales[3] — result.Π is a stacked (Nx,Ny,Nscales) array
 result.cumulative_energy     # ½ρ₀⟨|ū_ℓ|²⟩ per scale (Sadek–Aluie Eq. 15)
 result.wavenumber            # k_ℓ = L/ℓ
@@ -166,11 +174,23 @@ spec = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKern
 spec.filtering_spectrum      # Ẽ(k_ℓ) density (Eq. 14)
 ```
 
-!!! note "The top-hat cannot carry a filtering spectrum"
-    `TopHatKernel`'s `|Ĝ|²` is not monotone decreasing, so the spectral density is not guaranteed
-    non-negative (Sadek & Aluie 2018 eq. 21) and `coarse_grain` refuses to produce one for it. Use
-    `kernel = CGEF.GaussianKernel()` when you want `filtering_spectrum`, or `spectrum = false` when
-    you only want `Π` and `cumulative_energy`. See [`Kernels.transfer_monotone`](@ref).
+!!! note "The top-hat's filtering spectrum is not guaranteed non-negative"
+    `TopHatKernel`'s `|Ĝ|²` is not monotone decreasing, so Sadek & Aluie (2018) eq. 21 does not apply
+    and the spectral density may dip below zero. That condition is **sufficient, not necessary** — the
+    top-hat's `|Ĝ|²` falls to zero at `kℓ ≈ 7.66` and then climbs back to only `0.0175` at `kℓ ≈ 10.27`
+    (the first Airy sidelobe; later ones reach `0.0042` and `0.0016`), so the violation is confined to
+    the far sub-filter tail at under 2% of the DC value. The density is usually perfectly usable and
+    the default merely declines to vouch for it. Three ways forward, per
+    [`Diagnostics.AbstractSpectrumPolicy`](@ref):
+
+    | you want | pass |
+    |---|---|
+    | a density you don't have to check | `kernel = CGEF.GaussianKernel()` |
+    | the top-hat's density, sign checked yourself | `spectrum = CGEF.Diagnostics.ForceSpectrum()` |
+    | only `Π` and `cumulative_energy` | `spectrum = CGEF.Diagnostics.NoSpectrum()` |
+
+    `Π` and `cumulative_energy` are unaffected by the choice — neither depends on the condition. See
+    [`Kernels.transfer_monotone`](@ref).
 
 ## Spherical domain with a mask
 
@@ -186,7 +206,7 @@ grid = FG.Grids.StructuredGrid(geom, lon, lat)   # full-circle lon ⇒ periodic 
 
 scales = collect(10e3:10e3:300e3)
 result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel(),
-                           spectrum = false)
+                           spectrum = CGEF.Diagnostics.NoSpectrum())
 ```
 
 The `ZeroFill` mask strategy (default) treats excluded cells as zeros, keeping the kernel
@@ -219,7 +239,7 @@ grid = FG.Grids.CurvilinearGrid(geom, x, y)     # exact corner-based cell areas,
 
 u = randn(N, N); v = randn(N, N)
 result = CGEF.coarse_grain(u, v, grid; scales = collect(10e3:10e3:60e3),
-                           kernel = CGEF.TopHatKernel(), spectrum = false)
+                           kernel = CGEF.TopHatKernel(), spectrum = CGEF.Diagnostics.NoSpectrum())
 ```
 
 ## Scattered / unstructured point clouds
@@ -300,7 +320,7 @@ grid = FG.Grids.StructuredGrid(geom, xs, xs)    # a 2D grid — z is a third arr
 u = randn(N, N, Nz); v = randn(N, N, Nz)                 # (x, y, z)
 scales = collect(5e3:5e3:30e3)
 batch = CGEF.coarse_grain_profile(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel(),
-                                  spectrum = false)
+                                  spectrum = CGEF.Diagnostics.NoSpectrum())
 # The vertical axis is a batch axis, so it is TRAILING: Π is (x, y, scale, level).
 batch.Π[:, :, 3, :]                 # flux profile at scales[3], all Nz levels
 batch.cumulative_energy[3, :]       # per-level cumulative energy at scales[3]
@@ -314,15 +334,15 @@ Every backend reuses a footprint/plan built once per `(grid, kernel, scale)`, no
 
 ```julia
 using OhMyThreads: OhMyThreads          # enables ThreadedBackend (2D row-parallel + 1D/3D point-parallel)
-result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = false, backend = CGEF.ComputationalBackends.ThreadedBackend())
+result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = CGEF.ComputationalBackends.ThreadedBackend())
 
 using KernelAbstractions: KernelAbstractions   # enables GPUBackend (2D grids only)
 # Takes the device to run on — `KernelAbstractions.CPU()` here, `CUDABackend()`/`ROCBackend()` on a GPU.
-result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = false,
+result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(),
                            backend = CGEF.ComputationalBackends.GPUBackend(KernelAbstractions.CPU()))
 
 using MPI: MPI                          # enables MPIBackend (2D grids; requires MPI.Init() first)
-result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = false, backend = CGEF.ComputationalBackends.MPIBackend())
+result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = CGEF.ComputationalBackends.MPIBackend())
 
 # AutoBackend (default) picks ThreadedBackend when Threads.nthreads() > 1, else SerialBackend.
 ```

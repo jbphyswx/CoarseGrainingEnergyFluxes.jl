@@ -12,6 +12,73 @@ export compute_Π_strain_convergence, compute_Π_strain_convergence!, PiStrainWo
 export vorticity, vorticity!, enstrophy_flux, enstrophy_flux!, EnstrophyFluxWorkspace
 export band_energies
 export compressible_flux, compressible_flux!, FavreWorkspace, favre_filter!
+export AbstractSpectrumPolicy, StrictSpectrum, ForceSpectrum, NoSpectrum
+
+# ---------------------------------------------------------------------------
+# Spectrum admissibility policy (singleton types — specializable, same idiom as AbstractMaskStrategy)
+# ---------------------------------------------------------------------------
+
+"""
+    AbstractSpectrumPolicy
+
+What to do when a filtering spectral density is asked for with a kernel whose `|Ĝ(k)|²` is not monotone
+decreasing — [`StrictSpectrum`](@ref), [`ForceSpectrum`](@ref) or [`NoSpectrum`](@ref).
+
+Sadek & Aluie (2018) eq. (21) guarantees `Ẽ(k_ℓ) ≥ 0` only when `d|Ĝ(k)|²/dk ≤ 0`. That condition is
+**sufficient, not necessary**, and where it fails it tends to fail narrowly: the default `TopHatKernel`'s
+`|Ĝ|²` falls to zero at `kℓ ≈ 7.66` and climbs back to only `0.0175` at `kℓ ≈ 10.27`, so the violation
+sits in the far sub-filter tail at under 2% of the DC value while the rest of the curve is usable.
+Hence three settings rather than a veto: the safe reading stays the default, and the other one stays
+reachable.
+
+`Π` and the cumulative energy carry no such condition and are unaffected by this choice.
+"""
+abstract type AbstractSpectrumPolicy end
+
+"""
+    StrictSpectrum <: AbstractSpectrumPolicy
+
+Refuse to produce a spectral density for a kernel that fails [`Kernels.transfer_monotone`](@ref). The
+default: either a density guaranteed non-negative, or an error naming the alternatives.
+"""
+struct StrictSpectrum <: AbstractSpectrumPolicy end
+
+"""
+    ForceSpectrum <: AbstractSpectrumPolicy
+
+Compute the density regardless, warning once per session. The caller owns checking its sign — the right
+setting when the kernel's non-monotone band sits outside the range of scales being interpreted.
+"""
+struct ForceSpectrum <: AbstractSpectrumPolicy end
+
+"""
+    NoSpectrum <: AbstractSpectrumPolicy
+
+Skip the density entirely; the field is filled with `NaN` rather than a number that would read as
+computed. `Π` and the cumulative energy are still produced.
+"""
+struct NoSpectrum <: AbstractSpectrumPolicy end
+
+"""
+    gate_spectrum(kernel, policy) -> Bool
+
+Apply `policy` to `kernel`, returning whether a spectral density should be computed. Throws under
+[`StrictSpectrum`](@ref) for a non-monotone kernel; warns once under [`ForceSpectrum`](@ref).
+"""
+function gate_spectrum end
+
+gate_spectrum(kernel, ::StrictSpectrum) = (Kernels.check_spectrum_kernel(kernel); true)
+gate_spectrum(::Any, ::NoSpectrum) = false
+
+function gate_spectrum(kernel, ::ForceSpectrum)
+    Kernels.transfer_monotone(kernel) || @warn(
+        "ForceSpectrum with $(nameof(typeof(kernel))): its |Ĝ(k)|² is not monotone decreasing, so " *
+        "Sadek & Aluie (2018) eq. (21) does not apply and the filtering spectral density is not " *
+        "guaranteed non-negative. Check its sign before interpreting it.",
+        maxlog = 1,
+    )
+    return true
+end
 
 """
     ΠWorkspace{T, A}
@@ -1215,8 +1282,9 @@ cumulative energy [`cumulative_energy`](@ref) is convention-free; only the densi
   `TopHatKernel` and `GaussianKernel` have `p = 1`, so **the measured slope locks at `k⁻³`**. This
   bites hardest in 2-D and QG work, where the enstrophy-range target slope *is* ≈ `k⁻³`. The flux
   `Π` is unaffected — this is a limitation of the spectrum diagnostic alone.
-- **Kernel admissibility.** `Ẽ(k_ℓ) ≥ 0` is guaranteed only when `d|Ĝ(k)|²/dk ≤ 0`; this function
-  throws for a kernel that fails it. See [`Kernels.transfer_monotone`](@ref).
+- **Kernel admissibility.** `Ẽ(k_ℓ) ≥ 0` is guaranteed only when `d|Ĝ(k)|²/dk ≤ 0`. By default this
+  function throws for a kernel that fails it; pass `policy = ForceSpectrum()` to compute it anyway.
+  See [`AbstractSpectrumPolicy`](@ref) and [`Kernels.transfer_monotone`](@ref).
 
 # References
 - Sadek & Aluie (2018), *Phys. Rev. Fluids* 3, 124610.
@@ -1232,10 +1300,12 @@ function filtering_spectrum(
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
+    policy::AbstractSpectrumPolicy = StrictSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    Kernels.check_spectrum_kernel(kernel)
+    compute = gate_spectrum(kernel, policy)
     cum = cumulative_energy(u, v, w, grid, kernel, scales; backend=backend, mask_strategy=mask_strategy, method=method)
     kℓ = T(L) ./ T.(scales)
+    compute || return kℓ, fill(T(NaN), length(kℓ))
     return kℓ, spectral_density(cum, kℓ)
 end
 
