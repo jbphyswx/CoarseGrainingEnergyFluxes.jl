@@ -929,22 +929,34 @@ function fig_compressible()
     save_fig("compressible_flux.png", fig)
 end
 
-println("Generating CoarseGrainingEnergyFluxes.jl documentation assets …")
-fig_hero()
-fig_filtering_scales()
-fig_filtering_spectrum()
-fig_kernels()
-fig_rigid_rotation()
-fig_helmholtz()
-fig_tracer_flux()
-fig_masking()
-fig_spherical()
-fig_curvilinear()
-fig_unstructured()
-fig_volumetric_3d()
-fig_profile()
-fig_strain_convergence()
-fig_enstrophy()
-fig_band_energies()
-fig_compressible()
-println("done.")
+const FIGURES = (
+    "hero" => fig_hero,
+    "filtering_scales" => fig_filtering_scales,
+    "filtering_spectrum" => fig_filtering_spectrum,
+    "kernels" => fig_kernels,
+    "rigid_rotation" => fig_rigid_rotation,
+    "helmholtz" => fig_helmholtz,
+    "tracer_flux" => fig_tracer_flux,
+    "masking" => fig_masking,
+    "spherical" => fig_spherical,
+    "curvilinear" => fig_curvilinear,
+    "unstructured" => fig_unstructured,
+    "volumetric_3d" => fig_volumetric_3d,
+    "profile" => fig_profile,
+    "strain_convergence" => fig_strain_convergence,
+    "enstrophy" => fig_enstrophy,
+    "band_energies" => fig_band_energies,
+    "compressible" => fig_compressible,
+)
+
+# Name figures on the command line to regenerate a subset; no arguments regenerates all of them.
+let names = isempty(ARGS) ? first.(FIGURES) : ARGS
+    unknown = setdiff(names, first.(FIGURES))
+    isempty(unknown) || error("unknown figure(s) $(join(unknown, ", ")); available: " *
+                              join(first.(FIGURES), ", "))
+    println("Generating CoarseGrainingEnergyFluxes.jl documentation assets … ($(length(names)))")
+    for (name, f) in FIGURES
+        name in names && f()
+    end
+    println("done.")
+end
