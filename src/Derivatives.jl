@@ -14,29 +14,20 @@ export gradient_plan
 """
     gradient_plan(grid) -> Operators.GradientPlan
 
-The least-squares tangent-plane gradient plan for `grid`, asking for its adjacency the way that grid
-supplies one.
-
-`Operators.gradient_plan` takes a `stencil`, which describes an offset pattern in an index space. A
-layout whose neighbours come from a formula on the cell id — a ring grid, a pixelization, a panel
-mesh — has no index space to offset in, and its connectivity builder accepts no `stencil`. So the
-adjacency is built first, through the trait, and handed over as `conn`.
+The least-squares tangent-plane gradient plan for `grid`, refusing a grid that carries no adjacency
+for it to fit.
 """
 gradient_plan(grid::FlowGeometries.Grids.AbstractGrid) =
     _gradient_plan(FlowGeometries.Grids.adjacency_source(grid), grid)
 
+# A formula layout derives its neighbours from the cell id, so it always has them.
 _gradient_plan(::FlowGeometries.Grids.AbstractAdjacency, grid) =
     FlowGeometries.Operators.gradient_plan(grid)
 
+# A node set is handed its adjacency at construction, and can be built without one.
 function _gradient_plan(::FlowGeometries.Grids.StoredMeshNeighbors, grid)
     _require_adjacency(FlowGeometries.Grids.neighbor_nbrs(grid), grid)
     return FlowGeometries.Operators.gradient_plan(grid)
-end
-
-function _gradient_plan(adj::FlowGeometries.Grids.FormulaNeighbors, grid)
-    conn = FlowGeometries.Connectivity.build_connectivity(grid, adj)
-    _require_adjacency(conn.nbrs, grid)
-    return FlowGeometries.Operators.gradient_plan(grid; conn = conn)
 end
 
 # A least-squares gradient is a fit over a cell's neighbours, so a grid carrying none of them fits
