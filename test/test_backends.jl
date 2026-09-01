@@ -233,8 +233,9 @@ end
 # NDScatteredFilterPlan representation (no row structure), but the per-point kernel is
 # data-race-free (reads neighbours, writes only its own cell) — verify it matches serial exactly,
 # covering both the fast (Range-axis, translation-invariant) and general (nonuniform/spherical
-# scattered) footprint paths. Distributed/GPU/MPI remain unsupported here (still row-only) and
-# must raise a clear error when requested explicitly, per `_check_backend_compatible`.
+# scattered) footprint paths. The spherical volumetric case below is the one the point-indexed sweep
+# in "Backends" does not reach; that sweep already asserts every parallel backend bit-identical to
+# serial on the Cartesian point-indexed grids.
 Test.@testset "Threaded backend: 1D/true-3D StructuredGrid (ND footprint)" begin
     # 1D Cartesian, uniform (Range) axis -> fast FilterFootprintND path.
     geom1 = FG.Geometry.CartesianGeometry()
@@ -566,9 +567,9 @@ Test.@testset "filter_apply_batched!: fused device batch and exact slice-loop fa
     cart = FG.Geometry.CartesianGeometry()
     gcart = FG.Grids.StructuredGrid(cart, range(0.0, 6.4e4; length = 64), range(0.0, 3.2e4; length = 32))
 
-    # Every engine with a per-point device kernel must fold the batch into ONE launch. The only engine
-    # exempt is the prefix-sum top-hat, whose running scan along an axis is not a per-point kernel and
-    # runs on the host by design (a device version needs a parallel Blelloch scan).
+    # Every engine folds the whole batch into a single launch per pass. The prefix-sum top-hat's scan is
+    # sequential along axis 1 and independent across the others, so its batch axis rides on the launch
+    # exactly as the per-point engines' does.
     for (grid, kern, sc) in (
         (FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(Rearth), lon, lat), CGEF.GaussianKernel(), 400e3),
         (FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(Rearth), lon, lat, msk), CGEF.GaussianKernel(), 400e3),
@@ -579,7 +580,7 @@ Test.@testset "filter_apply_batched!: fused device batch and exact slice-loop fa
         f = randn(dims..., Nb)
         ps = F.plan_filter(grid, kern, sc; backend = CB.SerialBackend(), mask_strategy = F.Deformable())
         pg = F.plan_filter(grid, kern, sc; backend = CB.GPUBackend(KA.CPU()), mask_strategy = F.Deformable())
-        Test.@test F._gpu_batched_supported(pg) || pg.footprint isa CGEF.Filtering.PrefixSumTopHatPlan
+        Test.@test F._gpu_batched_supported(pg)
 
         loop = zeros(dims..., Nb)
         for b in 1:Nb

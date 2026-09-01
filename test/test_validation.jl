@@ -436,8 +436,10 @@ Test.@testset "Band energies: repeated-filter Germano identity sums to the total
     Etot = 0.5 * sum(u .^ 2 .+ v .^ 2) / (N * N)
 
     for kern in (CGEF.TopHatKernel(), CGEF.GaussianKernel(), CGEF.Kernels.SmoothHatKernel())
-        r = CGEF.Diagnostics.band_energies(u, v, grid, kern, scales)
+        r = CGEF.Diagnostics.band_energies(u, v, grid, kern, scales; maps = true)
         Test.@test length(r.bands) == length(scales)
+        # Maps are opt-in: the default call returns the scalars alone.
+        Test.@test CGEF.Diagnostics.band_energies(u, v, grid, kern, scales).band_maps === nothing
         # The identity, exact: bands + resolved == the unfiltered energy.
         Test.@test r.total ≈ Etot rtol = 1e-12
         Test.@test sum(r.bands) + r.resolved == r.total
@@ -496,7 +498,7 @@ Test.@testset "Band energies: repeated-filter Germano identity sums to the total
     # A signed kernel breaks the pointwise positivity, hence the non-negative-kernel requirement.
     # The integrated identity still closes: conserving the mean does not need a positive kernel.
     let ho = CGEF.Kernels.HighOrderKernel(; order = 3),
-        rh = CGEF.Diagnostics.band_energies(u, v, grid, ho, [8 * dx, 16 * dx])
+        rh = CGEF.Diagnostics.band_energies(u, v, grid, ho, [8 * dx, 16 * dx]; maps = true)
         Test.@test any(km -> any(<(0), km), rh.band_maps)
         Test.@test rh.total ≈ Etot rtol = 1e-12
     end
@@ -603,11 +605,129 @@ Test.@testset "check_setup reports what will run, and every capability it claims
         ru = CGEF.check_setup(ug, CGEF.GaussianKernel(), 6 * dx)
         Test.@test ru.spacing == ()
         Test.@test any(n -> occursin("no axes", n), ru.notes)
-        Test.@test occursin("scattered", ru.engine)
+        # A flat-cell grid's real-space engine is the CSR gather over its own ball query. A structured
+        # grid with a nonuniform axis takes the scattered per-point footprint instead.
+        Test.@test occursin("node CSR", ru.engine)
     end
 
     Test.@test_throws ArgumentError CGEF.check_setup(grid, CGEF.TopHatKernel(), 0.0)
     Test.@test_throws ArgumentError CGEF.check_setup(grid, CGEF.TopHatKernel(), -1.0)
+end
+
+
+# `check_setup` exists so a user does not have to read `src/` to learn which engine runs. That makes
+# its engine string a claim about dispatch, and a claim about dispatch has to be checked against
+# dispatch — otherwise it drifts silently, which is how it came to describe a spherical Gaussian (the
+# package's most expensive engine) as "separable".
+Test.@testset "check_setup names the engine that is actually constructed" begin
+    dx = 1_000.0
+    ℓ = 8 * dx
+    geom = FG.Geometry.CartesianGeometry()
+    sgeom = FG.Geometry.SphericalGeometry(6.371e6)
+    R2 = 0.0:dx:19*dx                                   # Range axis  => uniform-axis engines
+    V2 = collect(R2) .+ [0.2 * dx * sin(3.3i) for i in 1:20]   # Vector axis => scattered engines
+    R3 = 0.0:dx:9*dx
+    lon = range(0.0; step = 2π / 24, length = 24)
+    lat = range(deg2rad(-60.0); stop = deg2rad(60.0), length = 16)
+
+    # Every real-space footprint type, and the phrase the report must use for it.
+    expected = [
+        (CGEF.Filtering.PrefixSumTopHatPlan,   "O(N·w_y)"),
+        (CGEF.Filtering.PrefixSumTopHat3DPlan, "O(N·w_y·w_z)"),
+        (CGEF.Filtering.SeparableFootprint,    "separable two-pass"),
+        (CGEF.Filtering.SeparableFootprintND,  "separable N-pass"),
+        (CGEF.Filtering.FilterFootprint,       "banded footprint"),
+        (CGEF.Filtering.ScatteredFilterPlan,   "scattered per-point"),
+        (CGEF.Filtering.FilterFootprintND,     "N-dimensional ball"),
+        (CGEF.Filtering.NDScatteredFilterPlan, "scattered N-dimensional"),
+        (CGEF.Filtering.NodeFilterPlan,        "node CSR"),
+    ]
+    phrase_for(fp) = begin
+        hits = [p for (Tfp, p) in expected if fp isa Tfp]
+        length(hits) == 1 || error("footprint $(typeof(fp)) matches $(length(hits)) engine phrases")
+        only(hits)
+    end
+
+    RS = CGEF.Filtering.RealSpace()
+    cases = Any[
+        # (name, grid, kernel, method)
+        ("2D Cartesian Range   / tophat",   FG.Grids.StructuredGrid(geom, R2, R2, trues(20, 20)),  CGEF.TopHatKernel(),   RS),
+        ("2D Cartesian Vector  / tophat",   FG.Grids.StructuredGrid(geom, V2, V2, trues(20, 20)),  CGEF.TopHatKernel(),   RS),
+        ("2D spherical        / tophat",    FG.Grids.StructuredGrid(sgeom, lon, lat, trues(24, 16)), CGEF.TopHatKernel(), RS),
+        ("2D Cartesian Range   / gaussian", FG.Grids.StructuredGrid(geom, R2, R2, trues(20, 20)),  CGEF.GaussianKernel(), RS),
+        ("2D Cartesian Vector  / gaussian", FG.Grids.StructuredGrid(geom, V2, V2, trues(20, 20)),  CGEF.GaussianKernel(), RS),
+        # The case that motivated this testset: separable KERNEL, non-separable METRIC.
+        ("2D spherical        / gaussian",  FG.Grids.StructuredGrid(sgeom, lon, lat, trues(24, 16)), CGEF.GaussianKernel(), RS),
+        ("2D Cartesian Range   / sharp",    FG.Grids.StructuredGrid(geom, R2, R2, trues(20, 20)),  CGEF.SharpSpectralKernel(), RS),
+        ("3D Cartesian Range   / gaussian", FG.Grids.StructuredGrid(geom, R3, R3, R3, trues(10, 10, 10)), CGEF.GaussianKernel(), RS),
+        ("3D Cartesian Range   / tophat",   FG.Grids.StructuredGrid(geom, R3, R3, R3, trues(10, 10, 10)), CGEF.TopHatKernel(), RS),
+        ("1D Cartesian Range   / gaussian", FG.Grids.StructuredGrid(geom, R2, trues(20)),          CGEF.GaussianKernel(), RS),
+        ("curvilinear         / gaussian",  FG.Grids.CurvilinearGrid(geom,
+                                              [Float64(i - 1) * dx for i in 1:20, j in 1:20],
+                                              [Float64(j - 1) * dx for i in 1:20, j in 1:20],
+                                              trues(20, 20)),                                      CGEF.GaussianKernel(), RS),
+    ]
+
+    for (name, g, k, m) in cases
+        plan = CGEF.Filtering.plan_filter(g, k, ℓ; method = m,
+                                          backend = CGEF.ComputationalBackends.SerialBackend())
+        reported = CGEF.Pipeline._engine_class(g, k, m)
+        want = phrase_for(plan.footprint)
+        Test.@test occursin(want, reported) ||
+            error("$name: built $(nameof(typeof(plan.footprint))) but reported \"$reported\"")
+    end
+
+    # Flat-cell grids. One CSR engine over the grid's own ball query serves every architecture that
+    # names a cell by a single index, so the report must name that engine for each of them.
+    let nn = 12,
+        xg = [Float64(i - 1) * dx for i in 1:nn, j in 1:nn],
+        yg = [Float64(j - 1) * dx for i in 1:nn, j in 1:nn],
+        R = 6.371e6,
+        flat = Any[
+            (FG.Grids.UnstructuredGrid(geom, vec(xg), vec(yg), trues(nn * nn);
+                                       k = 6, areas = fill(dx^2, nn * nn)), ℓ),
+            (FG.Grids.RingGrid(FG.Geometry.SphericalGeometry(R),
+                               FG.SphericalSampling.ReducedGaussianSampling([8, 12, 12, 8])), 0.3R),
+            (FG.Grids.CubedSphereGrid(4), 0.3R),
+            (FG.Grids.HEALPixGrid(2), 0.3R),
+            (FG.Grids.IcosahedralGrid(1), 0.3R),
+            (FG.Grids.YinYangGrid(12, 6), 0.3R),
+        ]
+        for (g, s) in flat
+            plan = CGEF.Filtering.plan_filter(g, CGEF.GaussianKernel(), s; method = RS,
+                                              backend = CGEF.ComputationalBackends.SerialBackend())
+            Test.@test occursin(phrase_for(plan.footprint),
+                                CGEF.Pipeline._engine_class(g, CGEF.GaussianKernel(), RS))
+        end
+    end
+
+    # The complexity the report states must name the width, not claim linearity in N alone: the
+    # prefix-sum engine is O(N·w_y), and reporting it as "O(N)" told users the filter width was free.
+    let g = FG.Grids.StructuredGrid(geom, R2, R2, trues(20, 20))
+        e = CGEF.Pipeline._engine_class(g, CGEF.TopHatKernel(), RS)
+        Test.@test occursin("O(N·w", e)
+        Test.@test !occursin("exact O(N)", e)
+    end
+
+    # `AutoMethod` reaches two transform-based evaluators of the same real-space convolution. They are
+    # engines, not `Spectral()`, so the report must name them rather than the direct sum they replace.
+    AM = CGEF.Filtering.AutoMethod()
+    let g = FG.Grids.StructuredGrid(geom, R2, R2, trues(20, 20))   # bounded => padded, not Spectral
+        plan = CGEF.Filtering.plan_filter(g, CGEF.SharpSpectralKernel(), ℓ; method = AM,
+                                          backend = CGEF.ComputationalBackends.SerialBackend())
+        rep = CGEF.Pipeline._engine_class(g, CGEF.SharpSpectralKernel(), AM)
+        Test.@test occursin("padded-FFT", rep) ==
+                   (nameof(typeof(plan.footprint)) === :PaddedFFTFootprint)
+    end
+    let g = FG.Grids.StructuredGrid(sgeom, lon, lat, trues(24, 16))
+        plan = CGEF.Filtering.plan_filter(g, CGEF.GaussianKernel(), ℓ; method = AM,
+                                          backend = CGEF.ComputationalBackends.SerialBackend())
+        rep = CGEF.Pipeline._engine_class(g, CGEF.GaussianKernel(), AM)
+        Test.@test occursin("zonal-FFT", rep) ==
+                   (nameof(typeof(plan.footprint)) === :ZonalFFTFootprint)
+        # A top-hat must NOT be diverted there: its prefix-sum engine is exact and cheaper.
+        Test.@test !occursin("zonal-FFT", CGEF.Pipeline._engine_class(g, CGEF.TopHatKernel(), AM))
+    end
 end
 
 _cgef_alloc_favre(ws, u, v, ρ, P, g, k, ℓ, fp, dp) =

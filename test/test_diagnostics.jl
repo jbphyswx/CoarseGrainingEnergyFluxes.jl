@@ -491,6 +491,89 @@ Test.@testset "Helmholtz flux decomposition" begin
 end
 
 
+# Measured through a top-level, fully-qualified helper: inside a testset the arguments and the module
+# alias are captured locals, and `@allocated` then charges that capture to the call under test.
+_alloc_decomposed3d!(ws, u, v, w, ur, vr, wr, grid, kern, scale, pl, dp) =
+    @allocated CGEF.Diagnostics.compute_Π_decomposed!(
+        ws, u, v, w, ur, vr, wr, grid, kern, scale; filter_plan = pl, deriv_plan = dp,
+    )
+
+# True-3D rotational/divergent split: the same both-sides decomposition over all six independent
+# tensor components, checked against the definition assembled from primitives.
+Test.@testset "3D decomposed flux" begin
+    n = 12
+    ax = range(0.0, 1200.0; length = n + 1)[1:n]
+    g3 = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), ax, ax, ax;
+                                 periodic = (true, true, true))
+    kern = CGEF.TopHatKernel(); scale = 300.0
+    # Deterministic and mutually independent, with a different wavenumber triple and phase per
+    # component, so every one of the six tensor components carries a distinct signal.
+    L = 1200.0
+    field(a, b, c, φ) = [sinpi(a * ax[i] / L + φ) * cospi(b * ax[j] / L) * sinpi(c * ax[k] / L + φ / 2)
+                         for i in 1:n, j in 1:n, k in 1:n]
+    u, v, w = field(2, 1, 1, 0.0), field(1, 3, 2, 0.3), field(3, 2, 1, 0.7)
+    ur, vr, wr = field(1, 2, 3, 0.11), field(2, 3, 1, 0.53), field(3, 1, 2, 0.91)
+
+    dec = CGEF.Diagnostics.compute_Π_decomposed(u, v, w, ur, vr, wr, g3, kern, scale)
+
+    # (1) the three channels sum to the total to the last bit, by construction.
+    Test.@test dec.total == dec.rotational .+ dec.cross .+ dec.divergent
+
+    # (2) against the definition, assembled independently from `filter_apply!` and the derivatives:
+    #     Π_RR = −S̄ʳ:τʳʳ, Π_DD = −S̄ᵈ:τᵈᵈ, Π_X = −(S̄ʳ:τᵈᵈ + S̄ᵈ:τʳʳ + S̄ʳ:τ_X + S̄ᵈ:τ_X).
+    pl = CGEF.Filtering.plan_filter(g3, kern, scale;
+                                    backend = CGEF.ComputationalBackends.SerialBackend())
+    dp = CGEF.Derivatives.StencilPlan(g3)
+    flt(f) = (o = zeros(n, n, n); CGEF.Filtering.filter_apply!(o, f, pl); o)
+    rot = (ur, vr, wr)
+    dv = (u .- ur, v .- vr, w .- wr)
+    br = map(flt, rot)
+    bd = map(flt, dv)
+    SYM = ((1, 1), (1, 2), (1, 3), (2, 2), (2, 3), (3, 3))
+    τRR = ntuple(k -> ((i1, i2) = SYM[k]; flt(rot[i1] .* rot[i2]) .- br[i1] .* br[i2]), 6)
+    τDD = ntuple(k -> ((i1, i2) = SYM[k]; flt(dv[i1] .* dv[i2]) .- bd[i1] .* bd[i2]), 6)
+    τX = ntuple(6) do k
+        (i1, i2) = SYM[k]
+        (flt(rot[i1] .* dv[i2]) .- br[i1] .* bd[i2]) .+ (flt(dv[i1] .* rot[i2]) .- bd[i1] .* br[i2])
+    end
+    dd(f, d) = begin
+        o = zeros(n, n, n)
+        d == 1 ? CGEF.Derivatives.ddx!(o, f, g3, dp) :
+        d == 2 ? CGEF.Derivatives.ddy!(o, f, g3, dp) : CGEF.Derivatives.ddz!(o, f, g3, dp)
+        o
+    end
+    strain(b) = ntuple(6) do k
+        (i1, i2) = SYM[k]
+        i1 == i2 ? dd(b[i1], i1) : 0.5 .* (dd(b[i1], i2) .+ dd(b[i2], i1))
+    end
+    SR = strain(br); SD = strain(bd)
+    con(S, t) = -(S[1] .* t[1] .+ S[4] .* t[4] .+ S[6] .* t[6] .+
+                  2 .* (S[2] .* t[2] .+ S[3] .* t[3] .+ S[5] .* t[5]))
+    Test.@test dec.rotational ≈ con(SR, τRR)
+    Test.@test dec.divergent ≈ con(SD, τDD)
+    Test.@test dec.cross ≈ con(SR, τDD) .+ con(SD, τRR) .+ con(SR, τX) .+ con(SD, τX)
+
+    # (3) a purely rotational field leaves the other two channels at zero.
+    dec_r = CGEF.Diagnostics.compute_Π_decomposed(ur, vr, wr, ur, vr, wr, g3, kern, scale)
+    Test.@test maximum(abs, dec_r.divergent) == 0.0
+    Test.@test maximum(abs, dec_r.cross) == 0.0
+
+    # (4) the workspace form is what the allocating one delegates to, and holding it plus both plans
+    # makes a repeated evaluation allocation-free.
+    ws = CGEF.Diagnostics.PiDecomposed3DWorkspace(g3)
+    dw = CGEF.Diagnostics.compute_Π_decomposed!(ws, u, v, w, ur, vr, wr, g3, kern, scale;
+                                                filter_plan = pl, deriv_plan = dp)
+    for k in (:total, :rotational, :cross, :divergent)
+        Test.@test getproperty(dw, k) == getproperty(dec, k)
+    end
+    dw2 = CGEF.Diagnostics.compute_Π_decomposed!(ws, u, v, w, ur, vr, wr, g3, kern, scale;
+                                                 filter_plan = pl, deriv_plan = dp)
+    Test.@test dw2.total == dw.total
+    _alloc_decomposed3d!(ws, u, v, w, ur, vr, wr, g3, kern, scale, pl, dp)
+    Test.@test _alloc_decomposed3d!(ws, u, v, w, ur, vr, wr, g3, kern, scale, pl, dp) == 0
+end
+
+
 # Cross-scale tracer-variance flux (scalar analog of Π).
 Test.@testset "Tracer variance flux" begin
     geom = FG.Geometry.CartesianGeometry()

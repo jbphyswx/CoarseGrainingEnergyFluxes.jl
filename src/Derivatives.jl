@@ -4,14 +4,56 @@ using FlowGeometries: FlowGeometries
 
 export ddx!, ddy!, ddz!
 export StencilPlan
+export gradient_plan
 
 # A grid with no separable axis to difference along — curvilinear, or a node set — takes the
-# least-squares tangent-plane gradient instead: `Connectivity.gradient_plan(grid)` once, then
-# `Discretization.gradient!(g1, g2, field, plan)`, which returns both components from one traversal.
+# least-squares tangent-plane gradient instead: `gradient_plan(grid)` once, then
+# `Operators.gradient!(g1, g2, field, plan)`, which returns both components from one traversal.
 # Nothing of that belongs here; it is geometry and connectivity.
 
+"""
+    gradient_plan(grid) -> Operators.GradientPlan
+
+The least-squares tangent-plane gradient plan for `grid`, asking for its adjacency the way that grid
+supplies one.
+
+`Operators.gradient_plan` takes a `stencil`, which describes an offset pattern in an index space. A
+layout whose neighbours come from a formula on the cell id — a ring grid, a pixelization, a panel
+mesh — has no index space to offset in, and its connectivity builder accepts no `stencil`. So the
+adjacency is built first, through the trait, and handed over as `conn`.
+"""
+gradient_plan(grid::FlowGeometries.Grids.AbstractGrid) =
+    _gradient_plan(FlowGeometries.Grids.adjacency_source(grid), grid)
+
+_gradient_plan(::FlowGeometries.Grids.AbstractAdjacency, grid) =
+    FlowGeometries.Operators.gradient_plan(grid)
+
+function _gradient_plan(::FlowGeometries.Grids.StoredMeshNeighbors, grid)
+    _require_adjacency(FlowGeometries.Grids.neighbor_nbrs(grid), grid)
+    return FlowGeometries.Operators.gradient_plan(grid)
+end
+
+function _gradient_plan(adj::FlowGeometries.Grids.FormulaNeighbors, grid)
+    conn = FlowGeometries.Connectivity.build_connectivity(grid, adj)
+    _require_adjacency(conn.nbrs, grid)
+    return FlowGeometries.Operators.gradient_plan(grid; conn = conn)
+end
+
+# A least-squares gradient is a fit over a cell's neighbours, so a grid carrying none of them fits
+# nothing and every derivative reads zero — and a flux contracted against a zero strain is zero, with
+# no other sign that the grid was built without an adjacency. A node set gets one from `k` (the
+# k-nearest count) or from an explicit neighbour list.
+function _require_adjacency(nbrs, grid)
+    isempty(nbrs) && throw(ArgumentError(
+        "$(nameof(typeof(grid))) carries no neighbour adjacency, so a least-squares gradient has " *
+        "nothing to fit and every derivative on it is zero. Build the grid with an adjacency — " *
+        "`k = <n>` for k-nearest neighbours on a node set — or supply one explicitly.",
+    ))
+    return nothing
+end
+
 # ---------------------------------------------------------------------------
-# Structured derivatives: `Discretization.derivative!` per direction.
+# Structured derivatives: `Operators.derivative!` per direction.
 #
 # One set of methods for every geometry — the metric division and the pole, where `h_λ = R cos φ → 0`
 # and the derivative does not exist, are the geometry's own and are handled there. On a Cartesian
@@ -24,10 +66,10 @@ Derivative of `f` with respect to distance along direction `d`. `nodes = 3` for 
 stretched axis; `ReduceInRun` keeps the one-sided value at a mask edge, where the default writes zero.
 """
 _dd!(∂f::AbstractArray{T}, f::AbstractArray{T}, grid, d::Int) where {T<:AbstractFloat} =
-    FlowGeometries.Discretization.derivative!(
+    FlowGeometries.Operators.derivative!(
         ∂f, f, grid, d;
         order = 1, nodes = 3, masked = zero(T),
-        policy = FlowGeometries.Discretization.ReduceInRun(),
+        policy = FlowGeometries.Operators.ReduceInRun(),
     )
 
 """
@@ -39,7 +81,7 @@ Pass a [`StencilPlan`](@ref) to reuse the weights across calls; without one they
 The dimensionality is pinned per direction, so asking a grid for a derivative it has no axis for is a
 `MethodError` at the call rather than a bounds error inside the kernel.
 """
-ddx!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{G,T,N}) where {T<:AbstractFloat,N,G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
+ddx!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}) where {T<:AbstractFloat,N,G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
     _dd!(∂f, f, grid, 1)
 
 """
@@ -47,7 +89,7 @@ ddx!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{G,T,N}) where {T<:Abstra
 
 Derivative of `f` with respect to distance along the Northward/φ direction — see [`ddx!`](@ref).
 """
-ddy!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{G,T,N}) where {T<:AbstractFloat,N,G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
+ddy!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}) where {T<:AbstractFloat,N,G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
     _dd!(∂f, f, grid, 2)
 
 """
@@ -56,14 +98,14 @@ ddy!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{G,T,N}) where {T<:Abstra
 Derivative of `f` with respect to distance along the third direction of a 3D grid, which supplies the
 axis — see [`ddx!`](@ref). For a 3D field over a *2D* grid, see the `dz` method below.
 """
-ddz!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{G,T,3}) where {T<:AbstractFloat,G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
+ddz!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{T,G,3}) where {T<:AbstractFloat,G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
     _dd!(∂f, f, grid, 3)
 
 """
     StencilPlan(grid; order = 1, nodes = 3)
 
 The finite-difference weights of every direction of `grid`, built once. `Discretization.axis_stencils`
-per axis; the derivative is then `Discretization.derivative!` reading a table it does not have to
+per axis; the derivative is then `Operators.derivative!` reading a table it does not have to
 rebuild.
 
 The weights depend only on the axis, its wrap period and the requested order — never on a field — so a
@@ -89,7 +131,7 @@ Base.show(io::IO, p::StencilPlan{N}) where {N} =
           count(!isnothing, p.tables), " of ", N, " directions differentiable)")
 
 function StencilPlan(
-    grid::FlowGeometries.Grids.StructuredGrid{G,T,N}; order::Integer = 1, nodes::Integer = 3,
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}; order::Integer = 1, nodes::Integer = 3,
 ) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     ord = Int(order)
     tables = ntuple(Val(N)) do d
@@ -130,17 +172,17 @@ end
 ) where {T<:AbstractFloat}
     tab = plan.tables[d]
     tab === nothing && return fill!(∂f, zero(T))
-    return FlowGeometries.Discretization.derivative!(
+    return FlowGeometries.Operators.derivative!(
         ∂f, f, grid, tab[1], tab[2], d;
         order = plan.order, masked = zero(T),
-        policy = FlowGeometries.Discretization.ReduceInRun(),
+        policy = FlowGeometries.Operators.ReduceInRun(),
         scratch = plan.scratch,
     )
 end
 
 ddx!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid, plan::StencilPlan) = _dd!(∂f, f, grid, 1, plan)
 ddy!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid, plan::StencilPlan) = _dd!(∂f, f, grid, 2, plan)
-ddz!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{G,T,3}, plan::StencilPlan) where {T<:AbstractFloat,G} =
+ddz!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, plan::StencilPlan) where {T<:AbstractFloat,G} =
     _dd!(∂f, f, grid, 3, plan)
 
 # ---------------------------------------------------------------------------
@@ -165,19 +207,19 @@ Since the vertical axis is not on the grid, its weights cannot come from a grid-
 function ddz!(
     ∂f∂z::AbstractArray{T,3},
     f::AbstractArray{T,3},
-    grid::FlowGeometries.Grids.StructuredGrid{FlowGeometries.Geometry.CartesianGeometry{T},T,2},
+    grid::FlowGeometries.Grids.StructuredGrid{T,FlowGeometries.Geometry.CartesianGeometry{T},2},
     dz::T,
     plan::Union{Nothing,StencilPlan} = nothing,
 ) where {T<:AbstractFloat}
     Nx, Ny, Nz = size(f)
     tab = plan === nothing ? nothing : plan.tables[1]
     if tab === nothing
-        FlowGeometries.Discretization.apply_stencil!(
+        FlowGeometries.Operators.apply_stencil!(
             ∂f∂z, f, range(zero(T); step = dz, length = Nz), 3;
             order = 1, nodes = 3, masked = zero(T),
         )
     else
-        FlowGeometries.Discretization.apply_stencil!(
+        FlowGeometries.Operators.apply_stencil!(
             ∂f∂z, f, tab[1], tab[2], 3; masked = zero(T),
         )
     end

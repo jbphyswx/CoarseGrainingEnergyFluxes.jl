@@ -16,7 +16,7 @@ using FlowGeometries: FlowGeometries
 function CGEF.Filtering.mpi_filter_field!(
     out::AbstractMatrix{T},
     field::AbstractMatrix,
-    grid::Union{FlowGeometries.Grids.StructuredGrid{G,T,2}, FlowGeometries.Grids.CurvilinearGrid{T,G}},
+    grid::Union{FlowGeometries.Grids.StructuredGrid{T,G,2}, FlowGeometries.Grids.CurvilinearGrid{T,G}},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T,
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
@@ -40,6 +40,9 @@ function CGEF.Filtering.mpi_filter_field!(
     _, Ny = FlowGeometries.Grids.size_tuple(grid)
 
     fill!(out, zero(T))
+    # `field` is replicated on every rank, so each derives the engine's whole-grid source itself rather
+    # than exchanging it — no message, and the rows below then need nothing but their own band.
+    CGEF.Filtering.prepare_row_apply!(fp, field, grid)
     # Round-robin row partition across ranks (balances per-row masking cost like dynamic scheduling).
     for j in (rank + 1):nproc:Ny
         CGEF.Filtering.apply_footprint_row!(out, field, grid, fp, mask_strategy, periodic_x, periodic_y, j)
@@ -62,8 +65,11 @@ function _mpi_apply_separable!(
     di_lim, dj_lim = fp.di_lim, fp.dj_lim
     periodic_x, periodic_y = fp.periodic_x, fp.periodic_y
 
-    masked_input = T.(mask) .* field
-    row_pass = similar(masked_input)
+    # The plan's own pass buffers, not fresh ones: `field` is replicated, so each rank fills its local
+    # copy with no message, and a repeated sweep then allocates nothing here.
+    masked_input = fp.masked_input
+    row_pass = fp.row_pass
+    @. masked_input = T(mask) * field
     for j in 1:Ny   # redundant across ranks -- zero communication, `field` already replicated
         CGEF.Filtering._separable_row_pass_at!(row_pass, masked_input, gx, di_lim, periodic_x, Nx, j)
     end
@@ -109,7 +115,7 @@ end
 function CGEF.Filtering.mpi_filter_field!(
     out::AbstractArray{T,N},
     field::AbstractArray,
-    grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T,
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
@@ -121,6 +127,13 @@ function CGEF.Filtering.mpi_filter_field!(
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
     dims = FlowGeometries.Grids.size_tuple(grid)
     mask = FlowGeometries.Grids.mask(grid)
+
+    if fp isa CGEF.Filtering.PrefixSumTopHat3DPlan
+        # `field` is replicated on every rank and a running scan does not decompose over points, so each
+        # rank computes the whole thing locally — redundant work, zero messages, and still faster than a
+        # distributed O(N·w³) ball walk. Same treatment as the separable-ND path below.
+        return CGEF.Filtering.apply_prefixsum_tophat_3d!(out, field, grid, fp, mask_strategy)
+    end
 
     if fp isa CGEF.Filtering.SeparableFootprintND
         return CGEF.Filtering.apply_separable_nd!(out, field, grid, fp, mask_strategy)
@@ -160,16 +173,15 @@ end
 function CGEF.Filtering.mpi_filter_field!(
     out::AbstractVector{T},
     field::AbstractVector,
-    grid::FlowGeometries.Grids.UnstructuredGrid{T},
+    grid::FlowGeometries.Grids.AbstractGrid{G,T},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T,
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
-    workspace,
-) where {T<:AbstractFloat}
+    fp::CGEF.Filtering.NodeFilterPlan,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nproc = MPI.Comm_size(comm)
-    fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
 
     fill!(out, zero(T))
     for t in (rank + 1):nproc:length(out)

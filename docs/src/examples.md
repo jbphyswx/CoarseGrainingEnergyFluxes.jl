@@ -35,7 +35,7 @@ CoarseGrainingEnergyFluxes setup check
   masking         : ZeroFill
   method          : default for this grid
   backend         : AutoBackend -> SerialBackend
-  real-space engine: prefix-sum top-hat, exact O(N)
+  real-space engine: prefix-sum top-hat, exact, O(N·w_y)
   ℓ resolvable    : yes
   supports Π      : yes
   spectrum ≥ 0    : NO
@@ -74,8 +74,8 @@ What every result field's axes mean. `Ns = length(scales)`; the spatial rank `R`
 | `compute_Π!` | `Π` | `(spatial…)` or `(spatial…, batch…)` | the grid's rank fixes the split |
 | `compute_Π_strain_convergence` | `total`, `strain`, `convergence`, `divergence`, `strain_magnitude` | `(spatial…)` | `total = strain − convergence` |
 | `compute_Π_decomposed` | `total`, `rotational`, `cross`, `divergent` | `(spatial…)` | `total` is the sum of the other three |
-| `tau_decomposition` | `L`, `C`, `R`, each `(; xx, xy, yy)` | `(spatial…)` | `L + C + R = τ` exactly |
-| `band_energies` | `bands` | `(Ns,)` | domain means; `band_maps[n]` is the pointwise map |
+| `tau_decomposition` | `L`, `C`, `R`, each `(; xx, xy, yy)`, or `(; xx, xy, xz, yy, yz, zz)` given `w` | `(spatial…)` | `L + C + R = τ` exactly |
+| `band_energies` | `bands` | `(Ns,)` | domain means; with `maps = true`, `band_maps[n]` is the pointwise map |
 | `enstrophy_flux` | `Z` | `(spatial…)` | same gauge as `Π` |
 
 Two conventions worth stating outright, because getting either wrong changes the numbers:
@@ -246,10 +246,10 @@ result = CGEF.coarse_grain(u, v, grid; scales = collect(10e3:10e3:60e3),
 
 `UnstructuredGrid` is the full pipeline for genuinely scattered observations (moorings, drifters,
 along-track altimetry): k-d tree neighbor search and Voronoi cell areas at construction time, WLSQ
-gradients over that adjacency, and both filtering methods. `Spectral()` (FINUFFT/NUFSHT) is the
-default — exact for a band-limited field and `O(n log n)`. Pass `method = CGEF.Filtering.RealSpace()`
-when the kernel must be applied exactly as written, e.g. near a boundary or a masked region, where a
-transform's global support is wrong.
+gradients over that adjacency, and both filtering methods. `RealSpace()` is the default, as on every
+other grid: the compact kernel applied exactly as written, through a gather over each point's metric
+ball, which holds next to a boundary or a masked region. Pass `method = CGEF.Filtering.Spectral()`
+for the transform — exact for a band-limited field on a homogeneous domain, and `O(n log n)`.
 
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
@@ -272,6 +272,44 @@ CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, grid, CGEF.GaussianKernel(), 8_0
 For scattered spherical observations, build `grid` with `FG.Geometry.SphericalGeometry(R)` instead and load
 `Quickhull` (Voronoi areas) and `NUFSHT` (spectral filtering) in place of `DelaunayTriangulation`/
 `FINUFFT`.
+
+## Sphere pixelizations: ring, cubed-sphere, healpix, icosahedral, Yin–Yang
+
+A model that stores one value per cell and names that cell by a single index is served by the same
+engine as a scattered point cloud: a gather over each cell's own metric ball, with each cell weighted
+by its own area. The grid declares `Grids.cell_address(grid) === Grids.FlatCells()` and the whole
+pipeline follows — filtering, gradients, `compute_Π!`, a scale sweep, every execution backend, and
+the tensor diagnostics (`tau_decomposition`, `tracer_variance_flux`, `vorticity`, `enstrophy_flux`,
+and on a Cartesian metric `compute_Π_strain_convergence`, `compute_Π_decomposed` and
+`compressible_flux`). Nothing in the call names the layout.
+
+```julia
+using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
+using FlowGeometries: FlowGeometries as FG
+
+geom = FG.Geometry.SphericalGeometry(6.371e6)
+
+grid = FG.Grids.HEALPixGrid(geom, 64)               # 12·64² = 49,152 equal-area pixels
+# grid = FG.Grids.CubedSphereGrid(geom, 48)         # 6 faces of 48²
+# grid = FG.Grids.IcosahedralGrid(geom, 32)         # 10·32² + 2 vertices
+# grid = FG.Grids.YinYangGrid(geom, 192, 96)        # two overlapping lat-lon panels
+# grid = FG.Grids.RingGrid(geom, FG.SphericalSampling.ReducedGaussianSampling(nlon_per_ring))
+
+n = length(FG.Grids.mask(grid))
+u = randn(n); v = randn(n)                          # one value per cell, in the grid's own ordering
+
+Π = zeros(n)
+CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, grid, CGEF.GaussianKernel(), 300e3)
+
+result = CGEF.coarse_grain(u, v, grid; scales = collect(100e3:100e3:600e3),
+                           kernel = CGEF.GaussianKernel(),
+                           spectrum = CGEF.Diagnostics.NoSpectrum())
+```
+
+Pass `mask = <Vector{Bool}>` to any of these constructors for a regional or land-masked domain; the
+mask strategies behave as they do everywhere else. These layouts store no coordinate arrays — a cell's
+position, neighbours and area are arithmetic in the resolution parameter — so `Grids.coordinates` is
+unavailable on them and `check_setup` reports no axis spacing.
 
 ## True 3D volumetric flux (Cartesian and spherical)
 
@@ -350,6 +388,74 @@ result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = CGEF.Diagnost
 `MPIBackend`'s real multi-rank behavior (round-robin row decomposition + `Allreduce!`) is only
 meaningfully exercised under `mpiexec -n P`; see `test/mpi_runtests.jl` for a runnable reference.
 
+## Planning a sweep once instead of once per scale
+
+A filter plan splits by how often each part changes: what the **grid** fixes (transform objects,
+measure prefix scans, a scattered point sort), what the **scale** fixes (tap tables, `Ĝ(ℓ)`, the
+reciprocal window mass), and transient **scratch**. `plan_filter` builds one of each for a single
+scale; [`Filtering.plan_filter_sweep`](@ref) builds the grid part and the scratch once for a whole
+sweep and gives each scale only its own tables.
+
+```julia
+scales = collect(10e3:10e3:80e3)
+family = CGEF.Filtering.plan_filter_sweep(grid, CGEF.TopHatKernel(), scales)
+
+# The allocating entry point sizes the result and a workspace; hand both, plus the family, to the
+# in-place one for every later timestep.
+result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum())
+ws = CGEF.Diagnostics.ΠWorkspace(grid)
+for t in 2:nt
+    CGEF.coarse_grain!(result, us[t], vs[t], grid; scales = scales,
+                       filter_plans = family, workspace = ws,
+                       spectrum = CGEF.Diagnostics.NoSpectrum())
+end
+```
+
+A `FilterPlanFamily` is an `AbstractVector` of the per-scale plans, so it can be indexed, iterated, and
+passed anywhere a plain vector of plans was. `coarse_grain` builds one internally for a one-shot sweep;
+`coarse_grain!` is the entry point that takes a prebuilt one.
+
+Because the scales of one family share a scratch buffer, **a family may not be applied from several
+tasks at once**. Give each concurrent worker its own — the batch and slice drivers already do.
+
+## Choosing the evaluator: `AutoMethod()`
+
+`RealSpace()` computes the direct sum. `AutoMethod()` picks the fastest engine that computes the *same*
+convolution, which on some grids means evaluating it by transform:
+
+```julia
+# Global sphere + a radial kernel: each latitude band becomes a circular convolution along longitude.
+res_fast = CGEF.coarse_grain(u, v, sphere_grid; scales = scales, kernel = CGEF.GaussianKernel(),
+                             method = CGEF.Filtering.AutoMethod(),
+                             spectrum = CGEF.Diagnostics.NoSpectrum())
+
+# Which engine did that pick, and what would RealSpace() have used?
+CGEF.check_setup(sphere_grid, CGEF.GaussianKernel(), 800e3; method = CGEF.Filtering.AutoMethod())
+CGEF.check_setup(sphere_grid, CGEF.GaussianKernel(), 800e3)   # notes that AutoMethod would be faster
+```
+
+These are the same compact kernel with the same weights, so they agree with the direct sum to
+round-off rather than exactly — which is why `RealSpace()` remains the default. Neither is
+`method = Spectral()`: no transfer function is sampled and no spherical-harmonic truncation happens.
+
+## Workspaces sized to what you asked for
+
+Each in-place diagnostic takes a workspace holding only the buffers its configuration can reach:
+
+```julia
+ws  = CGEF.Diagnostics.ΠWorkspace(grid)                  # 2-D flux, no vertical component
+wsw = CGEF.Diagnostics.ΠWorkspace(grid; has_w = true)    # 2.5-D: adds the vertical-component buffers
+ew  = CGEF.Diagnostics.EnergyWorkspace(grid)             # E(ℓ) reads only filtered velocity: 2 buffers
+
+CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, grid, kernel, ℓ; workspace = ws)
+CGEF.Diagnostics.cumulative_energy!(E, u, v, nothing, grid, kernel, scales; workspace = ew)
+```
+
+`has_w` must be given at construction, because the buffers have to exist before the first call — a
+workspace built without them refuses a `w` rather than returning a wrong answer. Spherical and true-3-D
+grids always carry the full set, since the spherical branch works in three planetary-Cartesian
+components whether or not a vertical velocity was supplied.
+
 ## Spectral filtering (`method = Spectral()`)
 
 Spectral filtering multiplies by Ĝ(k) and is selected by the grid type (FFTW / FINUFFT /
@@ -394,7 +500,14 @@ dec.cross        # Π_X    (every interaction / "stimulated cascade" term)
 dec.divergent    # Π_DD   (divergent → divergent)      dec.rotational .+ dec.cross .+ dec.divergent ≈ dec.total
 ```
 
-The true-3D Cartesian method has the same signature with `w`/`w_rot` added.
+The true-3D method has the same signature with `w`/`w_rot` added, on a Cartesian volume or a spherical
+shell.
+
+On a spherical grid the call is identical. The three stress pieces are formed as generalized second
+moments in planetary-Cartesian coordinates and rotated back to the local frame, and each part's strain
+carries the frame's `tanφ/R` curvature terms, so `dec.total` still equals `compute_Π!` — the suite
+asserts it. Pass `SphericalPiDecomposedWorkspace(grid)` to `compute_Π_decomposed!` to reuse the
+buffers across a sweep.
 
 ## Tracer / buoyancy variance flux
 
@@ -416,6 +529,15 @@ d.L.xx; d.C.xy; d.R.yy        # d.L + d.C + d.R == τ exactly
 
 On a spherical grid, `xx`/`xy`/`yy` are local east/north components (the moments are taken in
 planetary-Cartesian coordinates, then rotated back — see [Theory](theory.md)).
+
+Add `w` for the true-3-D split, on a Cartesian volume or a spherical shell. Each tensor then comes
+back with all six independent components, `(; xx, xy, xz, yy, yz, zz)`, and `L + C + R = τ` holds
+componentwise:
+
+```julia
+d3 = CGEF.Diagnostics.tau_decomposition(u, v, w, grid3d, CGEF.GaussianKernel(), 20_000.0)
+d3.L.xz; d3.C.yz; d3.R.zz
+```
 
 ## Strain / convergence decomposition of Π
 
@@ -457,7 +579,9 @@ total** — unlike band-passing the velocity, whose cross terms have indefinite 
 
 ```julia
 # `scales` ASCENDING: band n is what the n-th, progressively coarser, filter removes.
-r = CGEF.Diagnostics.band_energies(u, v, grid, CGEF.GaussianKernel(), [3e3, 6e3, 12e3])
+# `maps = true` adds the pointwise fields; without it only the scalars are formed.
+r = CGEF.Diagnostics.band_energies(u, v, grid, CGEF.GaussianKernel(), [3e3, 6e3, 12e3];
+                                   maps = true)
 r.bands                       # domain-mean energy per band
 r.resolved                    # what is left above the coarsest scale
 r.total                       # == ½⟨|u|²⟩ exactly on a periodic, unmasked grid

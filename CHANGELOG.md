@@ -10,6 +10,52 @@ A correctness/performance/feature overhaul is in progress (see the project plan)
 tracks the work as it lands.
 
 ### Added
+- **The strain/convergence split, the Helmholtz split and the Favre budget now work on a sphere.**
+  `compute_Π_strain_convergence`, `compute_Π_decomposed` (2-D) and `compressible_flux` took a
+  Cartesian metric on every grid, so a spherical caller — the package's primary case — could not call
+  them at all. Each gets a spherical method, with `SphericalPiDecomposedWorkspace` and
+  `SphericalFavreWorkspace` alongside the Cartesian workspaces. Every quantity carrying a direction is
+  formed in planetary-Cartesian coordinates and rotated back to the local frame, and every spatial
+  operator carries the frame's `tanφ/R` curvature terms. The stress moments come from one shared
+  routine with the spherical `tau_decomposition!`, and the strain from one shared routine with
+  `compute_Π!`, so each decomposition's total equals `compute_Π!` by construction — asserted, since
+  that identity holds on either metric.
+- **The rotational/divergent split on a spherical shell.** `compute_Π_decomposed` covered a Cartesian
+  volume in true 3-D and both metrics in the tangent plane; the volumetric shell — the configuration a
+  global model runs — had no method. `SphericalPiDecomposed3DWorkspace` closes it: the three stresses
+  come from the shared moment routine in planetary-Cartesian coordinates and rotate back to local
+  `(east, north, radial)`, and each part's strain carries the shell's curvature terms. Naming the whole
+  field rotational leaves the other two channels exactly zero and the total equal to `compute_Π!`.
+- **True-3-D forms of the Germano split and the Favre budget, on both metrics.**
+  `tau_decomposition` and `compressible_flux` were 2-D tangent only, so a true-3-D caller — the case
+  the package's volumetric `compute_Π!` exists for — had neither. Both now take `(u, v, w)` on a
+  Cartesian volume or a spherical shell, over all six independent components, with
+  `Sym3TauWorkspace` and `Favre3DWorkspace`. `tracer_variance_flux!` gained its 3-D in-place form.
+  The 3-D strain now carries the shell's curvature terms through one geometry-dispatched step, so the
+  Favre budget reaching `ρ·Π` on a shell is itself the check that it matches `compute_Π!`.
+- **Allocation gates for every new workspace form.** The seven workspaces added here exist so a
+  repeated evaluation costs no field-sized allocation, and each is now asserted to on a grid whose
+  single field is several times the bound.
+- **In-place forms for the spherical tracer and enstrophy fluxes.** `tracer_variance_flux!` and
+  `enstrophy_flux!` had Cartesian-only workspace forms, so a spherical caller paid the allocating path
+  on every scale of a sweep. `SphericalTracerFluxWorkspace` and a metric-dispatched
+  `EnstrophyFluxWorkspace` close that; both are bit-identical to the allocating forms.
+- **Every diagnostic works on every grid architecture.** `tau_decomposition`,
+  `tracer_variance_flux`, `vorticity`, `enstrophy_flux`, `compute_Π_strain_convergence`,
+  `compute_Π_decomposed` and `compressible_flux` took a `StructuredGrid`, so a curvilinear mesh, a
+  scattered node set or a sphere pixelization could compute `Π` and the spectrum but none of the
+  tensor decompositions. All seven, their in-place forms and their six workspace types now take any
+  grid resolving two tangent directions. The gradient comes from the architecture's own operator, so
+  no call names a grid type. Verified by identities that hold on any grid — `L + C + R = τ`,
+  `Π_α − Π_δ = −S̄:τ̄`, the Helmholtz channels summing to the total, `Z` being the tracer flux of `ω`,
+  and the Favre budget collapsing to `ρ·Π` at constant density.
+- **Real-space filtering and the full flux pipeline on every flat-cell grid architecture.** Ring,
+  cubed-sphere, healpix, icosahedral and Yin–Yang layouts join scattered node sets: `filter_field!`,
+  `plan_filter`, `compute_Π!`, the spectrum, `coarse_grain` and `check_setup` all work on them, under
+  serial, threaded, GPU, Distributed and MPI execution. Selection is by the grid's own
+  `Grids.cell_address` trait, so a layout added upstream is served as soon as it declares itself
+  flat-celled. The engine is the node CSR gather over the grid's ball query, and each family is
+  gated against the operator assembled from the kernel and that grid's own distance and measure.
 - **Every grid architecture now reaches every execution backend.** Node sets gained threaded, GPU,
   Distributed and MPI paths (they previously had none — a 48-thread run on scattered data executed
   serially); 1-D and true-3-D structured grids gained GPU, Distributed and MPI. All decompose over
@@ -71,6 +117,103 @@ tracks the work as it lands.
   `plan_filter`'s per-grid default.
 
 ### Changed
+- **`RealSpace()` is the default method on every grid architecture, node sets included.** Coarse
+  graining is defined as a convolution against a compact kernel (Aluie 2019), and that compact support
+  is what survives a regional domain and a coastline. A scattered `UnstructuredGrid` defaulted to
+  `Spectral()`, so the same `coarse_grain(u, v, grid; scales)` call computed a different operator there
+  than on any other grid. **Numbers change** for a node-set caller who named no `method`; pass
+  `method = Spectral()` for the transform.
+- **Gradient plans are built through the grid's own adjacency.** `Derivatives.gradient_plan(grid)`
+  selects on `Grids.adjacency_source`: a layout whose neighbours come from a formula on the cell id
+  has no index space to offset in, so its connectivity is built first and handed over as `conn`.
+- **Follows FlowGeometries' current module layout and grid type parameters.** Field operations moved
+  from `Discretization` to `Operators` (`derivative!`, `apply_stencil!`, `gradient!`, `GradientPlan`,
+  and `gradient_plan`, which moved out of `Connectivity`); `StructuredGrid` now spells its parameters
+  `{T, G, N, S, TP, C, AT, BT}`, with the element type first and a sampling slot after the rank. A
+  `deriv_plan` built by hand is now `FG.Operators.gradient_plan(grid)`.
+- **`Filtering` and `Diagnostics` are assembled from per-topic files.** `src/Filtering/` holds the
+  strategy singletons, the plan lifetimes, the cache strategy, the extension hooks, the public API, one
+  file per real-space engine under `engines/`, the apply drivers, the plan types, engine selection and
+  the slice-parallel entry; `src/Diagnostics/` holds the spectrum policy, the flux, the shared tensor
+  driver, the spectrum, and one file per diagnostic. Both remain single modules with the same names,
+  qualified access and exports.
+- **Filter plans separate three lifetimes.** A plan's state is now split by how often it changes:
+  what the grid fixes (`AbstractGridPlan` — transform objects, measure prefix scans, the extended axis,
+  a scattered point sort), what the scale fixes (tap tables, `Ĝ(ℓ)`, the reciprocal window mass), and
+  transient per-apply `AbstractFilterScratch`. `plan_filter_sweep` returns a `FilterPlanFamily` — an
+  `AbstractVector` of the per-scale plans sharing one grid plan and one scratch — so an `S`-scale sweep
+  builds the grid half once rather than `S` times. `coarse_grain` and `cumulative_energy!` use it
+  internally. One family may not be applied from several tasks concurrently; give each worker its own.
+- **Real-space engines, by grid and kernel.** A 3-D top-hat on a uniform Cartesian grid now uses
+  per-plane prefix sums, `O(N·w_y·w_z)` instead of walking the whole ball; the banded engine's
+  contiguous axpy now covers masked grids and the columns within one filter radius of an edge, which
+  previously had no vectorized path at all; and a batched prefix-sum apply shares one support walk
+  across fields where the axis is nonuniform.
+- **`AutoMethod()` reaches two transform-based evaluators of the same real-space convolution**: a
+  padded FFT of the sampled kernel on a uniform Cartesian lattice, and a transform along the longitude
+  ring on a global sphere, where a great-circle kernel depends on the longitude difference alone. Both
+  use the same compact kernel and weights and agree with the direct sum to round-off, so `RealSpace()`
+  remains the default; `check_setup` names the engine each method selects and flags when `AutoMethod`
+  would pick a faster one.
+- **Workspaces are sized to the requested configuration.** `ΠWorkspace(grid; has_w)` allocates only the
+  buffers that configuration can reach (15 of the former 30 for a 2-D flux without a vertical
+  component). `has_w` is a construction argument because the buffers must exist before the first call —
+  a workspace built without them refuses a `w` rather than returning a wrong answer. The energy and
+  spectrum paths take a two-buffer `EnergyWorkspace`, and `filtering_spectrum` gained the
+  `workspace`/`filter_plans` keywords it previously had no way to be made cheap with.
+- **The spherical `tau_decomposition` has an in-place form** with a `Sym3TauWorkspace`, and forms
+  its moments through batched applies. `band_energies` returns scalars by default with `maps = true`
+  for the per-band fields, and accepts a prebuilt plan family.
+- **Wall-clock assertions removed from the test suite.** Three timing comparisons are now deterministic
+  gates — which engine is selected, bit-identity against the per-field loop, and tap counts for the
+  complexity claim — with the timings moved to `benchmark/`.
+- `check_setup` reports the engine that is actually constructed. It previously described a spherical
+  Gaussian as separable (it takes the banded engine) and gave the prefix-sum top-hat's cost as `O(N)`
+  rather than `O(N·w_y)`; a test now asserts the reported string against the footprint type built, for
+  every grid/kernel combination.
+
+### Fixed
+- **A node set carrying no adjacency returned a flux of exactly zero.** A least-squares gradient fits
+  a cell's neighbours, so a grid built with none of them fits nothing: every derivative read zero, the
+  strain was zero, and `compute_Π!` and every diagnostic built on it returned an all-zero field — the
+  same numbers a quiescent flow gives, with nothing to distinguish them. `Derivatives.gradient_plan`
+  now refuses such a grid and names the missing `k`. Filtering is unaffected, taking its
+  neighbourhoods from the metric ball.
+- **The spherical relative vorticity dropped its curvature term.** `ω = ∂v/∂x − ∂u/∂y` is the
+  Cartesian curl; in orthogonal curvilinear coordinates the sphere adds `u·tanφ/R`, the same factor
+  the spherical strain in `compute_Π!` already carried. A solid-body rotation `u = ΩR cosφ` has
+  relative vorticity `2Ω sinφ`, and the previous form gave half of it, so `vorticity` and
+  `enstrophy_flux` on a spherical grid were out of gauge with `Π`. **Numbers change** for a spherical
+  caller of either.
+- **The API reference is one page per submodule.** As a single page it crossed Documenter's hard size
+  threshold and failed the build.
+- **A separable kernel raised on a grid uniform along one axis and stretched along the other.**
+  `SeparableFootprint` tied both axis weight tables to one type parameter, while the builder produces a
+  length-`2·lim+1` vector for a uniform axis and a position-major `(n, 2·lim+1)` matrix for a stretched
+  one, so the mixed pair had no constructor. The two tables now carry a parameter each.
+- **The 1-D flux referenced a vertical component that method has no argument for**, so any
+  `compute_Π!` on a genuinely 1-D grid raised an `UndefVarError`. One axis carries one velocity
+  component; the workspace it builds holds no vertical buffers and there is nothing to check.
+- **The prefix-sum top-hat ran on the host under a GPU backend**, in both 2-D and 3-D, so a device array
+  reached host indexing. It is now two device kernels — a scan that is sequential along axis 1 and
+  parallel across the others, then a per-point window difference that locates its own interval from the
+  window table or by binary search over the extended axis — and both carry the batch axis on the launch.
+  Results are bit-identical to serial.
+- The threaded batch on a true-3-D grid had no branch for the 3-D prefix-sum plan and fell through to an
+  engine that has no method for it, raising from inside the parallel region.
+- **Row-decomposing backends skipped engine setup.** The threaded, Distributed and MPI drivers call
+  `apply_footprint_row!` directly rather than through the whole-grid entry point, so any whole-grid
+  preparation an engine needs was silently omitted on those paths — which would have produced wrong
+  results on masked grids with the banded engine. `prepare_row_apply!`/`prepare_row_apply_batch!` are
+  the hook, with a no-op fallback so an engine that acquires such a step gets it on every backend.
+- The MPI separable path allocated two full-grid buffers on every call instead of using the plan's.
+- `vorticity!` allocated a full field per call despite being the in-place form; it now takes a
+  `scratch`, and `enstrophy_flux!` routes through it instead of duplicating the curl inline.
+- `energy_from_filtered!` allocated on every call at a runtime-range tuple slice — the exact trap the
+  surrounding code documents — and now uses the `Val`-typed `_batch_dims` helper.
+- `AutoCache`'s size estimate measured the enclosing box while the cache stores the inscribed ball,
+  overstating by `4/π` in 2-D and `6/π` in 3-D and declining caches that would have fit.
+
 - **Discretization moved to FlowGeometries.** `Derivatives.jl` held no coarse-graining content — every
   external name in it was a FlowGeometries one — so it is now a thin layer over the geometry package:
   - the structured `ddx!`/`ddy!`/`ddz!` are `Discretization.derivative!` per direction, one set of

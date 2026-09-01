@@ -37,7 +37,7 @@ Test.@testset "UnstructuredGrid (k-d tree / Voronoi / WLSQ / pipeline)" begin
     rgrid = FG.Grids.UnstructuredGrid(cart, rlon, rlat, trues(Random_N); k = 8)
     flin = 2.0 .* rlon .+ 3.0 .* rlat
     gx_lin = zeros(Random_N); gy_lin = zeros(Random_N)
-    FG.Discretization.gradient!(gx_lin, gy_lin, flin, FG.Connectivity.gradient_plan(rgrid))
+    FG.Operators.gradient!(gx_lin, gy_lin, flin, FG.Operators.gradient_plan(rgrid))
     # Only nodes with a full (non-rank-deficient) stencil are guaranteed exact; boundary/corner
     # nodes with a degenerate one-sided stencil are excluded — an honest test, not a silent one.
     interior_r = [i for i in 1:Random_N if length(FG.Grids.neighbors(rgrid, i)) >= 4]
@@ -122,6 +122,11 @@ Test.@testset "Real-space filtering on an UnstructuredGrid" begin
     )
     Test.@test maximum(abs.(node .- vec(structured))) < 1e-12
 
-    # Spectral remains the default for a node set, so the real-space plan is opt-in.
-    Test.@test !(CGEF.Filtering.plan_filter(ug, K, ℓ) isa CGEF.Filtering.PhysicalFilterPlan)
+    # Coarse graining is the compact real-space convolution on every architecture alike, so a node set
+    # defaults to it like the rest and a transform is opt-in.
+    Test.@test CGEF.Filtering._default_method(ug) isa CGEF.Filtering.RealSpace
+    Test.@test CGEF.Filtering.plan_filter(ug, K, ℓ) isa CGEF.Filtering.PhysicalFilterPlan
+    Test.@test CGEF.Filtering.plan_filter(ug, K, ℓ).footprint isa CGEF.Filtering.NodeFilterPlan
+    Test.@test !(CGEF.Filtering.plan_filter(ug, K, ℓ; method = CGEF.Filtering.Spectral()) isa
+                 CGEF.Filtering.PhysicalFilterPlan)
 end

@@ -27,27 +27,52 @@ end
     CGEF.Kernels.spectral_transfer_degree(t.kernel, l, t.scale, t.R)
 
 """
-    NUFSHTFilterPlan
+    NUFSHTGridPlan
 
-Cached scattered-spherical filter plan: the NUSHT plan over the grid's nodes, the CGEF transfer
-adapter, the (optional) mask, and a scratch buffer for `mask · field` so a masked apply allocates
-nothing. Built by `plan_filter(scattered_spherical_grid, kernel, scale; method = Spectral())`.
+The half of a scattered-spherical plan the filter scale does not reach: the NUSHT plan over the grid's
+nodes, the sphere radius, and the mask.
+
+Only the transfer adapter depends on ℓ, and it is three fields. Everything expensive — the bandlimit
+choice, the Clenshaw–Curtis detection, and building the transform over every node — belongs here, so a
+sweep pays for it once.
+
+The NUSHT plan carries the coefficient workspace a transform overwrites, so two tasks may not execute
+one concurrently; a concurrent driver needs its own grid plan per worker.
 """
-struct NUFSHTFilterPlan{P, F, T<:AbstractFloat, M, SV<:AbstractVector{T}} <: CGEF.Filtering.AbstractFilterPlan
+struct NUFSHTGridPlan{P, T<:AbstractFloat, M} <: CGEF.Filtering.AbstractGridPlan
     plan::P
-    filter::F
+    radius::T
     mask::M          # Vector{T} of 0/1, or nothing when fully active (unmasked)
-    renorm::Bool     # divide by the filtered mask mass: `Deformable` only, never `ZeroFill`
-    scratch::SV      # length-npts scratch for `mask .* field`; unused when mask === nothing
+    npts::Int
 end
 
-function CGEF.Filtering.spectral_filter_plan(
-    ::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractNUFSHTSpectralBackend},
+"""
+    NUFSHTScratch
+
+The transient half of a scattered-spherical plan: the length-`npts` staging vector for `mask .* field`,
+so a masked apply allocates nothing. One per concurrent worker.
+"""
+struct NUFSHTScratch{T<:AbstractFloat, SV<:AbstractVector{T}} <: CGEF.Filtering.AbstractFilterScratch
+    masked_input::SV   # unused when mask === nothing
+end
+
+"""
+    NUFSHTFilterPlan
+
+Cached scattered-spherical filter plan: the shared [`NUFSHTGridPlan`](@ref), the CGEF transfer adapter,
+whether `Deformable` renormalization applies, and the [`NUFSHTScratch`](@ref) a masked apply stages
+through. Built by `plan_filter(scattered_spherical_grid, kernel, scale; method = Spectral())`.
+"""
+struct NUFSHTFilterPlan{T<:AbstractFloat, GP<:NUFSHTGridPlan, F, SC<:NUFSHTScratch{T}} <:
+       CGEF.Filtering.AbstractFilterPlan
+    grid_plan::GP
+    filter::F
+    renorm::Bool     # divide by the filtered mask mass: `Deformable` only, never `ZeroFill`
+    scratch::SC
+end
+
+function _nufsht_grid_plan(
     grid::FlowGeometries.Grids.UnstructuredGrid{T,G},
-    kernel::CGEF.Kernels.AbstractFilterKernel,
-    scale::T;
-    mask_strategy = CGEF.Filtering.ZeroFill(),
-    backend = CGEF.ComputationalBackends.AutoBackend(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     npts = length(FlowGeometries.Grids.coordinates(grid, 1))
     npts > 0 || throw(ArgumentError("NUFSHT spectral filtering needs at least one point."))
@@ -69,53 +94,82 @@ function CGEF.Filtering.spectral_filter_plan(
     φ = FlowGeometries.Grids.coordinates(grid, 1)
     # Element type is the leading positional argument, not a keyword.
     nplan = NUFSHT.make_plan(T, collect(T, θ), collect(T, φ), lmax)
-    filter = _CGEFTransfer(kernel, scale, FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid)))
     mask = all(FlowGeometries.Grids.mask(grid)) ? nothing : T.(FlowGeometries.Grids.mask(grid))
-    # `ZeroFill` is already exactly `filter(mask · field)`; only `Deformable` divides by the local mass.
-    renorm = mask !== nothing && mask_strategy isa CGEF.Filtering.Deformable
-    scratch = zeros(T, npts)
-    return NUFSHTFilterPlan{typeof(nplan), typeof(filter), T, typeof(mask), typeof(scratch)}(
-        nplan, filter, mask, renorm, scratch,
+    return NUFSHTGridPlan(
+        nplan, T(FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid))), mask, npts,
     )
+end
+
+_nufsht_scratch(gp::NUFSHTGridPlan{P,T}) where {P, T<:AbstractFloat} =
+    NUFSHTScratch(zeros(T, gp.npts))
+
+CGEF.Filtering.spectral_grid_plan(
+    ::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractNUFSHTSpectralBackend},
+    grid::FlowGeometries.Grids.UnstructuredGrid{T,G},
+    kernel::CGEF.Kernels.AbstractFilterKernel;
+    kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}} = _nufsht_grid_plan(grid)
+
+CGEF.Filtering.spectral_scratch(gp::NUFSHTGridPlan) = _nufsht_scratch(gp)
+
+function CGEF.Filtering.spectral_filter_plan(
+    ::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractNUFSHTSpectralBackend},
+    grid::FlowGeometries.Grids.UnstructuredGrid{T,G},
+    kernel::CGEF.Kernels.AbstractFilterKernel,
+    scale::T;
+    mask_strategy = CGEF.Filtering.ZeroFill(),
+    backend = CGEF.ComputationalBackends.AutoBackend(),
+    grid_plan::Union{Nothing,NUFSHTGridPlan} = nothing,
+    scratch::Union{Nothing,NUFSHTScratch} = nothing,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
+    gp = grid_plan === nothing ? _nufsht_grid_plan(grid) : grid_plan
+    sc = scratch === nothing ? _nufsht_scratch(gp) : scratch
+    filter = _CGEFTransfer(kernel, scale, gp.radius)
+    # `ZeroFill` is already exactly `filter(mask .* field)`; only `Deformable` divides by the local mass.
+    renorm = gp.mask !== nothing && mask_strategy isa CGEF.Filtering.Deformable
+    return NUFSHTFilterPlan(gp, filter, renorm, sc)
 end
 
 # The forward transform (points → harmonic coefficients) depends on the field alone, so a sweep runs it
 # once and each scale only applies its own transfer function and evaluates back to points.
-# `nusht_synthesize!` does not consume `C`, which is what lets the same coefficients serve every scale.
-CGEF.Filtering.analyze_buffer(plan::NUFSHTFilterPlan, ::AbstractVector) = similar(plan.plan.C)
+# `nusht_synthesize!` leaves `C` intact, so the same coefficients serve every scale.
+CGEF.Filtering.analyze_buffer(plan::NUFSHTFilterPlan, ::AbstractVector) = similar(plan.grid_plan.plan.C)
 
 function CGEF.Filtering.filter_analyze!(
-    Ĉ::AbstractArray, field::AbstractVector, plan::NUFSHTFilterPlan{P, F, T},
-) where {P, F, T<:AbstractFloat}
-    if plan.mask === nothing
-        NUFSHT.nusht_type1!(Ĉ, convert(Vector{T}, field), plan.plan)
+    Ĉ::AbstractArray, field::AbstractVector, plan::NUFSHTFilterPlan{T},
+) where {T<:AbstractFloat}
+    gp, sc = plan.grid_plan, plan.scratch
+    if gp.mask === nothing
+        NUFSHT.nusht_type1!(Ĉ, convert(Vector{T}, field), gp.plan)
     else
-        plan.scratch .= field .* plan.mask
-        NUFSHT.nusht_type1!(Ĉ, plan.scratch, plan.plan)
+        sc.masked_input .= field .* gp.mask
+        NUFSHT.nusht_type1!(Ĉ, sc.masked_input, gp.plan)
     end
     return Ĉ
 end
 
 function CGEF.Filtering.filter_synthesize!(
-    out::AbstractVector{T}, Ĉ::AbstractArray, plan::NUFSHTFilterPlan{P, F, T},
-) where {P, F, T<:AbstractFloat}
-    NUFSHT.nusht_synthesize!(out, Ĉ, plan.filter, plan.plan)
-    plan.renorm && NUFSHT.nusht_filter_renorm!(out, plan.mask, plan.filter, plan.plan)
+    out::AbstractVector{T}, Ĉ::AbstractArray, plan::NUFSHTFilterPlan{T},
+) where {T<:AbstractFloat}
+    gp = plan.grid_plan
+    NUFSHT.nusht_synthesize!(out, Ĉ, plan.filter, gp.plan)
+    plan.renorm && NUFSHT.nusht_filter_renorm!(out, gp.mask, plan.filter, gp.plan)
     return out
 end
 
 function CGEF.Filtering.filter_apply!(
     out::AbstractVector{T},
     field::AbstractVector,
-    plan::NUFSHTFilterPlan{P, F, T},
-) where {P, F, T<:AbstractFloat}
-    if plan.mask === nothing
-        NUFSHT.nusht_filter!(out, convert(Vector{T}, field), plan.filter, plan.plan)
+    plan::NUFSHTFilterPlan{T},
+) where {T<:AbstractFloat}
+    gp, sc = plan.grid_plan, plan.scratch
+    if gp.mask === nothing
+        NUFSHT.nusht_filter!(out, convert(Vector{T}, field), plan.filter, gp.plan)
         return out
     end
-    plan.scratch .= field .* plan.mask
-    NUFSHT.nusht_filter!(out, plan.scratch, plan.filter, plan.plan)
-    plan.renorm && NUFSHT.nusht_filter_renorm!(out, plan.mask, plan.filter, plan.plan)
+    sc.masked_input .= field .* gp.mask
+    NUFSHT.nusht_filter!(out, sc.masked_input, plan.filter, gp.plan)
+    plan.renorm && NUFSHT.nusht_filter_renorm!(out, gp.mask, plan.filter, gp.plan)
     return out
 end
 

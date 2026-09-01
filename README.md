@@ -38,11 +38,36 @@ stress τ_ℓ = (u⊗u)̄_ℓ − ū_ℓ⊗ū_ℓ, the cross-scale kinetic-energ
 (FFTW / FINUFFT / spherical-harmonic / NUFSHT) backends and serial/threaded/GPU/distributed/MPI
 execution.
 
-Every diagnostic works across the full grid×dimensionality matrix: 1D transects, 2D (Cartesian or
-spherical, single-level or the standard literature "vertical structure" profile method), true
-3D (Cartesian and spherical-volumetric, genuinely coupled vertical derivatives), model-native
-curvilinear grids (orthogonal curvilinear meshes, via weighted-least-squares gradients), and scattered/unstructured
-point clouds (via k-d tree neighbor search, Voronoi cell areas, and non-uniform spectral transforms).
+Each diagnostic has an in-place form taking a workspace, so a sweep over scales or timesteps allocates
+nothing after the first call, and each workspace holds only the buffers its configuration can reach —
+a 2-D flux without a vertical component does not carry the vertical-component buffers, and the
+energy/spectrum path takes a two-buffer `EnergyWorkspace` rather than a full flux workspace.
+
+The grid×dimensionality matrix spans 1D transects, 2D (Cartesian or spherical, single-level or the
+standard literature "vertical structure" profile method), true 3D (Cartesian and spherical-volumetric,
+genuinely coupled vertical derivatives), model-native curvilinear grids (orthogonal curvilinear meshes,
+via weighted-least-squares gradients), scattered/unstructured point clouds (via k-d tree neighbor
+search, Voronoi cell areas, and non-uniform spectral transforms), and the sphere pixelizations.
+
+Every diagnostic takes any grid in that matrix, on either metric. What varies is the rank each one is
+defined for:
+
+| diagnostic | rank |
+|---|---|
+| `compute_Π!`, `coarse_grain`, `cumulative_energy`, `filtering_spectrum`, `band_energies` | 1D, 2D, true 3D |
+| `tau_decomposition`, `tracer_variance_flux`, `compressible_flux`, `compute_Π_decomposed` | 2D tangent, and true 3D |
+| `vorticity`, `enstrophy_flux`, `compute_Π_strain_convergence` | 2D tangent — the definition of each, the vertical vorticity and the horizontal strain split |
+
+"Any grid" means any layout resolving two tangent directions: `StructuredGrid`, `CurvilinearGrid`,
+`UnstructuredGrid` and every sphere pixelization. The gradient each one needs is taken through the
+architecture's own operator — a stencil table where there are axes to difference along, a
+least-squares tangent-plane fit where there are not — so nothing in these calls names a grid type.
+
+On a sphere every quantity carrying a direction is built in planetary-Cartesian coordinates and
+rotated back to the local frame, since a local (east, north) pair filtered component-wise is not a
+filtered vector (Aluie 2019); and every spatial operator carries the local frame's `tanφ/R` curvature
+terms. The suite gates that by asserting each decomposition's total against `compute_Π!`, which is an
+identity on either metric.
 
 ## Results
 
@@ -157,7 +182,9 @@ types, `check_setup`, the three headline kernels, and `plot_Π_map`/`plot_spectr
 geometries come from FlowGeometries.jl, and everything else — `filter_field!`, `compute_Π!`,
 `compute_Π_strain_convergence`, `compute_Π_decomposed`, `tau_decomposition`, `tracer_variance_flux`,
 `enstrophy_flux`, `band_energies`, the remaining kernels, backends, mask strategies,
-`ddx!`/`ddy!`/`ddz!`, `plan_filter`, `ΠWorkspace`, `spectral_transfer`, … — is reached through the
+`ddx!`/`ddy!`/`ddz!`, `plan_filter`, `plan_filter_sweep`, `spectral_transfer`, the workspaces
+(`ΠWorkspace`, `EnergyWorkspace`, `TauWorkspace`, `Sym3TauWorkspace`, `FavreWorkspace`,
+`EnstrophyFluxWorkspace`, …), … — is reached through the
 qualified submodule path shown in [Architecture](#architecture) below, e.g.
 `CGEF.Diagnostics.compute_Π!(...)`, `CGEF.Filtering.filter_field!(...)`.
 
@@ -169,14 +196,20 @@ coarse-graining engine on top of them.
 
 ```
 src/
-  Kernels.jl      — TopHatKernel, GaussianKernel, SharpSpectralKernel
+  Kernels.jl      — TopHatKernel, GaussianKernel, SmoothHatKernel, HyperGaussianKernel,
+                    HighOrderKernel{P}, SharpSpectralKernel, and the spectrum policies
   Filtering.jl    — filter_field! (real-space footprint engine + spectral plan dispatch)
+  Filtering/      — the module's files: Strategies, Lifetimes, CacheStrategy, Hooks, Api, Apply,
+                    Plans, Selection, Slices, and engines/ (Footprint, PrefixSumTopHat, Separable,
+                    NDim, PrefixSumTopHat3D)
   Derivatives.jl  — ddx!/ddy!/ddz! + StencilPlan, over FlowGeometries' discretization
                     (least-squares gradients on CurvilinearGrid/UnstructuredGrid come from
-                    Connectivity.gradient_plan there)
+                    Operators.gradient_plan there)
   Diagnostics.jl  — compute_Π!, compute_Π_decomposed, compute_Π_strain_convergence,
                     tau_decomposition, tracer_variance_flux, enstrophy_flux, band_energies,
                     compressible_flux, cumulative_energy, filtering_spectrum
+  Diagnostics/    — the module's files: SpectrumPolicy, Flux, TensorDriver, Spectrum, Stress,
+                    Helmholtz, StrainConvergence, Tracer, Favre, Bands, Enstrophy
   Pipeline.jl     — coarse_grain / coarse_grain! / coarse_grain_profile / coarse_grain_batch!,
                     check_setup (high-level orchestration)
   Visualization.jl — plot_Π_map / plot_spectrum stubs (methods provided by the CairoMakie ext)
@@ -201,8 +234,9 @@ Backend implementations and all spectral/spatial-indexing transforms live in **p
 | Grid | Dimensionality | Real-space filter | Spectral filter | Derivatives | `compute_Π!` |
 |------|-----------------|--------------------|-----------------|--------------|--------------|
 | `StructuredGrid` | 1D, 2D, true 3D (Cartesian or spherical-volumetric) | Yes | Yes (FFTW 2D Cartesian; FastSphericalHarmonics 2D spherical) | `ddx!`/`ddy!`/`ddz!` (+ a reusable `Derivatives.StencilPlan`) | Yes, all dimensionalities + a 2.5D vertical-profile wrapper (`compute_Π_profile!`) |
-| `CurvilinearGrid` | 2D (model-native, orthogonal curvilinear meshes) | Yes (per-point footprint, no translation invariance assumed) | Not yet (no spectral extension targets it — real-space only) | `FG.Connectivity.gradient_plan` + `FG.Discretization.gradient!` (least-squares tangent plane) | Yes |
-| `UnstructuredGrid` | 1D (scattered points) | Yes (`RealSpace()` — ball query over the grid's own adjacency; `Spectral()` is the default) | Yes (FINUFFT Cartesian; NUFSHT spherical) | the same, over the grid's k-d tree adjacency | Yes |
+| `CurvilinearGrid` | 2D (model-native, orthogonal curvilinear meshes) | Yes (per-point footprint, no translation invariance assumed) | Not yet (no spectral extension targets it — real-space only) | `FG.Operators.gradient_plan` + `FG.Operators.gradient!` (least-squares tangent plane) | Yes |
+| `UnstructuredGrid` | 1D (scattered points) | Yes, and the default (`RealSpace()` — ball query over the grid's own adjacency) | Yes (FINUFFT Cartesian; NUFSHT spherical) | the same, over the grid's k-d tree adjacency | Yes |
+| `RingGrid`, `CubedSphereGrid`, `HEALPixGrid`, `IcosahedralGrid`, `YinYangGrid` | 1D (sphere pixelizations: one index names a cell) | Yes, and the default — the same node CSR gather over each grid's own ball query | Not yet (no spectral extension targets them — real-space only) | `Derivatives.gradient_plan` + `FG.Operators.gradient!`, through each grid's own adjacency | Yes |
 
 `CurvilinearGrid` and `UnstructuredGrid` are built genuinely from scratch, not thin wrappers: exact
 quadrilateral corner-based cell areas (curvilinear) or k-d tree adjacency + real Voronoi tessellation
@@ -233,14 +267,55 @@ function, so only they can be used with `method = Spectral()`. And only `Gaussia
 `SharpSpectralKernel` have a monotone `|Ĝ|²`, which is what `filtering_spectrum` requires — see
 `Kernels.transfer_monotone`, or just ask `check_setup`.
 
-Real-space filtering cost is **not** `O(N · window²)` for every kernel — two kernels have exact fast
-paths that make cost grow linearly, rather than quadratically, with the filter width in grid cells:
+Real-space filtering cost is **not** `O(N · window^d)` for every kernel. `RealSpace()` names the
+operator — a local space average against the compact kernel — and the engine that evaluates it is
+picked from the grid and kernel. Ask `check_setup` which one a given configuration will take.
 
 | Kernel | Grid | Real-space algorithm | Cost |
 |--------|------|----------------------|------|
-| `TopHatKernel` | any rectilinear 2D `StructuredGrid` (Cartesian or spherical, uniform or nonuniform) | per-row prefix sums + monotone two-pointer interval sweep | `O(N · dj_lim)`, exact |
-| `GaussianKernel` | Cartesian `StructuredGrid`, 1D/2D/3D, uniform or stretched axes | one separable pass per axis | `O(N · Σᵈrᵈ)`, exact up to the square-vs-disk truncation shape |
-| any | everything else (curvilinear meshes, spherical Gaussians, `SharpSpectralKernel`) | bounded per-point window (optionally cached, see `AbstractCacheStrategy`) | `O(N · window)` |
+| `TopHatKernel` | any rectilinear 2D `StructuredGrid` (Cartesian or spherical, uniform or nonuniform) | per-row prefix sums + monotone two-pointer interval sweep | `O(N · w_y)`, exact |
+| `TopHatKernel` | uniform Cartesian 3D `StructuredGrid` | per-plane prefix sums; the ball's `x`-interval is contiguous at each `(dy, dz)` | `O(N · w_y · w_z)`, exact |
+| `GaussianKernel`, `HighOrderKernel` | Cartesian `StructuredGrid`, 1D/2D/3D, uniform or stretched axes | one separable pass per axis | `O(N · Σᵈwᵈ)`, exact up to the square-vs-disk truncation shape |
+| any radial | uniform 2D grid (one band on Cartesian, one per latitude on the sphere) | banded footprint, contiguous axpy along `x` | `O(N · wx · wy)` |
+| any | everything else (curvilinear meshes, nonuniform axes) | bounded per-point window (optionally cached, see `AbstractCacheStrategy`) | `O(N · window)` |
+
+Two further engines evaluate that **same** convolution by transform, and are selected with
+`method = AutoMethod()`:
+
+| Engine | Applies to | Cost |
+|--------|-----------|------|
+| padded FFT of the sampled kernel | uniform Cartesian, kernels with no factored engine (`SharpSpectralKernel`, `SmoothHatKernel`) | `O(N log N)` |
+| zonal FFT along the longitude ring | global rectilinear sphere, radial kernel — for a fixed pair of latitudes the great-circle weight depends on the longitude difference alone, so each band is a circular convolution | `O(N·(log Nλ + w_φ))` |
+
+Both use the same compact kernel and the same weights, so they agree with the direct sum to round-off
+rather than exactly — which is why `RealSpace()` stays the default and they are one keyword away.
+`check_setup` flags when `AutoMethod()` would pick a faster engine than the method you asked about.
+Neither is `Spectral()`: no transfer function is sampled and no spherical-harmonic truncation happens,
+so the kernel keeps its compact support.
+
+### Sweeping scales
+
+A plan splits into three parts by how often each changes: what the **grid** fixes (transform objects,
+measure prefix scans, point sorts), what the **scale** fixes (tap tables, `Ĝ(ℓ)`, the reciprocal window
+mass), and transient **scratch**. `plan_filter` builds one of each for a single scale;
+`plan_filter_sweep` builds the grid part and the scratch **once** for a whole sweep:
+
+```julia
+# one grid plan, one scratch, N scale plans
+family = CGEF.Filtering.plan_filter_sweep(grid, kernel, scales)
+
+result = CGEF.coarse_grain(u, v, grid; scales = scales)   # allocates the result and a workspace
+ws = CGEF.Diagnostics.ΠWorkspace(grid)
+for t in 2:nt                                            # later timesteps reuse all three
+    CGEF.coarse_grain!(result, us[t], vs[t], grid; scales = scales,
+                       filter_plans = family, workspace = ws)
+end
+```
+
+A `FilterPlanFamily` is an `AbstractVector` of the per-scale plans, so it goes anywhere a vector of
+plans did. `coarse_grain` builds one internally for a one-shot sweep; `coarse_grain!` takes a prebuilt
+one, along with the result and workspace to write through. One family may not be applied from several
+tasks at once — the scratch is shared — so give each concurrent worker its own.
 
 ## Execution Backends
 
@@ -250,11 +325,11 @@ once per `(grid, kernel, scale)` (via `plan_filter`) rather than rebuilding it o
 
 | Backend | Extension | Grid shapes supported | Notes |
 |---------|-----------|------------------------|-------|
-| `SerialBackend()` | — | All (1D/2D/3D, Structured/Curvilinear; Unstructured via spectral) | Default for small grids |
-| `ThreadedBackend()` | OhMyThreads | 2D (row-parallel) **and** 1D/true-3D (point-parallel) | Only backend with 1D/3D parallel support |
-| `GPUBackend()` | KernelAbstractions | 2D (`StructuredGrid`/`CurvilinearGrid`) | Device residency established once with the plan; kernels run the grid's own ball query, so device and host results are bit-identical |
-| `DistributedBackend()` | Distributed + SharedArrays | 2D | Multi-process via `SharedArray` |
-| `MPIBackend()` | MPI | 2D | Multi-node, round-robin row decomposition + `Allreduce!`; exercised by `test/mpi_runtests.jl` under `mpiexec` |
+| `SerialBackend()` | — | Everything | The reference every other backend is asserted bit-identical to |
+| `ThreadedBackend()` | OhMyThreads | 2D structured/curvilinear (row-parallel); 1D and true-3D structured, and every flat-cell grid (cell-parallel) | |
+| `GPUBackend()` | KernelAbstractions | the same three shapes | Device residency established once with the plan; kernels run the grid's own ball query, so device and host results are bit-identical |
+| `DistributedBackend()` | Distributed + SharedArrays | the same three shapes | Multi-process on one shared-memory node via `SharedArray` |
+| `MPIBackend()` | MPI | the same three shapes | Multi-node, round-robin decomposition + `Allreduce!`; exercised by `test/mpi_runtests.jl` under `mpiexec` |
 | `AutoBackend()` | — | — | Picks `ThreadedBackend` when `nthreads() > 1`, else `SerialBackend` |
 
 `DistributedBackend`/`MPIBackend` are parametric over an inner local backend (e.g.

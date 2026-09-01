@@ -16,7 +16,7 @@ forward (Π>0) and inverse (Π<0) cascade read at a glance.
 function CGEF.plot_Π_map(
     res::CGEF.CoarseGrainResult{T},
     scale_idx::Integer,
-    grid::FlowGeometries.Grids.StructuredGrid{G,T};
+    grid::FlowGeometries.Grids.StructuredGrid{T,G};
     colormap = :balance,
     title = nothing,
 ) where {T<:AbstractFloat, G}

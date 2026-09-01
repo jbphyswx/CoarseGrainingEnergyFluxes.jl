@@ -34,9 +34,16 @@ using FlowGeometries: FlowGeometries
 @inline _setI!(A::AbstractArray{<:Any,N}, I::CartesianIndex{N}, ::Int, v) where {N} = @inbounds A[I] = v
 @inline _setI!(A::AbstractArray{<:Any,M}, I::CartesianIndex{N}, b::Int, v) where {M,N} = @inbounds A[I, b] = v
 
+# Numerator only, normalized by the host-built `invden`. The host engine accumulates the same taps in
+# the same `k` order and multiplies by the same reciprocal, so the device result is bit-identical to
+# serial rather than a rounding away from it — which is the package's contract for every backend.
+#
+# An inactive source contributes `wk * 0` rather than being skipped, matching the host's `mask · field`
+# input exactly: adding a zero leaves the accumulator unchanged, so both strategies share one loop and
+# the mask never changes the summation order.
 @kernel function _cgef_filter_kernel!(
     out, @Const(field), @Const(mask), @Const(di), @Const(dj), @Const(w), @Const(ptr),
-    nbands::Int, periodic_x::Bool, periodic_y::Bool, is_zerofill::Bool,
+    @Const(invden), nbands::Int, periodic_x::Bool, periodic_y::Bool,
 )
     i, j, b = @index(Global, NTuple)
     T = eltype(out)
@@ -47,7 +54,6 @@ using FlowGeometries: FlowGeometries
             lo = ptr[band]
             hi = ptr[band+1] - 1
             ws = zero(T)
-            wn = zero(T)
             for k in lo:hi
                 jj = j + dj[k]
                 inbounds = true
@@ -68,21 +74,11 @@ using FlowGeometries: FlowGeometries
                         end
                     end
                     if inbounds
-                        active = mask[ii, jj]
-                        wk = w[k]
-                        if is_zerofill
-                            wn += wk
-                            if active
-                                ws += wk * _at(field, ii, jj, b)
-                            end
-                        elseif active
-                            wn += wk
-                            ws += wk * _at(field, ii, jj, b)
-                        end
+                        ws += w[k] * (mask[ii, jj] ? _at(field, ii, jj, b) : zero(T))
                     end
                 end
             end
-            _set!(out, i, j, b, wn > T(1e-15) ? ws / wn : zero(T))
+            _set!(out, i, j, b, ws * invden[i, j])
         else
             _set!(out, i, j, b, zero(T))
         end
@@ -382,6 +378,181 @@ end
 
 move(dev, x) = (y = KA.allocate(dev, eltype(x), size(x)); copyto!(y, x); y)
 
+# ---------------------------------------------------------------------------
+# Prefix-sum top-hat, on the device
+# ---------------------------------------------------------------------------
+#
+# The engine is two passes: a running scan along axis 1, then a window difference per output point. The
+# scan is sequential along its own axis and independent across the others, so it is one work item per
+# row (2-D) or per (j, k) plane (3-D), each summing in the host's order. The device result is therefore
+# bit-identical to serial.
+#
+# The sweep is where the host walks two monotone pointers along the row. A work item owning a single
+# output point has no predecessor to carry those pointers from, so it locates its own interval: `O(1)`
+# from `wcell` wherever the axis is uniform, and a binary search over the extended axis otherwise. Both
+# return exactly the interval the host's walk lands on, so the summed prefix differences agree.
+
+# First index with `xe[idx] >= v`, or `n + 1`.
+@inline function _xe_lower(xe, n::Int, v)
+    lo = 1
+    hi = n + 1
+    while lo < hi
+        mid = (lo + hi) >>> 1
+        if @inbounds(xe[mid]) < v
+            lo = mid + 1
+        else
+            hi = mid
+        end
+    end
+    return lo
+end
+
+# Last index with `xe[idx] <= v`, or `0`.
+@inline function _xe_upper(xe, n::Int, v)
+    lo = 1
+    hi = n + 1
+    while lo < hi
+        mid = (lo + hi) >>> 1
+        if @inbounds(xe[mid]) <= v
+            lo = mid + 1
+        else
+            hi = mid
+        end
+    end
+    return lo - 1
+end
+
+# The scan tables carry the batch as their own trailing axis, so an unbatched apply is the `Nb == 1`
+# case of the same two launches.
+@kernel function _cgef_prefixsum_scan_kernel!(
+    P, @Const(field), @Const(mask), @Const(src), @Const(wx), ne::Int,
+)
+    j, b = @index(Global, NTuple)
+    T = eltype(P)
+    Ny, Nb = size(P, 2), size(P, 3)
+    if j <= Ny && b <= Nb
+        acc = zero(T)
+        @inbounds P[1, j, b] = acc
+        for k in 1:ne
+            i = @inbounds src[k]
+            acc += @inbounds(mask[i, j]) ? T(_at(field, i, j, b)) * @inbounds(wx[i]) : zero(T)
+            @inbounds P[k+1, j, b] = acc
+        end
+    end
+end
+
+@kernel function _cgef_prefixsum_sweep_kernel!(
+    out, @Const(P), @Const(x), @Const(xe), @Const(wy), @Const(invden), @Const(hwt), @Const(wcell),
+    dj_lim::Int, ne::Int, periodic_x::Bool, x_period, Nx::Int, Ny::Int,
+)
+    i, j, b = @index(Global, NTuple)
+    T = eltype(out)
+    Nb = size(P, 3)
+    if i <= Nx && j <= Ny && b <= Nb
+        acc = zero(T)
+        nband = min(2 * dj_lim + 1, Ny)
+        xc = @inbounds x[i]
+        spans_possible = periodic_x && ne > Nx
+        for t in 0:(nband - 1)
+            h = @inbounds hwt[t+1, j]
+            if h >= zero(T)
+                jj = mod1(j - dj_lim + t, Ny)
+                wyj = @inbounds wy[jj]
+                if spans_possible && T(2) * h >= x_period
+                    acc += wyj * (@inbounds(P[Nx+1, jj, b]) - @inbounds(P[1, jj, b]))
+                else
+                    w = @inbounds wcell[t+1, j]
+                    if w >= 0
+                        lo = max(1, i - w)
+                        hi = min(Nx, i + w)
+                        acc += wyj * (@inbounds(P[hi+1, jj, b]) - @inbounds(P[lo, jj, b]))
+                    else
+                        lo = _xe_lower(xe, ne, xc - h)
+                        hi = _xe_upper(xe, ne, xc + h)
+                        if hi >= lo
+                            acc += wyj * (@inbounds(P[hi+1, jj, b]) - @inbounds(P[lo, jj, b]))
+                        end
+                    end
+                end
+            end
+        end
+        _set!(out, i, j, b, acc * @inbounds(invden[i, j]))
+    end
+end
+
+@kernel function _cgef_prefixsum3d_scan_kernel!(
+    P, @Const(field), @Const(mask), masked::Bool, Nx::Int,
+)
+    j, k, b = @index(Global, NTuple)
+    T = eltype(P)
+    Ny, Nz, Nb = size(P, 2), size(P, 3), size(P, 4)
+    if j <= Ny && k <= Nz && b <= Nb
+        acc = zero(T)
+        @inbounds P[1, j, k, b] = acc
+        for i in 1:Nx
+            acc += (masked && !@inbounds(mask[i, j, k])) ? zero(T) :
+                   T(_atI(field, CartesianIndex(i, j, k), b))
+            @inbounds P[i+1, j, k, b] = acc
+        end
+    end
+end
+
+@kernel function _cgef_prefixsum3d_sweep_kernel!(
+    out, @Const(P), @Const(wcell), @Const(invden), dims,
+    dj_lim::Int, dk_lim::Int, px::Bool, py::Bool, pz::Bool,
+)
+    lin, b = @index(Global, NTuple)
+    T = eltype(out)
+    Nx, Ny, Nz = dims[1], dims[2], dims[3]
+    Nb = size(P, 4)
+    if lin <= Nx * Ny * Nz && b <= Nb
+        I = CartesianIndices(dims)[lin]
+        i, j, k = Tuple(I)
+        acc = zero(T)
+        for dk in (-dk_lim):dk_lim
+            kk = k + dk
+            inz = true
+            if kk < 1 || kk > Nz
+                pz ? (kk = mod1(kk, Nz)) : (inz = false)
+            end
+            if inz
+                for dj in (-dj_lim):dj_lim
+                    w = @inbounds wcell[dj+dj_lim+1, dk+dk_lim+1]
+                    if w >= 0
+                        jj = j + dj
+                        iny = true
+                        if jj < 1 || jj > Ny
+                            py ? (jj = mod1(jj, Ny)) : (iny = false)
+                        end
+                        if iny
+                            if px && 2 * w + 1 >= Nx
+                                acc += @inbounds(P[Nx+1, jj, kk, b]) - @inbounds(P[1, jj, kk, b])
+                            elseif px
+                                lo = i - w
+                                hi = i + w
+                                if lo < 1
+                                    acc += (@inbounds(P[hi+1, jj, kk, b]) - @inbounds(P[1, jj, kk, b])) +
+                                           (@inbounds(P[Nx+1, jj, kk, b]) - @inbounds(P[Nx+lo, jj, kk, b]))
+                                elseif hi > Nx
+                                    acc += (@inbounds(P[Nx+1, jj, kk, b]) - @inbounds(P[lo, jj, kk, b])) +
+                                           (@inbounds(P[hi-Nx+1, jj, kk, b]) - @inbounds(P[1, jj, kk, b]))
+                                else
+                                    acc += @inbounds(P[hi+1, jj, kk, b]) - @inbounds(P[lo, jj, kk, b])
+                                end
+                            else
+                                lo = max(1, i - w)
+                                hi = min(Nx, i + w)
+                                acc += @inbounds(P[hi+1, jj, kk, b]) - @inbounds(P[lo, jj, kk, b])
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        _setI!(out, I, b, acc * @inbounds(invden[I]))
+    end
+end
+
 """
     GPUResident
 
@@ -394,13 +565,14 @@ calls.
 abstract type GPUResident end
 
 # Banded (uniform-axis) footprint: per-band offset/weight tables.
-struct GPUBandedFootprint{F, DI, DJ, VW, VP, MA} <: GPUResident
+struct GPUBandedFootprint{F, DI, DJ, VW, VP, MA, IN} <: GPUResident
     fp::F
     di::DI
     dj::DJ
     w::VW
     ptr::VP
     maskd::MA
+    invden::IN   # reciprocal window mass, built once on the host with the plan
 end
 
 # Scattered footprint with a materialized neighbour cache: absolute neighbour indices per point.
@@ -425,7 +597,7 @@ end
 # Separable Gaussian: the two weight tables, the two scratch planes the passes need, and whichever
 # denominator the footprint was built with — the `ZeroFill` one is the rank-1 outer product, constant
 # across calls, so it is formed here rather than rebuilt every apply.
-struct GPUSeparable{F, GX, GY, AT, IR, DE, MA} <: GPUResident
+struct GPUSeparable{F, GX, GY, AT, IR, DE, MA, BB<:Base.RefValue} <: GPUResident
     fp::F
     gx::GX
     gy::GY
@@ -434,6 +606,11 @@ struct GPUSeparable{F, GX, GY, AT, IR, DE, MA} <: GPUResident
     invrenorm::IR   # dense Deformable denominator, or nothing
     denom::DE       # rank-1 ZeroFill denominator, or nothing
     maskd::MA
+    # Batch-shaped pass buffers, filled on the first batched apply and reused after. A `Ref`, because the
+    # batch extent arrives with the apply. Its element type is `Union{Nothing,Tuple{AT3,AT3}}` with the
+    # rank-3 device array type taken from an empty allocation at construction, so reading the cell
+    # resolves to a two-way union the compiler splits, with no dynamic dispatch.
+    batch_buffers::BB
 end
 
 # Separable Gaussian on a 1-D / true-3-D grid: the whole footprint is rebuilt with device arrays, so
@@ -469,14 +646,92 @@ struct GPUNodeFootprint{F, VN, VW, VP, MA} <: GPUResident
     maskd::MA
 end
 
+# Prefix-sum top-hat: the axis tables, the per-(band, row) window table, the reciprocal window mass, and
+# the device numerator scan `P` the two kernels hand between them. `P` carries a trailing batch axis of
+# extent 1; a batched apply takes a wider one from `batch_scan`, allocated on first use and reused.
+struct GPUPrefixSum{F, T, VT, VI, MT, WT, MA, PB} <: GPUResident
+    fp::F
+    x::VT
+    xe::VT
+    src::VI
+    wx::VT
+    wy::VT
+    invden::MT
+    hw::MT
+    wcell::WT
+    maskd::MA
+    P::PB
+    # The batch axis is the scan table's own trailing dimension, so a batched table has exactly `PB`'s
+    # type and only its extent differs. It is filled on the first batched apply and reused after.
+    batch_scan::Base.RefValue{Union{Nothing,PB}}
+    ne::Int
+    x_period::T
+end
+
+struct GPUPrefixSum3D{F, WT, AT, MA, PB} <: GPUResident
+    fp::F
+    wcell::WT
+    invden::AT
+    maskd::MA
+    P::PB
+    batch_scan::Base.RefValue{Union{Nothing,PB}}
+end
+
+@inline _batch_scan_ref(P) = Base.RefValue{Union{Nothing,typeof(P)}}(nothing)
+
+# The scan table for this apply: the resident one when the output carries no batch axis, and otherwise a
+# batch-shaped table held on the workspace, so a repeated batched apply allocates nothing.
+@inline function _scan_table(dev, base::PB, cache::Base.RefValue{Union{Nothing,PB}}, sz::NTuple{N,Int}) where {PB,N}
+    size(base) == sz && return base
+    c = cache[]
+    (c !== nothing && size(c) == sz) && return c
+    b = KA.allocate(dev, eltype(base), sz...)
+    cache[] = b
+    return b
+end
+
 _maskd(dev, grid) = move(dev, Array{Bool}(FlowGeometries.Grids.mask(grid)))
+
+function CGEF.Filtering.prepare_workspace(
+    b::CGEF.ComputationalBackends.GPUBackend, grid::FlowGeometries.Grids.AbstractGrid,
+    fp::CGEF.Filtering.PrefixSumTopHatPlan{T},
+) where {T<:AbstractFloat}
+    dev = b.backend
+    gp = fp.grid_plan
+    _, Ny = FlowGeometries.Grids.size_tuple(grid)
+    ne = length(gp.xe)
+    P = KA.allocate(dev, T, ne + 1, Ny, 1)
+    return GPUPrefixSum(
+        fp,
+        move(dev, collect(T, FlowGeometries.Grids.coordinates(grid, 1))),
+        move(dev, collect(T, gp.xe)), move(dev, collect(Int, gp.src)),
+        move(dev, collect(T, gp.wx)), move(dev, collect(T, gp.wy)),
+        move(dev, fp.invden), move(dev, fp.hw), move(dev, fp.wcell),
+        _maskd(dev, grid), P, _batch_scan_ref(P), ne, gp.x_period,
+    )
+end
+
+function CGEF.Filtering.prepare_workspace(
+    b::CGEF.ComputationalBackends.GPUBackend, grid::FlowGeometries.Grids.AbstractGrid,
+    fp::CGEF.Filtering.PrefixSumTopHat3DPlan{T},
+) where {T<:AbstractFloat}
+    dev = b.backend
+    Nx, Ny, Nz = FlowGeometries.Grids.size_tuple(grid)
+    P = KA.allocate(dev, T, Nx + 1, Ny, Nz, 1)
+    return GPUPrefixSum3D(
+        fp, move(dev, fp.wcell), move(dev, fp.invden), _maskd(dev, grid), P, _batch_scan_ref(P),
+    )
+end
 
 function CGEF.Filtering.prepare_workspace(
     b::CGEF.ComputationalBackends.GPUBackend, grid::FlowGeometries.Grids.AbstractGrid,
     fp::CGEF.Filtering.FilterFootprint,
 )
     dev = b.backend
-    return GPUBandedFootprint(fp, move(dev, fp.di), move(dev, fp.dj), move(dev, fp.w), move(dev, fp.ptr), _maskd(dev, grid))
+    return GPUBandedFootprint(
+        fp, move(dev, fp.di), move(dev, fp.dj), move(dev, fp.w), move(dev, fp.ptr),
+        _maskd(dev, grid), move(dev, fp.invden),
+    )
 end
 
 # A device kernel cannot run the grid's own ball query for a nonuniform ND axis without the topology
@@ -563,10 +818,13 @@ function CGEF.Filtering.prepare_workspace(
     else
         nothing
     end
+    # An empty rank-3 allocation, purely to name the type the batch buffers will have.
+    AT3 = typeof(KA.allocate(dev, T, 0, 0, 0))
     return GPUSeparable(
         fp, move(dev, fp.gx), move(dev, fp.gy),
         KA.allocate(dev, T, Nx, Ny), KA.allocate(dev, T, Nx, Ny),
         invrenorm, denom, _maskd(dev, grid),
+        Base.RefValue{Union{Nothing,Tuple{AT3,AT3}}}(nothing),
     )
 end
 
@@ -576,9 +834,11 @@ end
 # banded engine exists only for 2-D structured grids, so the extra axis cannot be spatial — and a 2-D
 # output is the `Nb == 1` case of the same launch.
 function _run_gpu_kernel!(dev, out, field, ws::GPUBandedFootprint, grid, periodic_x::Bool, periodic_y::Bool, is_zerofill::Bool)
+    # `is_zerofill` is accepted for interface uniformity and unused: the strategy is already baked into
+    # `invden`, which the host builds per scale, and the plan refuses a strategy it was not built for.
     _cgef_filter_kernel!(dev)(
-        out, field, ws.maskd, ws.di, ws.dj, ws.w, ws.ptr, ws.fp.nbands,
-        periodic_x, periodic_y, is_zerofill;
+        out, field, ws.maskd, ws.di, ws.dj, ws.w, ws.ptr, ws.invden, ws.fp.nbands,
+        ws.fp.periodic_x, ws.fp.periodic_y;
         ndrange = (size(out, 1), size(out, 2), size(out, 3)),
     )
 end
@@ -595,6 +855,7 @@ end
 CGEF.Filtering._gpu_batched_supported(plan::CGEF.Filtering.PhysicalFilterPlan) =
     plan.footprint isa Union{GPUBandedFootprint, GPUSeparable, GPUNodeFootprint, GPUFootprintND, GPUSeparableND,
                              GPUScatteredCached, GPUScatteredNDCached, GPUStreaming,
+                             GPUPrefixSum, GPUPrefixSum3D,
                              CGEF.Filtering.NodeFilterPlan}
 
 # Node grids: the spatial rank is 1, so a batch is a `(Nnodes, Nb)` matrix rather than a 3-D array.
@@ -602,7 +863,7 @@ function CGEF.Filtering.gpu_filter_field_batched!(
     gpu_backend::CGEF.ComputationalBackends.GPUBackend,
     out::AbstractArray{T,2},
     field::AbstractArray{T,2},
-    grid::FlowGeometries.Grids.UnstructuredGrid,
+    grid::FlowGeometries.Grids.AbstractGrid,
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T,
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
@@ -621,7 +882,7 @@ function CGEF.Filtering.gpu_filter_field_batched!(
     gpu_backend::CGEF.ComputationalBackends.GPUBackend,
     out::AbstractArray{T},
     field::AbstractArray{T},
-    grid::Union{FlowGeometries.Grids.StructuredGrid{G,T}, FlowGeometries.Grids.CurvilinearGrid{T,G}},
+    grid::Union{FlowGeometries.Grids.StructuredGrid{T,G}, FlowGeometries.Grids.CurvilinearGrid{T,G}},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T,
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
@@ -639,6 +900,36 @@ function CGEF.Filtering.gpu_filter_field_batched!(
     py = nspatial >= 2 ? FlowGeometries.Grids.isperiodic(grid, 2) : false
     _run_gpu_kernel!(dev, out, field, ws, grid, px, py, mask_strategy isa CGEF.Filtering.ZeroFill)
     KA.synchronize(dev)
+    return out
+end
+
+# Two launches, ordered: the sweep reads every row of the scan, so it waits on the whole scan.
+function _run_gpu_kernel!(dev, out, field, ws::GPUPrefixSum, grid, periodic_x::Bool, periodic_y::Bool, is_zerofill::Bool)
+    fp = ws.fp
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
+    Nb = ndims(out) == 2 ? 1 : size(out, 3)
+    P = _scan_table(dev, ws.P, ws.batch_scan, (ws.ne + 1, Ny, Nb))
+    _cgef_prefixsum_scan_kernel!(dev)(P, field, ws.maskd, ws.src, ws.wx, ws.ne; ndrange = (Ny, Nb))
+    KA.synchronize(dev)
+    _cgef_prefixsum_sweep_kernel!(dev)(
+        out, P, ws.x, ws.xe, ws.wy, ws.invden, ws.hw, ws.wcell,
+        fp.dj_lim, ws.ne, fp.grid_plan.periodic_x, ws.x_period, Nx, Ny; ndrange = (Nx, Ny, Nb),
+    )
+    return out
+end
+
+function _run_gpu_kernel!(dev, out, field, ws::GPUPrefixSum3D, grid, periodic_x::Bool, periodic_y::Bool, is_zerofill::Bool)
+    fp = ws.fp
+    dims = FlowGeometries.Grids.size_tuple(grid)
+    Nx, Ny, Nz = dims
+    Nb = ndims(out) == 3 ? 1 : size(out, 4)
+    P = _scan_table(dev, ws.P, ws.batch_scan, (Nx + 1, Ny, Nz, Nb))
+    _cgef_prefixsum3d_scan_kernel!(dev)(P, field, ws.maskd, fp.masked, Nx; ndrange = (Ny, Nz, Nb))
+    KA.synchronize(dev)
+    _cgef_prefixsum3d_sweep_kernel!(dev)(
+        out, P, ws.wcell, ws.invden, dims, fp.dj_lim, fp.dk_lim,
+        fp.periodic[1], fp.periodic[2], fp.periodic[3]; ndrange = (prod(dims), Nb),
+    )
     return out
 end
 
@@ -696,8 +987,19 @@ end
 # whole row pass, so a batch needs its own intermediates. Two device allocations buy 2 launches instead
 # of 2*Nb; the spatial-only mask and denominator broadcast against the trailing batch axis unchanged.
 @inline _sep_buffers(dev, ws::GPUSeparable, ::AbstractArray{<:Any,2}) = (ws.masked_input, ws.row_pass)
-@inline _sep_buffers(dev, ws::GPUSeparable, out::AbstractArray{T,3}) where {T} =
-    (KA.allocate(dev, T, size(out)...), KA.allocate(dev, T, size(out)...))
+
+# A batched apply needs buffers shaped like the batch, not like the grid. They are cached on the
+# workspace and reused: allocating two full device arrays on every apply is a per-call device
+# allocation on the hot path, and a sweep issues one apply per field per scale.
+function _sep_buffers(dev, ws::GPUSeparable, out::AbstractArray{T,3}) where {T}
+    cached = ws.batch_buffers[]
+    if cached !== nothing && size(cached[1]) == size(out)
+        return cached
+    end
+    bufs = (KA.allocate(dev, T, size(out)...), KA.allocate(dev, T, size(out)...))
+    ws.batch_buffers[] = bufs
+    return bufs
+end
 
 function _run_gpu_kernel!(dev, out, field, ws::GPUSeparable, grid, periodic_x::Bool, periodic_y::Bool, is_zerofill::Bool)
     T = eltype(out)
@@ -733,22 +1035,16 @@ function CGEF.Filtering.gpu_filter_field!(
     gpu_backend::CGEF.ComputationalBackends.GPUBackend,
     out::AbstractMatrix{T},
     field::AbstractMatrix{T},
-    grid::Union{FlowGeometries.Grids.StructuredGrid{G,T,2}, FlowGeometries.Grids.CurvilinearGrid{T,G}},
+    grid::Union{FlowGeometries.Grids.StructuredGrid{T,G,2}, FlowGeometries.Grids.CurvilinearGrid{T,G}},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T,
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
     workspace,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     dev = gpu_backend.backend
-    if workspace isa CGEF.Filtering.PrefixSumTopHatPlan
-        # Phase 1 is a running scan along axis 1, so it is not a per-point-parallel device kernel, and
-        # the plan's buffers are host arrays. Run it on the host: at O(N·dj_lim) against the device
-        # kernels' O(N·di_lim·dj_lim) it is still the fastest path for this kernel and grid. A device
-        # implementation needs a parallel (Blelloch) scan.
-        return CGEF.Filtering.apply_prefixsum_tophat!(out, field, grid, workspace, mask_strategy)
-    end
     ws = _resident(gpu_backend, grid, workspace, kernel, scale, mask_strategy)
     ws isa GPUSeparable && CGEF.Filtering._separable_check_strategy(ws.fp, mask_strategy)
+    ws isa GPUPrefixSum && CGEF.Filtering._prefixsum_check_strategy(ws.fp, mask_strategy)
     is_zerofill = mask_strategy isa CGEF.Filtering.ZeroFill
     _run_gpu_kernel!(
         dev, out, field, ws, grid,
@@ -764,12 +1060,36 @@ function CGEF.Filtering.gpu_filter_field!(
     gpu_backend::CGEF.ComputationalBackends.GPUBackend,
     out::AbstractArray{T,N},
     field::AbstractArray{T,N},
-    grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T,
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
     workspace,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
+    dev = gpu_backend.backend
+    ws = _resident(gpu_backend, grid, workspace, kernel, scale, mask_strategy)
+    ws isa GPUPrefixSum3D && CGEF.Filtering._prefixsum3d_check_strategy(ws.fp, mask_strategy)
+    _run_gpu_kernel!(
+        dev, out, field, ws, grid, false, false, mask_strategy isa CGEF.Filtering.ZeroFill,
+    )
+    KA.synchronize(dev)
+    return out
+end
+
+# The node CSR engine, on any flat-cell grid. The footprint slot selects it: the output is a vector and
+# the plan carries its own adjacency, so none of the periodic-wrap or window machinery above applies. A
+# 1-D `StructuredGrid` also has a vector output, and its ND footprint sends it to the rank-generic
+# method above.
+function CGEF.Filtering.gpu_filter_field!(
+    gpu_backend::CGEF.ComputationalBackends.GPUBackend,
+    out::AbstractVector{T},
+    field::AbstractVector{T},
+    grid::FlowGeometries.Grids.AbstractGrid{G,T},
+    kernel::CGEF.Kernels.AbstractFilterKernel,
+    scale::T,
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
+    workspace::Union{CGEF.Filtering.NodeFilterPlan, GPUNodeFootprint},
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     dev = gpu_backend.backend
     ws = _resident(gpu_backend, grid, workspace, kernel, scale, mask_strategy)
     _run_gpu_kernel!(
@@ -779,13 +1099,18 @@ function CGEF.Filtering.gpu_filter_field!(
     return out
 end
 
-# Node sets. Separate from the 2-D method because the output is a vector and the footprint carries its
-# own adjacency, so none of the periodic-wrap or window machinery above applies.
-function CGEF.Filtering.gpu_filter_field!(
+# ---------------------------------------------------------------------------
+# Several separate fields, one device footprint, one host wait
+# ---------------------------------------------------------------------------
+#
+# `compute_Π!` filters five to nine fields per scale. Each is an independent launch over the same
+# resident footprint, so the batch enqueues them all and blocks once. The prefix-sum engines keep their
+# host batch path, which shares the support walk across the fields; the separable engine keeps its
+# per-field call, because its two passes go through workspace buffers every field overwrites.
+function CGEF.Filtering.gpu_filter_fields!(
     gpu_backend::CGEF.ComputationalBackends.GPUBackend,
-    out::AbstractVector{T},
-    field::AbstractVector{T},
-    grid::FlowGeometries.Grids.UnstructuredGrid{T},
+    outs, fields,
+    grid::FlowGeometries.Grids.AbstractGrid,
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T,
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
@@ -793,11 +1118,31 @@ function CGEF.Filtering.gpu_filter_field!(
 ) where {T<:AbstractFloat}
     dev = gpu_backend.backend
     ws = _resident(gpu_backend, grid, workspace, kernel, scale, mask_strategy)
-    _run_gpu_kernel!(
-        dev, out, field, ws, grid, false, false, mask_strategy isa CGEF.Filtering.ZeroFill,
-    )
+    # The separable and prefix-sum engines pass their fields through workspace buffers every launch
+    # overwrites, so their applies stay serialized behind one another.
+    if ws isa Union{GPUSeparable, GPUPrefixSum, GPUPrefixSum3D}
+        ws isa GPUSeparable && CGEF.Filtering._separable_check_strategy(ws.fp, mask_strategy)
+        ws isa GPUPrefixSum && CGEF.Filtering._prefixsum_check_strategy(ws.fp, mask_strategy)
+        ws isa GPUPrefixSum3D && CGEF.Filtering._prefixsum3d_check_strategy(ws.fp, mask_strategy)
+        nspat = length(FlowGeometries.Grids.size_tuple(grid))
+        pxs = FlowGeometries.Grids.isperiodic(grid, 1)
+        pys = nspat >= 2 ? FlowGeometries.Grids.isperiodic(grid, 2) : false
+        isz = mask_strategy isa CGEF.Filtering.ZeroFill
+        for k in eachindex(outs)
+            _run_gpu_kernel!(dev, outs[k], fields[k], ws, grid, pxs, pys, isz)
+            KA.synchronize(dev)
+        end
+        return outs
+    end
+    nspatial = length(FlowGeometries.Grids.size_tuple(grid))
+    px = FlowGeometries.Grids.isperiodic(grid, 1)
+    py = nspatial >= 2 ? FlowGeometries.Grids.isperiodic(grid, 2) : false
+    is_zerofill = mask_strategy isa CGEF.Filtering.ZeroFill
+    for k in eachindex(outs)
+        _run_gpu_kernel!(dev, outs[k], fields[k], ws, grid, px, py, is_zerofill)
+    end
     KA.synchronize(dev)
-    return out
+    return outs
 end
 
 end # module

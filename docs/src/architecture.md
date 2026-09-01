@@ -14,7 +14,7 @@ coarse-graining engine built on them:
 CoarseGrainingEnergyFluxes (main module)
 ├── Kernels       — filter kernels + spectral transfer functions Ĝ(|k|, ℓ)
 ├── Filtering     — real-space footprint convolution engine + spectral plan dispatch
-├── Derivatives   — `FG.Discretization.derivative!` per direction on a StructuredGrid, plus a
+├── Derivatives   — `FG.Operators.derivative!` per direction on a StructuredGrid, plus a
 │                   reusable `StencilPlan`. A grid with no separable axis takes the least-squares
 │                   tangent-plane gradient from FlowGeometries directly
 ├── Diagnostics   — energy flux Π (2D/2.5D, vertical-profile, and true 3D), filtering spectrum,
@@ -22,6 +22,13 @@ CoarseGrainingEnergyFluxes (main module)
 ├── Pipeline      — high-level `coarse_grain` orchestration over scales
 └── Visualization — `plot_Π_map` / `plot_spectrum` stubs (methods provided by the CairoMakie ext)
 ```
+
+`Filtering` and `Diagnostics` are each one module assembled from per-topic files. `src/Filtering/`
+holds the strategy singletons, the plan lifetimes, the cache strategy, the extension hooks, the public
+API, one file per real-space engine under `engines/`, the apply drivers, the plan types, engine
+selection and the slice-parallel entry. `src/Diagnostics/` holds the spectrum policy, the flux, the
+shared per-point tensor driver, the spectrum, and one file per diagnostic. Every name is still reached
+through its module, exactly as a single-file module's would be.
 
 Backend implementations and the spectral transforms live in **package extensions** (weak
 dependencies), so the core package has no heavy dependencies.
@@ -82,15 +89,55 @@ Two orthogonal choices control *how* a filter is evaluated:
    backends share the *same* footprint engine, so results are identical to the serial path, and every
    backend reuses a single footprint/plan built once per `(grid, kernel, scale)` rather than
    rebuilding it on every `filter_field!` call. Coverage differs by backend:
-   - `ThreadedBackend` is the only parallel backend with 1D/true-3D support: 2D `StructuredGrid`/
-     `CurvilinearGrid` are decomposed by latitude row; 1D/true-3D `StructuredGrid` are decomposed by
-     output point (`CartesianIndices`), reusing the same per-point kernel the serial n-D engine uses.
-   - `GPUBackend`/`DistributedBackend`/`MPIBackend` cover 2D `StructuredGrid`/`CurvilinearGrid` only;
-     an explicit request for one of these on an unsupported grid shape raises an `ArgumentError`
-     rather than silently falling back (only `AutoBackend` silently downgrades to serial).
-   - `UnstructuredGrid` has a real-space engine (`RealSpace()` builds a `NodeFilterPlan` from the
-     grid's own ball query), but no parallel decomposition, so it runs serially whichever backend is
-     asked for. Its default method remains `Spectral()`.
+   - Every parallel backend covers 2D `StructuredGrid`/`CurvilinearGrid`, decomposed by latitude row,
+     and 1D/true-3D `StructuredGrid` plus every flat-cell grid, decomposed by output point — threads
+     over `CartesianIndices`, Distributed over a `SharedArray`, MPI round-robin with an `Allreduce!`,
+     and the device over one linear index. All of them reuse the per-point kernel the serial n-D
+     engine uses.
+   - An explicit request for a backend on a grid shape it has no hook for raises an `ArgumentError`;
+     only `AutoBackend` downgrades to serial.
+   - Every flat-cell layout — a node set, and the ring/cubed-sphere/healpix/icosahedral/Yin–Yang
+     pixelizations — builds a `NodeFilterPlan` from the grid's own ball query, and takes `RealSpace()`
+     by default like every other architecture.
+
+## Real-space engines
+
+`RealSpace()` names the operator — a local space average against the compact kernel — not a summation
+method. Which engine evaluates it is chosen from the grid and kernel:
+
+| engine | selected for | cost |
+|---|---|---|
+| prefix-sum top-hat | `TopHatKernel`, any rectilinear 2-D grid | `O(N·w_y)`, exact |
+| prefix-sum top-hat (3-D) | `TopHatKernel`, uniform Cartesian volume | `O(N·w_y·w_z)`, exact |
+| separable two-pass | `GaussianKernel`/`HighOrderKernel`, Cartesian | `O(N·(wx+wy))` |
+| separable N-pass | the same, 1-D or true 3-D Cartesian | `O(N·Σ w_d)` |
+| banded footprint | other radial kernels on a uniform grid; one band on Cartesian, one per latitude on the sphere | `O(N·wx·wy)` |
+| scattered footprint | any nonuniform axis, or a curvilinear mesh | `O(N·wx·wy)`, optional neighbour cache |
+| node CSR gather | any flat-cell layout: a node set, or a ring/cubed-sphere/healpix/icosahedral/Yin–Yang pixelization | `O(N·⟨neighbours⟩)` |
+
+Every one of these has a device kernel. The prefix-sum engines run as two launches — a scan that is
+sequential along axis 1 and parallel across the rows (2-D) or planes (3-D), then a per-point window
+difference. On the device that difference locates its own interval, from the window table where the
+axis is uniform and by a binary search over the extended axis where it is not, costing an extra `log`
+per point that the host's monotone two-pointer walk avoids.
+
+Two further engines evaluate that **same** convolution by transform, and are reached with
+`method = AutoMethod()`:
+
+- **padded FFT of the sampled kernel** — uniform Cartesian, for kernels with no factored engine. Zero
+  padding makes the transform compute the *linear* convolution, so it is valid on bounded and masked
+  domains where a periodic transform is not.
+- **zonal FFT along the longitude ring** — a global rectilinear sphere with a radial kernel. For a
+  fixed pair of latitudes the great-circle weight depends on the longitude difference alone, so each
+  latitude band is a circular convolution. It is worth most near the poles, where the direct engine's
+  longitude window widens as `1/cos φ` and a transform's cost does not.
+
+Both use the same compact kernel and the same weights, so they agree with the direct sum to round-off
+rather than exactly — which is why neither is the default. `check_setup` names the engine each method
+would select, and flags when `AutoMethod` would choose a faster one.
+
+Neither is [`Filtering.Spectral`](@ref): no transfer function is sampled and no spherical-harmonic truncation is
+involved, so the kernel keeps its compact support.
 
 ## Spectral backend lattice
 
@@ -109,8 +156,17 @@ transforms, multiplies by the shared `spectral_transfer`, and inverse transforms
 ```
 AbstractGeometry{T}                 AbstractFilterKernel
 ├── CartesianGeometry{T}            ├── TopHatKernel
-└── SphericalGeometry{T}            ├── GaussianKernel{T}      (α: 6 = Pope, 4 = FlowSieve)
+└── SphericalGeometry{T}            ├── GaussianKernel{T}       (α: 6 = Pope, 4 = FlowSieve)
+                                    ├── SmoothHatKernel{T}      (tanh-tapered top hat)
+                                    ├── HyperGaussianKernel{T}  (exp(-D⁴), flatter core)
+                                    ├── HighOrderKernel{P,T}    (P = 3, 5 vanishing moments; separable,
+                                    │                            sign-indefinite, no radial form)
                                     └── SharpSpectralKernel
+
+AbstractSpectrumPolicy              (what to do when |Ĝ|² is not monotone decreasing)
+├── StrictSpectrum                  refuse (default)
+├── ForceSpectrum                   compute anyway, warn once
+└── NoSpectrum                      skip; fill NaN
 AbstractGrid{G,T}
 ├── StructuredGrid{G,T,N}      N = 1, 2, 3   (rectilinear; N-D cell measure + mask; N=3 spherical
 │                              is a genuine volumetric shell — lon,lat,radius axes, r²cosφ volume)
@@ -146,6 +202,30 @@ Not loading the relevant extension (and not supplying `areas`/adjacency explicit
 `ArgumentError` naming the exact package needed, rather than silently falling back to a brute-force
 or approximate method.
 
+## Plan lifetimes
+
+An engine's state changes at three different rates, and each piece is built once per rate rather than
+once per plan:
+
+| lifetime | depends on | examples | built |
+|---|---|---|---|
+| **grid plan** (`AbstractGridPlan`) | grid, kernel family, mask strategy, method | measure prefix scans, the extended axis and its permutation, FFT/SHT transform objects, NUFFT point sorts | once per sweep |
+| **scale plan** | grid plan, ℓ | support radius and band limit, per-axis tap tables, the reciprocal window mass `1/den(ℓ)`, the transfer function `Ĝ(ℓ)` | once per scale |
+| **scratch** (`AbstractFilterScratch`) | grid, applied array rank, batch shape | the per-field prefix scans, row-pass and masked-input buffers, padded transform buffers, the complex spectrum buffers | once per concurrent worker |
+
+[`Filtering.plan_filter`](@ref) builds one of each for a single scale. A sweep uses `plan_filter_sweep`, which
+returns a `FilterPlanFamily`: one grid plan and one scratch, shared by a vector of per-scale plans.
+The family indexes and iterates like that vector, so it drops in wherever per-scale plans were passed.
+
+Scratch is the only part mutated during an apply. A driver that runs applies concurrently —
+`filter_slices!`, the batch pipeline drivers, Distributed/MPI ranks — must therefore give each worker
+its own family; grid and scale plans are freely shared.
+
+Two spectral backends narrow that: `FastSphericalHarmonics`' `SphPlanCache` is a memo table its
+transform populates on first use, and a FINUFFT/NUFSHT guru plan carries the working state of its own
+execution. Those grid plans are written during an apply, so they too go one per worker — which the
+underlying transforms require in any case, `FastTransforms` being restricted to the root task.
+
 ## Plan reuse & workspace pre-allocation
 
 `plan_filter` builds the convolution footprint (or cached transform plan) once; `filter_apply!`
@@ -153,10 +233,13 @@ reuses it across every velocity component, quadratic product, and vertical layer
 pre-allocated `ΠWorkspace` to avoid per-scale allocations when sweeping scales:
 
 ```julia
-ws = ΠWorkspace(grid)                  # allocate once
+ws = CGEF.Diagnostics.ΠWorkspace(grid; has_w = w !== nothing)   # allocate once
 for ℓ in scales
-    compute_Π!(Π, u, v, w, grid, kernel, ℓ; workspace = ws)
+    CGEF.Diagnostics.compute_Π!(Π, u, v, w, grid, kernel, ℓ; workspace = ws)
 end
 ```
+
+`has_w` is a construction argument: the vertical-component buffers have to exist before the first call,
+so a workspace built without them refuses a `w` and names the fix.
 
 The high-level [`coarse_grain`](@ref) handles plan reuse and the scale sweep automatically.

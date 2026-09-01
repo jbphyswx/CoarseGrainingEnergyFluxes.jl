@@ -346,7 +346,7 @@ that [`Filtering.filter_field!`](@ref)'s `mask_strategy` note is about. The full
 ## Curvilinear & unstructured grids: WLSQ gradients
 
 `CurvilinearGrid` and `UnstructuredGrid` have no fixed axis spacing to difference against, so the
-gradient (`FG.Connectivity.gradient_plan` + `FG.Discretization.gradient!`, which returns both tangent
+gradient (`FG.Operators.gradient_plan` + `FG.Operators.gradient!`, which returns both tangent
 components from one neighbour sweep) is reconstructed from a local weighted-least-squares (WLSQ) fit over each point's neighbor
 stencil (its 4 index-offset neighbors on a curvilinear mesh; its k-d tree neighbors on a scattered
 point cloud), projected into the local tangent plane (`project_to_tangent_plane` — an exact 3D-chord
