@@ -29,6 +29,20 @@ transfer function, only some can carry a filtering spectrum, and only some are v
 
 The approach follows Aluie (2011, 2019) and Aluie, Hecht, & Vallis (2018), using real-space convolution kernels to separate large-scale (ū) and sub-scale (u') motions at each point in space.
 
+`RealSpace()` names that operator: a local space average against the compact kernel. Which engine
+evaluates it is chosen from the grid and kernel — exact prefix sums for a top-hat in 2-D and 3-D, separable passes for the factorizing
+kernels, a vectorized banded footprint otherwise — and
+[`check_setup`](@ref) reports the choice and its cost before anything runs. Two further engines
+evaluate the same convolution by transform under `method = AutoMethod()`: a padded FFT of the sampled
+kernel on a uniform Cartesian lattice, and a transform along the longitude ring on a global sphere,
+where a great-circle kernel depends on the longitude difference alone. See
+[Architecture](architecture.md#Real-space-engines) for the full table.
+
+Sweeping scales, the parts of a plan that the scale does not change — transform objects, measure
+prefix scans, point sorts — are built once by
+[`Filtering.plan_filter_sweep`](@ref) rather than once per scale, and every diagnostic has an in-place
+form whose workspace holds only the buffers its configuration can reach.
+
 Every diagnostic works across the full grid×dimensionality matrix — `StructuredGrid` (1D, 2D, and
 true 3D Cartesian or spherical-volumetric), `CurvilinearGrid` (model-native orthogonal curvilinear meshes), and
 `UnstructuredGrid` (scattered points, via k-d tree neighbors, Voronoi cell areas, and non-uniform

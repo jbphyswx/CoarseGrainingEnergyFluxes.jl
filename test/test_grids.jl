@@ -179,6 +179,66 @@ Test.@testset "Nonuniform axes" begin
 end
 
 
+# A grid uniform along one axis and stretched along the other. The separable engine builds a weight
+# vector for the uniform axis and a position-major weight matrix for the stretched one, so this is the
+# only configuration where the two axis tables differ in rank.
+Test.@testset "Separable engine on a mixed uniform/stretched axis pair" begin
+    geom = FG.Geometry.CartesianGeometry()
+    N = 21
+    xr = range(0.0, 20_000.0; length = N)                        # uniform
+    yv = cumsum(vcat(0.0, [700.0 + 40.0 * j for j in 1:(N-1)]))  # strictly increasing, stretched
+    msk = trues(N, N); msk[6:9, 7:11] .= false
+    ker = CGEF.GaussianKernel(); scale = 3500.0
+    f = [sinpi(xr[i] / 9000) * cospi(yv[j] / 7000) for i in 1:N, j in 1:N]
+
+    for (label, grid) in (("unmasked", FG.Grids.StructuredGrid(geom, xr, yv)),
+                          ("masked", FG.Grids.StructuredGrid(geom, xr, yv, msk)))
+        for strat in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
+            fp = CGEF.Filtering.build_footprint(grid, ker, scale; mask_strategy = strat)
+            Test.@test fp isa CGEF.Filtering.SeparableFootprint
+            Test.@test fp.gx isa AbstractVector      # uniform axis: one weight per offset
+            Test.@test fp.gy isa AbstractMatrix      # stretched axis: one row per position
+
+            out = zeros(N, N)
+            CGEF.Filtering.filter_apply!(
+                out, f,
+                CGEF.Filtering.plan_filter(grid, ker, scale; mask_strategy = strat,
+                                           backend = CGEF.ComputationalBackends.SerialBackend()),
+            )
+
+            # The operator, assembled from the kernel primitives and the grid's own axis measures: a
+            # product of two 1-D cell-averaged profiles, truncated per axis. The Gaussian's radius is a
+            # tolerance, so the window itself comes from the engine; every weight and both
+            # normalizations are derived here.
+            wy = FG.Grids.measure_factors(grid)[2]
+            Δx = step(xr)
+            gxr(ddi) = CGEF.Kernels.profile_cell_average(ker, ddi * Δx, Δx, scale)
+            gyr(j, ddj) = CGEF.Kernels.profile_cell_average(ker, yv[j+ddj] - yv[j], wy[j+ddj], scale) *
+                          wy[j+ddj]
+            ref = zeros(N, N)
+            for j in 1:N, i in 1:N
+                if !FG.Grids.isactive(grid, i, j)
+                    ref[i, j] = 0.0
+                    continue
+                end
+                num = 0.0; den = 0.0
+                for ddj in (-fp.dj_lim):(fp.dj_lim), ddi in (-fp.di_lim):(fp.di_lim)
+                    ii = i + ddi; jj = j + ddj
+                    (1 <= ii <= N && 1 <= jj <= N) || continue    # bounded axes: outside is zero
+                    wt = gxr(ddi) * gyr(j, ddj)
+                    active = FG.Grids.isactive(grid, ii, jj)
+                    active && (num += wt * f[ii, jj])
+                    # `ZeroFill` divides by the whole window's mass; `Deformable` by the active part.
+                    den += (strat isa CGEF.Filtering.ZeroFill || active) ? wt : 0.0
+                end
+                ref[i, j] = den > 1e-15 ? num / den : 0.0
+            end
+            Test.@test maximum(abs, out .- ref) / maximum(abs, ref) < 1e-12
+        end
+    end
+end
+
+
 Test.@testset "1D and singleton-dimension StructuredGrid" begin
     # --- Genuinely 1D Cartesian StructuredGrid: ddx! exact for a linear field, compute_Π!/
     # coarse_grain finite. ---

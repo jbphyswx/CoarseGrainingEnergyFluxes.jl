@@ -12,7 +12,7 @@ using FlowGeometries: FlowGeometries
 function CGEF.Filtering.distributed_filter_field!(
     out::AbstractMatrix{T},
     field::AbstractMatrix,
-    grid::Union{FlowGeometries.Grids.StructuredGrid{G,T,2}, FlowGeometries.Grids.CurvilinearGrid{T,G}},
+    grid::Union{FlowGeometries.Grids.StructuredGrid{T,G,2}, FlowGeometries.Grids.CurvilinearGrid{T,G}},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T,
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
@@ -34,6 +34,7 @@ function CGEF.Filtering.distributed_filter_field!(
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     s_out = SharedArrays.SharedArray{T}(Nx, Ny)
     fill!(s_out, zero(T))
+    CGEF.Filtering.prepare_row_apply!(fp, field, grid)
     @sync Distributed.@distributed for j in 1:Ny
         CGEF.Filtering.apply_footprint_row!(s_out, field, grid, fp, mask_strategy, periodic_x, periodic_y, j)
     end
@@ -90,7 +91,7 @@ _shared_like(a::AbstractArray{T}) where {T} =
 function CGEF.Filtering.distributed_filter_field!(
     out::AbstractArray{T,N},
     field::AbstractArray,
-    grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T,
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
@@ -99,6 +100,13 @@ function CGEF.Filtering.distributed_filter_field!(
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
     dims = FlowGeometries.Grids.size_tuple(grid)
     mask = FlowGeometries.Grids.mask(grid)
+
+    if fp isa CGEF.Filtering.PrefixSumTopHat3DPlan
+        # A running scan along axis 1 is not a per-point-parallel decomposition, and the plan's buffers
+        # are local arrays. Run it in full locally, as the 2-D prefix-sum path does: at O(N·w_y·w_z)
+        # against the distributed ball walk's O(N·w³) it is still the faster path.
+        return CGEF.Filtering.apply_prefixsum_tophat_3d!(out, field, grid, fp, mask_strategy)
+    end
 
     if fp isa CGEF.Filtering.SeparableFootprintND
         CGEF.Filtering._separable_check_strategy(fp, mask_strategy)
@@ -151,13 +159,12 @@ end
 function CGEF.Filtering.distributed_filter_field!(
     out::AbstractVector{T},
     field::AbstractVector,
-    grid::FlowGeometries.Grids.UnstructuredGrid{T},
+    grid::FlowGeometries.Grids.AbstractGrid{G,T},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T,
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
-    workspace,
-) where {T<:AbstractFloat}
-    fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    fp::CGEF.Filtering.NodeFilterPlan,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     n = length(out)
     s_out = SharedArrays.SharedArray{T}(n)
     fill!(s_out, zero(T))

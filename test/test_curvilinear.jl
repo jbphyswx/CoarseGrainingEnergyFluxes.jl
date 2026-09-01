@@ -18,12 +18,12 @@ Test.@testset "CurvilinearGrid (WLSQ / areas / pipeline)" begin
     x = [xs[i] for i in 1:Nx, j in 1:Ny]
     y = [ys[j] for i in 1:Nx, j in 1:Ny]
     cgrid = FG.Grids.CurvilinearGrid(cart, x, y, trues(Nx, Ny))
-    dplan = FG.Connectivity.gradient_plan(cgrid)
+    dplan = FG.Operators.gradient_plan(cgrid)
 
     f = [3.0*xs[i] - 2.0*ys[j] + 0.5*xs[i]^2 + 0.25*ys[j]^2 for i in 1:Nx, j in 1:Ny]
     sx = zeros(Nx, Ny); sy = zeros(Nx, Ny); cx = zeros(Nx, Ny); cy = zeros(Nx, Ny)
     CGEF.Derivatives.ddx!(sx, f, sgrid); CGEF.Derivatives.ddy!(sy, f, sgrid)
-    FG.Discretization.gradient!(cx, cy, f, dplan)
+    FG.Operators.gradient!(cx, cy, f, dplan)
     Test.@test maximum(abs.(cx[2:end-1, :] .- sx[2:end-1, :])) < 1e-10   # hard gate (ddx vs structured)
     Test.@test maximum(abs.(cy[:, 2:end-1] .- sy[:, 2:end-1])) < 1e-10   # hard gate (ddy vs structured)
 
@@ -51,11 +51,11 @@ Test.@testset "CurvilinearGrid (WLSQ / areas / pipeline)" begin
     slon = [a*i + b*j for i in 1:Ni, j in 1:Nj]
     slat = [c*i + d*j for i in 1:Ni, j in 1:Nj]
     shear = FG.Grids.CurvilinearGrid(cart, slon, slat, trues(Ni, Nj))
-    splan = FG.Connectivity.gradient_plan(shear)
+    splan = FG.Operators.gradient_plan(shear)
     p, q = 1.3, -2.1
     g = [p*slon[i,j] + q*slat[i,j] for i in 1:Ni, j in 1:Nj]
     gx = zeros(Ni, Nj); gy = zeros(Ni, Nj)
-    FG.Discretization.gradient!(gx, gy, g, splan)
+    FG.Operators.gradient!(gx, gy, g, splan)
     Test.@test maximum(abs.(gx .- p)) < 1e-10
     Test.@test maximum(abs.(gy .- q)) < 1e-10
 
@@ -73,7 +73,7 @@ Test.@testset "CurvilinearGrid (WLSQ / areas / pipeline)" begin
     flin = [2.0*xnu[i] + 3.0*ynu[j] for i in 1:Nxn, j in 1:Nyn]
     gxs = zeros(Nxn, Nyn); gxc = zeros(Nxn, Nyn); gyc = zeros(Nxn, Nyn)
     CGEF.Derivatives.ddx!(gxs, flin, sgnu)
-    FG.Discretization.gradient!(gxc, gyc, flin, FG.Connectivity.gradient_plan(cgnu))
+    FG.Operators.gradient!(gxc, gyc, flin, FG.Operators.gradient_plan(cgnu))
     Test.@test maximum(abs.(gxc .- 2.0)) < 1e-10   # WLSQ exact for linear on nonuniform stencil
     Test.@test maximum(abs.(gyc .- 3.0)) < 1e-10
     Test.@test maximum(abs.(gxs .- 2.0)) < 1e-10   # structured also exact for linear

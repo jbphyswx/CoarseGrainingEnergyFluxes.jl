@@ -10,9 +10,9 @@ Documenter.makedocs(;
         CGEF.Pipeline, CGEF.Visualization,
     ],
     sitename = "CoarseGrainingEnergyFluxes.jl",
-    # The API reference is one `@autodocs` block per submodule and comes out around 220 KiB, over
-    # Documenter's 200 KiB default. That default guards against a page bloated by accident; a complete
-    # reference for this many exported symbols is not that.
+    # The reference is one `@autodocs` block per submodule, one submodule per page. As a single page
+    # it passed Documenter's hard size threshold, which is a page nobody scrolls as much as a build
+    # failure.
     format = Documenter.HTML(; size_threshold = 400 * 1024, size_threshold_warn = 250 * 1024),
     checkdocs = :exports,
     pages = [
@@ -20,7 +20,13 @@ Documenter.makedocs(;
         "Theory" => "theory.md",
         "Architecture" => "architecture.md",
         "Examples" => "examples.md",
-        "API Reference" => "reference.md",
+        "API Reference" => [
+            "Overview" => "reference.md",
+            "Pipeline" => "reference/pipeline.md",
+            "Diagnostics" => "reference/diagnostics.md",
+            "Filtering" => "reference/filtering.md",
+            "Kernels and derivatives" => "reference/kernels.md",
+        ],
     ],
 )
 
