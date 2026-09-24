@@ -214,7 +214,7 @@ src/
                     check_setup (high-level orchestration)
   Visualization.jl — plot_Π_map / plot_spectrum stubs (methods provided by the CairoMakie ext)
 ext/
-  FFTWExt                       — FFT spectral filtering (uniform periodic Cartesian StructuredGrid)
+  FFTWExt                       — FFT spectral filtering (uniform Cartesian StructuredGrid; bounded axes zero-padded)
   FINUFFTExt                    — non-uniform FFT filtering (scattered Cartesian UnstructuredGrid)
   FastSphericalHarmonicsExt     — spherical-harmonic transform (uniform spherical StructuredGrid)
   NUFSHTExt                     — non-uniform spherical-harmonic transform (scattered spherical UnstructuredGrid)

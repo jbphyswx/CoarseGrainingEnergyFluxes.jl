@@ -18,7 +18,7 @@ export tracer_variance_flux!
 export band_energies
 export compressible_flux, compressible_flux!, favre_filter!
 export FavreWorkspace, SphericalFavreWorkspace, Favre3DWorkspace
-export AbstractSpectrumPolicy, StrictSpectrum, ForceSpectrum, NoSpectrum
+export AbstractSpectrumPolicy, AutoSpectrum, StrictSpectrum, ForceSpectrum, NoSpectrum
 
 include("Diagnostics/SpectrumPolicy.jl")
 include("Diagnostics/Flux.jl")

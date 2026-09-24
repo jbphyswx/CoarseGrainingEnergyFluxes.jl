@@ -13,8 +13,8 @@ using FlowTransformBindings: FlowTransformBindings as FTB
 const _SCHED = OhMyThreads.DynamicScheduler()
 @inline _sched() = _SCHED
 
-# Pass driver for the separable ND engine: same shape as `CGEF.Filtering._sep_serial`, so the passes
-# and the normalization sweep parallelize without duplicating either kernel.
+# Pass driver for the separable ND engine and row driver for the FFTW extension's transform engines:
+# same shape as `CGEF.Filtering._sep_serial`, so each parallelizes without duplicating its kernel.
 @inline _omt_driver(f::F, indices) where {F} =
     OhMyThreads.tforeach(f, indices; scheduler = _sched())
 
@@ -35,6 +35,8 @@ function CGEF.Filtering.threaded_filter_field!(
         return _threaded_apply_separable!(out, field, grid, fp, mask_strategy)
     elseif fp isa CGEF.Filtering.PrefixSumTopHatPlan
         return _threaded_apply_prefixsum_tophat!(out, field, grid, fp, mask_strategy)
+    elseif CGEF.Filtering._transform_footprint(fp)
+        return CGEF.Filtering.apply_footprint!(out, field, grid, fp, mask_strategy, _omt_driver)
     end
     periodic_x = FlowGeometries.Grids.isperiodic(grid, 1)
     periodic_y = FlowGeometries.Grids.isperiodic(grid, 2)
@@ -146,7 +148,7 @@ function CGEF.Filtering.threaded_filter_fields!(
     if fp isa CGEF.Filtering.PrefixSumTopHatPlan
         return _threaded_apply_prefixsum_tophat_batch!(outs, fields, grid, fp, mask_strategy)
     end
-    if fp isa CGEF.Filtering.SeparableFootprint
+    if fp isa CGEF.Filtering.SeparableFootprint || CGEF.Filtering._transform_footprint(fp)
         for k in eachindex(outs)
             CGEF.Filtering.threaded_filter_field!(outs[k], fields[k], grid, kernel, scale, mask_strategy, fp)
         end
@@ -271,7 +273,7 @@ function CGEF.Filtering.threaded_filter_field!(
     else
         OhMyThreads.tforeach(CartesianIndices(out); scheduler = _sched()) do I
             mask[I] || return
-            out[I] = CGEF.Filtering._footprint_nd_point_streaming(field, grid, fp, mask_strategy, mask, dims, I)
+            out[I] = CGEF.Filtering._footprint_nd_point_streaming(field, grid, fp, mask_strategy, mask, I)
         end
     end
     return out

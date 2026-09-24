@@ -184,28 +184,9 @@ function _separable_convolve!(dst::AbstractMatrix{T}, src::AbstractMatrix{T}, fp
     return dst
 end
 
-"""
-    _separable_axis_weights(x, lim, periodic, period, kernel, scale, wfac) -> AbstractVecOrMat
-
-A separable kernel's per-axis weight table: `Kernels.kernel_profile(kernel, Δx, ℓ)` over the stencil,
-in the layout [`_sepw`](@ref) reads. Any kernel with a 1-D profile takes this path — the Gaussian,
-whose radial form happens to factor, and [`Kernels.HighOrderKernel`](@ref), which is separable by
-definition and has no radial form at all.
-
-Uniform axis: the displacement is `ddi·Δ` wherever the stencil sits, so one vector serves every
-position. Stretched axis: the displacement depends on the position too, so the table gains a position
-axis — `(2·lim+1) × N`, which is `O(N·lim)` against the `O(N·lim²)` of a per-point neighbour cache, and
-leaves the apply at `O(N·lim)` instead of `O(N·lim²)`.
-
-`lim` comes from the SMALLEST gap on the axis, so on a stretched axis a coarse region's stencil is
-wider than it needs to be; those slots hold exact zeros rather than being trimmed, which keeps the
-inner loop's bounds static. A periodic displacement carries the image offset, matching the tiling
-convention the scattered engine uses.
-"""
-# Cell-averaged weights keep a discontinuous kernel's MASS exact on any grid, but they cannot recover
-# the vanishing MOMENTS if a limb is thinner than a cell — there is simply no resolution there to
-# distinguish it from a box. That is a warning rather than an error: the filter is still a valid
-# normalized low-pass, it just is not the high-order one that was asked for.
+# Cell-averaged weights keep a discontinuous kernel's mass exact on any grid, and cannot recover the
+# vanishing moments where a limb is thinner than a cell. The filter is still a valid normalized
+# low-pass there, just not the high-order one asked for, so this warns.
 _warn_unresolved_limbs(::Kernels.AbstractFilterKernel, _, ::Int, _) = nothing
 
 function _warn_unresolved_limbs(
@@ -224,11 +205,27 @@ function _warn_unresolved_limbs(
     return nothing
 end
 
+"""
+    _separable_axis_weights(x, lim, periodic, period, kernel, scale, wfac) -> AbstractVecOrMat
+
+A separable kernel's per-axis weight table: `Kernels.kernel_profile(kernel, Δx, ℓ)` over the stencil,
+in the layout [`_sepw`](@ref) reads. Any kernel with a 1-D profile takes this path — the Gaussian,
+whose radial form happens to factor, and [`Kernels.HighOrderKernel`](@ref), which is separable by
+definition and has no radial form at all.
+
+Uniform axis: the displacement is `ddi·Δ` wherever the stencil sits, so one vector serves every
+position. Stretched axis: the displacement depends on the position too, so the table gains a position
+axis, `(2·lim+1) × N`, and the apply stays `O(N·lim)`.
+
+`lim` comes from the smallest gap on the axis, so on a stretched axis a coarse region's stencil carries
+slots beyond its support; they hold exact zeros, and the inner loop's bounds stay static. A periodic
+displacement carries the image offset, matching the tiling convention the scattered engine uses.
+"""
 function _separable_axis_weights(
     x::AbstractRange{T}, lim::Int, ::Bool, ::T, kernel::Kernels.AbstractFilterKernel, scale::T,
     ::AbstractVector{T},
 ) where {T<:AbstractFloat}
-    Δ = T(step(x))
+    Δ = abs(T(step(x)))
     # `profile_cell_average` is the point sample for every smooth kernel and the exact cell integral
     # for a discontinuous one — see `Kernels.profile_cell_average`.
     return [Kernels.profile_cell_average(kernel, T(ddi) * Δ, Δ, scale) for ddi in -lim:lim]
@@ -243,12 +240,13 @@ function _separable_axis_weights(
     # be the contiguous axis or every inner loop gathers with stride `2·lim+1`.
     # An untouched slot is an exact zero: outside the domain.
     g = zeros(T, n, 2 * lim + 1)
+    s = (n > 1 && x[n] < x[1]) ? -one(T) : one(T)   # coordinate direction of increasing index
     @inbounds for i in 1:n, ddi in -lim:lim
         ii = i + ddi
         shift = zero(T)
         if ii < 1 || ii > n
             periodic || continue
-            shift = T(fld(ii - 1, n)) * period
+            shift = s * T(fld(ii - 1, n)) * period
             ii = mod1(ii, n)
         end
         # The NEIGHBOUR's measure factor, so the two passes together weight by `kernel · cell area` —
@@ -474,17 +472,6 @@ function apply_footprint!(
     return out
 end
 
-"""
-    apply_footprint_row!(out, field, grid, fp, strategy, periodic_x, periodic_y, j)
-
-Fill output row `j` (`out[:, j]`) from a precomputed footprint, as one contiguous axpy per tap
-normalized by the plan's `invden`. Rows are independent (each writes a disjoint column of the
-column-major output), so this is the unit of parallelism for the threaded / distributed backends.
-
-The whole row is written, including the columns within one filter radius of an axis-1 edge and every
-column of a masked grid: a tap that would read out of bounds simply contributes over a shorter range,
-and the matching shortfall is already in `invden`.
-"""
 # A plan's `invden` was accumulated under one mask strategy, so it cannot serve another. On an
 # UNMASKED grid the two coincide exactly — `ZeroFill` divides by the total in-support mass and
 # `Deformable` by the mass of the active taps, the same number when every cell is active — so the
@@ -560,6 +547,17 @@ function prepare_row_apply_batch!(
     return nothing
 end
 
+"""
+    apply_footprint_row!(out, field, grid, fp, strategy, periodic_x, periodic_y, j)
+
+Fill output row `j` (`out[:, j]`) from a precomputed footprint, as one contiguous axpy per tap
+normalized by the plan's `invden`. Rows are independent (each writes a disjoint column of the
+column-major output), so this is the unit of parallelism for the threaded / distributed backends.
+
+The whole row is written, including the columns within one filter radius of an axis-1 edge and every
+column of a masked grid: a tap reaching past an edge contributes over the in-range part of the row,
+and `invden` holds the matching mass.
+"""
 function apply_footprint_row!(
     out::AbstractMatrix{T},
     field::AbstractMatrix,

@@ -596,6 +596,24 @@ Test.@testset "check_setup reports what will run, and every capability it claims
         Test.@test rc isa CGEF.SetupReport      # reports, does not throw
     end
 
+    # On a sphere the coordinates are angles and ℓ is in metres. Longitude spacing is the chord-angle
+    # distance `2R·asin(cos φ·sin(Δλ/2))`: coarsest at the equator, finest at the most poleward row.
+    # Resolvability is judged where the grid is coarsest.
+    let R = 6.371e6, d = deg2rad(1.0),
+        lon = range(0.0; step = d, length = 360),
+        lat = range(deg2rad(-60.0), deg2rad(60.0); step = d / 4),
+        sg = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), lon, lat; periodic = (true, false)),
+        rs = CGEF.check_setup(sg, CGEF.GaussianKernel(), 500e3)
+        Test.@test rs.coarsest_spacing[1] ≈ R * d rtol = 1e-12
+        Test.@test rs.spacing[1] ≈ 2R * asin(cos(deg2rad(60.0)) * sin(d / 2)) rtol = 1e-12
+        Test.@test rs.spacing[2] ≈ R * d / 4 rtol = 1e-12
+        Test.@test rs.coarsest_spacing[2] ≈ R * d / 4 rtol = 1e-12
+        Test.@test rs.cells_per_scale[1] ≈ 500e3 / (R * d) rtol = 1e-12
+        Test.@test rs.resolvable
+        # 150 km is 2.7 of the 60° row's longitude cells but 1.35 of the equator's.
+        Test.@test !CGEF.check_setup(sg, CGEF.GaussianKernel(), 150e3).resolvable
+    end
+
     # A node set has no axes, so it must SAY it could not check rather than report all-clear.
     let nn = 16,
         xg = [Float64(i - 1) * dx for i in 1:nn, j in 1:nn],
@@ -727,7 +745,208 @@ Test.@testset "check_setup names the engine that is actually constructed" begin
                    (nameof(typeof(plan.footprint)) === :ZonalFFTFootprint)
         # A top-hat must NOT be diverted there: its prefix-sum engine is exact and cheaper.
         Test.@test !occursin("zonal-FFT", CGEF.Pipeline._engine_class(g, CGEF.TopHatKernel(), AM))
+        # A device plan keeps the direct engine, and the report says so.
+        gpu = CGEF.ComputationalBackends.GPUBackend(KA.CPU())
+        pg = CGEF.Filtering.plan_filter(g, CGEF.GaussianKernel(), ℓ; method = AM, backend = gpu)
+        Test.@test nameof(typeof(pg.footprint)) !== :ZonalFFTFootprint
+        Test.@test !occursin("zonal-FFT",
+                             CGEF.check_setup(g, CGEF.GaussianKernel(), ℓ; method = AM, backend = gpu).engine)
     end
+end
+
+Test.@testset "AutoMethod's transform engines equal the direct engine on every host path" begin
+    # The padded FFT of the sampled kernel and the transform along the longitude ring evaluate the
+    # direct engine's convolution, so every host apply — one field, a batch, threaded — and every
+    # diagnostic built on them agrees with it to round-off.
+    AM, RS = CGEF.Filtering.AutoMethod(), CGEF.Filtering.RealSpace()
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    THR = CGEF.ComputationalBackends.ThreadedBackend()
+    dx = 1000.0
+    xs = 0.0:dx:(39 * dx)
+    cmask = trues(40, 40); cmask[5:9, 12:20] .= false
+    gc = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs, cmask)       # bounded
+    # Periodic in both axes, and in one: the transform wraps where the grid does and pads elsewhere.
+    gpp = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs, cmask; periodic = (true, true))
+    gpx = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs, cmask; periodic = (true, false))
+    R = 6.371e6
+    lon = range(0.0; step = 2π / 48, length = 48)
+    lat = range(deg2rad(-70.0); stop = deg2rad(70.0), length = 24)
+    smask = trues(48, 24); smask[10:16, 8:12] .= false
+    gs = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), lon, lat, smask;
+                                 periodic = (true, false))
+    fieldset(n1, n2) = ntuple(q -> [sin(2π * q * i / n1) * cos(2π * (q + 1) * j / n2) + 0.3q
+                                    for i in 1:n1, j in 1:n2], 3)
+    cases = ((gc, CGEF.Kernels.HyperGaussianKernel(), 6dx, :PaddedFFTFootprint),
+             (gpp, CGEF.Kernels.HyperGaussianKernel(), 30dx, :PaddedFFTFootprint),
+             (gpx, CGEF.Kernels.SmoothHatKernel(), 30dx, :PaddedFFTFootprint),
+             (gs, CGEF.GaussianKernel(), 900e3, :ZonalFFTFootprint))
+    for (g, k, ℓ, engine) in cases, strat in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
+        fs = fieldset(size(FG.Grids.mask(g))...)
+        pr = CGEF.Filtering.plan_filter(g, k, ℓ; method = RS, backend = SER, mask_strategy = strat)
+        ref = ntuple(i -> CGEF.Filtering.filter_apply!(zeros(size(fs[i])), fs[i], pr), 3)
+        batches = map((SER, THR)) do b
+            p = CGEF.Filtering.plan_filter(g, k, ℓ; method = AM, backend = b, mask_strategy = strat)
+            Test.@test nameof(typeof(p.footprint)) === engine
+            outs = ntuple(_ -> zeros(size(fs[1])), 3)
+            CGEF.Filtering.filter_apply_batch!(outs, fs, p)
+            Test.@test CGEF.Filtering.filter_apply!(zeros(size(fs[1])), fs[1], p) == outs[1]
+            for i in 1:3
+                Test.@test outs[i] ≈ ref[i] rtol = 1e-10
+            end
+            outs
+        end
+        Test.@test batches[1] == batches[2]
+    end
+
+    # Through a diagnostic: `coarse_grain` filters every field of `Π` through `filter_apply_batch!`.
+    for (g, k, scales) in ((gc, CGEF.Kernels.HyperGaussianKernel(), [4dx, 7dx]),
+                           (gs, CGEF.GaussianKernel(), [600e3, 1200e3])), b in (SER, THR)
+        u, v = fieldset(size(FG.Grids.mask(g))...)
+        sweep(m) = CGEF.coarse_grain(u, v, g; scales, kernel = k, method = m, backend = b,
+                                     spectrum = CGEF.Diagnostics.NoSpectrum())
+        ra, rr = sweep(AM), sweep(RS)
+        Test.@test ra.Π ≈ rr.Π rtol = 1e-9
+        Test.@test ra.cumulative_energy ≈ rr.cumulative_energy rtol = 1e-12
+    end
+end
+
+# The filter's definition summed directly: every source cell and, on a periodic Cartesian direction,
+# every image of it inside the support, at the geometry's own distance, weighted `G(d)·A` and normalized
+# by the weight that falls on the grid. A spherical longitude identifies, so its cells come once.
+function _cgef_direct_filter(grid, kernel, ℓ, f)
+    geo = FG.Grids.grid_geometry(grid)
+    cart = geo isa FG.Geometry.CartesianGeometry
+    sz = FG.Grids.size_tuple(grid)
+    N = length(sz)
+    rad = CGEF.Kernels.kernel_radius(kernel, ℓ)
+    tiles = ntuple(d -> cart && FG.Grids.isperiodic(grid, d), N)
+    P = ntuple(d -> tiles[d] ? FG.Grids.period(grid, d) : 0.0, N)
+    M = ntuple(d -> tiles[d] ? ceil(Int, rad / P[d]) + 1 : 0, N)
+    out = zeros(sz)
+    for I in CartesianIndices(sz)
+        xi = FG.Grids.coords(grid, Tuple(I)...)
+        num = 0.0
+        den = 0.0
+        for J in CartesianIndices(sz), m in CartesianIndices(ntuple(d -> (-M[d]):M[d], N))
+            xj = FG.Grids.coords(grid, Tuple(J)...)
+            xm = ntuple(d -> xj[d] + m[d] * P[d], N)
+            dist = FG.Geometry.distance(geo, xi, xm)
+            dist <= rad || continue
+            w = CGEF.Kernels.kernel_weight(kernel, dist, ℓ) * FG.Grids.measure(grid, Tuple(J)...)
+            num += w * f[J]
+            den += w
+        end
+        out[I] = num / den
+    end
+    return out
+end
+
+_cgef_relerr(a, b) = maximum(abs, a .- b) / maximum(abs, b)
+
+# A support wider than half the domain reaches cells through several images on a periodic Cartesian
+# direction, and more than half the rows on a bounded one. Every real-space engine must still equal the
+# definition, on every host and device path.
+Test.@testset "Real-space engines equal the direct sum at supports past half the domain" begin
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    THR = CGEF.ComputationalBackends.ThreadedBackend()
+    DEV = CGEF.ComputationalBackends.GPUBackend(KA.CPU())
+    cart = FG.Geometry.CartesianGeometry()
+    TH, SH = CGEF.TopHatKernel(), CGEF.Kernels.SmoothHatKernel()
+    field(sz) = [sin(1.3 * I[1] + 0.7 * I[2] + (length(sz) > 2 ? 0.4 * I[3] : 0.0)) + 0.2
+                 for I in CartesianIndices(sz)]
+    function check(g, k, ℓ, engine; backends = (SER, THR, DEV), method = CGEF.Filtering.RealSpace(), kw...)
+        f = field(FG.Grids.size_tuple(g))
+        ref = _cgef_direct_filter(g, k, ℓ, f)
+        for b in backends
+            p = CGEF.Filtering.plan_filter(g, k, ℓ; method = method, backend = b, kw...)
+            # A device plan holds its footprint's resident copy, which wraps the host plan.
+            fp = b isa CGEF.ComputationalBackends.GPUBackend ? p.footprint.fp : p.footprint
+            Test.@test nameof(typeof(fp)) === engine
+            Test.@test _cgef_relerr(CGEF.Filtering.filter_apply!(zero(f), f, p), ref) < 1e-11
+        end
+    end
+
+    # Periodic in both directions, periods 16 and 8.4; ℓ/Lx = 0.3, 0.6, 1.2, 2.55. No cell sits on the
+    # support boundary: `i² + 0.49 j²` never equals `rad²` for these radii.
+    gp = FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:7.7; periodic = (true, true))
+    for ℓ in (4.8, 9.6, 19.2, 40.8)
+        check(gp, TH, ℓ, :PrefixSumTopHatPlan)
+        check(gp, SH, ℓ, :FilterFootprint; backends = (SER, THR))
+        check(gp, SH, ℓ, :PaddedFFTFootprint; backends = (SER, THR), method = CGEF.Filtering.AutoMethod())
+    end
+    # A stretched periodic axis takes the two-pointer walk over the tripled coordinates.
+    xs = cumsum([0.0, 1.1, 0.8, 1.3, 0.9, 1.2, 0.7, 1.0, 1.1, 0.95, 1.05, 1.15, 0.85])
+    gs = FG.Grids.StructuredGrid(cart, xs, 0.0:0.7:7.7; periodic = (true, true), period = (13.0, 8.4))
+    # Radii off every sum of consecutive gaps, so no cell sits on the support boundary.
+    for ℓ in (5.1462, 14.3874, 29.9226)
+        check(gs, TH, ℓ, :PrefixSumTopHatPlan)
+    end
+    # Bounded, with the support reaching more than half the rows.
+    gb = FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:2.8)
+    for ℓ in (4.8, 9.6)
+        check(gb, TH, ℓ, :PrefixSumTopHatPlan)
+        check(gb, SH, ℓ, :FilterFootprint; backends = (SER, THR))
+        check(gb, SH, ℓ, :PaddedFFTFootprint; backends = (SER, THR), method = CGEF.Filtering.AutoMethod())
+    end
+
+    # Periodic volume: whole turns of axis 1 and images along axes 2 and 3.
+    g3 = FG.Grids.StructuredGrid(cart, 0.0:1.0:5.0, 0.0:0.7:2.8, 0.0:0.9:2.7; periodic = (true, true, true))
+    for ℓ in (4.8, 13.3)
+        check(g3, TH, ℓ, :PrefixSumTopHat3DPlan)
+        check(g3, SH, ℓ, :FilterFootprintND; backends = (SER, THR))
+    end
+    # A stretched volume streams its neighbourhoods through the grid's ball query, or caches them.
+    g3s = FG.Grids.StructuredGrid(cart, cumsum([0.0, 1.1, 0.8, 1.3, 0.9, 1.2]), 0.0:0.7:2.8, 0.0:0.9:2.7;
+                                  periodic = (true, true, true), period = (6.2, 3.5, 3.6))
+    for ℓ in (4.8, 13.3), cs in (CGEF.Filtering.NeverCache(), CGEF.Filtering.AlwaysCache())
+        check(g3s, SH, ℓ, :NDScatteredFilterPlan; backends = (SER, THR), cache_strategy = cs)
+    end
+
+    # Sphere: latitude reaching more than half the rows, and a regional box whose longitude support is
+    # wider than half its columns (2° at 80° is 39 km, so 500 km spans 13 of 20 columns).
+    R = 6.371e6
+    sph = FG.Geometry.SphericalGeometry(R)
+    gw = FG.Grids.StructuredGrid(sph, deg2rad.(0.0:10.0:350.0), deg2rad.(-80.0:10.0:80.0);
+                                 periodic = (true, false))
+    check(gw, TH, 2 * 12_000e3, :PrefixSumTopHatPlan)
+    # Range axes take the banded footprint; the same box as vectors takes the scattered one.
+    gr = FG.Grids.StructuredGrid(sph, range(0.0, deg2rad(38.0); length = 20),
+                                 range(deg2rad(60.0), deg2rad(80.0); length = 11))
+    grv = FG.Grids.StructuredGrid(sph, deg2rad.(0.0:2.0:38.0), deg2rad.(60.0:2.0:80.0))
+    Test.@test !FG.Grids.isperiodic(gr, 1) && !FG.Grids.isperiodic(grv, 1)
+    check(gr, SH, 1000e3, :FilterFootprint; backends = (SER, THR))
+    check(grv, SH, 1000e3, :ScatteredFilterPlan; backends = (SER, THR))
+    check(gr, TH, 1000e3, :PrefixSumTopHatPlan)
+end
+
+Test.@testset "Sphere: the energy diagnostics filter the planetary velocity, as the flux does" begin
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    R = 6.371e6
+    lon = range(0.0; step = 2π / 144, length = 144)
+    lat = range(deg2rad(-75.0); stop = deg2rad(75.0), length = 61)
+    g = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), lon, lat, trues(144, 61);
+                                periodic = (true, false))
+    k = CGEF.GaussianKernel()
+    scales = [600e3, 1200e3]
+    u = [cos(φ) + 0.3sin(2λ) * cos(φ)^2 for λ in lon, φ in lat]
+    v = [0.2cos(3λ) * cos(φ) for λ in lon, φ in lat]
+
+    r = CGEF.coarse_grain(u, v, g; scales, kernel = k, backend = SER)
+    Test.@test CGEF.Diagnostics.cumulative_energy(u, v, nothing, g, k, scales; backend = SER) ≈
+               r.cumulative_energy rtol = 1e-13
+    Test.@test CGEF.Diagnostics.filtering_spectrum(u, v, nothing, g, k, scales; backend = SER)[2] ≈
+               r.filtering_spectrum rtol = 1e-12
+
+    # Solid-body rotation about the polar axis: its planetary velocity Ω×r is a degree-1 field, which a
+    # radial kernel maps to a multiple of itself (Funk–Hecke), so the filtered field stays `∝ cos φ` and
+    # `resolved_map / (½cos²φ)` is one constant across latitude. Rows within |φ| ≤ 50° sit more than one
+    # kernel radius inside the ±75° boundary. Filtering `u = cos φ` as a scalar spreads that ratio by
+    # 4e-3 here.
+    ub = [cos(φ) for λ in lon, φ in lat]
+    c2 = [0.5cos(φ)^2 for λ in lon, φ in lat]
+    rows = findall(φ -> abs(φ) <= deg2rad(50.0) + 1e-9, lat)
+    ratio = CGEF.Diagnostics.band_energies(ub, zero(ub), g, k, [1200e3]; backend = SER).resolved_map ./ c2
+    Test.@test (maximum(ratio[:, rows]) - minimum(ratio[:, rows])) < 1e-8 * ratio[1, rows[1]]
 end
 
 _cgef_alloc_favre(ws, u, v, ρ, P, g, k, ℓ, fp, dp) =

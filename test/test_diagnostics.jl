@@ -750,29 +750,40 @@ Test.@testset "filtering spectrum: only kernels with monotone |Ĝ|² are admitte
         Test.@test EL ≈ E1 ./ Lbox
     end
 
-    # The pipeline is gated the same way, so the headline entry point cannot bypass it.
-    Test.@test_throws ArgumentError CGEF.coarse_grain(u, v, grid; scales = scales)
+    # The pipeline's default policy computes the density for a monotone kernel and fills NaN for any
+    # other, so the default call — top-hat kernel included — returns Π and the cumulative energy.
+    SP = CGEF.Diagnostics
+    r0 = CGEF.coarse_grain(u, v, grid; scales = scales)
+    Test.@test all(isfinite, r0.Π)
+    Test.@test all(isfinite, r0.cumulative_energy)
+    Test.@test all(isnan, r0.filtering_spectrum)
+    rn = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = SP.NoSpectrum())
+    Test.@test r0.Π == rn.Π && r0.cumulative_energy == rn.cumulative_energy
+    rg = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel())
+    Test.@test rg.filtering_spectrum ==
+               CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel(),
+                                 spectrum = SP.StrictSpectrum()).filtering_spectrum
+    Test.@test all(isfinite, rg.filtering_spectrum)
+
+    # `StrictSpectrum()` refuses a non-monotone kernel on every pipeline entry point.
     Test.@test_throws ArgumentError CGEF.coarse_grain(u, v, grid; scales = scales,
-                                                      kernel = CGEF.TopHatKernel())
+                                                      spectrum = SP.StrictSpectrum())
     let b = CGEF.Pipeline.CoarseGrainBatchResult(grid, length(scales), (2,))
         Test.@test_throws ArgumentError CGEF.Pipeline.coarse_grain_batch!(
-            b, randn(N, N, 2), randn(N, N, 2), grid; scales = scales,
+            b, randn(N, N, 2), randn(N, N, 2), grid; scales = scales, spectrum = SP.StrictSpectrum(),
         )
         Test.@test_throws ArgumentError CGEF.Pipeline.coarse_grain_slices!(
             [CGEF.Pipeline._allocate_result(grid, length(scales))], [u], [v], [grid]; scales = scales,
+            spectrum = SP.StrictSpectrum(),
         )
     end
-
-    # `NoSpectrum()` is the explicit opt-out: Π and the cumulative energy are computed as usual and
-    # the density is left as NaN, which cannot be mistaken for a number that was computed.
-    rf = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum())
-    Test.@test all(isfinite, rf.Π)
-    Test.@test all(isfinite, rf.cumulative_energy)
-    Test.@test all(isnan, rf.filtering_spectrum)
-    # ... and it changes nothing else: Π matches an admissible-kernel-free reference at the same kernel.
-    rg = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel())
-    Test.@test all(isfinite, rg.filtering_spectrum)
-    Test.@test size(rg.Π) == size(rf.Π)
+    # And the default resolves the same way through the batch drivers.
+    let b = CGEF.Pipeline.CoarseGrainBatchResult(grid, length(scales), (2,))
+        CGEF.Pipeline.coarse_grain_batch!(b, cat(u, u; dims = 3), cat(v, v; dims = 3), grid;
+                                          scales = scales)
+        Test.@test all(isnan, b.filtering_spectrum)
+        Test.@test b.slices[1].Π ≈ r0.Π rtol = 1e-12
+    end
 end
 
 # ---------------------------------------------------------------------------

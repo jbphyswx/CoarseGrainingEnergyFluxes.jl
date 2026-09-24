@@ -60,7 +60,7 @@ function plan_filter(
     kwargs...,
 ) where {G<:FlowGeometries.Geometry.AbstractGeometry{T}} where {T<:AbstractFloat}
     _validate_scale(scale)
-    if _resolve_method(grid, kernel, method) isa Spectral
+    if _resolve_method(method) isa Spectral
         return spectral_filter_plan(
             spectral_backend, grid, kernel, scale;
             mask_strategy = mask_strategy, backend = backend,
@@ -69,9 +69,12 @@ function plan_filter(
     end
     resolved = _resolve_backend(backend, grid)
     _check_backend_compatible(grid, backend)
-    fp = if _padded_fft_applicable(grid, kernel, method)
+    # The transform engines run on the host (see `_transform_footprint`), so `AutoMethod` takes them only
+    # there; a device, distributed or MPI plan keeps the direct engine.
+    host = _host_backend(resolved)
+    fp = if host && _padded_fft_applicable(grid, kernel, method)
         padded_fft_footprint(grid, kernel, scale; mask_strategy = mask_strategy)
-    elseif _zonal_fft_applicable(grid, kernel, method)
+    elseif host && _zonal_fft_applicable(grid, kernel, method)
         zonal_fft_footprint(grid, kernel, scale; mask_strategy = mask_strategy)
     else
         build_footprint(grid, kernel, scale; mask_strategy = mask_strategy,

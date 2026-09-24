@@ -104,9 +104,13 @@ end
     cumulative_energy!(spectrum, u, v, w, grid, kernel, scales; workspace=nothing, backend=AutoBackend(), mask_strategy=ZeroFill())
 
 In-place [`cumulative_energy`](@ref): writes into the caller-supplied `spectrum` vector and, when
-`workspace` (a [`ΠWorkspace`](@ref)) is supplied, reuses its `u_filt`/`v_filt`/`w_filt` scratch arrays
-instead of allocating fresh ones — the same buffers `compute_Π!` already fills at each scale, so a
-`coarse_grain!` sweep pays for this filtered-velocity scratch space once, not twice.
+`workspace` (a [`ΠWorkspace`](@ref) or [`EnergyWorkspace`](@ref)) is supplied, filters through its
+buffers.
+
+On a grid of non-Cartesian geometry the filtered velocity is the one [`compute_Π!`](@ref) uses: the
+planetary Cartesian components are filtered and rotated back to the local frame (Aluie 2019), and
+`E(ℓ)` is the energy of the tangent part (with the radial one when `w` is given), equal to what
+`coarse_grain` reports.
 """
 function cumulative_energy!(
     spectrum::AbstractVector{T},
@@ -137,6 +141,16 @@ function cumulative_energy!(
     ws = workspace === nothing ? EnergyWorkspace(grid; has_w = w !== nothing) : workspace
     _check_workspace_w(ws, w)
     u_filt, v_filt, w_filt = ws.u_filt, ws.v_filt, ws.w_filt
+    planetary = !(G <: FlowGeometries.Geometry.CartesianGeometry)
+    if planetary
+        (ws.ux === nothing || ws.w_filt === nothing) && throw(ArgumentError(
+            "this workspace has no planetary-component buffers; build it from the $(nameof(typeof(grid))) " *
+            "it filters, `EnergyWorkspace(grid)`",
+        ))
+        pin, pout = _planetary_buffers(ws)
+        _fill_planetary!(pin, u, v, w, grid)
+        loc = w === nothing ? (u_filt, v_filt) : (u_filt, v_filt, w_filt)
+    end
 
     # Dimension-generic active-cell iteration: `Tuple(I)...` splats to (i,) for a 1D UnstructuredGrid
     # or (i,j) for a 2D Structured/CurvilinearGrid, matching each grid's own `isactive`/`area` arity.
@@ -168,7 +182,10 @@ function cumulative_energy!(
         plan = plans[s_idx]
 
         # Filter velocity fields at this scale — batched (one derivation per point, not one per field).
-        if w !== nothing
+        if planetary
+            Filtering.filter_apply_batch!(pout, pin, plan)
+            _planetary_to_local!(loc, pout, grid)
+        elseif w !== nothing
             Filtering.filter_apply_batch!((u_filt, v_filt, w_filt), (u, v, w), plan)
         else
             Filtering.filter_apply_batch!((u_filt, v_filt), (u, v), plan)

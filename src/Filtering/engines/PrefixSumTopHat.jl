@@ -13,6 +13,13 @@
 #     are monotone in the target index, so a two-pointer sweep finds them in O(1) amortized.
 #     Cartesian: `|Δx| ≤ √(rad²−Δy²)`. Spherical: `cos d = sinφ₁sinφ₂ + cosφ₁cosφ₂·cosΔλ` decreases
 #     monotonically in `|Δλ|` on [0,π], so `d ≤ rad` ⟺ `|Δλ| ≤ acos((cos rad − sinφ₁sinφ₂)/(cosφ₁cosφ₂))`.
+#
+# A periodic Cartesian axis tiles, and a cell contributes once per image inside the support. Along axis
+# 1, with the interval half-width `h` and period `P`, write `2h = qP + r` (`0 ≤ r < P`): the interval is
+# `q` whole periods and a closed remainder of length `r`, which a shift by whole periods places at
+# `[x − ρ, x − ρ + r]`, `ρ = mod(h, P)`. So each row contributes `q` row totals plus one interval sum, and
+# both ends of that interval stay monotone in `x`. Along axis 2 every row image is its own band, at its
+# own displacement. A spherical longitude identifies instead: each cell counts once.
 # ---------------------------------------------------------------------------
 
 """
@@ -43,6 +50,9 @@ struct PrefixSumGridPlan{
     masked::Bool        # grid has inactive cells, so Deformable genuinely needs `prefix_den`
     x_period::T
     y_period::T
+    tiles_x::Bool       # axis 1 is a periodic Cartesian direction: its cells count once per image
+    rings_x::Bool       # axis 1 is a periodic longitude: its cells count once
+    tiles_y::Bool       # axis 2 is a periodic Cartesian direction
     strategy::MS        # the strategy `prefix_den` — and hence every scale's `invden` — was built for
     # The grid's own measure factors, whatever it stores them as: a uniform axis carries one number
     # and a length, so these are not pinned to a dense vector.
@@ -126,7 +136,7 @@ struct PrefixSumTopHatPlan{
     dj_lim::Int
     uniform_axis::Bool  # axis 1 is a bounded ascending Range: every interval is O(1), no walk anywhere
     invden::MT          # 1/(window mass) per point (Nx × Ny), zero where the point is inactive/empty
-    hw::MT              # support half-width per (band, row) ((2dj_lim+1) × Ny); negative ⇒ band empty
+    hw::MT              # support half-width per (band, row); negative ⇒ band empty
     wcell::WT           # uniform-axis constant cell half-width per (band, row), else -1
 end
 
@@ -213,8 +223,12 @@ function _build_prefixsum_grid_plan(
         nothing
     end
 
+    is_cartesian = G <: FlowGeometries.Geometry.CartesianGeometry{T}
+    tiles_x = nrep == 3 && is_cartesian
+    rings_x = nrep == 3 && !is_cartesian
+    tiles_y = periodic_y && Ny > 1 && is_cartesian && y_period > zero(T)
     return PrefixSumGridPlan(
-        periodic_x, periodic_y, masked, x_period, y_period, mask_strategy,
+        periodic_x, periodic_y, masked, x_period, y_period, tiles_x, rings_x, tiles_y, mask_strategy,
         wx, wy, xe, src, prefix_wx, prefix_den,
     )
 end
@@ -232,14 +246,28 @@ function _prefixsum_scratch(
     return PrefixSumScratch([zeros(T, length(gp.xe) + 1, Ny)])
 end
 
-# Which of the three interval branches a `(band, row)` takes. Written once and called from both the
-# plan build (to accumulate the denominator) and the apply (to sum the numerator), so the two cannot
-# drift apart and disagree about where a window starts.
-@inline _prefixsum_spans_period(gp::PrefixSumGridPlan{T}, ne::Int, Nx::Int, hw::T) where {T} =
-    gp.periodic_x && ne > Nx && T(2) * hw >= gp.x_period
-
 @inline _prefixsum_uniform_axis(gp::PrefixSumGridPlan, x, ne::Int, Nx::Int) =
     !gp.periodic_x && ne == Nx && x isa AbstractRange && step(x) > zero(eltype(x))
+
+# The source row of band 0 for target row `j`. On a tiling axis 2 every raw offset `-dj_lim:dj_lim` is
+# one row image; on a bounded one the bands start at the first row in reach, so at most `Ny` of them.
+@inline _prefixsum_row0(tiles_y::Bool, j::Integer, dj_lim::Int) = tiles_y ? j - dj_lim : max(1, j - dj_lim)
+@inline _prefixsum_nbands(tiles_y::Bool, dj_lim::Int, Ny::Int) =
+    tiles_y ? 2 * dj_lim + 1 : min(2 * dj_lim + 1, Ny)
+
+# For a band of half-width `h`: the whole row totals the support holds and the interval `[x - a, x + c]`
+# it adds (empty where `c < -a`). See the section comment above. Scalar arguments, so the device sweep
+# calls it too.
+@inline function _prefixsum_window(tiles_x::Bool, rings_x::Bool, P::T, h::T) where {T<:AbstractFloat}
+    if tiles_x
+        q = floor(Int, 2h / P)
+        ρ = mod(h, P)
+        return q, ρ, (2h - q * P) - ρ
+    elseif rings_x && 2h >= P
+        return 1, zero(T), -one(T)
+    end
+    return 0, h, h
+end
 
 """
     _build_prefixsum_tophat(grid, kernel::TopHatKernel, scale; mask_strategy=ZeroFill(), kwargs...)
@@ -266,16 +294,19 @@ function _build_prefixsum_tophat(
     rad = Kernels.kernel_radius(kernel, scale)
     is_cartesian = G <: FlowGeometries.Geometry.CartesianGeometry{T}
 
-    # Axis-2 band bound from the axis's own minimum gap, converted to a physical distance.
+    # Axis-2 band bound from the axis's own minimum gap, converted to a physical distance. A tiling
+    # axis-2 reaches rows through their images, so its bound is not capped at the axis.
     min_dy = FlowGeometries.Grids.minimum_spacing(grid, 2)
     dy_phys = is_cartesian ? min_dy : FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid)) * min_dy
-    dj_lim = (isfinite(dy_phys) && dy_phys > 0) ? min(Ny - 1, ceil(Int, rad / dy_phys)) : 0
+    dj_lim = !(isfinite(dy_phys) && dy_phys > 0) ? 0 :
+             gp.tiles_y ? ceil(Int, rad / dy_phys) : min(Ny - 1, ceil(Int, rad / dy_phys))
 
     x = FlowGeometries.Grids.coordinates(grid, 1)
     y = FlowGeometries.Grids.coordinates(grid, 2)
     ne = length(gp.xe)
-    nb = min(2 * dj_lim + 1, Ny)
+    nb = _prefixsum_nbands(gp.tiles_y, dj_lim, Ny)
     uniform = _prefixsum_uniform_axis(gp, x, ne, Nx)
+    sy = (Ny > 1 && y[Ny] < y[1]) ? -one(T) : one(T)   # coordinate direction of increasing index
 
     # `hw` needs `metric_band`, which is a transcendental on the sphere, and `wcell` was a linear walk
     # up from zero. Both are functions of the grid and `rad`, so they are tabulated per (band, row)
@@ -284,14 +315,12 @@ function _build_prefixsum_tophat(
     wcell = fill(-1, nb, Ny)
     @inbounds for j in 1:Ny
         y_t = y[j]
+        row0 = _prefixsum_row0(gp.tiles_y, j, dj_lim)
         for b in 0:(nb - 1)
-            jj_raw = j - dj_lim + b
-            (gp.periodic_y || (1 <= jj_raw <= Ny)) || continue
-            jj = mod1(jj_raw, Ny)
-            dy = y[jj] - y_t
-            if gp.periodic_y && gp.y_period > zero(T)
-                dy -= gp.y_period * round(dy / gp.y_period)
-            end
+            jj_raw = row0 + b
+            (gp.tiles_y || jj_raw <= Ny) || continue
+            m = fld(jj_raw - 1, Ny)
+            dy = y[jj_raw - m * Ny] + sy * T(m) * gp.y_period - y_t
             h = FlowGeometries.Connectivity.metric_band(grid, 1, y_t, y_t + dy, rad)
             h < zero(T) && continue
             hw[b + 1, j] = h
@@ -337,32 +366,35 @@ function _prefixsum_build_invden(
 
     den = zeros(T, Nx, Ny)
     @inbounds for j in 1:Ny
+        row0 = _prefixsum_row0(gp.tiles_y, j, dj_lim)
         for b in 0:(nb - 1)
             h = hw[b + 1, j]
             h < zero(T) && continue
-            jj = mod1(j - dj_lim + b, Ny)
+            jj = mod1(row0 + b, Ny)
             wyj = gp.wy[jj]
 
-            if _prefixsum_spans_period(gp, ne, Nx, h)
-                den_all = use_mask_den ? (Pd[Nx + 1, jj] - Pd[1, jj]) : (Pwx[Nx + 1] - Pwx[1])
+            q, a, c = _prefixsum_window(gp.tiles_x, gp.rings_x, gp.x_period, h)
+            if q > 0
+                den_all = q * (use_mask_den ? (Pd[Nx + 1, jj] - Pd[1, jj]) : (Pwx[Nx + 1] - Pwx[1]))
                 for i in 1:Nx
                     den[i, j] += wyj * den_all
                 end
-            elseif wcell[b + 1, j] >= 0
+            end
+            if wcell[b + 1, j] >= 0
                 w = wcell[b + 1, j]
                 for i in 1:Nx
                     lo = max(1, i - w)
                     hi = min(Nx, i + w)
                     den[i, j] += wyj * (use_mask_den ? (Pd[hi + 1, jj] - Pd[lo, jj]) : (Pwx[hi + 1] - Pwx[lo]))
                 end
-            else
+            elseif -a <= c
                 lo = 1
                 hi = 0
                 for t in 1:Nx
                     i = src[t]
                     xc = x[i]
-                    xlo = xc - h
-                    xhi = xc + h
+                    xlo = xc - a
+                    xhi = xc + c
                     while lo <= ne && xe[lo] < xlo
                         lo += 1
                     end
@@ -520,24 +552,24 @@ function _prefixsum_row!(
         out[i, j] = zero(T)
     end
 
-    # Visit each contributing row EXACTLY ONCE. `nb` is capped at `Ny` because a periodic axis-2 with a
-    # band wider than the grid would otherwise map two different offsets onto the same row via `mod1`
-    # and count it twice; capping at `Ny` consecutive raw offsets keeps `mod1` a bijection onto `1:Ny`.
-    nb = min(2 * fp.dj_lim + 1, Ny)
+    # On a tiling axis-2 two bands naming one row are two of its images.
+    nb = size(hwj, 1)
+    row0 = _prefixsum_row0(gp.tiles_y, j, fp.dj_lim)
     @inbounds for b in 0:(nb - 1)
         hw = hwj[b + 1, j]
         hw < zero(T) && continue        # band empty, or off a non-periodic axis-2 edge
-        jj = mod1(j - fp.dj_lim + b, Ny)
+        jj = mod1(row0 + b, Ny)
         wyj = gp.wy[jj]
 
-        if _prefixsum_spans_period(gp, ne, Nx, hw)
-            # Support spans at least a full period: every cell of the row is included exactly once.
-            # Summing over the tripled axis would triple-count, so use one replica's total directly.
-            num_all = Pn[Nx + 1, jj] - Pn[1, jj]
+        q, a, c = _prefixsum_window(gp.tiles_x, gp.rings_x, gp.x_period, hw)
+        if q > 0
+            # Whole periods in support: `q` totals of one replica.
+            num_all = q * (Pn[Nx + 1, jj] - Pn[1, jj])
             for i in 1:Nx
                 out[i, j] += wyj * num_all
             end
-        elseif wcellj[b + 1, j] >= 0
+        end
+        if wcellj[b + 1, j] >= 0
             # Uniform ascending axis: the two pointers advance by exactly one per target, so the window
             # is a constant ±w and the walk collapses. Peeling the interior leaves it branch-free.
             w = wcellj[b + 1, j]
@@ -554,7 +586,7 @@ function _prefixsum_row!(
                 lo = max(1, i - w)
                 out[i, j] += wyj * (Pn[Nx + 1, jj] - Pn[lo, jj])
             end
-        else
+        elseif -a <= c
             lo = 1
             hi = 0
             # Walk the TARGET index in ascending-coordinate order (`src[1:Nx]` is exactly that
@@ -564,8 +596,8 @@ function _prefixsum_row!(
             for t in 1:Nx
                 i = src[t]
                 xc = x[i]
-                xlo = xc - hw
-                xhi = xc + hw
+                xlo = xc - a
+                xhi = xc + c
                 while lo <= ne && xe[lo] < xlo
                     lo += 1
                 end
@@ -646,30 +678,32 @@ function apply_prefixsum_tophat_batch_row!(
         end
     end
 
-    nb = min(2 * fp.dj_lim + 1, Ny)
+    nb = size(hwj, 1)
+    row0 = _prefixsum_row0(gp.tiles_y, j, fp.dj_lim)
     @inbounds for b in 0:(nb - 1)
         hw = hwj[b + 1, j]
         hw < zero(T) && continue
-        jj = mod1(j - fp.dj_lim + b, Ny)
+        jj = mod1(row0 + b, Ny)
         wyj = gp.wy[jj]
 
-        if _prefixsum_spans_period(gp, ne, Nx, hw)
-            # Whole period in support: one total per field, no walk.
+        q, a, c = _prefixsum_window(gp.tiles_x, gp.rings_x, gp.x_period, hw)
+        if q > 0
             for m in eachindex(outs)
                 o = outs[m]
-                num_all = Ps[m][Nx + 1, jj] - Ps[m][1, jj]
+                num_all = q * (Ps[m][Nx + 1, jj] - Ps[m][1, jj])
                 for i in 1:Nx
                     o[i, j] += wyj * num_all
                 end
             end
-        else
+        end
+        if -a <= c
             lo = 1
             hi = 0
             for t in 1:Nx
                 i = src[t]
                 xc = x[i]
-                xlo = xc - hw
-                xhi = xc + hw
+                xlo = xc - a
+                xhi = xc + c
                 while lo <= ne && xe[lo] < xlo
                     lo += 1
                 end

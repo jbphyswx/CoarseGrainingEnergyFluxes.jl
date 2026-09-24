@@ -39,8 +39,8 @@ using Test: Test
 # Measured through top-level, fully-qualified helpers: inside a testset the arguments are captured
 # locals, and `@allocated` then charges that capture to the call under test.
 _cgef_alloc_filter_apply!(out, field, plan) = @allocated CGEF.Filtering.filter_apply!(out, field, plan)
-_cgef_alloc_nusht_filter!(out, field, xfer, plan) =
-    @allocated NUFSHT.nusht_filter!(out, field, xfer, plan)
+_cgef_alloc_nusht_filter!(out, field, xfer, plan, ws, rtol) =
+    @allocated NUFSHT.nusht_filter!(out, field, xfer, plan; ws = ws, rtol = rtol)
 
 Test.@testset "Zero-/bounded-allocation hot paths" begin
 
@@ -263,10 +263,12 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
         nushtplan = CGEF.Filtering.plan_filter(nugrid, CGEF.GaussianKernel(), π * R / 8; backend = SERIAL, method = CGEF.Filtering.Spectral())
         CGEF.Filtering.filter_apply!(outnu, nuf, nushtplan); CGEF.Filtering.filter_apply!(outnu, nuf, nushtplan)
         a_through = _cgef_alloc_filter_apply!(outnu, nuf, nushtplan)
-        # The same transform, driven directly: the plan and the transfer adapter the extension holds.
-        gp = nushtplan.grid_plan
-        NUFSHT.nusht_filter!(outnu, nuf, nushtplan.filter, gp.plan)
-        a_upstream = _cgef_alloc_nusht_filter!(outnu, nuf, nushtplan.filter, gp.plan)
+        # The same fit and synthesis, driven directly through the plan, transfer adapter, workspace and
+        # tolerance the extension holds.
+        gp, sc = nushtplan.grid_plan, nushtplan.scratch
+        rtol = Base.get_extension(CGEF, :CoarseGrainingEnergyFluxesNUFSHTExt)._fit_rtol(gp.plan)
+        NUFSHT.nusht_filter!(outnu, nuf, nushtplan.filter, gp.plan; ws = sc.ws, rtol = rtol)
+        a_upstream = _cgef_alloc_nusht_filter!(outnu, nuf, nushtplan.filter, gp.plan, sc.ws, rtol)
         Test.@test a_through <= a_upstream + TASK_SLACK
         # The grid is fully active, so the extension takes the unmasked branch and stages nothing.
         Test.@test gp.mask === nothing

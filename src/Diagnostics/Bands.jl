@@ -39,6 +39,10 @@ which report zero). `Deformable` renormalizes that leakage away and does better 
 4.8e-4 — at the cost of the commutation property `ZeroFill` is the default for. So: read the bands as
 exact on a periodic unmasked domain, and as carrying an `O(ℓ/L)` boundary residual otherwise.
 
+On a grid of non-Cartesian geometry `f_n` is the local part of the filtered planetary Cartesian
+components of `f_{n-1}` (Aluie 2019) — the filtered velocity [`compute_Π!`](@ref) uses — and `|f|²`
+is filtered as a scalar.
+
 # Why not band-pass the velocity
 
 The obvious alternative, `u = ū₀ + Σ(ū_n − ū_{n-1})`, gives
@@ -88,19 +92,44 @@ function band_energies(
                                     mask_strategy = mask_strategy, backend = backend, method = method) :
         filter_plans
 
-    # `f` is the running repeatedly-filtered field; `nxt` receives each next application. `sq`/`fsq`
-    # carry `|f|²` and its filtered image, which is what makes this a second moment and not a
-    # band-passed velocity.
-    f = (copy(u), copy(v), has_w ? copy(w) : nothing)
-    nxt = (zeros(T, gsz), zeros(T, gsz), has_w ? zeros(T, gsz) : nothing)
-    sq = zeros(T, gsz); fsq = zeros(T, gsz)
-
     # Per-band maps are `N` full fields and most callers want only the scalars they reduce to, so they
     # are opt-in. Without them one scratch map is reused for every band.
     band_maps = maps ? [zeros(T, gsz) for _ in eachindex(scales)] : nothing
     scratch_map = maps ? nothing : zeros(T, gsz)
     bands = zeros(T, length(scales))
+    mask = FlowGeometries.Grids.mask(grid)
 
+    # `f` is the running repeatedly-filtered field in local components. Each band filters it and
+    # `|f|²`, and the band energy is the second moment `(|f|²)‾ − |f̄|²`.
+    f = (copy(u), copy(v), has_w ? copy(w) : zeros(T, gsz))
+    loc = has_w ? f : (f[1], f[2])
+
+    if !(G <: FlowGeometries.Geometry.CartesianGeometry)
+        # The velocity is filtered as its planetary Cartesian components (Aluie 2019), and the next
+        # field is the local part of the result: its tangent components, with the radial one when `w`
+        # is given — the filtered velocity `compute_Π!` uses. `|f|²` is a scalar and is filtered as one.
+        P = ntuple(_ -> zeros(T, gsz), 3)
+        GP = ntuple(_ -> zeros(T, gsz), 3)
+        sq = zeros(T, gsz); fsq = zeros(T, gsz)
+        for n in eachindex(scales)
+            km = maps ? band_maps[n] : scratch_map
+            _fill_planetary!(P, f[1], f[2], has_w ? f[3] : nothing, grid)
+            @. sq = P[1]^2 + P[2]^2 + P[3]^2
+            Filtering.filter_apply_batch!((GP[1], GP[2], GP[3], fsq), (P[1], P[2], P[3], sq), plans[n])
+            _planetary_to_local!(loc, GP, grid)
+            copyto!(km, fsq)
+            for c in eachindex(loc)
+                fc = loc[c]
+                @. km -= fc * fc
+            end
+            @. km = ifelse(mask, T(0.5) * km, zero(T))
+            bands[n] = _area_mean(km, grid, total_area)
+        end
+        return _band_result(bands, band_maps, loc, mask, grid, total_area)
+    end
+
+    # `nxt` receives each next application.
+    nxt = (zeros(T, gsz), zeros(T, gsz), zeros(T, gsz))
     # Each band filters the running field AND its square, for every component — one batched apply
     # instead of `2C` separate ones, so the geometry is walked once per band rather than `2C` times.
     nc = has_w ? 3 : 2
@@ -122,22 +151,22 @@ function band_energies(
             # τ(f;f) = (f²)‾ − (f̄)², summed over components; the ½ is applied once at the end.
             @. km += fsqs[c] - nxt[c] * nxt[c]
         end
-        mask = FlowGeometries.Grids.mask(grid)
         @. km = ifelse(mask, T(0.5) * km, zero(T))
         bands[n] = _area_mean(km, grid, total_area)
         for c in 1:nc
             copyto!(f[c], nxt[c])
         end
     end
+    return _band_result(bands, band_maps, loc, mask, grid, total_area)
+end
 
-    resolved_map = zeros(T, gsz)
-    let mask = FlowGeometries.Grids.mask(grid)
-        for c in 1:(has_w ? 3 : 2)
-            fc = f[c]
-            @. resolved_map += fc * fc
-        end
-        @. resolved_map = ifelse(mask, T(0.5) * resolved_map, zero(T))
+# The resolved energy `½⟨|f_N|²⟩` of the final field and the returned named tuple.
+function _band_result(bands, band_maps, loc, mask, grid, total_area::T) where {T}
+    resolved_map = zero(first(loc))
+    for fc in loc
+        @. resolved_map += fc * fc
     end
+    @. resolved_map = ifelse(mask, T(0.5) * resolved_map, zero(T))
     resolved = _area_mean(resolved_map, grid, total_area)
     return (; bands, resolved, total = sum(bands) + resolved, band_maps, resolved_map)
 end

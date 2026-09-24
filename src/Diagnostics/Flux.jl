@@ -86,33 +86,67 @@ struct SphericalAnalysis end
 
 """
     _fill_planetary!(ws, u, v, w, grid) -> nothing
+    _fill_planetary!((px, py, pz), u, v, w, grid) -> nothing
 
-Rotate the local (east, north, up) velocity into planetary Cartesian components in `ws.ux/uy/uz`.
-Inactive cells are zeroed rather than skipped, so the filter sees a genuine zero there.
+Rotate the local (east, north, up) velocity into planetary Cartesian components in `ws.ux/uy/uz`, or
+in `px/py/pz`. Inactive cells are set to zero, which is the value the filter reads there.
 """
+_fill_planetary!(ws::ΠWorkspace, u, v, w, grid::FlowGeometries.Grids.AbstractGrid) =
+    _fill_planetary!((ws.ux, ws.uy, ws.uz), u, v, w, grid)
+
 function _fill_planetary!(
-    ws::ΠWorkspace, u, v, w, grid::FlowGeometries.Grids.AbstractGrid{G,T},
+    p::NTuple{3,AbstractArray}, u, v, w, grid::FlowGeometries.Grids.AbstractGrid{G,T},
 ) where {G, T<:AbstractFloat}
     has_w = w !== nothing
     geo = FlowGeometries.Grids.grid_geometry(grid)
-    for I in CartesianIndices(ws.ux)
+    px, py, pz = p
+    for I in CartesianIndices(px)
         let i = Tuple(I)
             if FlowGeometries.Grids.isactive(grid, i...)
                 λ, φ = FlowGeometries.Grids.coords(grid, i...)
                 p_vel = FlowGeometries.Geometry.vector_to_cartesian(
                     geo, u[I], v[I], has_w ? w[I] : zero(T), λ, φ,
                 )
-                ws.ux[I] = p_vel[1]
-                ws.uy[I] = p_vel[2]
-                ws.uz[I] = p_vel[3]
+                px[I] = p_vel[1]
+                py[I] = p_vel[2]
+                pz[I] = p_vel[3]
             else
-                ws.ux[I] = zero(T)
-                ws.uy[I] = zero(T)
-                ws.uz[I] = zero(T)
+                px[I] = zero(T)
+                py[I] = zero(T)
+                pz[I] = zero(T)
             end
         end
     end
     return nothing
+end
+
+"""
+    _planetary_to_local!(l, (px, py, pz), grid) -> l
+
+The local (east, north[, up]) components of the planetary vector `(px, py, pz)` into the arrays of `l`,
+two or three of them; zero on inactive cells. Each point reads all three planetary components before
+it writes, so `l` may alias them.
+"""
+function _planetary_to_local!(
+    l::Tuple, p::NTuple{3,AbstractArray}, grid::FlowGeometries.Grids.AbstractGrid{G,T},
+) where {G, T<:AbstractFloat}
+    geo = FlowGeometries.Grids.grid_geometry(grid)
+    px, py, pz = p
+    for I in CartesianIndices(px)
+        i = Tuple(I)
+        if FlowGeometries.Grids.isactive(grid, i...)
+            λ, φ = FlowGeometries.Grids.coords(grid, i...)
+            loc = FlowGeometries.Geometry.vector_from_cartesian(geo, px[I], py[I], pz[I], λ, φ)
+            for c in eachindex(l)
+                l[c][I] = loc[c]
+            end
+        else
+            for c in eachindex(l)
+                l[c][I] = zero(T)
+            end
+        end
+    end
+    return l
 end
 
 # Spherical grids: the shareable half is the rotation into planetary Cartesian, not a transform. Doing
@@ -240,15 +274,6 @@ compute_Π!(Π, u, v, nothing, grid, TopHatKernel(), 30000.0)
 - Buzzicotti, Storer, Khatri, Griffies & Aluie (2023), *J. Adv. Model. Earth Syst.*:
   https://doi.org/10.1029/2021MS002583
 """
-#
-# The GRID's rank is pinned and the arrays' is not, which is what lets a field carry trailing batch axes:
-# `(Nx, Ny, Nb)` here is a batch of 2-D slices, while the same shape against a rank-3 grid is genuine
-# volumetric data and takes the true-3D method. Binding the array rank instead — as this once did — makes
-# a batch unrepresentable, and binding neither makes the two indistinguishable.
-#
-# Nothing below needs to know about the batch: the filter applies route themselves to a fused pass, the
-# tensor algebra is elementwise so it broadcasts over trailing axes, and the stencil derivatives carry the
-# extra axes through.
 function compute_Π!(
     Π::AbstractArray{T},
     u::AbstractArray,
@@ -266,6 +291,9 @@ function compute_Π!(
     # scale-independent forward transform out of its scale loop.
     analyzed = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    # The grid's rank is fixed and the arrays' is not, so a field may carry trailing batch axes:
+    # `(Nx, Ny, Nb)` against this rank-2 grid is a batch of slices. The filter applies, the elementwise
+    # tensor algebra and the stencil derivatives all carry the trailing axes through.
     _validate_field_sizes(grid, Π, u, v, w)
     ws = workspace === nothing ?
         ΠWorkspace(grid, _batch_dims(Π, grid); has_w = w !== nothing) : workspace

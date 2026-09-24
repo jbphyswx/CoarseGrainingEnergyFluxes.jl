@@ -5,24 +5,27 @@ using LinearAlgebra: LinearAlgebra as LA
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries
 
-# Spectral filtering for uniform, doubly-periodic Cartesian grids. Convolution is a pointwise multiply
-# by the kernel's transfer function `Ĝ(|k|, ℓ)` (`CGEF.Kernels.spectral_transfer`, shared with the
-# other spectral backends), so the cost is O(N log N) and independent of the filter scale. Plans and
-# the transfer array are built once per plan. `Ĝ(0) = 1`, so the domain mean is preserved.
+# Spectral filtering for uniform Cartesian grids: a pointwise multiply by the kernel's transfer function
+# `Ĝ(|k|, ℓ)` (`CGEF.Kernels.spectral_transfer`, shared with the other spectral backends), O(N log N)
+# whatever the filter scale. `Ĝ(0) = 1`.
+#
+# A periodic axis is transformed at its own length. A bounded one is zero-padded to
+# `2·nextprod((2,3,5), N)`, the least even 2·3·5-smooth length of at least `2N`, and the result cropped
+# back to the grid: the field is extended by zero beyond the domain, the kernel's full mass is in the
+# normalization, and the wrap-around path between two cells of the grid is at least the domain length.
 #
 # Masking uses the normalized-convolution identity (Knutsson & Westin 1993) that `RealSpace`'s
 # strategies implement pointwise: `ZeroFill` filters `mask·field` directly, and `Deformable`
 # additionally divides by the local kernel mass over active cells, `filter(mask)`. The mask is fixed
-# for a plan, so that denominator is computed at build time and stored inverted — one multiply per
-# apply rather than a divide.
+# for a plan, so that denominator is computed at build time and stored inverted.
 
 """
     FFTWGridPlan
 
-The half of an FFTW spectral plan the filter scale does not reach: the forward and inverse transforms,
-the mask, the angular wavenumber grids, and — when the plan was built for a trailing batch axis — the
-transforms bound to that shape. One instance serves every scale of a sweep, and it is immutable during
-an apply, so concurrent workers may share it.
+The half of an FFTW spectral plan the filter scale does not reach: the forward and inverse transforms
+over the transform grid, the mask, the angular wavenumber grids, and — when the plan was built for a
+trailing batch axis — the transforms bound to that shape. One instance serves every scale of a sweep,
+and it is immutable during an apply, so concurrent workers may share it.
 
 Only `transfer` — and, for `Deformable`, the renormalization computed through it — depends on ℓ; every
 buffer written during an apply lives in [`FFTWScratch`](@ref). Planning an FFT means measuring, so it
@@ -35,22 +38,56 @@ struct FFTWGridPlan{T<:AbstractFloat, FP, IP, M, VX<:AbstractVector{T}, VY<:Abst
     mask::M        # BitMatrix, or nothing when fully active (no masking overhead at all)
     kx::VX
     ky::VY
-    dims::NTuple{2,Int}
+    dims::NTuple{2,Int}   # the grid
+    P::NTuple{2,Int}      # the transform grid: `dims` along periodic axes, padded along bounded ones
+    padded::Bool
     batched::BT    # (; fwd, inv, nb) for a trailing batch axis, or nothing
 end
 
 """
     FFTWScratch
 
-The transient half of an FFTW spectral plan: the complex spectrum buffer and the `mask · field` staging
-array, plus the same pair sized for a trailing batch axis. Every scale of a sweep shares one, since
-scales run sequentially; a driver that applies concurrently gives each worker its own.
+The transient half of an FFTW spectral plan: the complex spectrum buffer, the transform-grid input
+(`mask · field`, zero beyond the grid), the transform-grid output a padded plan crops from, and the same
+set sized for a trailing batch axis. Every scale of a sweep shares one, since scales run sequentially; a
+driver that applies concurrently gives each worker its own.
 """
-struct FFTWScratch{T<:AbstractFloat, CA<:AbstractMatrix{Complex{T}}, A<:AbstractMatrix{T}, BT} <:
+struct FFTWScratch{T<:AbstractFloat, CA<:AbstractMatrix{Complex{T}}, A<:AbstractMatrix{T}, PO, BT} <:
        CGEF.Filtering.AbstractFilterScratch
     cbuf::CA
     masked_input::A
-    batched::BT    # (; cbuf, masked_input) sized for the batch axis, or nothing
+    pad_out::PO    # transform-grid output, or nothing when unpadded
+    batched::BT    # (; cbuf, masked_input, pad_out) sized for the batch axis, or nothing
+end
+
+# The grid's cells within a transform-grid array.
+@inline _fftw_region(A::AbstractMatrix, (Nx, Ny)) = view(A, 1:Nx, 1:Ny)
+@inline _fftw_region(A::AbstractArray{<:Any,3}, (Nx, Ny)) = view(A, 1:Nx, 1:Ny, :)
+
+# The forward transform of `field` into `dst`: directly where nothing is masked or padded, otherwise
+# of `mask · field` written into the grid's region of `buf`, whose padding stays zero.
+function _fftw_forward!(dst, fwd, field, buf, gp::FFTWGridPlan)
+    if gp.padded
+        _fftw_stage!(_fftw_region(buf, gp.dims), field, gp.mask)
+        LA.mul!(dst, fwd, buf)
+    elseif gp.mask === nothing
+        LA.mul!(dst, fwd, field)
+    else
+        _fftw_stage!(buf, field, gp.mask)
+        LA.mul!(dst, fwd, buf)
+    end
+    return dst
+end
+
+@inline _fftw_stage!(data, field, ::Nothing) = (data .= field)
+@inline _fftw_stage!(data, field, mask) = (@. data = mask * field)
+
+# The inverse transform into `out`; a padded plan holds a transform-grid `pout` and crops it.
+@inline _fftw_inverse!(out, inv, spec, ::Nothing, ::FFTWGridPlan) = LA.mul!(out, inv, spec)
+function _fftw_inverse!(out, inv, spec, pout::AbstractArray, gp::FFTWGridPlan)
+    LA.mul!(pout, inv, spec)
+    out .= _fftw_region(pout, gp.dims)
+    return out
 end
 
 """
@@ -64,7 +101,7 @@ struct FFTWFilterPlan{
     T<:AbstractFloat, GP<:FFTWGridPlan{T}, A<:AbstractMatrix{T}, R, SC<:FFTWScratch{T},
 } <: CGEF.Filtering.AbstractFilterPlan
     grid_plan::GP
-    transfer::A    # Ĝ(|k|, ℓ) on the rfft grid  (Nx÷2+1, Ny)
+    transfer::A    # Ĝ(|k|, ℓ) on the rfft transform grid  (Px÷2+1, Py)
     invrenorm::R   # precomputed 1/filter(mask) for Deformable, or nothing (ZeroFill / fully active)
     scratch::SC
 end
@@ -92,14 +129,9 @@ function CGEF.Filtering.filter_apply_batched!(
         "plan was built for a batch of $(b.nb), got $(size(out, 3))",
     ))
     p = sc.batched
-    if gp.mask === nothing
-        LA.mul!(p.cbuf, b.fwd, field)
-    else
-        @. p.masked_input = gp.mask * field
-        LA.mul!(p.cbuf, b.fwd, p.masked_input)
-    end
+    _fftw_forward!(p.cbuf, b.fwd, field, p.masked_input, gp)
     p.cbuf .*= plan.transfer
-    LA.mul!(out, b.inv, p.cbuf)
+    _fftw_inverse!(out, b.inv, p.cbuf, p.pad_out, gp)
     plan.invrenorm === nothing || (out .*= plan.invrenorm)
     return out
 end
@@ -119,13 +151,7 @@ function CGEF.Filtering.filter_analyze!(
     F̂::AbstractMatrix{Complex{T}}, field::AbstractMatrix{T}, plan::FFTWFilterPlan{T},
 ) where {T<:AbstractFloat}
     gp = plan.grid_plan
-    if gp.mask === nothing
-        LA.mul!(F̂, gp.fwd, field)
-    else
-        @. plan.scratch.masked_input = gp.mask * field
-        LA.mul!(F̂, gp.fwd, plan.scratch.masked_input)
-    end
-    return F̂
+    return _fftw_forward!(F̂, gp.fwd, field, plan.scratch.masked_input, gp)
 end
 
 # Rank-3 analyze/synthesize over the batched transforms, so a batch driver that analyzes once per sweep
@@ -141,21 +167,16 @@ function CGEF.Filtering.filter_analyze!(
     b.nb == size(field, 3) || throw(DimensionMismatch(
         "plan was built for a batch of $(b.nb), got $(size(field, 3))",
     ))
-    if gp.mask === nothing
-        LA.mul!(F̂, b.fwd, field)
-    else
-        @. sc.batched.masked_input = gp.mask * field
-        LA.mul!(F̂, b.fwd, sc.batched.masked_input)
-    end
-    return F̂
+    return _fftw_forward!(F̂, b.fwd, field, sc.batched.masked_input, gp)
 end
 
 function CGEF.Filtering.filter_synthesize!(
     out::AbstractMatrix{T}, F̂::AbstractMatrix{Complex{T}}, plan::FFTWFilterPlan{T},
 ) where {T<:AbstractFloat}
     # `inv` consumes its input, so synthesize from a copy — `F̂` is reused by every later scale.
-    plan.scratch.cbuf .= F̂ .* plan.transfer
-    LA.mul!(out, plan.grid_plan.inv, plan.scratch.cbuf)
+    gp, sc = plan.grid_plan, plan.scratch
+    sc.cbuf .= F̂ .* plan.transfer
+    _fftw_inverse!(out, gp.inv, sc.cbuf, sc.pad_out, gp)
     plan.invrenorm === nothing || (out .*= plan.invrenorm)
     return out
 end
@@ -169,7 +190,7 @@ function CGEF.Filtering.filter_synthesize!(
         "this spectral plan was not built for a batch; pass `batch = Nb` to `plan_filter`",
     ))
     sc.batched.cbuf .= F̂ .* plan.transfer
-    LA.mul!(out, b.inv, sc.batched.cbuf)
+    _fftw_inverse!(out, b.inv, sc.batched.cbuf, sc.batched.pad_out, gp)
     plan.invrenorm === nothing || (out .*= plan.invrenorm)
     return out
 end
@@ -177,45 +198,50 @@ end
 function _fftw_grid_plan(
     grid::FlowGeometries.Grids.StructuredGrid{T,G}; batch::Union{Nothing,Integer} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    (FlowGeometries.Grids.isperiodic(grid, 1) && FlowGeometries.Grids.isperiodic(grid, 2)) || throw(ArgumentError(
-        "Spectral FFT filtering requires a doubly-periodic Cartesian grid; build it with " *
-        "`StructuredGrid(geom, x, y, mask; periodic = (true, true))`.",
+    (FlowGeometries.Grids.isuniform(grid, 1) && FlowGeometries.Grids.isuniform(grid, 2)) || throw(ArgumentError(
+        "Spectral FFT filtering needs uniformly spaced axes (`AbstractRange` coordinates); this grid has " *
+        "a stretched one. Use `RealSpace()`, or a node grid with `FINUFFT`.",
     ))
     Nx, Ny = size(FlowGeometries.Grids.mask(grid))
-    # The transform's wavenumbers are `k = 2π·m/(N·dx) = 2π·m/L`, so the only spacing the FFT actually
-    # needs is the domain PERIOD — which this plan already requires to exist, and which is well defined
-    # for any axis representation. On a uniform axis `L/N` is exactly `step`.
-    dx = FlowGeometries.Grids.period(grid, 1) / Nx
-    dy = FlowGeometries.Grids.period(grid, 2) / Ny
-    # Angular wavenumbers (rfft halves the first axis).
-    kx = T(2π) .* FFTW.rfftfreq(Nx, one(T) / dx)
-    ky = T(2π) .* FFTW.fftfreq(Ny, one(T) / dy)
+    px = FlowGeometries.Grids.isperiodic(grid, 1)
+    py = FlowGeometries.Grids.isperiodic(grid, 2)
+    # A periodic axis's spacing is its period over its length; a bounded one's is its step.
+    dx = px ? T(FlowGeometries.Grids.period(grid, 1)) / Nx : abs(T(FlowGeometries.Grids.spacing(grid, 1)))
+    dy = py ? T(FlowGeometries.Grids.period(grid, 2)) / Ny : abs(T(FlowGeometries.Grids.spacing(grid, 2)))
+    Px = px ? Nx : 2 * nextprod((2, 3, 5), Nx)
+    Py = py ? Ny : 2 * nextprod((2, 3, 5), Ny)
+    padded = (Px, Py) != (Nx, Ny)
+    # Angular wavenumbers on the transform grid (rfft halves the first axis).
+    kx = T(2π) .* FFTW.rfftfreq(Px, one(T) / dx)
+    ky = T(2π) .* FFTW.fftfreq(Py, one(T) / dy)
 
-    sample = zeros(T, Nx, Ny)
+    sample = zeros(T, Px, Py)
     fwd = FFTW.plan_rfft(sample)
-    cbuf = fwd * sample                 # complex spectrum (Nx÷2+1, Ny)
-    inv = FFTW.plan_irfft(cbuf, Nx)
+    cbuf = fwd * sample                 # complex spectrum (Px÷2+1, Py)
+    inv = FFTW.plan_irfft(cbuf, Px)
     mask = all(FlowGeometries.Grids.mask(grid)) ? nothing : FlowGeometries.Grids.mask(grid)
     batched = if batch === nothing
         nothing
     else
         nb = Int(batch)
-        bbuf = zeros(T, Nx, Ny, nb)
+        bbuf = zeros(T, Px, Py, nb)
         bfwd = FFTW.plan_rfft(bbuf, (1, 2))
-        (fwd = bfwd, inv = FFTW.plan_irfft(bfwd * bbuf, Nx, (1, 2)), nb = nb)
+        (fwd = bfwd, inv = FFTW.plan_irfft(bfwd * bbuf, Px, (1, 2)), nb = nb)
     end
-    return FFTWGridPlan(fwd, inv, mask, kx, ky, (Nx, Ny), batched)
+    return FFTWGridPlan(fwd, inv, mask, kx, ky, (Nx, Ny), (Px, Py), padded, batched)
 end
 
 # The buffers an apply writes through, sized from the grid plan's own shape.
 function _fftw_scratch(gp::FFTWGridPlan{T}) where {T<:AbstractFloat}
-    Nx, Ny = gp.dims
+    Px, Py = gp.P
     b = gp.batched
     return FFTWScratch(
-        zeros(Complex{T}, Nx ÷ 2 + 1, Ny),
-        zeros(T, Nx, Ny),   # allocated regardless; only touched when mask !== nothing
+        zeros(Complex{T}, Px ÷ 2 + 1, Py),
+        zeros(T, Px, Py),   # touched when masked or padded
+        gp.padded ? zeros(T, Px, Py) : nothing,
         b === nothing ? nothing :
-            (cbuf = zeros(Complex{T}, Nx ÷ 2 + 1, Ny, b.nb), masked_input = zeros(T, Nx, Ny, b.nb)),
+            (cbuf = zeros(Complex{T}, Px ÷ 2 + 1, Py, b.nb), masked_input = zeros(T, Px, Py, b.nb),
+             pad_out = gp.padded ? zeros(T, Px, Py, b.nb) : nothing),
     )
 end
 
@@ -250,14 +276,16 @@ function CGEF.Filtering.spectral_filter_plan(
     transfer = T[CGEF.Kernels.spectral_transfer(kernel, sqrt(kx[i]^2 + ky[j]^2), scale) for i in eachindex(kx), j in eachindex(ky)]
 
     mask = gp.mask
-    invrenorm = if mask !== nothing && mask_strategy isa CGEF.Filtering.Deformable
-        # Local kernel mass over active cells, `filter(mask)`, through the plan's own transforms. The
-        # mask is fixed for the plan, so this is built once and stored inverted.
-        sc.masked_input .= mask
+    invrenorm = if mask_strategy isa CGEF.Filtering.Deformable && (mask !== nothing || gp.padded)
+        # Local kernel mass over active cells, `filter(mask)`, through the plan's own transforms; the
+        # padding beyond a bounded axis is inactive. The mask is fixed for the plan, so this is built
+        # once and stored inverted.
+        region = _fftw_region(sc.masked_input, gp.dims)
+        mask === nothing ? fill!(region, one(T)) : (region .= mask)
         LA.mul!(sc.cbuf, gp.fwd, sc.masked_input)
         sc.cbuf .*= transfer
-        renorm = similar(sc.masked_input)
-        LA.mul!(renorm, gp.inv, sc.cbuf)
+        renorm = zeros(T, gp.dims)
+        _fftw_inverse!(renorm, gp.inv, sc.cbuf, sc.pad_out, gp)
         threshold = T(0.01)
         ir = similar(renorm)
         @. ir = ifelse(abs(renorm) >= threshold, one(T) / renorm, zero(T))
@@ -274,14 +302,9 @@ function CGEF.Filtering.filter_apply!(
     plan::FFTWFilterPlan{T},
 ) where {T<:AbstractFloat}
     gp, sc = plan.grid_plan, plan.scratch
-    if gp.mask === nothing
-        LA.mul!(sc.cbuf, gp.fwd, field)       # f̂ = rfft(field)
-    else
-        @. sc.masked_input = gp.mask * field
-        LA.mul!(sc.cbuf, gp.fwd, sc.masked_input)
-    end
-    sc.cbuf .*= plan.transfer             # ĝ · f̂
-    LA.mul!(out, gp.inv, sc.cbuf)         # irfft  (consumes cbuf, rebuilt next call)
+    _fftw_forward!(sc.cbuf, gp.fwd, field, sc.masked_input, gp)   # f̂ = rfft(mask · field)
+    sc.cbuf .*= plan.transfer                                     # ĝ · f̂
+    _fftw_inverse!(out, gp.inv, sc.cbuf, sc.pad_out, gp)          # irfft (consumes cbuf)
     plan.invrenorm === nothing || (out .*= plan.invrenorm)
     return out
 end
@@ -291,24 +314,29 @@ end
 # ---------------------------------------------------------------------------
 #
 # A non-separable kernel has no factored form, so the direct engine enumerates a whole disk per point:
-# O(N·w²), and `SharpSpectralKernel`'s radius is 10ℓ. Zero-padding to `N + 2w` makes the circular
-# convolution equal the LINEAR one, so this computes exactly what the direct sum computes — including
-# on bounded and masked domains, where a periodic transform would be wrong.
+# O(N·w²), and `SharpSpectralKernel`'s radius is 10ℓ. This evaluates the same sum by transform. A
+# periodic axis keeps its length, and the sampled kernel is accumulated modulo it, which is the sum over
+# every image. A bounded axis is zero-padded to `N + m`, `m = min(w, N - 1)` the widest offset between
+# two cells, the least length at which the circular convolution equals the linear one.
 #
 # `Deformable`/`ZeroFill` are normalized convolution: num = conv(mask·f, g), den = conv(mask, g). `den`
 # depends only on grid/kernel/scale/mask, so it is built once here rather than per apply.
 struct PaddedFFTFootprint{T<:AbstractFloat, A<:AbstractMatrix{T}, C<:AbstractMatrix{Complex{T}}, FP, IP, S}
-    Ĝ::C            # kernel spectrum on the padded grid
+    Ĝ::C            # kernel spectrum on the transform grid
     den::A          # the normalization, cropped and precomputed — it depends on the mask STRATEGY
-    pad::A          # padded scratch for mask·field
-    num::A          # padded scratch for the inverse transform
+    pad::A          # transform-grid scratch for mask·field
+    num::A          # transform-grid scratch for the inverse transform
     spec::C         # spectrum scratch
     fwd::FP
     inv::IP
     strategy::S     # the strategy `den` was built for; applying another one would be wrong
     N::NTuple{2,Int}
-    P::Int
+    P::NTuple{2,Int}   # transform length per axis
 end
+
+# Transform length along one axis: the axis itself where it wraps, else the least 2·3·5-smooth length
+# holding the data and the widest offset between two of its cells.
+_padded_length(N::Int, w::Int, periodic::Bool) = periodic ? N : nextprod((2, 3, 5), N + min(w, N - 1))
 
 function CGEF.Filtering.padded_fft_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
@@ -318,36 +346,40 @@ function CGEF.Filtering.padded_fft_footprint(
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    dx = step(FlowGeometries.Grids.coordinates(grid, 1))
-    dy = step(FlowGeometries.Grids.coordinates(grid, 2))
+    dx = abs(step(FlowGeometries.Grids.coordinates(grid, 1)))
+    dy = abs(step(FlowGeometries.Grids.coordinates(grid, 2)))
+    px = FlowGeometries.Grids.isperiodic(grid, 1)
+    py = FlowGeometries.Grids.isperiodic(grid, 2)
     rad = CGEF.Kernels.kernel_radius(kernel, scale)
-    wx = ceil(Int, rad / dx)
-    wy = ceil(Int, rad / dy)
-    P = max(Nx + 2wx, Ny + 2wy)
+    # A periodic axis reaches every image inside the support; a bounded one no farther than its extent.
+    wx = px ? ceil(Int, rad / dx) : min(ceil(Int, rad / dx), Nx - 1)
+    wy = py ? ceil(Int, rad / dy) : min(ceil(Int, rad / dy), Ny - 1)
+    Px = _padded_length(Nx, wx, px)
+    Py = _padded_length(Ny, wy, py)
     A = FlowGeometries.Grids.area(grid, 1, 1)
 
     # Kernel field, wrapped so index (1,1) is the zero offset — otherwise the result is shifted. Gated
     # on `d <= rad`: the footprint is a DISK, and including the enclosing box's corners changes a
     # slowly-decaying kernel's answer outright.
-    gpad = zeros(T, P, P)
+    gpad = zeros(T, Px, Py)
     for dj in (-wy):wy, di in (-wx):wx
         d = hypot(di * dx, dj * dy)
         d <= rad || continue
         wt = CGEF.Kernels.kernel_weight(kernel, d, scale) * A
         iszero(wt) && continue
-        gpad[mod1(1 + di, P), mod1(1 + dj, P)] += wt
+        gpad[mod1(1 + di, Px), mod1(1 + dj, Py)] += wt
     end
 
     fwd = FFTW.plan_rfft(gpad)
     Ĝ = fwd * gpad
     spec = similar(Ĝ)
-    inv = FFTW.plan_irfft(spec, P)
+    inv = FFTW.plan_irfft(spec, Px)
 
     # The denominator differs by strategy, exactly as it does in the direct engine: `Deformable`
     # renormalizes over ACTIVE cells, `ZeroFill` keeps a masked neighbour in the denominator and
     # contributes nothing for it, so its denominator is the in-domain kernel mass.
     maskv = FlowGeometries.Grids.mask(grid)
-    dpad = zeros(T, P, P)
+    dpad = zeros(T, Px, Py)
     @inbounds for j in 1:Ny, i in 1:Nx
         dpad[i, j] = (mask_strategy isa CGEF.Filtering.ZeroFill || maskv[i, j]) ? one(T) : zero(T)
     end
@@ -360,7 +392,8 @@ function CGEF.Filtering.padded_fft_footprint(
     end
 
     return PaddedFFTFootprint(
-        Ĝ, den, zeros(T, P, P), zeros(T, P, P), similar(Ĝ), fwd, inv, mask_strategy, (Nx, Ny), P,
+        Ĝ, den, zeros(T, Px, Py), zeros(T, Px, Py), similar(Ĝ), fwd, inv, mask_strategy, (Nx, Ny),
+        (Px, Py),
     )
 end
 
@@ -406,25 +439,32 @@ struct ZonalFFTFootprint{
 end
 
 # The band sum, in the transform domain. Shared by the apply and by the plan-time mass accumulation so
-# the two cannot disagree about which bands contribute.
+# the two cannot disagree about which bands contribute. Target row `j` writes only column `j` of
+# `acc`, so `rows` may visit the rows in any order or in parallel.
 function _zonal_accumulate!(
     out::AbstractMatrix{T}, src::AbstractMatrix{T}, fp::ZonalFFTFootprint{T}, Ny::Int,
-) where {T<:AbstractFloat}
+    rows::D = CGEF.Filtering._sep_serial,
+) where {T<:AbstractFloat, D}
     LA.mul!(fp.F, fp.fwd, src)
-    fill!(fp.acc, zero(Complex{T}))
     nk = size(fp.F, 1)
-    Ŵ = fp.Ŵ
-    @inbounds for j in 1:Ny
-        for dj in (-fp.dj_lim):(fp.dj_lim)
-            jj = j + dj
-            (1 <= jj <= Ny) || continue
-            b = dj + fp.dj_lim + 1
+    Ŵ, F, acc, dj_lim = fp.Ŵ, fp.F, fp.acc, fp.dj_lim
+    rows(1:Ny) do j
+        @inbounds begin
             @simd for n in 1:nk
-                fp.acc[n, j] += Ŵ[n, b, j] * fp.F[n, jj]
+                acc[n, j] = zero(Complex{T})
+            end
+            for dj in (-dj_lim):dj_lim
+                jj = j + dj
+                (1 <= jj <= Ny) || continue
+                b = dj + dj_lim + 1
+                @simd for n in 1:nk
+                    acc[n, j] += Ŵ[n, b, j] * F[n, jj]
+                end
             end
         end
+        return nothing
     end
-    LA.mul!(out, fp.inv, fp.acc)
+    LA.mul!(out, fp.inv, acc)
     return out
 end
 
@@ -508,11 +548,15 @@ function CGEF.Filtering.zonal_fft_footprint(
     return fp
 end
 
+CGEF.Filtering._transform_footprint(::Union{ZonalFFTFootprint, PaddedFFTFootprint}) = true
+
+# `rows(f, 1:Ny)` visits every latitude row; each row writes only its own column of every buffer.
 function CGEF.Filtering.apply_footprint!(
     out::AbstractMatrix{T}, field::AbstractMatrix,
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
     fp::ZonalFFTFootprint{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
+    rows::D = CGEF.Filtering._sep_serial,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}, D}
     (!fp.masked || typeof(strategy) === typeof(fp.strategy)) || throw(ArgumentError(
         "this zonal-FFT footprint was built for $(nameof(typeof(fp.strategy))) on a masked grid; its " *
         "normalization is not the one $(nameof(typeof(strategy))) needs. Rebuild the plan with the " *
@@ -520,15 +564,19 @@ function CGEF.Filtering.apply_footprint!(
     ))
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     maskv = FlowGeometries.Grids.mask(grid)
-    @inbounds for j in 1:Ny, i in 1:Nx
-        fp.src[i, j] = maskv[i, j] ? T(field[i, j]) : zero(T)
+    src, invden = fp.src, fp.invden
+    rows(1:Ny) do j
+        @inbounds @simd for i in 1:Nx
+            src[i, j] = maskv[i, j] ? T(field[i, j]) : zero(T)
+        end
+        return nothing
     end
-    _zonal_accumulate!(out, fp.src, fp, Ny)
-    invden = fp.invden
-    @inbounds for j in 1:Ny
-        @simd for i in 1:Nx
+    _zonal_accumulate!(out, src, fp, Ny, rows)
+    rows(1:Ny) do j
+        @inbounds @simd for i in 1:Nx
             out[i, j] *= invden[i, j]
         end
+        return nothing
     end
     return out
 end
@@ -542,24 +590,32 @@ function CGEF.Filtering.apply_footprint!(
     out::AbstractMatrix{T}, field::AbstractMatrix,
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
     fp::PaddedFFTFootprint{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    rows::D = CGEF.Filtering._sep_serial,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, D}
     strategy === fp.strategy || throw(ArgumentError(
         "this padded-FFT footprint was built for $(typeof(fp.strategy)); its denominator is not the " *
         "one $(typeof(strategy)) needs. Rebuild the plan with the strategy you intend to apply.",
     ))
     Nx, Ny = fp.N
     maskv = FlowGeometries.Grids.mask(grid)
-    fill!(fp.pad, zero(T))
-    @inbounds for j in 1:Ny, i in 1:Nx
-        fp.pad[i, j] = maskv[i, j] ? T(field[i, j]) : zero(T)
+    pad, num, den = fp.pad, fp.num, fp.den
+    fill!(pad, zero(T))
+    rows(1:Ny) do j
+        @inbounds @simd for i in 1:Nx
+            pad[i, j] = maskv[i, j] ? T(field[i, j]) : zero(T)
+        end
+        return nothing
     end
     # In place through the held buffers: `plan * array` allocates a fresh result on every apply.
-    LA.mul!(fp.spec, fp.fwd, fp.pad)
+    LA.mul!(fp.spec, fp.fwd, pad)
     fp.spec .*= fp.Ĝ
-    LA.mul!(fp.num, fp.inv, fp.spec)
-    @inbounds for j in 1:Ny, i in 1:Nx
-        d = fp.den[i, j]
-        out[i, j] = (maskv[i, j] && d > T(1e-15)) ? fp.num[i, j] / d : zero(T)
+    LA.mul!(num, fp.inv, fp.spec)
+    rows(1:Ny) do j
+        @inbounds @simd for i in 1:Nx
+            d = den[i, j]
+            out[i, j] = (maskv[i, j] && d > T(1e-15)) ? num[i, j] / d : zero(T)
+        end
+        return nothing
     end
     return out
 end

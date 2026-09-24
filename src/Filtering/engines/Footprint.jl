@@ -550,17 +550,19 @@ function build_footprint(
         #
         # The window must hold for every row the ball reaches, not just the target's — a row nearer the
         # pole spans more longitude for the same radius — which is what `metric_window` gives, taking
-        # the smallest cosφ over the latitude window. Capped at one turn besides: longitude identifies
-        # rather than tiles, so a ring contributes each of its `Nx` cells at most once.
+        # the smallest cosφ over the latitude window. On a periodic ring it is capped at one turn, since
+        # longitude identifies and a ring contributes each of its `Nx` cells at most once; on a regional
+        # box, at `Nx - 1`, the widest offset between two of its columns.
+        periodic_λ = FlowGeometries.Grids.isperiodic(grid, 1)
         di_lims = Vector{Int}(undef, Ny)
         total_entries = 0
         for j in 1:Ny
             dl = FlowGeometries.Connectivity.metric_window(grid, (1, j), rad)[1]
-            di_lims[j] = min(dl, Nx ÷ 2)
+            di_lims[j] = periodic_λ ? min(dl, Nx ÷ 2) : min(dl, Nx - 1)
             for ddj in -dj_lim:dj_lim
                 jj = j + ddj
                 (1 <= jj <= Ny) || continue
-                total_entries += min(2 * dl + 1, Nx)
+                total_entries += periodic_λ ? min(2 * dl + 1, Nx) : 2 * di_lims[j] + 1
             end
         end
         sizehint!(di, total_entries)
@@ -577,7 +579,7 @@ function build_footprint(
                 # Asymmetric by one when the window closes the ring: `-dl:dl` is `2dl+1` offsets, and at
                 # `dl = Nx÷2` on an even ring that is `Nx+1` — the antipodal column visited from both
                 # sides. Dropping the upper end leaves each of the `Nx` columns exactly once.
-                hi_i = (2 * di_lim + 1 > Nx) ? di_lim - 1 : di_lim
+                hi_i = (periodic_λ && 2 * di_lim + 1 > Nx) ? di_lim - 1 : di_lim
                 for ddi in -di_lim:hi_i
                     # Great-circle distance with Δλ = ddi·dλ (longitude-translation-invariant).
                     d = FlowGeometries.Geometry.distance(

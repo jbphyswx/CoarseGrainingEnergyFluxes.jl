@@ -76,12 +76,12 @@ Two orthogonal choices control *how* a filter is evaluated:
 
 1. **Filter method** (`method = RealSpace()` default, or `Spectral()`):
    - `RealSpace()` — real-space footprint convolution. Supports masks and regional/non-periodic
-     domains at arbitrary scales. The only method for a bounded (non-periodic) domain.
+     domains at arbitrary scales.
    - `Spectral()` — transform → multiply by Ĝ(|k|, ℓ) → inverse transform. `O(N log N)`,
-     scale-independent cost; requires a homogeneous (periodic / global) domain, but a partial mask is
-     supported (normalized convolution, Knutsson & Westin 1993 — `ZeroFill`/`Deformable` work exactly
-     as they do for `RealSpace()`, just evaluated in Fourier/spherical-harmonic space instead of real
-     space).
+     scale-independent cost. A bounded Cartesian direction is zero-padded, so the result is the filter
+     of the field extended by zero beyond the domain; the spherical-harmonic transforms need the whole
+     sphere. A partial mask is supported by normalized convolution (Knutsson & Westin 1993), with
+     `ZeroFill`/`Deformable` defined as for `RealSpace()`.
 
 2. **Execution backend** (for the `RealSpace()` engine): `SerialBackend`, `ThreadedBackend`
    (OhMyThreads), `GPUBackend` (KernelAbstractions), `DistributedBackend` (Distributed +
@@ -124,9 +124,9 @@ per point that the host's monotone two-pointer walk avoids.
 Two further engines evaluate that **same** convolution by transform, and are reached with
 `method = AutoMethod()`:
 
-- **padded FFT of the sampled kernel** — uniform Cartesian, for kernels with no factored engine. Zero
-  padding makes the transform compute the *linear* convolution, so it is valid on bounded and masked
-  domains where a periodic transform is not.
+- **FFT of the sampled kernel** — uniform Cartesian, for kernels with no factored engine. Along a
+  periodic axis the transform is circular, with the kernel summed over its images; along a bounded one
+  it is zero-padded, so it computes the *linear* convolution and holds on bounded and masked domains.
 - **zonal FFT along the longitude ring** — a global rectilinear sphere with a radial kernel. For a
   fixed pair of latitudes the great-circle weight depends on the longitude difference alone, so each
   latitude band is a circular convolution. It is worth most near the poles, where the direct engine's
@@ -146,7 +146,7 @@ transforms, multiplies by the shared `spectral_transfer`, and inverse transforms
 
 | Grid | Sampling | Extension | Transform |
 |------|----------|-----------|-----------|
-| `StructuredGrid{Cartesian}`   | uniform periodic  | `FFTW`                   | real FFT |
+| `StructuredGrid{Cartesian}`   | uniform           | `FFTW`                   | real FFT, zero-padded along bounded axes |
 | `UnstructuredGrid{Cartesian}` | scattered         | `FINUFFT`                | type-1/2 NUFFT |
 | `StructuredGrid{Spherical}`   | uniform (FSH grid)| `FastSphericalHarmonics` | scalar SHT |
 | `UnstructuredGrid{Spherical}` | scattered         | `NUFSHT`                 | non-uniform SHT |

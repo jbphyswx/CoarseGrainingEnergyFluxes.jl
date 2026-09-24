@@ -248,8 +248,11 @@ result = CGEF.coarse_grain(u, v, grid; scales = collect(10e3:10e3:60e3),
 along-track altimetry): k-d tree neighbor search and Voronoi cell areas at construction time, WLSQ
 gradients over that adjacency, and both filtering methods. `RealSpace()` is the default, as on every
 other grid: the compact kernel applied exactly as written, through a gather over each point's metric
-ball, which holds next to a boundary or a masked region. Pass `method = CGEF.Filtering.Spectral()`
-for the transform — exact for a band-limited field on a homogeneous domain, and `O(n log n)`.
+ball, which holds next to a boundary or a masked region. `method = CGEF.Filtering.Spectral()` is the
+`O(n log n)` spectral filter: it estimates the Fourier coefficients on a box with the quadrature rule of
+the grid's cell areas and multiplies by `Ĝ(k)`. The box is the grid's `period` in a direction declared
+periodic; elsewhere it pads the record (extent plus one spacing) as FFTW pads a bounded axis, the field
+being zero beyond the record. On a uniform lattice this is the FFTW result on the same grid.
 
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
@@ -459,15 +462,16 @@ components whether or not a vertical velocity was supplied.
 ## Spectral filtering (`method = Spectral()`)
 
 Spectral filtering multiplies by Ĝ(k) and is selected by the grid type (FFTW / FINUFFT /
-FastSphericalHarmonics / NUFSHT). It requires a homogeneous (periodic / global) domain, but a partial
-mask is supported — `ZeroFill`/`Deformable` work exactly as they do for `RealSpace()` (normalized
-convolution, evaluated in Fourier/spherical-harmonic space). `GaussianKernel`/`SharpSpectralKernel`
+FastSphericalHarmonics / NUFSHT). A bounded Cartesian direction is zero-padded, so the result is the
+filter of the field extended by zero beyond the domain; the spherical-harmonic transforms need the whole
+sphere. A partial mask is supported by normalized convolution, `ZeroFill`/`Deformable` defined as for
+`RealSpace()`. `GaussianKernel`/`SharpSpectralKernel`
 work with no extra dependency; `TopHatKernel` needs `using SpecialFunctions` (for its exact planar
 Bessel-`J₁` transfer function — the spherical-cap analog needs no extra dependency).
 
 ```julia
 using FlowGeometries: FlowGeometries as FG
-using FFTW: FFTW                       # uniform periodic Cartesian
+using FFTW: FFTW                       # uniform Cartesian
 N = 128; dx = 1.0
 geom = FG.Geometry.CartesianGeometry()
 x = collect(0.0:dx:dx*(N - 1))

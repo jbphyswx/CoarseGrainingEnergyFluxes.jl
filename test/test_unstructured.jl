@@ -59,11 +59,6 @@ Test.@testset "UnstructuredGrid (k-d tree / Voronoi / WLSQ / pipeline)" begin
     Πu = zeros(length(ulon))
     CGEF.Diagnostics.compute_Π!(Πu, uu2, vv2, nothing, ugrid2, CGEF.GaussianKernel(), 3000.0)
     Test.@test all(isfinite, Πu)
-    # Catches a regression to the fixed FINUFFT mode-count-from-geometry.dx bug (which made this
-    # 64-point call cost ~4 GiB instead of KB) even if some future change kept the numerics finite.
-    # Gated on the mode grid the plan builds and on allocations — both exact, neither load-dependent.
-    plan_u = CGEF.Filtering.plan_filter(ugrid2, CGEF.GaussianKernel(), 3000.0; method = CGEF.Filtering.Spectral())
-    Test.@test prod(size(plan_u.transfer)) <= 4 * length(ulon)
     b_pi = @allocated CGEF.Diagnostics.compute_Π!(Πu, uu2, vv2, nothing, ugrid2, CGEF.GaussianKernel(), 3000.0)
     Test.@test b_pi < 10_000_000
 

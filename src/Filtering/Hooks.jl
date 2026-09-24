@@ -36,6 +36,11 @@ function zonal_fft_footprint(args...; kwargs...)
     throw(ArgumentError("The zonal-FFT spherical engine needs FFTW — run `using FFTW`."))
 end
 
+# Whether `fp` is one of those two transform engines. They run on the host: serially, or under
+# `ThreadedBackend` through `apply_footprint!(out, field, grid, fp, strategy, driver)` with a row
+# driver of `_sep_serial`'s shape.
+_transform_footprint(::Any) = false
+
 function distributed_filter_field!(args...; kwargs...)
     throw(ArgumentError("DistributedBackend is unavailable — run `using Distributed` (or use SerialBackend())."))
 end

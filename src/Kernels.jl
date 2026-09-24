@@ -490,7 +490,8 @@ Whether `d|Ĝ(k)|²/dk ≤ 0` holds on `(0, ∞)`.
 
 Sadek & Aluie (2018) eq. (21): this is the condition under which the filtering spectral density
 `Ẽ(k_ℓ)` is guaranteed non-negative. A kernel that fails it can produce a spectrum with negative
-values, which is why `Diagnostics.StrictSpectrum` — the default policy — refuses one.
+values: `Diagnostics.StrictSpectrum` refuses one, and the `coarse_grain` default
+`Diagnostics.AutoSpectrum` fills `NaN` for it.
 
 | kernel | monotone | why |
 |---|---|---|

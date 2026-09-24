@@ -443,35 +443,35 @@ end
 
 @kernel function _cgef_prefixsum_sweep_kernel!(
     out, @Const(P), @Const(x), @Const(xe), @Const(wy), @Const(invden), @Const(hwt), @Const(wcell),
-    dj_lim::Int, ne::Int, periodic_x::Bool, x_period, Nx::Int, Ny::Int,
+    dj_lim::Int, ne::Int, Nx::Int, Ny::Int, tiles_x::Bool, rings_x::Bool, tiles_y::Bool, x_period,
 )
     i, j, b = @index(Global, NTuple)
     T = eltype(out)
     Nb = size(P, 3)
     if i <= Nx && j <= Ny && b <= Nb
         acc = zero(T)
-        nband = min(2 * dj_lim + 1, Ny)
+        nband = size(hwt, 1)
         xc = @inbounds x[i]
-        spans_possible = periodic_x && ne > Nx
+        row0 = CGEF.Filtering._prefixsum_row0(tiles_y, j, dj_lim)
         for t in 0:(nband - 1)
             h = @inbounds hwt[t+1, j]
             if h >= zero(T)
-                jj = mod1(j - dj_lim + t, Ny)
+                jj = mod1(row0 + t, Ny)
                 wyj = @inbounds wy[jj]
-                if spans_possible && T(2) * h >= x_period
-                    acc += wyj * (@inbounds(P[Nx+1, jj, b]) - @inbounds(P[1, jj, b]))
-                else
-                    w = @inbounds wcell[t+1, j]
-                    if w >= 0
-                        lo = max(1, i - w)
-                        hi = min(Nx, i + w)
+                q, a, c = CGEF.Filtering._prefixsum_window(tiles_x, rings_x, x_period, h)
+                if q > 0
+                    acc += wyj * q * (@inbounds(P[Nx+1, jj, b]) - @inbounds(P[1, jj, b]))
+                end
+                w = @inbounds wcell[t+1, j]
+                if w >= 0
+                    lo = max(1, i - w)
+                    hi = min(Nx, i + w)
+                    acc += wyj * (@inbounds(P[hi+1, jj, b]) - @inbounds(P[lo, jj, b]))
+                elseif -a <= c
+                    lo = _xe_lower(xe, ne, xc - a)
+                    hi = _xe_upper(xe, ne, xc + c)
+                    if hi >= lo
                         acc += wyj * (@inbounds(P[hi+1, jj, b]) - @inbounds(P[lo, jj, b]))
-                    else
-                        lo = _xe_lower(xe, ne, xc - h)
-                        hi = _xe_upper(xe, ne, xc + h)
-                        if hi >= lo
-                            acc += wyj * (@inbounds(P[hi+1, jj, b]) - @inbounds(P[lo, jj, b]))
-                        end
                     end
                 end
             end
@@ -525,19 +525,20 @@ end
                             py ? (jj = mod1(jj, Ny)) : (iny = false)
                         end
                         if iny
-                            if px && 2 * w + 1 >= Nx
-                                acc += @inbounds(P[Nx+1, jj, kk, b]) - @inbounds(P[1, jj, kk, b])
-                            elseif px
-                                lo = i - w
-                                hi = i + w
-                                if lo < 1
-                                    acc += (@inbounds(P[hi+1, jj, kk, b]) - @inbounds(P[1, jj, kk, b])) +
-                                           (@inbounds(P[Nx+1, jj, kk, b]) - @inbounds(P[Nx+lo, jj, kk, b]))
-                                elseif hi > Nx
-                                    acc += (@inbounds(P[Nx+1, jj, kk, b]) - @inbounds(P[lo, jj, kk, b])) +
-                                           (@inbounds(P[hi-Nx+1, jj, kk, b]) - @inbounds(P[1, jj, kk, b]))
-                                else
-                                    acc += @inbounds(P[hi+1, jj, kk, b]) - @inbounds(P[lo, jj, kk, b])
+                            if px
+                                q, rc = divrem(2 * w + 1, Nx)
+                                if q > 0
+                                    acc += q * (@inbounds(P[Nx+1, jj, kk, b]) - @inbounds(P[1, jj, kk, b]))
+                                end
+                                if rc > 0
+                                    lo = mod1(i - w, Nx)
+                                    hi = lo + rc - 1
+                                    if hi <= Nx
+                                        acc += @inbounds(P[hi+1, jj, kk, b]) - @inbounds(P[lo, jj, kk, b])
+                                    else
+                                        acc += (@inbounds(P[Nx+1, jj, kk, b]) - @inbounds(P[lo, jj, kk, b])) +
+                                               (@inbounds(P[hi-Nx+1, jj, kk, b]) - @inbounds(P[1, jj, kk, b]))
+                                    end
                                 end
                             else
                                 lo = max(1, i - w)
@@ -649,7 +650,7 @@ end
 # Prefix-sum top-hat: the axis tables, the per-(band, row) window table, the reciprocal window mass, and
 # the device numerator scan `P` the two kernels hand between them. `P` carries a trailing batch axis of
 # extent 1; a batched apply takes a wider one from `batch_scan`, allocated on first use and reused.
-struct GPUPrefixSum{F, T, VT, VI, MT, WT, MA, PB} <: GPUResident
+struct GPUPrefixSum{F, VT, VI, MT, WT, MA, PB} <: GPUResident
     fp::F
     x::VT
     xe::VT
@@ -665,7 +666,6 @@ struct GPUPrefixSum{F, T, VT, VI, MT, WT, MA, PB} <: GPUResident
     # type and only its extent differs. It is filled on the first batched apply and reused after.
     batch_scan::Base.RefValue{Union{Nothing,PB}}
     ne::Int
-    x_period::T
 end
 
 struct GPUPrefixSum3D{F, WT, AT, MA, PB} <: GPUResident
@@ -707,7 +707,7 @@ function CGEF.Filtering.prepare_workspace(
         move(dev, collect(T, gp.xe)), move(dev, collect(Int, gp.src)),
         move(dev, collect(T, gp.wx)), move(dev, collect(T, gp.wy)),
         move(dev, fp.invden), move(dev, fp.hw), move(dev, fp.wcell),
-        _maskd(dev, grid), P, _batch_scan_ref(P), ne, gp.x_period,
+        _maskd(dev, grid), P, _batch_scan_ref(P), ne,
     )
 end
 
@@ -911,9 +911,10 @@ function _run_gpu_kernel!(dev, out, field, ws::GPUPrefixSum, grid, periodic_x::B
     P = _scan_table(dev, ws.P, ws.batch_scan, (ws.ne + 1, Ny, Nb))
     _cgef_prefixsum_scan_kernel!(dev)(P, field, ws.maskd, ws.src, ws.wx, ws.ne; ndrange = (Ny, Nb))
     KA.synchronize(dev)
+    gp = fp.grid_plan
     _cgef_prefixsum_sweep_kernel!(dev)(
-        out, P, ws.x, ws.xe, ws.wy, ws.invden, ws.hw, ws.wcell,
-        fp.dj_lim, ws.ne, fp.grid_plan.periodic_x, ws.x_period, Nx, Ny; ndrange = (Nx, Ny, Nb),
+        out, P, ws.x, ws.xe, ws.wy, ws.invden, ws.hw, ws.wcell, fp.dj_lim, ws.ne, Nx, Ny,
+        gp.tiles_x, gp.rings_x, gp.tiles_y, gp.x_period; ndrange = (Nx, Ny, Nb),
     )
     return out
 end

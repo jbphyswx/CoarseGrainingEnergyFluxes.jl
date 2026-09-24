@@ -145,7 +145,7 @@ function CGEF.Filtering.distributed_filter_field!(
         @sync Distributed.@distributed for lin in 1:length(s_out)
             I = cart[lin]
             if mask[I]
-                s_out[I] = CGEF.Filtering._footprint_nd_point_streaming(field, grid, fp, mask_strategy, mask, dims, I)
+                s_out[I] = CGEF.Filtering._footprint_nd_point_streaming(field, grid, fp, mask_strategy, mask, I)
             end
         end
     end

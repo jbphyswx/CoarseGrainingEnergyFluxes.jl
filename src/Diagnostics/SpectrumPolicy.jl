@@ -6,24 +6,32 @@
     AbstractSpectrumPolicy
 
 What to do when a filtering spectral density is asked for with a kernel whose `|Ĝ(k)|²` is not monotone
-decreasing — [`StrictSpectrum`](@ref), [`ForceSpectrum`](@ref) or [`NoSpectrum`](@ref).
+decreasing — [`AutoSpectrum`](@ref), [`StrictSpectrum`](@ref), [`ForceSpectrum`](@ref) or
+[`NoSpectrum`](@ref).
 
-Sadek & Aluie (2018) eq. (21) guarantees `Ẽ(k_ℓ) ≥ 0` only when `d|Ĝ(k)|²/dk ≤ 0`. That condition is
-**sufficient, not necessary**, and where it fails it tends to fail narrowly: the default `TopHatKernel`'s
-`|Ĝ|²` falls to zero at `kℓ ≈ 7.66` and climbs back to only `0.0175` at `kℓ ≈ 10.27`, so the violation
-sits in the far sub-filter tail at under 2% of the DC value while the rest of the curve is usable.
-Hence three settings rather than a veto: the safe reading stays the default, and the other one stays
-reachable.
+Sadek & Aluie (2018) eq. (21) guarantees `Ẽ(k_ℓ) ≥ 0` only when `d|Ĝ(k)|²/dk ≤ 0`. The condition is
+sufficient, and a kernel that violates it usually does so narrowly: `TopHatKernel`'s `|Ĝ|²` falls to
+zero at `kℓ ≈ 7.66` and climbs back to only `0.0175` at `kℓ ≈ 10.27`, a violation in the far sub-filter
+tail at under 2% of the DC value.
 
 `Π` and the cumulative energy carry no such condition and are unaffected by this choice.
 """
 abstract type AbstractSpectrumPolicy end
 
 """
+    AutoSpectrum <: AbstractSpectrumPolicy
+
+The default of the `coarse_grain` family: the density for a kernel that passes
+[`Kernels.transfer_monotone`](@ref), `NaN` for one that does not, as [`NoSpectrum`](@ref) gives.
+"""
+struct AutoSpectrum <: AbstractSpectrumPolicy end
+
+"""
     StrictSpectrum <: AbstractSpectrumPolicy
 
-Refuse to produce a spectral density for a kernel that fails [`Kernels.transfer_monotone`](@ref). The
-default: either a density guaranteed non-negative, or an error naming the alternatives.
+Refuse to produce a spectral density for a kernel that fails [`Kernels.transfer_monotone`](@ref):
+either a density guaranteed non-negative, or an error naming the alternatives. The default of
+[`filtering_spectrum`](@ref), whose result is that density.
 """
 struct StrictSpectrum <: AbstractSpectrumPolicy end
 
@@ -53,6 +61,18 @@ function gate_spectrum end
 
 gate_spectrum(kernel, ::StrictSpectrum) = (Kernels.check_spectrum_kernel(kernel); true)
 gate_spectrum(::Any, ::NoSpectrum) = false
+gate_spectrum(kernel, ::AutoSpectrum) = Kernels.transfer_monotone(kernel)
+
+"""
+    resolve_spectrum(kernel, policy) -> AbstractSpectrumPolicy
+
+`policy` with [`AutoSpectrum`](@ref) replaced by the policy it means for `kernel`:
+[`StrictSpectrum`](@ref) for a kernel that passes [`Kernels.transfer_monotone`](@ref), [`NoSpectrum`](@ref)
+otherwise.
+"""
+resolve_spectrum(::Any, policy::AbstractSpectrumPolicy) = policy
+resolve_spectrum(kernel, ::AutoSpectrum) =
+    Kernels.transfer_monotone(kernel) ? StrictSpectrum() : NoSpectrum()
 
 function gate_spectrum(kernel, ::ForceSpectrum)
     Kernels.transfer_monotone(kernel) || @warn(
@@ -181,13 +201,20 @@ quadratic product, so two buffers serve (three with a vertical component).
 
 Interchangeable with [`ΠWorkspace`](@ref) wherever only the velocity buffers are used, so a sweep that
 already holds a flux workspace passes it straight through instead of allocating a second one.
+
+On a grid of non-Cartesian geometry the velocity is filtered as its planetary Cartesian components
+(Aluie 2019), so the workspace also holds those, `ux/uy/uz`, and all three filtered buffers.
 """
 struct EnergyWorkspace{
     T<:AbstractFloat, A<:AbstractArray{T}, AW<:Union{Nothing,AbstractArray{T}},
+    AP<:Union{Nothing,AbstractArray{T}},
 }
     u_filt::A
     v_filt::A
     w_filt::AW
+    ux::AP
+    uy::AP
+    uz::AP
 end
 
 function EnergyWorkspace(
@@ -195,8 +222,15 @@ function EnergyWorkspace(
     has_w::Bool = false,
 ) where {G, T<:AbstractFloat}
     sz = (FlowGeometries.Grids.size_tuple(grid)..., batch_size...)
-    return EnergyWorkspace(zeros(T, sz...), zeros(T, sz...), has_w ? zeros(T, sz...) : nothing)
+    planetary = !(G <: FlowGeometries.Geometry.CartesianGeometry)
+    z() = zeros(T, sz...)
+    zp() = planetary ? z() : nothing
+    return EnergyWorkspace(z(), z(), (has_w || planetary) ? z() : nothing, zp(), zp(), zp())
 end
+
+# The planetary input buffers and the three filtered ones they are filtered into.
+@inline _planetary_buffers(ws::Union{ΠWorkspace, EnergyWorkspace}) =
+    ((ws.ux, ws.uy, ws.uz), (ws.u_filt, ws.v_filt, ws.w_filt))
 
 # Whether a workspace carries the third-component buffers. Read off the type, so the check costs
 # nothing and cannot disagree with what was allocated.

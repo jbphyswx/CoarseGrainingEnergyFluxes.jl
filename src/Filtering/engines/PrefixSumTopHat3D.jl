@@ -117,24 +117,22 @@ end
                 periodic[2] || continue
                 jj = mod1(jj, Ny)
             end
-            if periodic[1] && 2 * w + 1 >= Nx
-                # The window covers the whole periodic axis: every cell exactly once.
-                tot = P[Nx + 1, jj, kk] - P[1, jj, kk]
-                @simd for i in 1:Nx
-                    oc[i] += tot
+            if periodic[1]
+                # The `2w+1` raw offsets are `q` whole turns of the axis and a remainder of `rc` cells,
+                # each cell counted once per image the offsets land on.
+                q, rc = divrem(2 * w + 1, Nx)
+                if q > 0
+                    tot = q * (P[Nx + 1, jj, kk] - P[1, jj, kk])
+                    @simd for i in 1:Nx
+                        oc[i] += tot
+                    end
                 end
-            elseif periodic[1]
-                for i in 1:Nx
-                    lo = i - w
-                    hi = i + w
-                    if lo < 1
-                        oc[i] += (P[hi + 1, jj, kk] - P[1, jj, kk]) +
-                                 (P[Nx + 1, jj, kk] - P[Nx + lo, jj, kk])
-                    elseif hi > Nx
-                        oc[i] += (P[Nx + 1, jj, kk] - P[lo, jj, kk]) +
-                                 (P[hi - Nx + 1, jj, kk] - P[1, jj, kk])
-                    else
-                        oc[i] += P[hi + 1, jj, kk] - P[lo, jj, kk]
+                if rc > 0
+                    for i in 1:Nx
+                        lo = mod1(i - w, Nx)
+                        hi = lo + rc - 1
+                        oc[i] += hi <= Nx ? P[hi + 1, jj, kk] - P[lo, jj, kk] :
+                                 (P[Nx + 1, jj, kk] - P[lo, jj, kk]) + (P[hi - Nx + 1, jj, kk] - P[1, jj, kk])
                     end
                 end
             else
@@ -170,8 +168,10 @@ function _build_prefixsum_tophat_3d(
     dy = step(FlowGeometries.Grids.coordinates(grid, 2))
     dz = step(FlowGeometries.Grids.coordinates(grid, 3))
     periodic = ntuple(d -> FlowGeometries.Grids.isperiodic(grid, d), 3)
-    dj_lim = dy > 0 ? min(Ny - 1, ceil(Int, rad / dy)) : 0
-    dk_lim = dz > 0 ? min(Nz - 1, ceil(Int, rad / dz)) : 0
+    # A periodic direction tiles, so the ball reaches a plane through each of its images and the band
+    # count is not capped at the axis.
+    dj_lim = dy > 0 ? (periodic[2] ? ceil(Int, rad / dy) : min(Ny - 1, ceil(Int, rad / dy))) : 0
+    dk_lim = dz > 0 ? (periodic[3] ? ceil(Int, rad / dz) : min(Nz - 1, ceil(Int, rad / dz))) : 0
 
     # The ball's axis-1 half-width at each (dj, dk). `-1` marks a slice the ball never reaches, matching
     # the `dist <= rad` gate the general engine applies per offset.
@@ -313,23 +313,23 @@ struct NDScatteredCache{N, T<:AbstractFloat, VO<:AbstractVector{NTuple{N,Int}}, 
 end
 
 """
-    NDScatteredFilterPlan{N, T, K}
+    NDScatteredFilterPlan{N, T, K, C, MT}
 
-N-D (1D or 3D) analog of [`ScatteredFilterPlan`](@ref): compact scalar metadata (per-axis window
-limits, periodicity/period, geometry flag) for when at least one of the N axes is a plain
-`AbstractVector` (no type-level uniformity proof) — no translation-invariance assumption, correct
-for any spacing pattern. `cache` holds the materialized [`NDScatteredCache`](@ref) only when the
-plan's cache strategy decided to build it, `nothing` otherwise (apply-time recomputation).
+N-D (1D or 3D) analog of [`ScatteredFilterPlan`](@ref), for when at least one of the N axes is a plain
+`AbstractVector` (no type-level uniformity proof): the kernel, the support radius, the per-axis window
+the cache size is estimated from, and the grid's ball-query topology. No translation invariance is
+assumed. `cache` holds the materialized [`NDScatteredCache`](@ref) only when the plan's cache strategy
+decided to build it, `nothing` otherwise (apply-time recomputation).
 """
-struct NDScatteredFilterPlan{N, T<:AbstractFloat, K<:Kernels.AbstractFilterKernel, C<:Union{Nothing,NDScatteredCache{N,T}}}
+struct NDScatteredFilterPlan{
+    N, T<:AbstractFloat, K<:Kernels.AbstractFilterKernel, C<:Union{Nothing,NDScatteredCache{N,T}}, MT,
+}
     kernel::K
     scale::T
     rad::T
     lim::NTuple{N,Int}
-    periodic::NTuple{N,Bool}
-    period::NTuple{N,T}
-    is_cartesian::Bool
     cache::C
+    topology::MT   # built once; the cache build and the streaming apply both query through it
 end
 
 # Ball-gated, as in 2-D. The 1-D case needs no correction (a 1-D ball IS the interval).
@@ -337,34 +337,6 @@ end
 @inline _nd_scattered_cache_bytes(dims::NTuple{N,Int}, lim::NTuple{N,Int}, ::Type{T}) where {N,T} =
     round(Int, prod(dims) * prod(2 .* lim .+ 1) * (sizeof(NTuple{N,Int}) + sizeof(T)) /
                _nd_box_to_ball(Val(N)))
-
-"""
-    _nd_scattered_window_bounds(grid, rad) -> (lim, periodic, period, is_cartesian)
-
-Compact per-axis scalar window-bound derivation for the nonuniform N-D (1D/3D) case — the same values
-an [`NDScatteredFilterPlan`](@ref) stores. The window itself is `Connectivity.metric_window`, read from
-the grid's cached axis statistics in O(1); nothing here scans the grid.
-"""
-function _nd_scattered_window_bounds(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, rad::T,
-) where {N, T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    periodic = FlowGeometries.Grids.periodic_flags(grid)
-    # Conservative per-axis index-radius bound, valid at every point of the grid; the exact `d <= rad`
-    # check below still gates inclusion. `metric_window` reads it from the grid's cached axis statistics
-    # in O(1) — converting a physical radius through the local metric (r·cosφ for longitude, r for
-    # latitude, the radial axis already being distance) is the geometry's own arithmetic.
-    lim = FlowGeometries.Connectivity.metric_window(grid, rad)
-
-    # A wrapped candidate's raw stored coordinate sits a full period away from the target on a
-    # periodic CARTESIAN axis, so plain Euclidean `distance` would reject every genuinely-close
-    # wrapped neighbor unless shifted back by one period first (a periodic spherical x axis needs
-    # no such shift — see `_build_footprint_scattered`'s identical point for the 2D case).
-    is_cartesian = G <: FlowGeometries.Geometry.CartesianGeometry{T}
-    period = ntuple(N) do d
-        (is_cartesian && periodic[d]) ? T(FlowGeometries.Grids.period(grid, d)) : zero(T)
-    end
-    return lim, periodic, period, is_cartesian
-end
 
 function _build_footprint_nd_scattered(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
@@ -376,7 +348,9 @@ function _build_footprint_nd_scattered(
 ) where {N, T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     dims = FlowGeometries.Grids.size_tuple(grid)
     rad = Kernels.kernel_radius(kernel, scale)
-    lim, periodic, period, is_cartesian = _nd_scattered_window_bounds(grid, rad)
+    # Per-axis index bound at the worst cell, for the cache estimate only; the traversal is the grid's.
+    lim = FlowGeometries.Connectivity.metric_window(grid, rad)
+    mt = _query_topology(grid, rad)
 
     cache = if _should_cache(cache_strategy, _nd_scattered_cache_bytes(dims, lim, T), cache_byte_budget)
         nbrs = NTuple{N,Int}[]
@@ -388,7 +362,7 @@ function _build_footprint_nd_scattered(
         ptr[1] = 1
         for I in CartesianIndices(dims)
             t = lin[I]
-            _nd_foldl(nothing, grid, Tuple(I), dims, lim, periodic, period, is_cartesian, rad) do _, J, d
+            _nd_foldl(nothing, grid, Tuple(I), rad, mt) do _, J, d
                 push!(nbrs, J)
                 push!(w, Kernels.kernel_weight(kernel, d, scale) * FlowGeometries.Grids.area(grid, J...))
                 nothing
@@ -399,37 +373,26 @@ function _build_footprint_nd_scattered(
     else
         nothing
     end
-    return NDScatteredFilterPlan(kernel, scale, rad, lim, periodic, period, is_cartesian, cache)
+    return NDScatteredFilterPlan(kernel, scale, rad, lim, cache, mt)
 end
 
-# Folds `acc = f(acc, J, d)` over every in-support neighbour of `Ti`, the centre included. The ND
-# counterpart of `_scattered_foldl`: the cache builder and the streaming apply both enumerate through
-# it, so they agree by construction rather than by two copies being kept in step.
-@inline function _nd_foldl(
-    f::F, acc, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, Ti::NTuple{N,Int},
-    dims::NTuple{N,Int}, lim::NTuple{N,Int}, periodic::NTuple{N,Bool}, period::NTuple{N,T},
-    is_cartesian::Bool, rad::T,
-) where {F, N, T<:AbstractFloat, G}
-    geo = FlowGeometries.Grids.grid_geometry(grid)
-    target = FlowGeometries.Grids.coords(SA.SVector, grid, Ti...)
-    for off in CartesianIndices(ntuple(d -> (-lim[d]):lim[d], N))
-        J = ntuple(N) do d
-            jj = Ti[d] + off[d]
-            (jj < 1 || jj > dims[d]) ? (periodic[d] ? mod1(jj, dims[d]) : 0) : jj
-        end
-        any(==(0), J) && continue
-        shift = ntuple(N) do d
-            jj = Ti[d] + off[d]
-            jj < 1 ? -period[d] : (jj > dims[d] ? period[d] : zero(T))
-        end
-        neighbor = FlowGeometries.Grids.coords(SA.SVector, grid, J...)
-        neighbor_shifted = is_cartesian ? (neighbor + SA.SVector{N,T}(shift)) : neighbor
-        d = FlowGeometries.Geometry.distance(geo, target, neighbor_shifted)
-        d <= rad || continue
-        acc = f(acc, J, d)
-    end
-    return acc
-end
+# Folds `acc = f(acc, J, d)` over every in-support neighbour of `Ti`, the centre included, through the
+# grid's own ball query. A periodic Cartesian direction tiles, so each image of a cell inside the
+# support comes at its own displacement; a periodic angle identifies, so its cells come once. The cache
+# builder and the streaming apply both enumerate through it.
+@inline _nd_foldl(
+    f::F, acc, grid::FlowGeometries.Grids.StructuredGrid, Ti::NTuple{N,Int}, rad, mt,
+) where {F, N} = FlowGeometries.Connectivity.fold_within(
+    f, acc, grid, Ti...;
+    ball = rad, self = true, active_only = false, topology = mt, images = _image_convention(grid),
+)
+
+@inline _image_convention(grid::FlowGeometries.Grids.StructuredGrid) =
+    _image_convention(FlowGeometries.Grids.grid_geometry(grid))
+@inline _image_convention(::FlowGeometries.Geometry.AbstractCartesianGeometry) =
+    FlowGeometries.Connectivity.AllImages()
+@inline _image_convention(::FlowGeometries.Geometry.AbstractGeometry) =
+    FlowGeometries.Connectivity.NearestImage()
 
 # Shifted neighbour multi-index with per-axis periodic wrap; returns (index, in-bounds?).
 @inline function _shift_index(I::NTuple{N,Int}, o::NTuple{N,Int}, dims::NTuple{N,Int}, periodic::NTuple{N,Bool}) where {N}
@@ -513,12 +476,10 @@ end
 # what keeps this allocation-free.
 function _footprint_nd_point_streaming(
     field::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, fp::NDScatteredFilterPlan{N,T},
-    strategy::AbstractMaskStrategy, mask, dims::NTuple{N,Int}, I::CartesianIndex{N},
+    strategy::AbstractMaskStrategy, mask, I::CartesianIndex{N},
 ) where {N, T<:AbstractFloat, G}
     kernel, scale = fp.kernel, fp.scale
-    ws, wn = _nd_foldl(
-        (zero(T), zero(T)), grid, Tuple(I), dims, fp.lim, fp.periodic, fp.period, fp.is_cartesian, fp.rad,
-    ) do acc, J, d
+    ws, wn = _nd_foldl((zero(T), zero(T)), grid, Tuple(I), fp.rad, fp.topology) do acc, J, d
         s, n = acc
         active = mask[J...]
         wk = Kernels.kernel_weight(kernel, d, scale) * FlowGeometries.Grids.area(grid, J...)
@@ -552,7 +513,7 @@ function apply_footprint_nd!(
     else
         @inbounds for I in CartesianIndices(out)
             mask[I] || continue
-            out[I] = _footprint_nd_point_streaming(field, grid, fp, strategy, mask, dims, I)
+            out[I] = _footprint_nd_point_streaming(field, grid, fp, strategy, mask, I)
         end
     end
     return out

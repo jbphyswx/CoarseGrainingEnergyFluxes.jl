@@ -24,19 +24,16 @@ _apply_serial_batch!(outs, fields, grid, fp::NDScatteredFilterPlan, strategy) =
 _apply_serial_batch!(outs, fields, grid, fp::PrefixSumTopHatPlan, strategy) =
     apply_prefixsum_tophat_batch!(outs, fields, grid, fp, strategy)
 
-# The remaining footprints carry no per-point neighbour derivation for a batch to share: the separable
-# Gaussians hold precomputed 1-D weight tables and `NodeFilterPlan` stores its adjacency outright, so
-# the only per-field work left really is per-field data and a batch here IS the per-field loop.
+# Every other footprint applies field by field. None carries a per-point neighbour derivation for a
+# batch to share: the separable Gaussians hold precomputed 1-D weight tables, `NodeFilterPlan` stores
+# its adjacency outright, and the FFTW extension's padded- and zonal-FFT engines filter a whole field
+# per transform.
 #
 # `PrefixSumTopHatPlan` is not among them. Its support intervals are O(1) amortized per point per band,
 # but the sweep TOTAL is O(N·dj_lim) — the engine's dominant cost — while its genuinely per-field part,
 # the numerator scan, is a small fraction of that. Whether sharing the sweep pays depends on the axis;
 # see `_prefixsum_batch_fuses`.
-function _apply_serial_batch!(
-    outs, fields, grid,
-    fp::Union{SeparableFootprint, SeparableFootprintND, NodeFilterPlan, PrefixSumTopHat3DPlan},
-    strategy,
-)
+function _apply_serial_batch!(outs, fields, grid, fp, strategy)
     for k in eachindex(outs)
         _apply_serial!(outs[k], fields[k], grid, fp, strategy)
     end
@@ -269,13 +266,11 @@ end
 @inline function _nd_stream_point!(
     outs::NTuple{K,<:AbstractArray}, fields::NTuple{K,<:AbstractArray},
     grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, fp::NDScatteredFilterPlan{N,T},
-    strategy::AbstractMaskStrategy, dims::NTuple{N,Int}, mask, I::CartesianIndex{N}, kernel, scale,
+    strategy::AbstractMaskStrategy, mask, I::CartesianIndex{N}, kernel, scale,
     _acc_ws, _acc_wn,
 ) where {K, N, T<:AbstractFloat, G}
     z = zero(SA.SVector{K,T})
-    ws, wn = _nd_foldl(
-        (z, z), grid, Tuple(I), dims, fp.lim, fp.periodic, fp.period, fp.is_cartesian, fp.rad,
-    ) do a, J, d
+    ws, wn = _nd_foldl((z, z), grid, Tuple(I), fp.rad, fp.topology) do a, J, d
         aws, awn = a
         active = mask[J...]
         wk = Kernels.kernel_weight(kernel, d, scale) * FlowGeometries.Grids.area(grid, J...)
@@ -296,14 +291,12 @@ end
 
 @inline function _nd_stream_point!(
     outs, fields, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, fp::NDScatteredFilterPlan{N,T},
-    strategy::AbstractMaskStrategy, dims::NTuple{N,Int}, mask, I::CartesianIndex{N}, kernel, scale,
+    strategy::AbstractMaskStrategy, mask, I::CartesianIndex{N}, kernel, scale,
     acc_ws, acc_wn,
 ) where {N, T<:AbstractFloat, G}
     fill!(acc_ws, zero(T))
     fill!(acc_wn, zero(T))
-    _nd_foldl(
-        nothing, grid, Tuple(I), dims, fp.lim, fp.periodic, fp.period, fp.is_cartesian, fp.rad,
-    ) do _, J, d
+    _nd_foldl(nothing, grid, Tuple(I), fp.rad, fp.topology) do _, J, d
         active = mask[J...]
         wk = Kernels.kernel_weight(kernel, d, scale) * FlowGeometries.Grids.area(grid, J...)
         if strategy isa ZeroFill
@@ -375,7 +368,7 @@ function apply_footprint_nd_batch_over!(
         kernel, scale = fp.kernel, fp.scale
         @inbounds for I in indices
             mask[I] || continue
-            _nd_stream_point!(outs, fields, grid, fp, strategy, dims, mask, I, kernel, scale, acc_ws, acc_wn)
+            _nd_stream_point!(outs, fields, grid, fp, strategy, mask, I, kernel, scale, acc_ws, acc_wn)
         end
     end
     return outs

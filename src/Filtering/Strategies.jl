@@ -54,12 +54,12 @@ struct Spectral <: AbstractFilterMethod end
 """
     AutoMethod <: AbstractFilterMethod
 
-Pick the engine from real capability, the same contract [`AutoCache`](@ref) and `AutoBackend` follow:
-[`Spectral`](@ref) only where a transform is available AND exact for this grid, otherwise
-[`RealSpace`](@ref).
-
-Selects [`Spectral`](@ref) only where every axis is periodic and uniform and a transform backend is
-loaded — the case where a periodic transform is the exact filter. Otherwise [`RealSpace`](@ref).
+The [`RealSpace`](@ref) convolution, evaluated by the fastest engine that computes its sum: the direct
+engines, or a transform of the same sampled kernel where the grid allows one — the FFT engine on a
+uniform Cartesian grid (circular along periodic axes, zero-padded along bounded ones) and the
+transform along the longitude ring of a global rectilinear sphere. These agree with the direct sum to
+round-off. [`Spectral`](@ref), which multiplies by the kernel's transfer function, is a different
+discretization and is never selected.
 """
 struct AutoMethod <: AbstractFilterMethod end
 

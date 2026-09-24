@@ -58,7 +58,7 @@ _sweep_shared(grid, kernel, mask_strategy, method) =
 # A spectral engine's shared half is its transform objects, whichever backend supplies them; its
 # scratch is sized from those and shared by the sequential scales of the sweep.
 function _spectral_sweep_shared(grid, kernel, mask_strategy, method)
-    _resolve_method(grid, kernel, method) isa Spectral || return (nothing, nothing)
+    _resolve_method(method) isa Spectral || return (nothing, nothing)
     gp = spectral_grid_plan(
         SpectralBackends.AutoSpectralBackend(), grid, kernel; mask_strategy = mask_strategy,
     )
@@ -71,7 +71,7 @@ function _sweep_shared(
     mask_strategy::AbstractMaskStrategy,
     method::AbstractFilterMethod,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    _resolve_method(grid, kernel, method) isa Spectral &&
+    _resolve_method(method) isa Spectral &&
         return _spectral_sweep_shared(grid, kernel, mask_strategy, method)
     FlowGeometries.Grids.measure_factors(grid) === nothing && return (nothing, nothing)
     gp = _build_prefixsum_grid_plan(grid; mask_strategy = mask_strategy)
@@ -84,7 +84,7 @@ function _sweep_shared(
     mask_strategy::AbstractMaskStrategy,
     method::AbstractFilterMethod,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    _resolve_method(grid, kernel, method) isa Spectral &&
+    _resolve_method(method) isa Spectral &&
         return _spectral_sweep_shared(grid, kernel, mask_strategy, method)
     FlowGeometries.Grids.measure_factors(grid) === nothing && return (nothing, nothing)
     return (nothing, _separable_scratch(grid))
@@ -150,16 +150,11 @@ defined as a convolution against a compact kernel (Aluie 2019), so the filter at
 own neighbourhood, which survives a regional domain and a coastline; `ZeroFill` keeps that kernel
 position-independent, so filtering commutes with `∇` and the `Π` budget closes.
 
-A transform reproduces the same convolution only on a global, unmasked domain and only up to its
-bandlimit, so it is reached by an explicit `method = Spectral()`, or by `AutoMethod()` choosing an
-evaluator on capability. The grid architecture never changes which operator ran.
-
-A layout with no real-space engine gets `Spectral()`, whose builder then names the backends that exist.
+Multiplying by the kernel's transfer function is a different discretization of the continuum filter,
+reached only by an explicit `method = Spectral()`. The grid architecture never changes which operator
+ran.
 """
-_default_method(::FlowGeometries.Grids.StructuredGrid) = RealSpace()
-_default_method(::FlowGeometries.Grids.CurvilinearGrid) = RealSpace()
-_default_method(grid::FlowGeometries.Grids.AbstractGrid) =
-    _is_flat_cell(grid) ? RealSpace() : RealSpace()
+_default_method(::FlowGeometries.Grids.AbstractGrid) = RealSpace()
 
 # The row-based parallel backends (Threaded/Distributed/GPU/MPI) decompose over rows of a 2D grid
 # via `apply_footprint_row!`, which already works generically for CurvilinearGrid (a 2D grid using
@@ -221,30 +216,9 @@ _backend_supported(grid::FlowGeometries.Grids.AbstractGrid, ::ComputationalBacke
 @inline _fftw_available() =
     Base.get_extension(parentmodule(@__MODULE__), :CoarseGrainingEnergyFluxesFFTWExt) !== nothing
 
-# A transform filters by PERIODIC convolution, so it reproduces the intended filter only where every
-# axis wraps, and it needs constant spacing — which a `Range` axis proves at the type level.
-_spectral_exact(grid::FlowGeometries.Grids.StructuredGrid{T,G,N}) where {
-    T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, N,
-} =
-    all(ntuple(d -> FlowGeometries.Grids.isperiodic(grid, d), N)) &&
-    all(ntuple(d -> FlowGeometries.Grids.coordinates(grid, d) isa AbstractRange, N))
-_spectral_exact(::FlowGeometries.Grids.AbstractGrid) = false
-
-@inline _besselj1_available() =
-    Base.get_extension(parentmodule(@__MODULE__), :CoarseGrainingEnergyFluxesSpecialFunctionsExt) !== nothing
-
-# `AutoMethod` picks on real capability, never on a preference: a transform only where it is available
-# AND exact for this grid. Every kernel wins there, including the top-hat — its prefix-sum engine is
-# O(N) but with a large enough constant to lose 60x to a transform whose cost does not scale with the
-# filter width at all (30.0 ms vs 0.5 ms at half-width 64 on a periodic 256^2 grid).
-@inline function _resolve_method(grid, kernel, method::AbstractFilterMethod)
-    method isa AutoMethod || return method
-    (_fftw_available() && _spectral_exact(grid)) || return RealSpace()
-    # The planar top-hat's transfer function is the Bessel-J₁ form, which only exists when the
-    # SpecialFunctions extension is loaded; without it there is no spectral top-hat to select.
-    kernel isa Kernels.TopHatKernel && !_besselj1_available() && return RealSpace()
-    return Spectral()
-end
+# `AutoMethod` chooses an evaluator of the real-space convolution, so it resolves to `RealSpace`.
+@inline _resolve_method(::AutoMethod) = RealSpace()
+@inline _resolve_method(method::AbstractFilterMethod) = method
 
 # Which kernels have a factored real-space engine. A `SharpSpectralKernel` has none — its radial `sinc`
 # does not separate — so it falls to the banded disk sum at O(N·w²) with a 10ℓ radius.
@@ -286,6 +260,11 @@ _zonal_fft_applicable(
 
 @inline _threading_available() =
     Base.get_extension(parentmodule(@__MODULE__), :CoarseGrainingEnergyFluxesOhMyThreadsExt) !== nothing
+
+# The backends whose applies run in this process's own loops, where the transform engines
+# (`_transform_footprint`) are available.
+_host_backend(b::ComputationalBackends.AbstractExecutionBackend) =
+    b isa Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend}
 
 # Upstream leaves `resolve_backend(::AutoBackend)` to the consumer, since it cannot see whether this
 # package's threading extension is loaded. Kept package-local rather than added as a method there:
@@ -511,15 +490,6 @@ function filter_apply!(out::AbstractArray, field::AbstractArray, plan::PhysicalF
     end
 end
 
-"""
-    filter_apply_batch!(outs, fields, plan::AbstractFilterPlan) -> outs
-
-Apply `plan` to every field in `fields`, writing into the matching entry of `outs`, deriving each
-target point's neighbour list/weight exactly ONCE and reusing it across the whole batch — not once
-per field. `outs`/`fields` must be equal-length, matching-shape collections of arrays: an
-`NTuple{K,V}` (single concrete array type `V`) for a compile-time-known batch size (fastest — see
-`_batch_zeros`), or an `AbstractVector` for a runtime-determined batch size.
-"""
 # A fused device batch exists only for engines whose kernel carries a batch index; the extension
 # overrides this for those. Never guess — an unfused engine must take the slice loop, not a wrong kernel.
 _gpu_batched_supported(::AbstractFilterPlan) = false
@@ -615,6 +585,9 @@ but the engines that derive per-point geometry — the scattered/node footprints
 point's neighbourhood once for the whole batch instead of once per field, which is where the saving is.
 
 `compute_Π!` filters five to nine fields per scale, so this is the shape its inner loop uses.
+
+`outs`/`fields` are equal-length collections of matching arrays: an `NTuple{K,V}` for a batch size
+known at compile time (stack accumulators, see `_batch_zeros`), or an `AbstractVector`.
 
 Distinct from [`filter_slices!`](@ref), which takes independent fields on DIFFERENT grids, one plan
 each; here there is one grid and one plan. For a single array carrying a trailing batch axis, this

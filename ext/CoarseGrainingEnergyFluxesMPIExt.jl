@@ -159,7 +159,7 @@ function CGEF.Filtering.mpi_filter_field!(
         for lin in (rank + 1):nproc:length(out)
             I = cart[lin]
             mask[I] || continue
-            out[I] = CGEF.Filtering._footprint_nd_point_streaming(field, grid, fp, mask_strategy, mask, dims, I)
+            out[I] = CGEF.Filtering._footprint_nd_point_streaming(field, grid, fp, mask_strategy, mask, I)
         end
     end
     MPI.Allreduce!(out, +, comm)
