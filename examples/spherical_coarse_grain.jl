@@ -2,8 +2,8 @@
 # spectrum on a synthetic non-divergent velocity field over a masked lon/lat patch.
 #
 # The velocity is built as u = ∇⊥ψ (a streamfunction), so it is non-divergent — the regime in which
-# the planetary-Cartesian filtering of Aluie (2019) / Storer et al. (2022) is exact. Masked cells are
-# handled by the default deformable kernel renormalization.
+# the planetary-Cartesian filtering of Aluie (2019) / Storer et al. (2022) is exact. Under the default
+# `ZeroFill` the masked cells are fluid at rest.
 
 using Random: Random
 using Statistics: Statistics
@@ -53,7 +53,7 @@ scales = collect(20e3:20e3:200e3)              # 20–200 km
 # top-hat's |Ĝ|² is not monotone so `coarse_grain` refuses to produce one for it.
 result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel())
 
-println("scale [km]   cumulative-KE     mean|Π| [W/m³]")
+println("scale [km]   cumulative-KE     mean|Π| [m²/s³]")
 for (i, ℓ) in enumerate(scales)
     println(
         rpad(round(ℓ / 1e3; digits = 1), 13),

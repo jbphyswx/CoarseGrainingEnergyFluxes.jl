@@ -22,40 +22,67 @@ Test.@testset "Kernels" begin
     Test.@test 1.5ℓ < r < 2.5ℓ
     Test.@test CGEF.Kernels.kernel_weight(g, r, ℓ) < 1e-9
 
-    # SharpSpectralKernel: exact spherical-cap-window transfer function, sinc real-space fallback
-    # with a 10x-scale window (20x TopHatKernel's ℓ/2 — sinc decays only as O(1/d)).
-    Test.@test CGEF.Kernels.kernel_radius(ss, ℓ) == 10 * ℓ
+    # SharpSpectralKernel: the brick wall at k_c = π/ℓ.
     Test.@test CGEF.Kernels.spectral_transfer(ss, π / ℓ - 1e-6, ℓ) == 1.0
     Test.@test CGEF.Kernels.spectral_transfer(ss, π / ℓ + 1e-6, ℓ) == 0.0
 end
 
 
-# `SharpSpectralKernel` with the default `RealSpace()` method computes exactly what was asked for:
-# the truncated-sinc real-space form. No interception — the accuracy tradeoff is documented on the
-# kernel, and the caller's explicit method choice is honoured on every grid, spectral-capable or not.
-Test.@testset "SharpSpectralKernel + RealSpace(): computes what was asked, on any grid" begin
+# `SharpSpectralKernel` in real space is the inverse transform of its brick wall in the grid's own
+# dimension, `∝ J_{D/2}(k_c r)/(k_c r)^{D/2}`, truncated where its mass inside the radius equals its mass
+# over all space.
+Test.@testset "SharpSpectralKernel in real space: the brick wall's inverse transform in D dimensions" begin
     ss = CGEF.SharpSpectralKernel()
-    scale = 5000.0
-    geom = FG.Geometry.CartesianGeometry()
-    N = 16
-    xsR = 0.0:1000.0:(N - 1) * 1000.0
-    field = randn(N, N)
-
-    for grid in (
-        FG.Grids.StructuredGrid(geom, xsR, xsR, trues(N, N); periodic = (true, true)),  # FFTW-capable
-        FG.Grids.StructuredGrid(geom, xsR, xsR, trues(N, N)),                            # not FFTW-capable
-    )
-        out = zeros(N, N)
-        CGEF.Filtering.filter_field!(out, field, grid, ss, scale)
-        Test.@test all(isfinite, out)
+    ℓ = 3.0
+    kc = π / ℓ
+    forms = (x -> sin(x) / x,
+             x -> 2 * SpecialFunctions.besselj1(x) / x,
+             x -> 3 * SpecialFunctions.sphericalbesselj(1, x) / x)
+    for D in 1:3
+        Test.@test CGEF.Kernels.kernel_weight(ss, 0.0, ℓ, Val(D)) == 1.0
+        for x in (1e-6, 0.05, 0.19, 0.21, 1.0, 4.3, 17.2, 30.0)
+            Test.@test CGEF.Kernels.kernel_weight(ss, x / kc, ℓ, Val(D)) ≈ forms[D](x) rtol = 1e-13
+        end
     end
 
-    # A CurvilinearGrid has no spectral backend at all; real-space must still just work.
-    ic = collect(0.0:(N - 1)); jc = collect(0.0:(N - 1))
-    clon = [1000.0 * ii for ii in ic, jj in jc]
-    clat = [1000.0 * jj for ii in ic, jj in jc]
-    cgrid = FG.Grids.CurvilinearGrid(geom, clon, clat, trues(N, N))
-    Test.@test CGEF.Filtering.plan_filter(cgrid, ss, scale) isa CGEF.Filtering.AbstractFilterPlan
+    # Truncated where the continuum mass inside `R` is the whole mass: `(2/π)Si(x)`, `1 − J₀(x)` and
+    # `(2/π)(Si(x) − sin x)` at `x = k_c R`.
+    Si = SpecialFunctions.sinint
+    mass = (x -> (2 / π) * Si(x), x -> 1 - SpecialFunctions.besselj0(x), x -> (2 / π) * (Si(x) - sin(x)))
+    for D in 1:3
+        x = kc * CGEF.Kernels.kernel_radius(ss, ℓ, Val(D))
+        Test.@test mass[D](x) ≈ 1 atol = 1e-14
+        Test.@test 9π < x < 11π
+    end
+
+    # Both depend on the dimension, so neither is defined without one.
+    Test.@test_throws ArgumentError CGEF.Kernels.kernel_weight(ss, 1.0, ℓ)
+    Test.@test_throws ArgumentError CGEF.Kernels.kernel_radius(ss, ℓ)
+    Test.@test_throws ArgumentError CGEF.Kernels.kernel_weight(ss, 1.0, ℓ, Val(4))
+
+    # On a periodic lattice with `k_c ≤ π/Δx` the sampled kernel transforms to the brick wall, so a
+    # filtered Fourier mode reads off the truncated footprint's transfer function. The dropped tail
+    # bounds its ripple, from the Bessel asymptotics: in two dimensions
+    # `|Ĝ(k) − 𝟙(k < k_c)| ≲ √(k_c/k)/π · (1/(|k_c − k|R) + 1/((k_c + k)R))`, 0.039 at `k_c/2` and 0.010
+    # at `2k_c`, and in one `(1/π)(1/(|k_c − k|R) + 1/((k_c + k)R))`, 0.028 and 0.014.
+    N = 64
+    ℓg = 4.0
+    geom = FG.Geometry.CartesianGeometry()
+    xs = 0.0:1.0:(N - 1)
+    g1 = FG.Grids.StructuredGrid(geom, xs, trues(N); periodic = true)
+    g2 = FG.Grids.StructuredGrid(geom, xs, xs, trues(N, N); periodic = (true, true))
+    gain(o, f) = sum(o .* f) / sum(f .* f)
+    for (m, target, tol) in ((4, 1.0, 0.05), (16, 0.0, 0.02))     # k = k_c/2 and k = 2k_c
+        k = 2π * m / N
+        f1 = cos.(k .* xs)
+        f2 = [cos(k * a) for a in xs, _ in xs]
+        o1 = CGEF.Filtering.filter_field!(zeros(N), f1, g1, ss, ℓg)
+        o2 = CGEF.Filtering.filter_field!(zeros(N, N), f2, g2, ss, ℓg)
+        Test.@test abs(gain(o1, f1) - target) < tol
+        Test.@test abs(gain(o2, f2) - target) < tol
+        # A mode is an eigenfunction of a translation-invariant filter.
+        Test.@test o2 ≈ gain(o2, f2) .* f2 atol = 1e-12
+    end
 end
 
 
@@ -196,17 +223,19 @@ Test.@testset "Kernel moments: normalization, vanishing first moment, second mom
         Test.@test abs(d40 - th2) < abs(d10 - th2)
     end
 
-    # Realizability: `Π` is only a meaningful pointwise transfer for a NON-NEGATIVE kernel. The two new
-    # real-space kernels are strictly positive on their support; `SharpSpectralKernel`'s sinc is not,
-    # which is why it is documented as spectrum-only.
+    # Realizability: `Π` is only a meaningful pointwise transfer for a non-negative kernel. The
+    # real-space kernels here are non-negative on their support; `SharpSpectralKernel`'s weights change
+    # sign in every dimension.
     for kern in (CGEF.TopHatKernel(), CGEF.GaussianKernel(),
                  CGEF.Kernels.SmoothHatKernel(), CGEF.Kernels.HyperGaussianKernel())
         R = CGEF.Kernels.kernel_radius(kern, 1.0)
         Test.@test all(r -> CGEF.Kernels.kernel_weight(kern, r, 1.0) >= 0,
                        range(0.0, R; length = 4001))
     end
-    Test.@test any(r -> CGEF.Kernels.kernel_weight(CGEF.SharpSpectralKernel(), r, 1.0) < 0,
-                   range(0.0, 10.0; length = 4001))
+    for D in 1:3
+        Test.@test any(r -> CGEF.Kernels.kernel_weight(CGEF.SharpSpectralKernel(), r, 1.0, Val(D)) < 0,
+                       range(0.0, 10.0; length = 4001))
+    end
 
     # Discretization: the Gaussian's footprint reproduces its continuum second moment essentially
     # exactly even at ℓ = 8Δx, while the top-hat's staircased disk boundary leaves it low and converges
@@ -226,27 +255,27 @@ Test.@testset "Kernel moments: normalization, vanishing first moment, second mom
     end
 
     # `∫G = 1` where it actually matters: the normalized filter reproduces a constant to round-off on a
-    # grid wide enough that the footprint is never truncated. Every dimensionality the package supports.
+    # periodic grid, where no footprint leaves the domain. Every dimensionality the package supports.
     let geom = FG.Geometry.CartesianGeometry(), dx = 1000.0, ℓ = 4000.0, C = 3.25
         for kern in (CGEF.TopHatKernel(), CGEF.GaussianKernel(), CGEF.GaussianKernel(; α = 4),
                      CGEF.Kernels.SmoothHatKernel(), CGEF.Kernels.HyperGaussianKernel())
             n1 = 64
             x1 = 0.0:dx:(n1 - 1) * dx
-            g1 = FG.Grids.StructuredGrid(geom, x1, trues(n1))
+            g1 = FG.Grids.StructuredGrid(geom, x1, trues(n1); periodic = true)
             o1 = zeros(n1)
             CGEF.Filtering.filter_field!(o1, fill(C, n1), g1, kern, ℓ)
             Test.@test all(≈(C; rtol = 1e-12), o1)
 
             n2 = 40
             x2 = 0.0:dx:(n2 - 1) * dx
-            g2 = FG.Grids.StructuredGrid(geom, x2, x2, trues(n2, n2))
+            g2 = FG.Grids.StructuredGrid(geom, x2, x2, trues(n2, n2); periodic = (true, true))
             o2 = zeros(n2, n2)
             CGEF.Filtering.filter_field!(o2, fill(C, n2, n2), g2, kern, ℓ)
             Test.@test all(≈(C; rtol = 1e-12), o2)
 
             n3 = 20
             x3 = 0.0:dx:(n3 - 1) * dx
-            g3 = FG.Grids.StructuredGrid(geom, x3, x3, x3, trues(n3, n3, n3))
+            g3 = FG.Grids.StructuredGrid(geom, x3, x3, x3, trues(n3, n3, n3); periodic = (true, true, true))
             o3 = zeros(n3, n3, n3)
             CGEF.Filtering.filter_field!(o3, fill(C, n3, n3, n3), g3, kern, ℓ)
             Test.@test all(≈(C; rtol = 1e-12), o3)

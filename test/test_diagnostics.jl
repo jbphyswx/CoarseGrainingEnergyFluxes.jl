@@ -584,9 +584,16 @@ Test.@testset "Tracer variance flux" begin
     θ = rand(length(x), length(y))
     kern = CGEF.TopHatKernel(); scale = 5000.0
 
-    # (1) constant tracer ⇒ zero gradient ⇒ zero flux.
+    # (1) constant tracer ⇒ zero gradient ⇒ zero flux: everywhere under `Deformable`, and under
+    # `ZeroFill` wherever the kernel and the derivative stencil stay on the grid — past the edge the
+    # zero-extended tracer is not constant.
+    Πd = CGEF.Diagnostics.tracer_variance_flux(u, v, fill(2.5, size(θ)), grid, kern, scale;
+                                               mask_strategy = CGEF.Filtering.Deformable())
+    Test.@test maximum(abs, Πd) < 1e-9
     Πc = CGEF.Diagnostics.tracer_variance_flux(u, v, fill(2.5, size(θ)), grid, kern, scale)
-    Test.@test maximum(abs, Πc) < 1e-9
+    pad = ceil(Int, CGEF.Kernels.kernel_radius(kern, scale) / 1000.0) + 1
+    Test.@test maximum(abs, Πc[(pad + 1):(end - pad), (pad + 1):(end - pad)]) < 1e-9
+    Test.@test maximum(abs, Πc) > 1e-6
 
     # (2) matches the explicit definition Πθ = -(τx ∂x θ̄ + τy ∂y θ̄) built from primitives.
     Πθ = CGEF.Diagnostics.tracer_variance_flux(u, v, θ, grid, kern, scale)
@@ -638,9 +645,15 @@ Test.@testset "Tracer variance flux: spherical" begin
     θ = rand(nx, ny)
     kern = CGEF.TopHatKernel(); scale = deg2rad(15.0) * R
 
-    # A constant tracer has no gradient, so the flux vanishes whatever the velocity does.
+    # A constant tracer has no gradient, so the flux vanishes whatever the velocity does: everywhere
+    # under `Deformable`, and under `ZeroFill` on the rows whose kernel and stencil stay inside ±40°.
+    Πd = CGEF.Diagnostics.tracer_variance_flux(u, v, fill(2.5, nx, ny), grid, kern, scale;
+                                               mask_strategy = CGEF.Filtering.Deformable())
+    Test.@test maximum(abs, Πd) < 1e-9
     Πc = CGEF.Diagnostics.tracer_variance_flux(u, v, fill(2.5, nx, ny), grid, kern, scale)
-    Test.@test maximum(abs, Πc) < 1e-9
+    rows = findall(φ -> abs(φ) < deg2rad(40.0 - 7.5 - 5.0) - 1e-9, lat)
+    Test.@test !isempty(rows)
+    Test.@test maximum(abs, Πc[:, rows]) < 1e-9
 
     # Against the definition, built from primitives with the rotation done explicitly.
     Πθ = CGEF.Diagnostics.tracer_variance_flux(u, v, θ, grid, kern, scale)

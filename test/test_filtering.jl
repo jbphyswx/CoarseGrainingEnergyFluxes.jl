@@ -221,7 +221,9 @@ Test.@testset "Prefix-sum top-hat engine: masking/strategy semantics and exact p
     oc = run_filter(g_m, CGEF.Filtering.Deformable(), fill(7.25, N, N))
     Test.@test all(abs.(oc[m] .- 7.25) .< 1e-12)
 
-    # A filter wider than the whole sphere must return the exact global area-weighted mean.
+    # A filter wider than the whole sphere returns the area-weighted mean over the grid under
+    # `Deformable`. Under `ZeroFill` the latitude lattice continues to both poles, its cells tile the
+    # rest of the sphere, and the result is the grid's integral over `4πR²`.
     R = 6.371e6
     gs = FG.Grids.StructuredGrid(
         FG.Geometry.SphericalGeometry(R),
@@ -230,12 +232,15 @@ Test.@testset "Prefix-sum top-hat engine: masking/strategy semantics and exact p
         trues(36, 33),
     )
     sf = [sin(2 * (i - 1) * deg2rad(10.0)) * cos((j - 17) * deg2rad(5.0)) + 2.0 for i in 1:36, j in 1:33]
-    fps = CGEF.Filtering.build_footprint(gs, CGEF.TopHatKernel(), 4 * π * R)
-    os = zeros(36, 33)
-    CGEF.Filtering._apply_serial!(os, sf, gs, fps, CGEF.Filtering.Deformable())
+    integral = sum(sf[i, j] * FG.Grids.area(gs, i, j) for i in 1:36, j in 1:33)
     wsum = sum(FG.Grids.area(gs, i, j) for i in 1:36, j in 1:33)
-    gmean = sum(sf[i, j] * FG.Grids.area(gs, i, j) for i in 1:36, j in 1:33) / wsum
-    Test.@test maximum(abs, os .- gmean) < 1e-10 * abs(gmean)
+    for (strat, expected) in ((CGEF.Filtering.Deformable(), integral / wsum),
+                              (CGEF.Filtering.ZeroFill(), integral / (4π * R^2)))
+        fps = CGEF.Filtering.build_footprint(gs, CGEF.TopHatKernel(), 4 * π * R; mask_strategy = strat)
+        os = zeros(36, 33)
+        CGEF.Filtering._apply_serial!(os, sf, gs, fps, strat)
+        Test.@test maximum(abs, os .- expected) < 1e-10 * expected
+    end
 
     # A Deformable apply against a ZeroFill-built plan on a masked grid has no renormalization data
     # and must THROW rather than silently computing ZeroFill (the silent-wrong-answer shape of a
@@ -261,7 +266,7 @@ Test.@testset "cache-strategy control (AutoCache budget, AlwaysCache/NeverCache 
     x_nu = collect(0.0:1000.0:(N - 1) * 1000.0) .+ [iseven(i) ? 3.0 : -2.0 for i in 1:N]
     grid = FG.Grids.StructuredGrid(geom, x_nu, x_nu, trues(N, N))
     scale = 20_000.0 * CGEF.Kernels.kernel_radius(CGEF.GaussianKernel(), 20_000.0) /
-            CGEF.Kernels.kernel_radius(ker, 20_000.0)
+            CGEF.Kernels.kernel_radius(ker, 20_000.0, Val(2))
 
     fp_always = CGEF.Filtering.build_footprint(grid, ker, scale; cache_strategy = CGEF.Filtering.AlwaysCache())
     fp_never = CGEF.Filtering.build_footprint(grid, ker, scale; cache_strategy = CGEF.Filtering.NeverCache())
@@ -315,7 +320,7 @@ Test.@testset "cached vs streaming apply are bit-identical (same candidate-itera
     grid = FG.Grids.StructuredGrid(geom, x_nu, y_nu, mask)
     # Same window the Gaussian at 12 km spanned, so the cache stays a sane size.
     scale = 12_000.0 * CGEF.Kernels.kernel_radius(CGEF.GaussianKernel(), 12_000.0) /
-            CGEF.Kernels.kernel_radius(ker, 12_000.0)
+            CGEF.Kernels.kernel_radius(ker, 12_000.0, Val(2))
     field = randn(N, N)
 
     for strategy in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
@@ -521,25 +526,23 @@ Test.@testset "separable fast path — dispatch and correctness against an indep
         out_fast = zeros(N, N)
         CGEF.Filtering.apply_separable!(out_fast, field, grid_m, fp_m, strategy)
 
+        # `ZeroFill` counts every tap of the box, those past an edge included, and keeps a masked
+        # target; `Deformable` counts the active in-domain taps and zeroes a masked target.
         di_lim, dj_lim = fp_m.di_lim, fp_m.dj_lim
         gx, gy = fp_m.gx, fp_m.gy
+        zf = strategy isa CGEF.Filtering.ZeroFill
         out_ref = zeros(N, N)
         for j in 1:N, i in 1:N
-            mask[i, j] || continue
+            (zf || mask[i, j]) || continue
             wsum = 0.0; wnorm = 0.0
             for ddj in -dj_lim:dj_lim, ddi in -di_lim:di_lim
                 ii, jj = i + ddi, j + ddj
-                (1 <= ii <= N && 1 <= jj <= N) || continue
+                active = 1 <= ii <= N && 1 <= jj <= N && mask[ii, jj]
                 w = gx[ddi + di_lim + 1] * gy[ddj + dj_lim + 1]
-                if strategy isa CGEF.Filtering.ZeroFill
-                    wnorm += w
-                    mask[ii, jj] && (wsum += w * field[ii, jj])
-                elseif mask[ii, jj]
-                    wnorm += w
-                    wsum += w * field[ii, jj]
-                end
+                (zf || active) && (wnorm += w)
+                active && (wsum += w * field[ii, jj])
             end
-            out_ref[i, j] = wnorm > 1e-15 ? wsum / wnorm : 0.0
+            out_ref[i, j] = wsum / wnorm
         end
         Test.@test out_fast ≈ out_ref rtol = 1e-10
     end
@@ -575,24 +578,35 @@ Test.@testset "Separable Gaussian on a stretched Cartesian grid" begin
     # truncation difference — the Gaussian is 1e-10 at its own truncation radius — not an error.
     # This is also what catches the cell measure being dropped from the separable weights, which is
     # invisible on a uniform grid (constant area cancels in the normalization) and ~16% here.
-    for (grid, ax) in ((gr, xr), (gs, xs))
+    # Both engines count the lattice continued past each edge at its edge gap under `ZeroFill`, and
+    # the in-domain cells alone under `Deformable`.
+    for (grid, ax) in ((gr, xr), (gs, xs)),
+        strat in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
         sep = zeros(n, n)
-        CGEF.Filtering.filter_field!(sep, f, grid, K, ℓ)
+        CGEF.Filtering.filter_field!(sep, f, grid, K, ℓ; mask_strategy = strat)
         sca = zeros(n, n)
         CGEF.Filtering.filter_field!(
             sca, f, grid, K, ℓ;
             filter_plan = CGEF.Filtering.PhysicalFilterPlan(
                 CGEF.Filtering._build_footprint_scattered(grid, K, ℓ), grid,
-                CGEF.Filtering.Deformable(), K, ℓ, CGEF.ComputationalBackends.SerialBackend(),
+                strat, K, ℓ, CGEF.ComputationalBackends.SerialBackend(),
             ),
         )
         Test.@test maximum(abs.(sep .- sca)) / maximum(abs, sca) < 1e-8
     end
 
-    # A filter reproduces a constant exactly, whatever the spacing does.
-    out = zeros(n, n)
-    CGEF.Filtering.filter_field!(out, fill(2.5, n, n), gs, K, ℓ)
-    Test.@test all(x -> isapprox(x, 2.5; atol = 1e-12), out)
+    # A normalized filter reproduces a constant whatever the spacing does: `Deformable` everywhere, and
+    # `ZeroFill` wherever the kernel's tail past an edge has decayed to round-off (two radii in). A
+    # corner cell has about three quarters of its mass past the edges.
+    rad = CGEF.Kernels.kernel_radius(K, ℓ)
+    inside = [min(xs[i] - xs[1], xs[n] - xs[i], xs[j] - xs[1], xs[n] - xs[j]) > 2rad for i in 1:n, j in 1:n]
+    Test.@test any(inside)
+    od = zeros(n, n); oz = zeros(n, n)
+    CGEF.Filtering.filter_field!(od, fill(2.5, n, n), gs, K, ℓ; mask_strategy = CGEF.Filtering.Deformable())
+    CGEF.Filtering.filter_field!(oz, fill(2.5, n, n), gs, K, ℓ)
+    Test.@test all(x -> isapprox(x, 2.5; atol = 1e-12), od)
+    Test.@test all(x -> isapprox(x, 2.5; atol = 1e-12), oz[inside])
+    Test.@test oz[1, 1] < 2.5 / 2
 end
 
 
@@ -615,26 +629,40 @@ Test.@testset "Separable Gaussian in 1D and 3D" begin
         Test.@test p.footprint isa CGEF.Filtering.SeparableFootprintND
         Test.@test length(p.footprint.lim) == 3
 
-        sep = zeros(n, n, n)
-        CGEF.Filtering.filter_field!(sep, f, g3, K, ℓ)
-        ref = zeros(n, n, n)
-        CGEF.Filtering.filter_field!(
-            ref, f, g3, K, ℓ;
-            filter_plan = CGEF.Filtering.PhysicalFilterPlan(
-                CGEF.Filtering._build_footprint_nd(g3, K, ℓ), g3,
-                CGEF.Filtering.Deformable(), K, ℓ, serial,
-            ),
-        )
-        Test.@test maximum(abs.(sep .- ref)) / maximum(abs, ref) < 1e-8
+        # The full-box reference counts the same continued lattice under `ZeroFill`, and the in-domain
+        # cells alone under `Deformable`; the two differ only by the box-versus-ball truncation.
+        for strat in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
+            sep = zeros(n, n, n)
+            CGEF.Filtering.filter_field!(sep, f, g3, K, ℓ; mask_strategy = strat)
+            ref = zeros(n, n, n)
+            CGEF.Filtering.filter_field!(
+                ref, f, g3, K, ℓ;
+                filter_plan = CGEF.Filtering.PhysicalFilterPlan(
+                    CGEF.Filtering._build_footprint_nd(g3, K, ℓ), g3,
+                    strat, K, ℓ, serial,
+                ),
+            )
+            Test.@test maximum(abs.(sep .- ref)) / maximum(abs, ref) < 1e-8
+        end
 
+        # `Deformable` reproduces a constant everywhere; `ZeroFill` wherever the box stays on the grid,
+        # and damps it where the box leaves it. At a corner each axis keeps the offsets `0:lim` of the
+        # `-lim:lim` its denominator counts.
+        lim = p.footprint.lim
+        inside(I) = all(d -> lim[d] < I[d] <= n - lim[d], 1:3)
         c = zeros(n, n, n)
-        CGEF.Filtering.filter_field!(c, fill(2.5, n, n, n), g3, K, ℓ)
+        CGEF.Filtering.filter_field!(c, fill(2.5, n, n, n), g3, K, ℓ; mask_strategy = CGEF.Filtering.Deformable())
         Test.@test all(v -> isapprox(v, 2.5; atol = 1e-12), c)
+        CGEF.Filtering.filter_field!(c, fill(2.5, n, n, n), g3, K, ℓ)
+        Test.@test any(inside, CartesianIndices(c))
+        Test.@test all(I -> !inside(I) || isapprox(c[I], 2.5; atol = 1e-12), CartesianIndices(c))
+        kept(L) = (g = [CGEF.Kernels.kernel_weight(K, k * dx, ℓ) for k in 0:L]; sum(g) / (2sum(g) - g[1]))
+        Test.@test c[1, 1, 1] ≈ 2.5 * prod(kept, lim) rtol = 1e-12
 
         # A masked grid under Deformable takes the dense denominator; masked cells read zero and
         # the rest are still a weighted mean, so a constant survives there too.
         m = trues(n, n, n)
-        m[3:5, 3:5, 3:5] .= false
+        m[2:3, 2:3, 2:3] .= false
         gm = FG.Grids.StructuredGrid(geom, x, x, x, m)
         cm = zeros(n, n, n)
         CGEF.Filtering.filter_field!(cm, fill(2.5, n, n, n), gm, K, ℓ;
@@ -642,19 +670,18 @@ Test.@testset "Separable Gaussian in 1D and 3D" begin
         Test.@test all(I -> m[I] ? isapprox(cm[I], 2.5; atol = 1e-12) : cm[I] == 0.0,
                        CartesianIndices(cm))
 
-        # The default, ZeroFill, keeps the excluded cells in the denominator, so the same constant is
-        # DAMPED wherever the footprint overlaps the hole and exact everywhere else. The separable ND
-        # engine's footprint is a per-axis BOX of half-width `lim`, not a ball, so the split between
-        # the two halves is taken from the plan's own limits rather than from the kernel radius.
+        # The default, ZeroFill, filters the zero-extended constant: it is exact where the box holds
+        # only active in-domain cells and damped where it overlaps the hole or leaves the grid, masked
+        # cells included. The separable ND engine's footprint is a per-axis box of half-width `lim`, so
+        # the split is taken from the plan's own limits.
         cz = zeros(n, n, n)
         CGEF.Filtering.filter_field!(cz, fill(2.5, n, n, n), gm, K, ℓ)
-        lim = CGEF.Filtering.plan_filter(gm, K, ℓ).footprint.lim
         holes = filter(J -> !m[J], collect(CartesianIndices(m)))
         overlaps(I) = any(J -> all(d -> abs(I[d] - J[d]) <= lim[d], 1:3), holes)
-        Test.@test all(iszero, @view cz[.!m])
-        Test.@test all(I -> !m[I] || overlaps(I) || isapprox(cz[I], 2.5; atol = 1e-12),
+        Test.@test all(I -> !inside(I) || overlaps(I) || isapprox(cz[I], 2.5; atol = 1e-12),
                        CartesianIndices(cz))
-        Test.@test any(I -> m[I] && cz[I] < 2.5 - 1e-6, CartesianIndices(cz))
+        Test.@test any(I -> m[I] && inside(I) && !overlaps(I), CartesianIndices(cz))
+        Test.@test all(I -> m[I] || 0 < cz[I] < 2.5 - 1e-6, CartesianIndices(cz))
     end
 
     Test.@testset "1D" begin
@@ -665,17 +692,19 @@ Test.@testset "Separable Gaussian in 1D and 3D" begin
         p = CGEF.Filtering.plan_filter(g1, K, ℓ)
         Test.@test p.footprint isa CGEF.Filtering.SeparableFootprintND
 
-        sep = zeros(n)
-        CGEF.Filtering.filter_field!(sep, f, g1, K, ℓ)
-        ref = zeros(n)
-        CGEF.Filtering.filter_field!(
-            ref, f, g1, K, ℓ;
-            filter_plan = CGEF.Filtering.PhysicalFilterPlan(
-                CGEF.Filtering._build_footprint_nd(g1, K, ℓ), g1,
-                CGEF.Filtering.Deformable(), K, ℓ, serial,
-            ),
-        )
-        Test.@test maximum(abs.(sep .- ref)) / maximum(abs, ref) < 1e-8
+        for strat in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
+            sep = zeros(n)
+            CGEF.Filtering.filter_field!(sep, f, g1, K, ℓ; mask_strategy = strat)
+            ref = zeros(n)
+            CGEF.Filtering.filter_field!(
+                ref, f, g1, K, ℓ;
+                filter_plan = CGEF.Filtering.PhysicalFilterPlan(
+                    CGEF.Filtering._build_footprint_nd(g1, K, ℓ), g1,
+                    strat, K, ℓ, serial,
+                ),
+            )
+            Test.@test maximum(abs.(sep .- ref)) / maximum(abs, ref) < 1e-8
+        end
     end
 
     # A stretched direction only changes the weight table's shape, exactly as in 2D.
@@ -688,7 +717,8 @@ Test.@testset "Separable Gaussian in 1D and 3D" begin
         Test.@test p.footprint.g[1] isa AbstractVector
         Test.@test p.footprint.g[3] isa AbstractMatrix
         c = zeros(n, n, n)
-        CGEF.Filtering.filter_field!(c, fill(1.25, n, n, n), gz, K, ℓ)
+        CGEF.Filtering.filter_field!(c, fill(1.25, n, n, n), gz, K, ℓ;
+                                     mask_strategy = CGEF.Filtering.Deformable())
         Test.@test all(v -> isapprox(v, 1.25; atol = 1e-12), c)
     end
 end
@@ -708,7 +738,9 @@ Test.@testset "Filter Normalization - Constant Field" begin
     C = 42.0  # Constant value
     field = fill(C, length(x), length(y))
 
-    # Test both masking strategies
+    # `Deformable` renormalizes over the in-domain cells, so it returns `C` everywhere. `ZeroFill`
+    # filters the constant extended by zero past the edges: exactly `C` where the kernel's tail past an
+    # edge has decayed to round-off (two radii in), and below `C` nearer an edge.
     for kernel in [CGEF.TopHatKernel(), CGEF.GaussianKernel()]
         for scale in [5000.0, 10000.0, 20000.0]
             out_zero = zeros(length(x), length(y))
@@ -717,11 +749,13 @@ Test.@testset "Filter Normalization - Constant Field" begin
             CGEF.Filtering.filter_field!(out_zero, field, grid, kernel, scale; mask_strategy=CGEF.Filtering.ZeroFill())
             CGEF.Filtering.filter_field!(out_renorm, field, grid, kernel, scale; mask_strategy=CGEF.Filtering.Deformable())
 
-            # Interior points should be exactly C
-            for j in 20:length(y)-20, i in 20:length(x)-20
-                Test.@test out_zero[i,j] ≈ C rtol=1e-10
-                Test.@test out_renorm[i,j] ≈ C rtol=1e-10
-            end
+            rad = CGEF.Kernels.kernel_radius(kernel, scale)
+            inside(i, j) = min(x[i] - x[1], x[end] - x[i], y[j] - y[1], y[end] - y[j]) > 2rad
+            Test.@test all(v -> isapprox(v, C; rtol = 1e-10), out_renorm)
+            Test.@test all(I -> !inside(Tuple(I)...) || isapprox(out_zero[I], C; rtol = 1e-10),
+                           CartesianIndices(out_zero))
+            Test.@test all(<=(C * (1 + 1e-12)), out_zero)
+            Test.@test out_zero[1, 1] < C / 2
         end
     end
 end
@@ -802,12 +836,12 @@ Test.@testset "Real-space engine fast paths" begin
         CGEF.Filtering.filter_apply!(oV, u, CGEF.Filtering.plan_filter(gV, CGEF.GaussianKernel(), 8000.0;
             backend = CGEF.ComputationalBackends.SerialBackend()))
         Test.@test oR ≈ oV rtol = 1e-12
-        # A normalized low-pass returns a constant unchanged, on both tables.
+        # A low-pass renormalized over the in-domain cells returns a constant unchanged, on both tables.
         cR = zeros(N, N); cV = zeros(N, N)
         CGEF.Filtering.filter_apply!(cR, fill(2.75, N, N), CGEF.Filtering.plan_filter(gR, CGEF.GaussianKernel(), 8000.0;
-            backend = CGEF.ComputationalBackends.SerialBackend()))
+            backend = CGEF.ComputationalBackends.SerialBackend(), mask_strategy = CGEF.Filtering.Deformable()))
         CGEF.Filtering.filter_apply!(cV, fill(2.75, N, N), CGEF.Filtering.plan_filter(gV, CGEF.GaussianKernel(), 8000.0;
-            backend = CGEF.ComputationalBackends.SerialBackend()))
+            backend = CGEF.ComputationalBackends.SerialBackend(), mask_strategy = CGEF.Filtering.Deformable()))
         Test.@test all(≈(2.75; rtol = 1e-12), cR)
         Test.@test all(≈(2.75; rtol = 1e-12), cV)
     end
@@ -915,7 +949,7 @@ Test.@testset "mask_strategy: ZeroFill commutes with ∂/∂x, Deformable does n
     end
 end
 
-Test.@testset "mask_strategy: the coast artifacts quoted in the filter_field! docstring" begin
+Test.@testset "mask_strategy: footprint shape and mass at a coast" begin
     geom = FG.Geometry.CartesianGeometry()
     N = 200
     xs = 0.0:1.0:(N - 1)                          # unit cells, so ℓ is in cells

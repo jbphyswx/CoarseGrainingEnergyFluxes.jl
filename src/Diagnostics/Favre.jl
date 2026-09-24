@@ -58,7 +58,8 @@ function compressible_flux!(
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
         filter_plan
-    dplan = _resolve_deriv_plan(deriv_plan, grid)
+    og = output_grid(grid, plan)
+    dplan = _resolve_deriv_plan(deriv_plan, og)
 
     # ρ̄, P̄ and the UNWEIGHTED velocities. `ū`/`v̄` are not a convenience: the budget's pressure term is
     # `P̄ ∇·ū`, with the unweighted divergence, and `τ̄(ρ,u_j)` needs `ū_j` too.
@@ -74,33 +75,40 @@ function compressible_flux!(
     @. p[5] = ρ * v * v
     Filtering.filter_apply_batch!((ws.mx, ws.my, ws.τxx, ws.τxy, ws.τyy), p, plan)
 
-    # Favre velocities ũ_i = (ρu_i)‾/ρ̄, read BEFORE `mx`/`my` are turned into the unweighted subscale
-    # mass flux τ̄(ρ,u_i) = (ρu_i)‾ − ρ̄ū_i, which is what baropycnal work contracts against.
-    @. ws.ũ = ws.mx / ws.ρ̄
-    @. ws.ṽ = ws.my / ws.ρ̄
+    # Favre velocities ũ_i = (ρu_i)‾/ρ̄, zero where no fluid lies under the kernel.
+    @. ws.ũ = _favre(ws.mx, ws.ρ̄)
+    @. ws.ṽ = _favre(ws.my, ws.ρ̄)
+
+    # ρ̄ ∂_j ũ_i = ∂_j (ρu_i)‾ − ũ_i ∂_j ρ̄. Both fields differenced here are defined at every cell, so no
+    # stencil reads ũ where ρ̄ = 0. `Px`/`Py` hold ∇ρ̄ until ∇P̄ replaces it.
+    _grad2!(ws.ux, ws.uy, ws.mx, og, dplan)
+    _grad2!(ws.vx, ws.vy, ws.my, og, dplan)
+    _grad2!(ws.Px, ws.Py, ws.ρ̄, og, dplan)
+    @. ws.ux -= ws.ũ * ws.Px
+    @. ws.uy -= ws.ũ * ws.Py
+    @. ws.vx -= ws.ṽ * ws.Px
+    @. ws.vy -= ws.ṽ * ws.Py
+
+    # The unweighted subscale mass flux τ̄(ρ,u_i) = (ρu_i)‾ − ρ̄ū_i, which baropycnal work contracts.
     @. ws.mx -= ws.ρ̄ * ws.ū
     @. ws.my -= ws.ρ̄ * ws.v̄
 
     # Favre stress τ̃(u_i,u_j) = (ρu_iu_j)‾/ρ̄ − ũ_iũ_j.
-    @. ws.τxx = ws.τxx / ws.ρ̄ - ws.ũ * ws.ũ
-    @. ws.τxy = ws.τxy / ws.ρ̄ - ws.ũ * ws.ṽ
-    @. ws.τyy = ws.τyy / ws.ρ̄ - ws.ṽ * ws.ṽ
+    @. ws.τxx = _favre(ws.τxx, ws.ρ̄) - ws.ũ * ws.ũ
+    @. ws.τxy = _favre(ws.τxy, ws.ρ̄) - ws.ũ * ws.ṽ
+    @. ws.τyy = _favre(ws.τyy, ws.ρ̄) - ws.ṽ * ws.ṽ
 
-    # Deformation work uses the Favre velocity gradient; pressure dilatation uses the unweighted one.
-    _grad2!(ws.ux, ws.uy, ws.ũ, grid, dplan)
-    _grad2!(ws.vx, ws.vy, ws.ṽ, grid, dplan)
-    _grad2!(ws.Px, ws.Py, ws.P̄, grid, dplan)
-
-    mask = FlowGeometries.Grids.mask(grid)
+    mask = FlowGeometries.Grids.mask(og)
     # Π = −ρ̄ ∂_j ũ_i τ̃(u_i,u_j), summed over i,j; τ̃ is symmetric so the two off-diagonals combine.
     @. ws.Π = ifelse(mask,
-        -ws.ρ̄ * (ws.ux * ws.τxx + (ws.uy + ws.vx) * ws.τxy + ws.vy * ws.τyy), zero(T))
+        -(ws.ux * ws.τxx + (ws.uy + ws.vx) * ws.τxy + ws.vy * ws.τyy), zero(T))
     # Λ = (1/ρ̄) ∂_j P̄ · τ̄(ρ,u_j) — baropycnal work.
-    @. ws.Λ = ifelse(mask, (ws.Px * ws.mx + ws.Py * ws.my) / ws.ρ̄, zero(T))
+    _grad2!(ws.Px, ws.Py, ws.P̄, og, dplan)
+    @. ws.Λ = ifelse(mask, _favre(ws.Px * ws.mx + ws.Py * ws.my, ws.ρ̄), zero(T))
     # P̄ ∇·ū, with the unweighted divergence. `ws.prod`/`ws.fbuf` are free again here, and `ws.τxx` is
     # spent, so it takes the two gradient components neither term reads.
-    _grad2!(ws.prod, ws.τxx, ws.ū, grid, dplan)
-    _grad2!(ws.τxx, ws.fbuf, ws.v̄, grid, dplan)
+    _grad2!(ws.prod, ws.τxx, ws.ū, og, dplan)
+    _grad2!(ws.τxx, ws.fbuf, ws.v̄, og, dplan)
     @. ws.PD = ifelse(mask, ws.P̄ * (ws.prod + ws.fbuf), zero(T))
 
     return (; Π = ws.Π, Λ = ws.Λ, pressure_dilatation = ws.PD,
@@ -131,6 +139,9 @@ genuinely needs both — which is the source of the trap below.
 P̄ ∇·ū                                                                   pressure dilatation
 ```
 
+All three are per unit volume, W m⁻³ with `ρ` in kg m⁻³ and `P` in Pa; at a constant `ρ₀`, `Π` is `ρ₀`
+times the specific flux [`compute_Π!`](@ref) returns.
+
 `Π` and `Λ` both pit a large-scale field against small-scale fluctuations, so **both transfer energy
 across scales**. `P̄∇·ū` involves only large scales and cannot — it is a conversion between kinetic and
 internal energy at the resolved scale, not a cascade term.
@@ -142,6 +153,14 @@ then dismissed as "large-scale pressure dilatation that needs no modelling". Tha
 term is `P̄∇·ū` with the **unweighted** divergence, and writing `∇·ũ` silently destroys `Λ` — a genuine
 cross-scale transfer. This implementation keeps them separate and uses `ū` for the dilatation; the
 suite asserts that `Λ` is non-zero for a baroclinic configuration, so it cannot be quietly dropped.
+
+# Masked and bounded grids
+
+Under `ZeroFill` a masked cell and the domain exterior hold no fluid, so `ρ̄` is the fluid mass under
+the kernel: the Favre fields are density-weighted means over the fluid, zero where none lies under the
+kernel, and `ρ̄ ∂_j ũ_i` is formed as `∂_j (ρu_i)‾ − ũ_i ∂_j ρ̄`, which differences only fields defined
+at every cell. Constant `ρ` collapses the budget to `ρ·Π` wherever the fluid fills the kernel, which
+under `Deformable` is every active cell. `ρ` is read, and must be positive, on active cells only.
 
 # Asymptotics
 
@@ -171,14 +190,11 @@ function compressible_flux(
     for (nm, a) in (("u", u), ("v", v), ("ρ", ρ), ("P", P))
         size(a) == gsz || throw(DimensionMismatch("$nm has size $(size(a)), grid expects $gsz"))
     end
-    all(>(0), ρ) || throw(ArgumentError(
-        "Favre filtering divides by the filtered density, so ρ must be strictly positive everywhere; " *
-        "got a minimum of $(minimum(ρ)).",
-    ))
+    _require_positive_density(ρ, grid)
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
     return compressible_flux!(
         FavreWorkspace(grid), u, v, ρ, P, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = _default_deriv_plan(grid),
+        filter_plan = plan, deriv_plan = _default_deriv_plan(output_grid(grid, plan)),
     )
 end
 
@@ -249,14 +265,11 @@ function compressible_flux(
     for (nm, a) in (("u", u), ("v", v), ("ρ", ρ), ("P", P))
         size(a) == gsz || throw(DimensionMismatch("$nm has size $(size(a)), grid expects $gsz"))
     end
-    all(>(0), ρ) || throw(ArgumentError(
-        "Favre filtering divides by the filtered density, so ρ must be strictly positive everywhere; " *
-        "got a minimum of $(minimum(ρ)).",
-    ))
+    _require_positive_density(ρ, grid)
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
     return compressible_flux!(
         SphericalFavreWorkspace(grid), u, v, ρ, P, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = _default_deriv_plan(grid),
+        filter_plan = plan, deriv_plan = _default_deriv_plan(output_grid(grid, plan)),
     )
 end
 
@@ -284,7 +297,8 @@ function compressible_flux!(
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
         filter_plan
-    dplan = _resolve_deriv_plan(deriv_plan, grid)
+    og = output_grid(grid, plan)
+    dplan = _resolve_deriv_plan(deriv_plan, og)
     geo = FlowGeometries.Grids.grid_geometry(grid)
     p, bp, m, up, pr, τ, loc = ws.p, ws.bp, ws.m, ws.up, ws.prod, ws.τ, ws.loc
 
@@ -316,17 +330,17 @@ function compressible_flux!(
 
     # Favre velocity ũ_i = (ρu_i)‾/ρ̄, read before `m` becomes the unweighted mass flux τ̄(ρ,u_i).
     for c in 1:3
-        @. up[c] = m[c] / ws.ρ̄
+        @. up[c] = _favre(m[c], ws.ρ̄)
         @. m[c] = m[c] - ws.ρ̄ * bp[c]
     end
     for (k, (i1, i2)) in enumerate(_SYM3)
-        @. τ[k] = τ[k] / ws.ρ̄ - up[i1] * up[i2]
+        @. τ[k] = _favre(τ[k], ws.ρ̄) - up[i1] * up[i2]
     end
 
     # The stress to the local frame, and every vector with it.
     @inbounds for I in CartesianIndices(ws.Π)
         i = Tuple(I)
-        if FlowGeometries.Grids.isactive(grid, i...)
+        if FlowGeometries.Grids.isactive(og, i...)
             λ, φ = FlowGeometries.Grids.coords(grid, i...)
             _store_local!(τ, I, _rotate_stress_to_local_enr(
                 geo, τ[1][I], τ[2][I], τ[3][I], τ[4][I], τ[5][I], τ[6][I], λ, φ,
@@ -346,18 +360,25 @@ function compressible_flux!(
         end
     end
 
-    mask = FlowGeometries.Grids.mask(grid)
+    mask = FlowGeometries.Grids.mask(og)
     # Π = −ρ̄ ∂_j ũ_i τ̃_ij; τ̃ is symmetric, so only the symmetric part of the gradient survives and
-    # this is −ρ̄ S̃:τ̃ with the curvature-carrying strain.
-    _strain_into!(ws.S[1], ws.S[2], ws.S[3], loc[1], loc[2], ws.tmp, grid, dplan, T)
-    @. ws.Π = ifelse(mask, -ws.ρ̄ * _sfs_contraction(
+    # this is −ρ̄ S̃:τ̃ with the curvature-carrying strain. The strain is linear in the velocity, so
+    # ρ̄ S(ũ) = S(ρ̄ũ) − sym(ũ ⊗ ∇ρ̄), which differences only fields defined at every cell.
+    @. pr[1] = ws.ρ̄ * loc[1]
+    @. pr[2] = ws.ρ̄ * loc[2]
+    _strain_into!(ws.S[1], ws.S[2], ws.S[3], pr[1], pr[2], ws.tmp, og, dplan, T)
+    _grad2!(ws.Px, ws.Py, ws.ρ̄, og, dplan)
+    @. ws.S[1] -= loc[1] * ws.Px
+    @. ws.S[2] -= T(0.5) * (loc[1] * ws.Py + loc[2] * ws.Px)
+    @. ws.S[3] -= loc[2] * ws.Py
+    @. ws.Π = ifelse(mask, -_sfs_contraction(
         ws.S[1], ws.S[2], ws.S[3], τ[1], τ[2], τ[3]), zero(T))
 
-    _grad2!(ws.Px, ws.Py, ws.P̄, grid, dplan)
-    @. ws.Λ = ifelse(mask, (ws.Px * ws.mloc[1] + ws.Py * ws.mloc[2]) / ws.ρ̄, zero(T))
+    _grad2!(ws.Px, ws.Py, ws.P̄, og, dplan)
+    @. ws.Λ = ifelse(mask, _favre(ws.Px * ws.mloc[1] + ws.Py * ws.mloc[2], ws.ρ̄), zero(T))
 
     # ∇·ū is the trace of the unweighted strain, so the frame's curvature term comes with it.
-    _strain_into!(ws.S[1], ws.S[2], ws.S[3], loc[3], loc[4], ws.tmp, grid, dplan, T)
+    _strain_into!(ws.S[1], ws.S[2], ws.S[3], loc[3], loc[4], ws.tmp, og, dplan, T)
     @. ws.PD = ifelse(mask, ws.P̄ * (ws.S[1] + ws.S[3]), zero(T))
 
     return (; Π = ws.Π, Λ = ws.Λ, pressure_dilatation = ws.PD,
@@ -431,10 +452,7 @@ function compressible_flux(
     for (nm, a) in (("u", u), ("v", v), ("w", w), ("ρ", ρ), ("P", P))
         size(a) == gsz || throw(DimensionMismatch("$nm has size $(size(a)), grid expects $gsz"))
     end
-    all(>(0), ρ) || throw(ArgumentError(
-        "Favre filtering divides by the filtered density, so ρ must be strictly positive everywhere; " *
-        "got a minimum of $(minimum(ρ)).",
-    ))
+    _require_positive_density(ρ, grid)
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
     return compressible_flux!(
         Favre3DWorkspace(grid), u, v, w, ρ, P, grid, kernel, scale;
@@ -484,34 +502,48 @@ function compressible_flux!(
 
     # Favre velocity ũ_i = (ρu_i)‾/ρ̄, read before `m` becomes the unweighted mass flux τ̄(ρ,u_i).
     for c in 1:3
-        @. up[c] = m[c] / ws.ρ̄
+        @. up[c] = _favre(m[c], ws.ρ̄)
         @. m[c] = m[c] - ws.ρ̄ * bp[c]
     end
     for (k, (i1, i2)) in enumerate(_SYM3)
-        @. τ[k] = τ[k] / ws.ρ̄ - up[i1] * up[i2]
+        @. τ[k] = _favre(τ[k], ws.ρ̄) - up[i1] * up[i2]
     end
 
     # On a shell the stress and both vectors come back to the local frame; on a Cartesian volume they
     # are already in it.
-    _rotate_tau3_to_local!((τ,), grid)
-    _localize_triple!(ws.loc, up, grid, T)
-    _localize_triple!(ws.mloc, m, grid, T)
+    og = output_grid(grid, plan)
+    _rotate_tau3_to_local!((τ,), og)
+    _localize_triple!(ws.loc, up, og, T)
+    _localize_triple!(ws.mloc, m, og, T)
 
-    mask = FlowGeometries.Grids.mask(grid)
-    _strain3_into!(ws.S, ws.loc, ws.tmp, grid, dplan, T)
-    @. ws.Π = ifelse(mask, -ws.ρ̄ * _sfs_contraction(
+    # ρ̄ S(ũ) = S(ρ̄ũ) − sym(ũ ⊗ ∇ρ̄): the strain and its curvature terms are linear in the velocity,
+    # and both fields differenced here are defined at every cell. `g` holds ∇ρ̄ until ∇P̄ replaces it.
+    mask = FlowGeometries.Grids.mask(og)
+    ρũ = (pr[1], pr[2], pr[3])
+    for c in 1:3
+        @. ρũ[c] = ws.ρ̄ * ws.loc[c]
+    end
+    _strain3_into!(ws.S, ρũ, ws.tmp, og, dplan, T)
+    Derivatives.ddx!(ws.g[1], ws.ρ̄, og, dplan)
+    Derivatives.ddy!(ws.g[2], ws.ρ̄, og, dplan)
+    Derivatives.ddz!(ws.g[3], ws.ρ̄, og, dplan)
+    for (k, (i1, i2)) in enumerate(_SYM3)
+        @. ws.S[k] -= T(0.5) * (ws.loc[i1] * ws.g[i2] + ws.loc[i2] * ws.g[i1])
+    end
+    @. ws.Π = ifelse(mask, -_sfs_contraction(
         ws.S[1], ws.S[2], ws.S[3], ws.S[4], ws.S[5], ws.S[6],
         τ[1], τ[2], τ[3], τ[4], τ[5], τ[6]), zero(T))
 
-    Derivatives.ddx!(ws.g[1], ws.P̄, grid, dplan)
-    Derivatives.ddy!(ws.g[2], ws.P̄, grid, dplan)
-    Derivatives.ddz!(ws.g[3], ws.P̄, grid, dplan)
+    Derivatives.ddx!(ws.g[1], ws.P̄, og, dplan)
+    Derivatives.ddy!(ws.g[2], ws.P̄, og, dplan)
+    Derivatives.ddz!(ws.g[3], ws.P̄, og, dplan)
     @. ws.Λ = ifelse(mask,
-        (ws.g[1] * ws.mloc[1] + ws.g[2] * ws.mloc[2] + ws.g[3] * ws.mloc[3]) / ws.ρ̄, zero(T))
+        _favre(ws.g[1] * ws.mloc[1] + ws.g[2] * ws.mloc[2] + ws.g[3] * ws.mloc[3], ws.ρ̄), zero(T))
 
     # ∇·ū is the trace of the unweighted strain, so a shell's curvature terms come with it.
-    _localize_triple!(ws.loc, bp, grid, T)
-    _strain3_into!(ws.S, ws.loc, ws.tmp, grid, dplan, T)
+    ub = (pr[4], pr[5], pr[6])
+    _localize_triple!(ub, bp, og, T)
+    _strain3_into!(ws.S, ub, ws.tmp, og, dplan, T)
     @. ws.PD = ifelse(mask, ws.P̄ * (ws.S[1] + ws.S[4] + ws.S[6]), zero(T))
 
     return (; Π = ws.Π, Λ = ws.Λ, pressure_dilatation = ws.PD,
@@ -547,12 +579,30 @@ function _localize_triple!(
     return nothing
 end
 
+# A density-weighted mean `x/ρ̄`, zero where no fluid lies under the kernel (`ρ̄ = 0` there under
+# `ZeroFill`, and at a masked target under `Deformable`).
+@inline _favre(x, ρ̄) = ifelse(ρ̄ > zero(ρ̄), x / ρ̄, zero(x))
+
+# ρ is read on active cells only; a masked cell's value is never filtered.
+function _require_positive_density(ρ::AbstractArray, grid::FlowGeometries.Grids.AbstractGrid)
+    mask = FlowGeometries.Grids.mask(grid)
+    lo = typemax(float(eltype(ρ)))
+    @inbounds for I in eachindex(ρ, mask)
+        mask[I] && (lo = min(lo, ρ[I]))
+    end
+    lo > 0 || throw(ArgumentError(
+        "Favre filtering divides by the filtered density, so ρ must be strictly positive on every " *
+        "active cell; got a minimum of $lo.",
+    ))
+    return nothing
+end
+
 """
     favre_filter!(out, tmp, f, ρ, ρ̄, plan) -> out
 
-`f̃ = (ρf)‾/ρ̄`, given an already-filtered `ρ̄` and a scratch array `tmp`. The building block of
-[`compressible_flux`](@ref), exposed because a caller filtering their own tracer Favre-style should not
-have to reimplement it (and get the weighting backwards).
+`f̃ = (ρf)‾/ρ̄`, given an already-filtered `ρ̄` and a scratch array `tmp`; zero where `ρ̄ = 0`. The
+building block of [`compressible_flux`](@ref), exposed because a caller filtering their own tracer
+Favre-style should not have to reimplement it (and get the weighting backwards).
 """
 function favre_filter!(
     out::AbstractArray{T}, tmp::AbstractArray{T}, f::AbstractArray, ρ::AbstractArray,
@@ -560,6 +610,6 @@ function favre_filter!(
 ) where {T<:AbstractFloat}
     @. tmp = ρ * f
     Filtering.filter_apply!(out, tmp, plan)
-    @. out = out / ρ̄
+    @. out = _favre(out, ρ̄)
     return out
 end

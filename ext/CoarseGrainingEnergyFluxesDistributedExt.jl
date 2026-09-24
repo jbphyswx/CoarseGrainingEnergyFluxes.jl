@@ -20,8 +20,8 @@ function CGEF.Filtering.distributed_filter_field!(
     workspace,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    CGEF.Filtering._check_strategy(fp, mask_strategy)
     if fp isa CGEF.Filtering.SeparableFootprint
-        CGEF.Filtering._separable_check_strategy(fp, mask_strategy)
         return _distributed_apply_separable!(out, field, grid, fp)
     elseif fp isa CGEF.Filtering.PrefixSumTopHatPlan
         # The prefix table lives in the plan (ordinary process-local arrays, not a SharedArray), so a
@@ -99,6 +99,7 @@ function CGEF.Filtering.distributed_filter_field!(
     workspace,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    CGEF.Filtering._check_strategy(fp, mask_strategy)
     dims = FlowGeometries.Grids.size_tuple(grid)
     mask = FlowGeometries.Grids.mask(grid)
 
@@ -110,9 +111,8 @@ function CGEF.Filtering.distributed_filter_field!(
     end
 
     if fp isa CGEF.Filtering.SeparableFootprintND
-        CGEF.Filtering._separable_check_strategy(fp, mask_strategy)
         sfp = CGEF.Filtering.SeparableFootprintND(
-            fp.g, fp.lim, fp.periodic, fp.profiles, fp.invrenorm, fp.masked,
+            fp.g, fp.lim, fp.periodic, fp.profiles, fp.invrenorm, fp.strategy, fp.masked, fp.bound,
             _shared_like(fp.masked_input), _shared_like(fp.scratch),
         )
         s_out = SharedArrays.SharedArray{T}(dims)
@@ -124,29 +124,25 @@ function CGEF.Filtering.distributed_filter_field!(
     s_out = SharedArrays.SharedArray{T}(dims)
     fill!(s_out, zero(T))
     cart = CartesianIndices(dims)
+    # The point functions decide which targets the strategy filters.
     if fp isa CGEF.Filtering.FilterFootprintND
         periodic = FlowGeometries.Grids.periodic_flags(grid)
         @sync Distributed.@distributed for lin in 1:length(s_out)
             I = cart[lin]
-            if mask[I]
-                s_out[I] = CGEF.Filtering._footprint_nd_point(field, fp, mask_strategy, dims, periodic, mask, I)
-            end
+            s_out[I] = CGEF.Filtering._footprint_nd_point(field, fp, mask_strategy, dims, periodic, mask, I)
         end
     elseif fp.cache !== nothing
         lin_idx = LinearIndices(dims)
         cache = fp.cache
+        exterior = fp.exterior
         @sync Distributed.@distributed for lin in 1:length(s_out)
             I = cart[lin]
-            if mask[I]
-                s_out[I] = CGEF.Filtering._footprint_nd_point_cached(field, cache, mask_strategy, mask, lin_idx, I)
-            end
+            s_out[I] = CGEF.Filtering._footprint_nd_point_cached(field, cache, exterior, mask_strategy, mask, lin_idx, I)
         end
     else
         @sync Distributed.@distributed for lin in 1:length(s_out)
             I = cart[lin]
-            if mask[I]
-                s_out[I] = CGEF.Filtering._footprint_nd_point_streaming(field, grid, fp, mask_strategy, mask, I)
-            end
+            s_out[I] = CGEF.Filtering._footprint_nd_point_streaming(field, grid, fp, mask_strategy, mask, I)
         end
     end
     copyto!(out, s_out)

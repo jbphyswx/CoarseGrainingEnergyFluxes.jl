@@ -64,13 +64,17 @@ Cached scattered-spherical filter plan: the shared [`NUFSHTGridPlan`](@ref), the
 whether `Deformable` renormalization applies, and the [`NUFSHTScratch`](@ref) an apply works in. Built
 by `plan_filter(scattered_spherical_grid, kernel, scale; method = Spectral())`.
 """
-struct NUFSHTFilterPlan{T<:AbstractFloat, GP<:NUFSHTGridPlan, F, SC<:NUFSHTScratch{T}} <:
-       CGEF.Filtering.AbstractFilterPlan
+struct NUFSHTFilterPlan{
+    T<:AbstractFloat, GP<:NUFSHTGridPlan, F, MS<:CGEF.Filtering.AbstractMaskStrategy, SC<:NUFSHTScratch{T},
+} <: CGEF.Filtering.AbstractFilterPlan
     grid_plan::GP
     filter::F
-    renorm::Bool     # divide by the filtered mask mass: `Deformable` only, never `ZeroFill`
+    renorm::Bool     # divide by the filtered mask mass and zero a masked point: `Deformable` on a masked grid
+    strategy::MS
     scratch::SC
 end
+
+CGEF.Filtering.plan_strategy(plan::NUFSHTFilterPlan) = plan.strategy
 
 # The fit cannot resolve a relative residual finer than the transform it is built on.
 _fit_rtol(plan::NUFSHT.NUSHTplan{T}) where {T} = max(T(10 * plan.tol), sqrt(eps(T)))
@@ -133,7 +137,7 @@ function CGEF.Filtering.spectral_filter_plan(
     filter = _CGEFTransfer(kernel, scale, gp.radius)
     # `ZeroFill` is already exactly `filter(mask .* field)`; only `Deformable` divides by the local mass.
     renorm = gp.mask !== nothing && mask_strategy isa CGEF.Filtering.Deformable
-    return NUFSHTFilterPlan(gp, filter, renorm, sc)
+    return NUFSHTFilterPlan(gp, filter, renorm, mask_strategy, sc)
 end
 
 # The fit (points → harmonic coefficients) depends on the field alone, so a sweep runs it once and each
@@ -156,8 +160,11 @@ function CGEF.Filtering.filter_synthesize!(
 ) where {T<:AbstractFloat}
     gp, sc = plan.grid_plan, plan.scratch
     NUFSHT.nusht_synthesize!(out, Ĉ, plan.filter, gp.plan)
-    plan.renorm && NUFSHT.nusht_filter_renorm!(out, gp.mask, plan.filter, gp.plan;
-                                               mask_filt = sc.mask_filt, ws = sc.ws, C_mask = gp.C_mask)
+    if plan.renorm
+        NUFSHT.nusht_filter_renorm!(out, gp.mask, plan.filter, gp.plan;
+                                    mask_filt = sc.mask_filt, ws = sc.ws, C_mask = gp.C_mask)
+        @. out = gp.mask * out   # a masked point is zero under `Deformable`
+    end
     return out
 end
 

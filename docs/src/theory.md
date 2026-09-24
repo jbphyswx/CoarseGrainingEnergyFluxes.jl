@@ -12,14 +12,17 @@ The coarse-grained (filtered) field at scale ℓ is a convolution with a normali
 ū_ℓ(x) = ∫ G_ℓ(x, x') u(x') dA(x')
 ```
 
-`G_ℓ` is normalized to unit mass, so a constant field filters to itself. On a masked domain the
-integral runs over active cells only, and the default `ZeroFill` strategy keeps `G_ℓ` unchanged —
-excluded cells simply contribute nothing. That preserves the property the rest of this page depends
-on: a position-independent kernel **commutes with spatial derivatives**, which is the step that turns
-the pointwise momentum equation into the filtered energy budget below. The alternative `Deformable`
-strategy renormalizes over the locally-active area, recovering constants exactly next to a boundary at
-the cost of that commutation. Under either strategy, points within `≈ℓ` of a mask boundary are
-contaminated; see [`Filtering.filter_field!`](@ref).
+`G_ℓ` is normalized to unit mass over all space, so a constant field filters to itself. The default
+`ZeroFill` strategy filters the field extended by zero over land and past a bounded edge — land is
+fluid at rest (Aluie et al. 2018; Grooms et al. 2021, eq. 7) — with `G_ℓ` unchanged: the denominator
+is the kernel's mass over the lattice continued past each bounded edge at its edge spacing, a latitude
+to the pole and a regional longitude around the ring. That preserves the property the rest of this
+page depends on: a position-independent kernel **commutes with spatial derivatives**, which is the
+step that turns the pointwise momentum equation into the filtered energy budget below. `ū_ℓ` and `Π`
+are therefore defined over land too, `Π` vanishing beyond the kernel's reach of the coast, and a domain
+mean sums every cell and divides by the water area (Storer et al. 2022). The alternative `Deformable`
+strategy renormalizes over the locally-active area and zeroes masked cells, recovering constants
+exactly next to a boundary at the cost of that commutation; see [`Filtering.filter_field!`](@ref).
 
 ### Sub-Scale Stress Tensor
 
@@ -37,8 +40,10 @@ The filtered kinetic-energy budget (Aluie 2011; Aluie, Hecht & Vallis 2018) cont
 flux
 
 ```
-Π_ℓ(x) = −ρ₀ τ_ℓ : S̄_ℓ = −ρ₀ Σᵢⱼ τᵢⱼ S̄ᵢⱼ ,   S̄ = ½(∇ū + (∇ū)ᵀ)
+Π_ℓ(x) = −τ_ℓ : S̄_ℓ = −Σᵢⱼ τᵢⱼ S̄ᵢⱼ ,   S̄ = ½(∇ū + (∇ū)ᵀ)
 ```
+
+per unit mass, in m² s⁻³; `ρ₀ Π_ℓ` is the flux per unit volume.
 
 - **Π > 0** — forward cascade (energy from large → small scales)
 - **Π < 0** — inverse cascade (small → large)
@@ -84,8 +89,8 @@ The results above are not valid for an arbitrary weighting. A kernel must be:
 
 Requirements 1 and 2 are gated in `runtests.jl` against closed forms; 3 is gated by the
 `filter ∘ ∇ == ∇ ∘ filter` test. `TopHatKernel` and `GaussianKernel` satisfy all four.
-`SharpSpectralKernel` satisfies 1–3 but its real-space `sinc` form takes negative values, so it fails
-4 — usable for the spectrum, questionable for a pointwise `Π`.
+`SharpSpectralKernel` satisfies 1–3 but its real-space form takes negative values, so it fails 4 —
+usable for the spectrum, questionable for a pointwise `Π`.
 
 ### Scale convention
 
@@ -126,8 +131,20 @@ like-for-like kernel comparison use `GaussianKernel(; α = 8)` in 2-D and `α = 
 
 ### Sharp Spectral — `SharpSpectralKernel`
 
-Ideal low-pass: `Ĝ_ℓ(k) = 1` for `k ≤ π/ℓ`, else `0`. Perfect scale separation in spectral space;
-the physical-space form is a slowly-decaying sinc.
+Ideal low-pass: `Ĝ_ℓ(k) = 1` for `k ≤ k_c = π/ℓ`, else `0`. `method = Spectral()` multiplies by it.
+`RealSpace()` convolves with its inverse transform in the grid's `D` dimensions,
+
+```
+G(r) ∝ J_{D/2}(k_c r) / (k_c r)^{D/2}:    sin x / x,   2 J₁(x)/x,   3 (sin x − x cos x)/x³,    x = k_c r,
+```
+
+for `D = 1, 2, 3` (the two-dimensional form needs `using SpecialFunctions`). `G` decays as
+`r^{−(D+1)/2}`, so `∫|G|` diverges and no finite footprint reproduces the brick wall: the truncated
+kernel's transfer function ripples about it, most near `k_c`, with an amplitude falling as
+`1/(|k_c − k| R)` in the truncation radius `R`. The footprint ends near `10ℓ`, at the root of the
+truncated mass, `(2/π) Si(k_c R) = 1`, `J₀(k_c R) = 0` or `(2/π)(Si(k_c R) − sin k_c R) = 1`, so the
+normalized passband is centred on 1. Its weights change sign, so under `Deformable` a window mass
+beside a coast can approach zero.
 
 ### Spectral transfer functions
 
@@ -152,15 +169,15 @@ Filtering at a continuum of scales yields a spectrum without windowing or period
 The **cumulative** coarse-grained kinetic energy ([`Diagnostics.cumulative_energy`](@ref), their Eq. 15) is
 
 ```
-E(ℓ) = ½ ρ₀ ⟨|ū_ℓ|²⟩ ,
+E(ℓ) = ½ ⟨|ū_ℓ|²⟩ ,
 ```
 
-a *cumulative* quantity. The **filtering spectral density** ([`Diagnostics.filtering_spectrum`](@ref), their
+per unit mass, a *cumulative* quantity. The **filtering spectral density** ([`Diagnostics.filtering_spectrum`](@ref), their
 Eq. 14 — comparable to a Fourier energy spectrum) is its derivative with respect to the filtering
 wavenumber `k_ℓ = L/ℓ`:
 
 ```
-Ẽ(k_ℓ) = d/dk_ℓ [ ½ ρ₀ ⟨|ū_ℓ|²⟩ ] .
+Ẽ(k_ℓ) = d/dk_ℓ [ ½ ⟨|ū_ℓ|²⟩ ] .
 ```
 
 `L` is the region length (`L = 1` gives the FlowSieve convention `k_ℓ = 1/ℓ`).
@@ -365,6 +382,7 @@ adversarial-stencil test.
 - Aluie, H., Hecht, M., & Vallis, G. K. (2018). Mapping the energy cascade in the North Atlantic Ocean. *J. Phys. Oceanogr.* 48(8). doi:10.1175/JPO-D-17-0100.1
 - Barkan, R., Srinivasan, K., & McWilliams, J. C. (2024). Eddy–internal wave interactions: stimulated cascades in cross-scale kinetic energy and enstrophy fluxes. *J. Phys. Oceanogr.* 54(6), 1309–1326. doi:10.1175/JPO-D-23-0191.1
 - Germano, M. (1992). Turbulence: the filtering approach. *J. Fluid Mech.* 238. doi:10.1017/S0022112092001733
+- Grooms, I., Loose, N., Abernathey, R., Steinberg, J. M., Bachman, S. D., Marques, G., Guillaumin, A. P., & Yankovsky, E. (2021). Diffusion-based smoothers for spatial filtering of gridded geophysical data. *J. Adv. Model. Earth Syst.* 13, e2021MS002552. doi:10.1029/2021MS002552
 - Loose, N., Bachman, S., Grooms, I., & Jansen, M. (2023). Diagnosing scale-dependent energy cycles in a high-resolution isopycnal ocean model. *J. Phys. Oceanogr.* 53, 157.
 - Pedlosky, J. (1987). *Geophysical Fluid Dynamics* (2nd ed.). Springer.
 - Sadek, M., & Aluie, H. (2018). Extracting the spectrum of a flow by spatial filtering. *Phys. Rev. Fluids* 3, 124610. doi:10.1103/PhysRevFluids.3.124610

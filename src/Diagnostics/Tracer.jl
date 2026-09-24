@@ -32,13 +32,12 @@ function tracer_variance_flux(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _require_tangent_pair(grid, "tracer_variance_flux")
-    # One derivative object for every gradient below; they differ only in the field.
-    dplan = _default_deriv_plan(grid)
     gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
     size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
     size(θ) == gsz || throw(DimensionMismatch("θ has size $(size(θ)), grid expects $gsz"))
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+    dplan = _default_deriv_plan(output_grid(grid, plan))
 
     return tracer_variance_flux!(
         zeros(T, gsz), TracerFluxWorkspace(grid), u, v, θ, grid, kernel, scale;
@@ -89,7 +88,8 @@ function tracer_variance_flux!(
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
         filter_plan
-    dplan = _resolve_deriv_plan(deriv_plan, grid)
+    og = output_grid(grid, plan)
+    dplan = _resolve_deriv_plan(deriv_plan, og)
 
     @. ws.uθ = u * θ
     @. ws.vθ = v * θ
@@ -102,9 +102,9 @@ function tracer_variance_flux!(
     @. ws.τy -= ws.v̄ * ws.θ̄
 
     # Resolved tracer gradient ∂_j θ̄.
-    _grad2!(ws.gx, ws.gy, ws.θ̄, grid, dplan)
+    _grad2!(ws.gx, ws.gy, ws.θ̄, og, dplan)
 
-    mask = FlowGeometries.Grids.mask(grid)
+    mask = FlowGeometries.Grids.mask(og)
     @. Πθ = ifelse(mask, -(ws.τx * ws.gx + ws.τy * ws.gy), zero(T))
     return Πθ
 end

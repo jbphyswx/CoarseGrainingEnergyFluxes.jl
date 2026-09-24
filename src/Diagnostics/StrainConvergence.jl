@@ -46,17 +46,18 @@ function compute_Π_strain_convergence!(
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
         filter_plan
-    dplan = _resolve_deriv_plan(deriv_plan, grid)
+    og = output_grid(grid, plan)
+    dplan = _resolve_deriv_plan(deriv_plan, og)
 
     Filtering.filter_apply_batch!((ws.ū, ws.v̄), (u, v), plan)
     _second_moment!(ws.τuu, u, u, ws.ū, ws.ū, ws.prod, ws.fbuf, plan)
     _second_moment!(ws.τuv, u, v, ws.ū, ws.v̄, ws.prod, ws.fbuf, plan)
     _second_moment!(ws.τvv, v, v, ws.v̄, ws.v̄, ws.prod, ws.fbuf, plan)
 
-    _grad2!(ws.ux, ws.uy, ws.ū, grid, dplan)
-    _grad2!(ws.vx, ws.vy, ws.v̄, grid, dplan)
+    _grad2!(ws.ux, ws.uy, ws.ū, og, dplan)
+    _grad2!(ws.vx, ws.vy, ws.v̄, og, dplan)
 
-    mask = FlowGeometries.Grids.mask(grid)
+    mask = FlowGeometries.Grids.mask(og)
     # δ̄ = ū_x + v̄_y and ᾱ² = σ̄_n² + σ̄_s² are the two rotation invariants of the filtered gradient;
     # σ̄_n = ū_x − v̄_y (normal strain) and σ̄_s = ū_y + v̄_x (shear strain) are not, so they are
     # consumed inline rather than returned.
@@ -102,7 +103,7 @@ therefore a genuine cross-check rather than a tautology: they contract different
 same four derivatives, so a sign or an ordering error in either shows up as a disagreement. The suite
 asserts they match to round-off on masked and unmasked grids.
 
-Returns flux maps in W m⁻³, plus the two rotation invariants, which are the natural axes to bin the
+Returns specific flux maps in m² s⁻³, as [`compute_Π!`](@ref) does, plus the two rotation invariants, which are the natural axes to bin the
 flux against (`divergence` = δ̄, `strain_magnitude` = ᾱ).
 
 # References
@@ -124,7 +125,7 @@ function compute_Π_strain_convergence(
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
     return compute_Π_strain_convergence!(
         PiStrainWorkspace(grid), u, v, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = _default_deriv_plan(grid),
+        filter_plan = plan, deriv_plan = _default_deriv_plan(output_grid(grid, plan)),
     )
 end
 
@@ -166,7 +167,7 @@ function compute_Π_strain_convergence(
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
     return compute_Π_strain_convergence!(
         workspace === nothing ? ΠWorkspace(grid) : workspace, u, v, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = _default_deriv_plan(grid),
+        filter_plan = plan, deriv_plan = _default_deriv_plan(output_grid(grid, plan)),
     )
 end
 
@@ -193,13 +194,14 @@ function compute_Π_strain_convergence!(
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
         filter_plan
-    dplan = _resolve_deriv_plan(deriv_plan, grid)
+    og = output_grid(grid, plan)
+    dplan = _resolve_deriv_plan(deriv_plan, og)
 
     _fill_stress_strain!(u, v, nothing, grid, ws, plan, dplan, nothing)
 
     # `scratch`/`scratch2`/`scratch3` are spent once the stress is built, so they carry the two
     # invariants and the deformation channel; `u_filt`/`v_filt` carry the rest.
-    mask = FlowGeometries.Grids.mask(grid)
+    mask = FlowGeometries.Grids.mask(og)
     δ, α, Πα = ws.scratch, ws.scratch2, ws.scratch3
     Πδ, total = ws.u_filt, ws.v_filt
     @. δ = ifelse(mask, ws.S_xx + ws.S_yy, zero(T))
@@ -400,11 +402,12 @@ function compute_Π_decomposed!(
     # The Germano split takes the same three of the filtered velocity and its residual.
     _pair_moments!(ws.τRR, ws.τX, ws.τDD, rot, dv, br, bd, pr, plan)
 
-    _strain3_into!(ws.SR, br, ws.tmp, grid, dplan, T)
-    _strain3_into!(ws.SD, bd, ws.tmp, grid, dplan, T)
+    og = output_grid(grid, plan)
+    _strain3_into!(ws.SR, br, ws.tmp, og, dplan, T)
+    _strain3_into!(ws.SD, bd, ws.tmp, og, dplan, T)
 
     # One pass builds all four flux channels, so each tensor component is read once.
-    mask = FlowGeometries.Grids.mask(grid)
+    mask = FlowGeometries.Grids.mask(og)
     @inbounds for I in CartesianIndices(ws.total)
         if mask[I]
             rr = _contract_sym3(ws.SR, ws.τRR, I)
@@ -530,15 +533,16 @@ function compute_Π_decomposed!(
 
     Filtering.filter_apply_batch!((br..., bd...), (pr..., pd...), plan)
     _pair_moments!(ws.τRR, ws.τX, ws.τDD, pr, pd, br, bd, ws.prod, plan)
-    _rotate_tau3_to_local!((ws.τRR, ws.τX, ws.τDD), grid)
+    og = output_grid(grid, plan)
+    _rotate_tau3_to_local!((ws.τRR, ws.τX, ws.τDD), og)
 
     # The strain is linear, so each part carries its own; both are taken in the local frame.
-    _localize_triple!(ws.loc, br, grid, T)
-    _strain3_into!(ws.SR, ws.loc, ws.tmp, grid, dplan, T)
-    _localize_triple!(ws.loc, bd, grid, T)
-    _strain3_into!(ws.SD, ws.loc, ws.tmp, grid, dplan, T)
+    _localize_triple!(ws.loc, br, og, T)
+    _strain3_into!(ws.SR, ws.loc, ws.tmp, og, dplan, T)
+    _localize_triple!(ws.loc, bd, og, T)
+    _strain3_into!(ws.SD, ws.loc, ws.tmp, og, dplan, T)
 
-    mask = FlowGeometries.Grids.mask(grid)
+    mask = FlowGeometries.Grids.mask(og)
     @inbounds for I in CartesianIndices(ws.total)
         if mask[I]
             rr = _contract_sym3(ws.SR, ws.τRR, I)

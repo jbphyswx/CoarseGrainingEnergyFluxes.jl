@@ -9,32 +9,20 @@ Filter a field on a grid using `kernel` at characteristic full width `scale` (�
 result to `out` (returned).
 
 # Keyword Arguments
-- `mask_strategy::AbstractMaskStrategy=ZeroFill()`: masking strategy — `ZeroFill()` (excluded cells count
-  in the denominator as zero; the kernel stays homogeneous) or `Deformable()` (excluded cells dropped
-  from numerator and denominator; renormalized over the locally-included area).
+- `mask_strategy::AbstractMaskStrategy=ZeroFill()`: how masked cells and a bounded edge enter the
+  filter. [`ZeroFill`](@ref) filters the field extended by zero over masked cells and past each bounded
+  edge, normalized by the kernel's full mass over the lattice continued at its edge spacing; the kernel
+  is position-independent, so filtering **commutes with spatial derivatives** — the step the flux
+  budget is derived by — and conserves the integral over all space (over the grid itself on a periodic
+  grid, masked or not), and the output is defined at masked cells too. [`Deformable`](@ref) sums and normalizes over the active in-domain cells of each window
+  and zeroes masked cells, so a constant is reproduced next to a boundary and the kernel changes shape
+  there.
 
-  Near a boundary the footprint is truncated, and both strategies inherit the same shape distortion
-  from that: measured on a straight coast, Gaussian at `ℓ = 16` cells, one cell inshore the footprint's
-  centroid sits 0.21ℓ offshore and its width is 62% of the interior value (75% at `ℓ/4` inshore, 90% at
-  `ℓ/2`, 100% at `ℓ`). Points within `≈ℓ` of a boundary are contaminated either way.
-
-  They differ on the footprint's **mass**:
-
-  - `ZeroFill` leaves it at the truncated value, so the kernel is position-independent and filtering
-    **commutes with spatial derivatives** — the step the flux budget is derived by. A uniform field
-    ≡ 1 then filters to 0.543 one cell from the coast, 0.948 at `ℓ/2`, 0.9996 at `ℓ`.
-  - `Deformable` divides it out, so a constant filters to 1.000 everywhere, at the cost of a
-    position-dependent kernel, which does not commute with derivatives.
-
-  `ZeroFill` is the default because the flux budget is a statement about commuting operators; prefer
-  `Deformable` when a locally unbiased amplitude near a coast matters more than a budget that closes.
-
-  Neither conserves the ACTIVE-cell integral on a masked domain, and they fail differently. `ZeroFill`
-  conserves it over the whole domain exactly (7e-18 relative, unmasked periodic) but smears part of it
-  onto masked cells, which report zero; `Deformable` renormalizes that away and tracks the active-cell
-  integral better — 4.8e-4 relative drift against `ZeroFill`'s 1.1e-2 on a masked periodic grid. On a
-  bounded grid the domain edge costs both about 1e-2 at `ℓ = 6Δx`. A closed energy budget wants a
-  periodic unmasked domain; otherwise expect an `O(ℓ/L)` boundary residual.
+  Near a coast the two see the same footprint shape, displaced offshore and narrowed within `≈ℓ`, and
+  differ only in its mass: `ZeroFill` keeps the active part of the full mass, so a uniform field falls
+  toward the coast, and `Deformable` divides it out. `ZeroFill` is the default because the flux budget
+  is a statement about commuting operators; prefer `Deformable` when a locally unbiased amplitude near
+  a coast matters more than a budget that closes.
 - `filter_plan::Union{Nothing,AbstractFilterPlan}=nothing`: a prebuilt [`plan_filter`](@ref) result to
   reuse instead of building one from scratch — the zero-(re)allocation entry point for a repeated
   sweep (many timesteps/fields over the same grid/kernel/scale). When supplied, `mask_strategy`/

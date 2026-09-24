@@ -21,10 +21,15 @@ Test.@testset "n-D filtering (1D + true 3D Cartesian)" begin
     nx, ny, nz = length(x3), length(y3), length(z3)
     grid3 = FG.Grids.StructuredGrid(geom3, x3, y3, z3, trues(nx, ny, nz))
     Test.@test FG.Grids.size_tuple(grid3) == (nx, ny, nz)
-    # constant -> constant
+    # constant -> constant: everywhere under `Deformable`, and under `ZeroFill` wherever the disk stays
+    # on the grid (radius 3 cells in x and y; the vertical spacing exceeds it).
     o3 = zeros(nx, ny, nz)
-    CGEF.Filtering.filter_field!(o3, fill(3.5, nx, ny, nz), grid3, CGEF.TopHatKernel(), 6.0)
+    CGEF.Filtering.filter_field!(o3, fill(3.5, nx, ny, nz), grid3, CGEF.TopHatKernel(), 6.0;
+                                 mask_strategy = CGEF.Filtering.Deformable())
     Test.@test all(≈(3.5), o3)
+    CGEF.Filtering.filter_field!(o3, fill(3.5, nx, ny, nz), grid3, CGEF.TopHatKernel(), 6.0)
+    Test.@test all(≈(3.5), o3[4:(nx - 3), 4:(ny - 3), :])
+    Test.@test o3[1, 1, 1] < 3.5 / 2
 
     # A z-invariant 3D field must reduce EXACTLY to the 2D filter of its slice (dz ≫ rad ⇒ no
     # vertical neighbours), validating the n-D engine against the 2D engine.
@@ -49,11 +54,17 @@ Test.@testset "3D Cartesian energy flux" begin
     grid3 = FG.Grids.StructuredGrid(geom3, x, y, z, trues(nx, ny, nz))
     ker = CGEF.TopHatKernel(); ℓ = 5.0
 
-    # (1) Constant velocity ⇒ zero strain ⇒ Π ≡ 0.
+    # (1) Constant velocity ⇒ zero strain ⇒ Π ≡ 0, under `Deformable`. Under `ZeroFill` the velocity
+    # extended by zero is not constant, and the flux is zero only where the disk and the stencil stay on
+    # the grid.
     Πc = zeros(nx, ny, nz)
     CGEF.Diagnostics.compute_Π!(Πc, fill(2.0, nx, ny, nz), fill(-3.0, nx, ny, nz),
-                    fill(0.5, nx, ny, nz), grid3, ker, ℓ)
+                    fill(0.5, nx, ny, nz), grid3, ker, ℓ; mask_strategy = CGEF.Filtering.Deformable())
     Test.@test maximum(abs, Πc) < 1e-9
+    CGEF.Diagnostics.compute_Π!(Πc, fill(2.0, nx, ny, nz), fill(-3.0, nx, ny, nz),
+                    fill(0.5, nx, ny, nz), grid3, ker, ℓ)
+    Test.@test maximum(abs, Πc[5:(nx - 4), 5:(ny - 4), :]) < 1e-9
+    Test.@test maximum(abs, Πc) > 1e-6
 
     # (2) z-invariant (u, v) with w = 0: the 3D six-term contraction must collapse EXACTLY to the
     # 2D three-term flux on every layer (Szz = Sxz = Syz = τxz = τyz = τzz = 0), validating the 3D
@@ -115,13 +126,13 @@ Test.@testset "True-3D spherical volumetric grid + Π" begin
     grid = FG.Grids.StructuredGrid(geo, lon, lat, r, mask)
     Test.@test FG.Grids.size_tuple(grid) == (length(lon), length(lat), length(r))
 
-    # Volume element is the genuine spherical-shell r²cosφΔλΔφΔr at each level's OWN local
-    # radius, not the fixed reference R — so cell volume must grow with height at fixed (i,j).
+    # The cell volume is the shell integral at each level's own radius, so it grows with height at fixed
+    # (i,j). Between interior faces `r ± Δr/2` the radial factor is `∫r²dr = Δr(r² + Δr²/12)`, and the
+    # angular factor cancels in the ratio.
     Test.@test FG.Grids.area(grid, 1, 7, 5) > FG.Grids.area(grid, 1, 7, 1)
-    # Exact ratio check at the equator-ish band (φ index 7 is closest to 0): volumes at two
-    # levels and the same (i,j) scale as (r[k]/r[k'])² (cosφ, Δλ, Δφ, Δr all cancel exactly
-    # away from the domain's radial boundary, where Δr is uniform anyway on this axis).
-    Test.@test FG.Grids.area(grid, 1, 7, 3) / FG.Grids.area(grid, 1, 7, 2) ≈ (r[3] / r[2])^2 rtol=1e-12
+    Δr = r[2] - r[1]
+    Test.@test FG.Grids.area(grid, 1, 7, 3) / FG.Grids.area(grid, 1, 7, 2) ≈
+               (r[3]^2 + Δr^2 / 12) / (r[2]^2 + Δr^2 / 12) rtol = 1e-12
 
     # A single radius level is the 2D/2.5D case, not true-3D — must be rejected, not silently
     # given a wrong (area-not-volume) measure.
@@ -131,13 +142,16 @@ Test.@testset "True-3D spherical volumetric grid + Π" begin
     # rotation — zero strain rate everywhere, hence Π ≡ 0 — regardless of the genuine radial
     # shear ∂u_e/∂r = Ω·cosφ ≠ 0 this induces (unlike the 2D invariant, which has no radial
     # shear to get wrong in the first place; this is the check that actually exercises the new
-    # S_er curvature-correction term).
+    # S_er curvature-correction term). The filter stays a weighted mean of the rotation under
+    # `Deformable`; `ZeroFill` extends the flow by rest past the 20 km shell, which the 250 km top-hat
+    # spans, and the extended flow is not a rotation.
     Ω = 7.292e-5
     u = [Ω * r[k] * cos(lat[j]) for _ in lon, j in eachindex(lat), k in eachindex(r)]
     v = zeros(length(lon), length(lat), length(r))
     w = zeros(length(lon), length(lat), length(r))
     Π = zeros(size(u))
-    CGEF.Diagnostics.compute_Π!(Π, u, v, w, grid, CGEF.TopHatKernel(), 500e3)
+    CGEF.Diagnostics.compute_Π!(Π, u, v, w, grid, CGEF.TopHatKernel(), 500e3;
+                                mask_strategy = CGEF.Filtering.Deformable())
     Test.@test maximum(abs, Π) < 1e-9 * maximum(abs, u)
 
     # Full pipeline: shape + finiteness.
@@ -163,8 +177,10 @@ Test.@testset "True-3D spherical volumetric grid + Π" begin
     # Wide enough that the top-hat spans several cells: at 10° resolution a radius under one cell
     # width makes the filter the identity, `τ` identically zero, and every assertion below vacuous.
     scale3 = 3.0e6
+    # A constant tracer is constant under `Deformable`; `ZeroFill` extends it by zero past the shell.
     Test.@test maximum(abs, CGEF.Diagnostics.tracer_variance_flux(
-        ut, vt, wt, fill(2.5, sz), grid_deep, CGEF.TopHatKernel(), scale3)) < 1e-9
+        ut, vt, wt, fill(2.5, sz), grid_deep, CGEF.TopHatKernel(), scale3;
+        mask_strategy = CGEF.Filtering.Deformable())) < 1e-9
 
     Πθ = CGEF.Diagnostics.tracer_variance_flux(ut, vt, wt, θ, grid_deep, CGEF.TopHatKernel(), scale3)
     ux = zeros(sz); uy = zeros(sz); uz = zeros(sz)
@@ -231,10 +247,11 @@ Test.@testset "True-3D Helmholtz flux decomposition & tracer flux" begin
     Test.@test maximum(abs, dec_r.cross) < 1e-10
     Test.@test dec_r.rotational ≈ Πr_full
 
-    # 3D tracer-variance flux: constant tracer ⇒ zero gradient ⇒ zero flux.
+    # 3D tracer-variance flux: constant tracer ⇒ zero gradient ⇒ zero flux, under `Deformable`.
     θ = rand(length(x), length(y), length(z))
     Πθ = CGEF.Diagnostics.tracer_variance_flux(u, v, w, θ, grid3, kern, scale)
     Test.@test all(isfinite, Πθ)
-    Πθ0 = CGEF.Diagnostics.tracer_variance_flux(u, v, w, fill(2.5, size(θ)), grid3, kern, scale)
+    Πθ0 = CGEF.Diagnostics.tracer_variance_flux(u, v, w, fill(2.5, size(θ)), grid3, kern, scale;
+                                                mask_strategy = CGEF.Filtering.Deformable())
     Test.@test maximum(abs, Πθ0) < 1e-9
 end

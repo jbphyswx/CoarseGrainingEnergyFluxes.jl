@@ -31,6 +31,7 @@ function CGEF.Filtering.threaded_filter_field!(
     workspace,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    CGEF.Filtering._check_strategy(fp, mask_strategy)
     if fp isa CGEF.Filtering.SeparableFootprint
         return _threaded_apply_separable!(out, field, grid, fp, mask_strategy)
     elseif fp isa CGEF.Filtering.PrefixSumTopHatPlan
@@ -61,7 +62,7 @@ function _threaded_apply_separable!(
     CGEF.Filtering._separable_check_strategy(fp, strategy)
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     mask = FlowGeometries.Grids.mask(grid)
-    @. fp.masked_input = T(mask) * field
+    @. fp.masked_input = mask * field
     gx, gy = fp.gx, fp.gy
     di_lim, dj_lim = fp.di_lim, fp.dj_lim
     periodic_x, periodic_y = fp.periodic_x, fp.periodic_y
@@ -145,6 +146,7 @@ function CGEF.Filtering.threaded_filter_fields!(
     workspace,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    CGEF.Filtering._check_strategy(fp, mask_strategy)
     if fp isa CGEF.Filtering.PrefixSumTopHatPlan
         return _threaded_apply_prefixsum_tophat_batch!(outs, fields, grid, fp, mask_strategy)
     end
@@ -211,6 +213,7 @@ function CGEF.Filtering.threaded_filter_fields!(
     workspace,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    CGEF.Filtering._check_strategy(fp, mask_strategy)
     # Neither of these is a per-point offset walk, so neither has a neighbour derivation for a batch to
     # share: the separable-ND passes read precomputed tap tables, and the 3-D prefix-sum reads a window
     # whose bounds are a table lookup. Both take the per-field threaded apply, which is also the only
@@ -245,6 +248,7 @@ function CGEF.Filtering.threaded_filter_field!(
     workspace,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    CGEF.Filtering._check_strategy(fp, mask_strategy)
     mask = FlowGeometries.Grids.mask(grid)
     # Bound once, outside the branches: a name assigned in more than one branch of this function and
     # then captured by a closure is boxed, which OhMyThreads rejects outright.
@@ -258,21 +262,20 @@ function CGEF.Filtering.threaded_filter_field!(
     elseif fp isa CGEF.Filtering.PrefixSumTopHat3DPlan
         return _threaded_apply_prefixsum_tophat_3d!(out, field, grid, fp, mask_strategy)
     elseif fp isa CGEF.Filtering.FilterFootprintND
+        # The point functions decide which targets the strategy filters.
         periodic = FlowGeometries.Grids.periodic_flags(grid)
         OhMyThreads.tforeach(CartesianIndices(out); scheduler = _sched()) do I
-            mask[I] || return
             out[I] = CGEF.Filtering._footprint_nd_point(field, fp, mask_strategy, dims, periodic, mask, I)
         end
     elseif fp.cache !== nothing
         lin = LinearIndices(dims)
         cache = fp.cache
+        exterior = fp.exterior
         OhMyThreads.tforeach(CartesianIndices(out); scheduler = _sched()) do I
-            mask[I] || return
-            out[I] = CGEF.Filtering._footprint_nd_point_cached(field, cache, mask_strategy, mask, lin, I)
+            out[I] = CGEF.Filtering._footprint_nd_point_cached(field, cache, exterior, mask_strategy, mask, lin, I)
         end
     else
         OhMyThreads.tforeach(CartesianIndices(out); scheduler = _sched()) do I
-            mask[I] || return
             out[I] = CGEF.Filtering._footprint_nd_point_streaming(field, grid, fp, mask_strategy, mask, I)
         end
     end

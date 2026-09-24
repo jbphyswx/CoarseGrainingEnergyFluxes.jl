@@ -72,13 +72,17 @@ transposes through. Built by
 `plan_filter(spherical_structured_grid, kernel, scale; method = Spectral())`.
 """
 struct SHTFilterPlan{
-    T<:AbstractFloat, A<:AbstractMatrix{T}, GP<:SHTGridPlan{T}, R, SC<:SHTScratch{T},
+    T<:AbstractFloat, A<:AbstractMatrix{T}, GP<:SHTGridPlan{T}, R,
+    MS<:CGEF.Filtering.AbstractMaskStrategy, SC<:SHTScratch{T},
 } <: CGEF.Filtering.AbstractFilterPlan
     mult::A        # N × M multiplier on the spherical-harmonic coefficients
     grid_plan::GP
-    invrenorm::R   # precomputed 1/filter(mask) for Deformable, or nothing (ZeroFill / fully active)
+    invrenorm::R   # 1/filter(mask) for Deformable, zero at a masked point; or nothing
+    strategy::MS
     scratch::SC
 end
+
+CGEF.Filtering.plan_strategy(plan::SHTFilterPlan) = plan.strategy
 
 function _sht_grid_plan(
     grid::FlowGeometries.Grids.StructuredGrid{T,G},
@@ -162,12 +166,13 @@ function CGEF.Filtering.spectral_filter_plan(
         permutedims!(renorm, sc.scratch, (2, 1))        # back to [lon,lat]
         threshold = T(0.01)
         ir = similar(renorm)
-        @. ir = ifelse(abs(renorm) >= threshold, one(T) / renorm, zero(T))
+        # A masked point is zero under `Deformable`, as in the real-space engines.
+        @. ir = ifelse(mask & (abs(renorm) >= threshold), one(T) / renorm, zero(T))
         ir
     else
         nothing   # ZeroFill: already exactly `filter(mask .* field)`, no renormalization
     end
-    return SHTFilterPlan(mult, gp, invrenorm, sc)
+    return SHTFilterPlan(mult, gp, invrenorm, mask_strategy, sc)
 end
 
 # The forward harmonic transform depends on the field alone, so a sweep runs it once and each scale only

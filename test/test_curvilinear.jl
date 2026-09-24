@@ -132,16 +132,18 @@ Test.@testset "CurvilinearGrid (WLSQ / areas / pipeline)" begin
 
     # --- Full compute_Π!/coarse_grain pipeline: on the uniform Cartesian "fake curvilinear" grid the
     # result must match the StructuredGrid pipeline on the identical coordinates wherever the two
-    # derivative engines agree — the interior — since the footprints carry identical weights and
-    # neighbours and the contraction is the same. The boundary ring inherits the end-stencil
-    # difference gated above. ---
+    # derivative engines agree and every window the flux reads stays on the grid: the footprints carry
+    # identical weights and neighbours there and the contraction is the same. A structured grid
+    # continues its lattice past a bounded edge and a curvilinear one does not, and the boundary ring
+    # inherits the end-stencil difference gated above. The top-hat radius 4 spans two cells in x and
+    # none in y. ---
     uu = [sin(xs[i]/7) * cos(ys[j]/9) for i in 1:Nx, j in 1:Ny]
     vv = [cos(xs[i]/5) * sin(ys[j]/11) for i in 1:Nx, j in 1:Ny]
     Πs = zeros(Nx, Ny); Πc = zeros(Nx, Ny)
     CGEF.Diagnostics.compute_Π!(Πs, uu, vv, nothing, sgrid, CGEF.TopHatKernel(), 8.0)
     CGEF.Diagnostics.compute_Π!(Πc, uu, vv, nothing, cgrid, CGEF.TopHatKernel(), 8.0)
-    Test.@test maximum(abs.(Πc[2:end-1, 2:end-1] .- Πs[2:end-1, 2:end-1])) <
-               1e-9 * maximum(abs.(Πs)) + 1e-12
+    ii, jj = 4:(Nx - 3), 2:(Ny - 1)
+    Test.@test maximum(abs.(Πc[ii, jj] .- Πs[ii, jj])) < 1e-9 * maximum(abs.(Πs)) + 1e-12
 
     res = CGEF.coarse_grain(uu, vv, cgrid; scales=[8.0, 12.0], kernel=CGEF.TopHatKernel(),
                             spectrum = CGEF.Diagnostics.NoSpectrum())

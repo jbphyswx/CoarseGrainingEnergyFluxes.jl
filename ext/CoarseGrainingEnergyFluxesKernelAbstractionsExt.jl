@@ -38,9 +38,9 @@ using FlowGeometries: FlowGeometries
 # the same `k` order and multiplies by the same reciprocal, so the device result is bit-identical to
 # serial rather than a rounding away from it — which is the package's contract for every backend.
 #
-# An inactive source contributes `wk * 0` rather than being skipped, matching the host's `mask · field`
-# input exactly: adding a zero leaves the accumulator unchanged, so both strategies share one loop and
-# the mask never changes the summation order.
+# An inactive source contributes `wk * 0` in place of a skip, matching the host's `mask · field` input:
+# adding a zero leaves the accumulator unchanged, so both strategies share one loop and the mask never
+# changes the summation order. `invden` holds zero at a target the strategy does not filter.
 @kernel function _cgef_filter_kernel!(
     out, @Const(field), @Const(mask), @Const(di), @Const(dj), @Const(w), @Const(ptr),
     @Const(invden), nbands::Int, periodic_x::Bool, periodic_y::Bool,
@@ -49,39 +49,35 @@ using FlowGeometries: FlowGeometries
     T = eltype(out)
     Nx, Ny, Nb = size(out, 1), size(out, 2), size(out, 3)
     if i <= Nx && j <= Ny && b <= Nb
-        if mask[i, j]
-            band = nbands == 1 ? 1 : j
-            lo = ptr[band]
-            hi = ptr[band+1] - 1
-            ws = zero(T)
-            for k in lo:hi
-                jj = j + dj[k]
-                inbounds = true
-                if jj < 1 || jj > Ny
-                    if periodic_y
-                        jj = mod1(jj, Ny)
+        band = nbands == 1 ? 1 : j
+        lo = ptr[band]
+        hi = ptr[band+1] - 1
+        ws = zero(T)
+        for k in lo:hi
+            jj = j + dj[k]
+            inbounds = true
+            if jj < 1 || jj > Ny
+                if periodic_y
+                    jj = mod1(jj, Ny)
+                else
+                    inbounds = false
+                end
+            end
+            if inbounds
+                ii = i + di[k]
+                if ii < 1 || ii > Nx
+                    if periodic_x
+                        ii = mod1(ii, Nx)
                     else
                         inbounds = false
                     end
                 end
                 if inbounds
-                    ii = i + di[k]
-                    if ii < 1 || ii > Nx
-                        if periodic_x
-                            ii = mod1(ii, Nx)
-                        else
-                            inbounds = false
-                        end
-                    end
-                    if inbounds
-                        ws += w[k] * (mask[ii, jj] ? _at(field, ii, jj, b) : zero(T))
-                    end
+                    ws += w[k] * (mask[ii, jj] ? _at(field, ii, jj, b) : zero(T))
                 end
             end
-            _set!(out, i, j, b, ws * invden[i, j])
-        else
-            _set!(out, i, j, b, zero(T))
         end
+        _set!(out, i, j, b, ws * invden[i, j])
     end
 end
 
@@ -90,7 +86,7 @@ end
 # through `CartesianIndices` so one kernel serves every `N` — a per-dimension kernel would be three
 # copies of the same arithmetic.
 @kernel function _cgef_filter_kernel_nd!(
-    out, @Const(field), @Const(mask), @Const(offsets), @Const(w),
+    out, @Const(field), @Const(mask), @Const(offsets), @Const(w), exterior,
     dims, periodic, is_zerofill::Bool,
 )
     lin, b = @index(Global, NTuple)
@@ -99,7 +95,7 @@ end
     Nb = size(out, length(dims) + 1)
     if lin <= nspatial && b <= Nb
         I = CartesianIndices(dims)[lin]
-        if mask[I]
+        if is_zerofill || mask[I]
             Ti = Tuple(I)
             ws = zero(T)
             wn = zero(T)
@@ -133,7 +129,8 @@ end
                     end
                 end
             end
-            _setI!(out, I, b, wn > T(1e-15) ? ws / wn : zero(T))
+            is_zerofill && (wn = CGEF.Filtering._add_exterior(wn, exterior, I))
+            _setI!(out, I, b, CGEF.Filtering._normalized(ws, wn))
         else
             _setI!(out, I, b, zero(T))
         end
@@ -163,7 +160,8 @@ end
 # Cached ND scattered footprint: `nbrs` holds resolved neighbour multi-indices (periodic wrap already
 # applied at build time), so like the 2-D cached kernel there is no offset or wrap arithmetic here.
 @kernel function _cgef_filter_kernel_nd_cached!(
-    out, @Const(field), @Const(mask), @Const(nbrs), @Const(w), @Const(ptr), dims, is_zerofill::Bool,
+    out, @Const(field), @Const(mask), @Const(nbrs), @Const(w), @Const(ptr), exterior, dims,
+    is_zerofill::Bool,
 )
     lin, b = @index(Global, NTuple)
     T = eltype(out)
@@ -171,7 +169,7 @@ end
     Nb = size(out, length(dims) + 1)
     if lin <= nspatial && b <= Nb
         I = CartesianIndices(dims)[lin]
-        if mask[I]
+        if is_zerofill || mask[I]
             ws = zero(T)
             wn = zero(T)
             for k in ptr[lin]:(ptr[lin+1] - 1)
@@ -188,7 +186,8 @@ end
                     ws += wk * _atI(field, JI, b)
                 end
             end
-            _setI!(out, I, b, wn > T(1e-15) ? ws / wn : zero(T))
+            is_zerofill && (wn = CGEF.Filtering._add_exterior(wn, exterior, I))
+            _setI!(out, I, b, CGEF.Filtering._normalized(ws, wn))
         else
             _setI!(out, I, b, zero(T))
         end
@@ -213,7 +212,7 @@ end
     T = eltype(out)
     Nn, Nb = size(out, 1), size(out, 2)
     if t <= Nn && b <= Nb
-        if mask[t]
+        if is_zerofill || mask[t]
             ws = zero(T)
             wn = zero(T)
             for k in ptr[t]:(ptr[t+1] - 1)
@@ -230,7 +229,7 @@ end
                     ws += wk * _at1(field, j, b)
                 end
             end
-            _set1!(out, t, b, wn > T(1e-15) ? ws / wn : zero(T))
+            _set1!(out, t, b, CGEF.Filtering._normalized(ws, wn))
         else
             _set1!(out, t, b, zero(T))
         end
@@ -243,13 +242,13 @@ end
 # branch.
 @kernel function _cgef_filter_kernel_scattered!(
     out, @Const(field), @Const(mask), @Const(ii_arr), @Const(jj_arr), @Const(w), @Const(ptr),
-    is_zerofill::Bool,
+    exterior, is_zerofill::Bool,
 )
     i, j, b = @index(Global, NTuple)
     T = eltype(out)
     Nx, Ny, Nb = size(out, 1), size(out, 2), size(out, 3)
     if i <= Nx && j <= Ny && b <= Nb
-        if mask[i, j]
+        if is_zerofill || mask[i, j]
             t = i + (j - 1) * Nx
             lo = ptr[t]
             hi = ptr[t+1] - 1
@@ -270,7 +269,8 @@ end
                     ws += wk * _at(field, ii, jj, b)
                 end
             end
-            _set!(out, i, j, b, wn > T(1e-15) ? ws / wn : zero(T))
+            is_zerofill && (wn = CGEF.Filtering._add_exterior(wn, exterior, i, j))
+            _set!(out, i, j, b, CGEF.Filtering._normalized(ws, wn))
         else
             _set!(out, i, j, b, zero(T))
         end
@@ -282,13 +282,14 @@ end
 # arithmetic over `metric_window` with no scratch and no spatial index. The window, the two periodic
 # conventions and the distance therefore have one implementation, not one per backend.
 @kernel function _cgef_filter_kernel_traversal!(
-    out, @Const(field), @Const(mask), grid, mt, kernel, scale, rad, is_cartesian::Bool, is_zerofill::Bool,
+    out, @Const(field), @Const(mask), grid, mt, kernel, scale, rad, exterior, is_cartesian::Bool,
+    is_zerofill::Bool,
 )
     i, j, bi = @index(Global, NTuple)
     T = eltype(out)
     Nx, Ny, Nb = size(out, 1), size(out, 2), size(out, 3)
     if i <= Nx && j <= Ny && bi <= Nb
-        if mask[i, j]
+        if is_zerofill || mask[i, j]
             # `Filtering._ball_fold` is the host's own entry point: it picks the image convention for a
             # `StructuredGrid` and omits the argument for a curvilinear mesh, which has no axis to tile.
             # The fold closure only READS `bi`; assigning to a captured variable would box it, which a
@@ -297,7 +298,7 @@ end
                 (zero(T), zero(T)), grid, Int(i), Int(j), rad, is_cartesian, mt,
             ) do acc, J, d
                 a, b = acc
-                wk = CGEF.Kernels.kernel_weight(kernel, T(d), scale) * FlowGeometries.Grids.area(grid, J[1], J[2])
+                wk = CGEF.Kernels.kernel_weight(kernel, T(d), scale, Val(2)) * FlowGeometries.Grids.area(grid, J[1], J[2])
                 active = mask[J[1], J[2]]
                 # No `return` anywhere: `@kernel` rejects one even inside a closure.
                 if is_zerofill
@@ -308,7 +309,8 @@ end
                     acc
                 end
             end
-            _set!(out, i, j, bi, wn > T(1e-15) ? ws / wn : zero(T))
+            n = is_zerofill ? CGEF.Filtering._add_exterior(wn, exterior, i, j) : wn
+            _set!(out, i, j, bi, CGEF.Filtering._normalized(ws, n))
         else
             _set!(out, i, j, bi, zero(T))
         end
@@ -577,22 +579,24 @@ struct GPUBandedFootprint{F, DI, DJ, VW, VP, MA, IN} <: GPUResident
 end
 
 # Scattered footprint with a materialized neighbour cache: absolute neighbour indices per point.
-struct GPUScatteredCached{F, II, JJ, VW, VP, MA} <: GPUResident
+struct GPUScatteredCached{F, II, JJ, VW, VP, MA, EX} <: GPUResident
     fp::F
     ii::II
     jj::JJ
     w::VW
     ptr::VP
     maskd::MA
+    exterior::EX   # `ZeroFill`'s mass past a bounded edge, or nothing
 end
 
 # Streaming footprint: no cache, so the kernel re-derives each point's neighbourhood from the grid
-# itself. Coordinates and the cell measure are read through the grid rather than uploaded separately.
-struct GPUStreaming{F, G, MT, MA} <: GPUResident
+# itself. Coordinates and the cell measure are read through the grid, uploaded with it.
+struct GPUStreaming{F, G, MT, MA, EX} <: GPUResident
     fp::F
     grid::G
     topology::MT
     maskd::MA
+    exterior::EX
 end
 
 # Separable Gaussian: the two weight tables, the two scratch planes the passes need, and whichever
@@ -621,20 +625,22 @@ struct GPUSeparableND{F} <: GPUResident
 end
 
 # Cached ND scattered footprint, device-resident.
-struct GPUScatteredNDCached{F, VN, VW, VP, MA} <: GPUResident
+struct GPUScatteredNDCached{F, VN, VW, VP, MA, EX} <: GPUResident
     fp::F
     nbrs::VN
     w::VW
     ptr::VP
     maskd::MA
+    exterior::EX
 end
 
 # 1-D / true-3-D translation-invariant offset table.
-struct GPUFootprintND{F, VO, VW, MA} <: GPUResident
+struct GPUFootprintND{F, VO, VW, MA, EX} <: GPUResident
     fp::F
     offsets::VO
     w::VW
     maskd::MA
+    exterior::EX
 end
 
 # Node set: the CSR adjacency and its weights, moved once. No coordinates and no topology are needed
@@ -691,6 +697,8 @@ end
 end
 
 _maskd(dev, grid) = move(dev, Array{Bool}(FlowGeometries.Grids.mask(grid)))
+_moved(_, ::Nothing) = nothing
+_moved(dev, x::AbstractArray) = move(dev, x)
 
 function CGEF.Filtering.prepare_workspace(
     b::CGEF.ComputationalBackends.GPUBackend, grid::FlowGeometries.Grids.AbstractGrid,
@@ -749,6 +757,7 @@ function CGEF.Filtering.prepare_workspace(
     cache = cached.cache
     return GPUScatteredNDCached(
         cached, move(dev, cache.nbrs), move(dev, cache.w), move(dev, cache.ptr), _maskd(dev, grid),
+        _moved(dev, cached.exterior),
     )
 end
 
@@ -760,8 +769,8 @@ function CGEF.Filtering.prepare_workspace(
     return GPUSeparableND(CGEF.Filtering.SeparableFootprintND(
         map(g -> move(dev, g), fp.g), fp.lim, fp.periodic,
         fp.profiles === nothing ? nothing : map(pv -> move(dev, pv), fp.profiles),
-        fp.invrenorm === nothing ? nothing : move(dev, fp.invrenorm),
-        fp.masked, move(dev, fp.masked_input), move(dev, fp.scratch),
+        _moved(dev, fp.invrenorm), fp.strategy, fp.masked, fp.bound,
+        move(dev, fp.masked_input), move(dev, fp.scratch),
     ))
 end
 
@@ -770,7 +779,9 @@ function CGEF.Filtering.prepare_workspace(
     fp::CGEF.Filtering.FilterFootprintND,
 )
     dev = b.backend
-    return GPUFootprintND(fp, move(dev, fp.offsets), move(dev, fp.w), _maskd(dev, grid))
+    return GPUFootprintND(
+        fp, move(dev, fp.offsets), move(dev, fp.w), _maskd(dev, grid), _moved(dev, fp.exterior),
+    )
 end
 
 function CGEF.Filtering.prepare_workspace(
@@ -787,18 +798,19 @@ function CGEF.Filtering.prepare_workspace(
 )
     dev = b.backend
     maskd = _maskd(dev, grid)
+    exterior = _moved(dev, fp.exterior)
     cache = fp.cache
     cache === nothing || return GPUScatteredCached(
         fp, move(dev, cache.ii), move(dev, cache.jj), move(dev, cache.w), move(dev, cache.ptr), maskd,
+        exterior,
     )
     # The kernel runs the grid's own ball query, so the grid goes where the kernel does — FlowGeometries'
     # `Adapt` support does the move, and on the CPU device it is the identity.
     #
-    # NOT the plan's topology: on a curvilinear grid that one carries a k-d tree, and `Adapt` refuses to
-    # move a spatial index rather than leave the device holding a host pointer. A device query is the
-    # unindexed scan.
+    # The plan's topology stays on the host: on a curvilinear grid it carries a k-d tree, which `Adapt`
+    # refuses to move, so a device query is the unindexed scan.
     return GPUStreaming(
-        fp, KA.adapt(dev, grid), FlowGeometries.Connectivity.MetricTopology(grid), maskd,
+        fp, KA.adapt(dev, grid), FlowGeometries.Connectivity.MetricTopology(grid), maskd, exterior,
     )
 end
 
@@ -890,9 +902,7 @@ function CGEF.Filtering.gpu_filter_field_batched!(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     dev = gpu_backend.backend
     ws = _resident(gpu_backend, grid, workspace, kernel, scale, mask_strategy)
-    # Same guard the per-slice apply performs: a separable footprint is built for one mask strategy and
-    # silently means something else under the other.
-    ws isa GPUSeparable && CGEF.Filtering._separable_check_strategy(ws.fp, mask_strategy)
+    _check_resident_strategy(ws, mask_strategy)
     # A 1-D grid has no direction 2, so it cannot be queried unconditionally. The ND engines read the
     # grid's own `periodic_flags` anyway and ignore these two.
     nspatial = length(FlowGeometries.Grids.size_tuple(grid))
@@ -937,7 +947,7 @@ end
 function _run_gpu_kernel!(dev, out, field, ws::GPUScatteredNDCached, grid, periodic_x::Bool, periodic_y::Bool, is_zerofill::Bool)
     dims = FlowGeometries.Grids.size_tuple(grid)
     _cgef_filter_kernel_nd_cached!(dev)(
-        out, field, ws.maskd, ws.nbrs, ws.w, ws.ptr, dims, is_zerofill;
+        out, field, ws.maskd, ws.nbrs, ws.w, ws.ptr, ws.exterior, dims, is_zerofill;
         ndrange = (prod(dims), size(out, length(dims) + 1)),
     )
 end
@@ -952,7 +962,7 @@ function _run_gpu_kernel!(dev, out, field, ws::GPUFootprintND, grid, periodic_x:
     # Spatial extent flattened, batch as the second launch axis. `size(out, length(dims)+1)` is 1 for an
     # unbatched output, so this is one launch shape for both cases.
     _cgef_filter_kernel_nd!(dev)(
-        out, field, ws.maskd, ws.offsets, ws.w,
+        out, field, ws.maskd, ws.offsets, ws.w, ws.exterior,
         dims, FlowGeometries.Grids.periodic_flags(grid), is_zerofill;
         ndrange = (prod(dims), size(out, length(dims) + 1)),
     )
@@ -967,7 +977,7 @@ end
 
 function _run_gpu_kernel!(dev, out, field, ws::GPUScatteredCached, grid, periodic_x::Bool, periodic_y::Bool, is_zerofill::Bool)
     _cgef_filter_kernel_scattered!(dev)(
-        out, field, ws.maskd, ws.ii, ws.jj, ws.w, ws.ptr, is_zerofill;
+        out, field, ws.maskd, ws.ii, ws.jj, ws.w, ws.ptr, ws.exterior, is_zerofill;
         ndrange = (size(out, 1), size(out, 2), size(out, 3)),
     )
 end
@@ -975,8 +985,8 @@ end
 function _run_gpu_kernel!(dev, out, field, ws::GPUStreaming, grid, periodic_x::Bool, periodic_y::Bool, is_zerofill::Bool)
     fp = ws.fp
     _cgef_filter_kernel_traversal!(dev)(
-        out, field, ws.maskd, ws.grid, ws.topology, fp.kernel, fp.scale, fp.rad, fp.is_cartesian,
-        is_zerofill; ndrange = (size(out, 1), size(out, 2), size(out, 3)),
+        out, field, ws.maskd, ws.grid, ws.topology, fp.kernel, fp.scale, fp.rad, ws.exterior,
+        fp.is_cartesian, is_zerofill; ndrange = (size(out, 1), size(out, 2), size(out, 3)),
     )
 end
 
@@ -1007,19 +1017,23 @@ function _run_gpu_kernel!(dev, out, field, ws::GPUSeparable, grid, periodic_x::B
     nd = (size(out, 1), size(out, 2), size(out, 3))
     fp = ws.fp
     masked, rowp = _sep_buffers(dev, ws, out)
-    masked .= T.(ws.maskd) .* field
+    masked .= ws.maskd .* field
     _cgef_separable_row_pass_kernel!(dev)(rowp, masked, ws.gx, fp.di_lim, fp.periodic_x; ndrange = nd)
     KA.synchronize(dev)
     _cgef_separable_column_pass_kernel!(dev)(out, rowp, ws.gy, fp.dj_lim, fp.periodic_y; ndrange = nd)
     KA.synchronize(dev)
     if ws.invrenorm === nothing
-        out .= ifelse.(ws.denom .> T(1e-15), out ./ ws.denom, zero(T))
+        out .= CGEF.Filtering._normalized.(out, ws.denom)
     else
-        out .*= ws.invrenorm
+        # Deformable on a masked grid: an inactive target is zero.
+        out .= ifelse.(ws.maskd, out .* ws.invrenorm, zero(T))
     end
-    out .= ifelse.(ws.maskd, out, zero(T))
     return out
 end
+
+# The host footprint a resident one wraps carries the strategy its denominator was built for.
+_check_resident_strategy(ws::GPUResident, s) = CGEF.Filtering._check_strategy(ws.fp, s)
+_check_resident_strategy(fp, s) = CGEF.Filtering._check_strategy(fp, s)
 
 # Whatever the caller supplied, end up with a device-resident footprint: a plan built for this backend
 # already holds one, anything else (no plan, or a plan built for another backend) is uploaded here.
@@ -1044,8 +1058,7 @@ function CGEF.Filtering.gpu_filter_field!(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     dev = gpu_backend.backend
     ws = _resident(gpu_backend, grid, workspace, kernel, scale, mask_strategy)
-    ws isa GPUSeparable && CGEF.Filtering._separable_check_strategy(ws.fp, mask_strategy)
-    ws isa GPUPrefixSum && CGEF.Filtering._prefixsum_check_strategy(ws.fp, mask_strategy)
+    _check_resident_strategy(ws, mask_strategy)
     is_zerofill = mask_strategy isa CGEF.Filtering.ZeroFill
     _run_gpu_kernel!(
         dev, out, field, ws, grid,
@@ -1069,7 +1082,7 @@ function CGEF.Filtering.gpu_filter_field!(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
     dev = gpu_backend.backend
     ws = _resident(gpu_backend, grid, workspace, kernel, scale, mask_strategy)
-    ws isa GPUPrefixSum3D && CGEF.Filtering._prefixsum3d_check_strategy(ws.fp, mask_strategy)
+    _check_resident_strategy(ws, mask_strategy)
     _run_gpu_kernel!(
         dev, out, field, ws, grid, false, false, mask_strategy isa CGEF.Filtering.ZeroFill,
     )
@@ -1119,12 +1132,10 @@ function CGEF.Filtering.gpu_filter_fields!(
 ) where {T<:AbstractFloat}
     dev = gpu_backend.backend
     ws = _resident(gpu_backend, grid, workspace, kernel, scale, mask_strategy)
+    _check_resident_strategy(ws, mask_strategy)
     # The separable and prefix-sum engines pass their fields through workspace buffers every launch
     # overwrites, so their applies stay serialized behind one another.
     if ws isa Union{GPUSeparable, GPUPrefixSum, GPUPrefixSum3D}
-        ws isa GPUSeparable && CGEF.Filtering._separable_check_strategy(ws.fp, mask_strategy)
-        ws isa GPUPrefixSum && CGEF.Filtering._prefixsum_check_strategy(ws.fp, mask_strategy)
-        ws isa GPUPrefixSum3D && CGEF.Filtering._prefixsum3d_check_strategy(ws.fp, mask_strategy)
         nspat = length(FlowGeometries.Grids.size_tuple(grid))
         pxs = FlowGeometries.Grids.isperiodic(grid, 1)
         pys = nspat >= 2 ? FlowGeometries.Grids.isperiodic(grid, 2) : false

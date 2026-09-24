@@ -150,10 +150,11 @@ _tracer_workspace(grid::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geome
 @inline _curl_scratch(ws::TracerFluxWorkspace) = ws.uθ
 
 """
-    enstrophy_flux!(Z, ws, u, v, grid, kernel, scale; filter_plan=nothing, deriv_plan=nothing, ...) -> Z
+    enstrophy_flux!(Z, ws, u, v, grid, kernel, scale; filter_plan=nothing, deriv_plan=nothing, curl_plan=nothing, ...) -> Z
 
-In-place [`enstrophy_flux`](@ref). With `ws` and both plans supplied, a repeated evaluation allocates
-nothing.
+In-place [`enstrophy_flux`](@ref). `curl_plan` takes the vorticity of `(u, v)` on `grid`; `deriv_plan`
+differences `ω̄` on [`output_grid`](@ref). A stencil table serves as both. With `ws` and every plan
+supplied, a repeated evaluation allocates nothing.
 """
 function enstrophy_flux!(
     Z::AbstractVecOrMat{T},
@@ -165,18 +166,28 @@ function enstrophy_flux!(
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
     deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
+    curl_plan::Union{Nothing,AnyDerivPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     _require_tangent_pair(grid, "enstrophy_flux!")
-    dplan = _resolve_deriv_plan(deriv_plan, grid)
+    plan = filter_plan === nothing ?
+        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
+        filter_plan
+    og = output_grid(grid, plan)
+    dplan = _resolve_deriv_plan(deriv_plan, og)
     # A tracer-workspace buffer is free at this point (each is only written inside
     # `tracer_variance_flux!`), so it serves as the `∂u/∂y` scratch the curl needs.
-    vorticity!(ws.ω, u, v, grid, dplan; scratch = _curl_scratch(ws.tracer))
+    vorticity!(ws.ω, u, v, grid, _curl_plan(curl_plan, dplan, grid, og); scratch = _curl_scratch(ws.tracer))
     return tracer_variance_flux!(Z, ws.tracer, u, v, ws.ω, grid, kernel, scale;
-                                 filter_plan = filter_plan, deriv_plan = dplan,
-                                 backend = backend, mask_strategy = mask_strategy)
+                                 filter_plan = plan, deriv_plan = dplan)
 end
+
+# The vorticity differences the raw velocity over `grid`'s own cells. A stencil table does not depend
+# on the mask; a least-squares plan fits over the cells it was built on.
+@inline _curl_plan(plan::AnyDerivPlan, _dplan, _grid, _og) = plan
+@inline _curl_plan(::Nothing, dplan::Derivatives.StencilPlan, _grid, _og) = dplan
+_curl_plan(::Nothing, dplan, grid, og) = _same_cells(grid, og) ? dplan : _default_deriv_plan(grid)
 
 """
     tracer_variance_flux(u, v, θ, grid::AbstractGrid{<:SphericalGeometry}, kernel, scale; ...) -> Πθ
@@ -207,7 +218,7 @@ function tracer_variance_flux(
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
     return tracer_variance_flux!(
         zeros(T, gsz), SphericalTracerFluxWorkspace(grid), u, v, θ, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = _default_deriv_plan(grid),
+        filter_plan = plan, deriv_plan = _default_deriv_plan(output_grid(grid, plan)),
     )
 end
 
@@ -265,7 +276,8 @@ function tracer_variance_flux!(
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
         filter_plan
-    dplan = _resolve_deriv_plan(deriv_plan, grid)
+    og = output_grid(grid, plan)
+    dplan = _resolve_deriv_plan(deriv_plan, og)
     geo = FlowGeometries.Grids.grid_geometry(grid)
     p, bp, pθ = ws.p, ws.bp, ws.pθ
 
@@ -301,7 +313,7 @@ function tracer_variance_flux!(
     # no radial part.
     @inbounds for I in CartesianIndices(Πθ)
         i = Tuple(I)
-        if FlowGeometries.Grids.isactive(grid, i...)
+        if FlowGeometries.Grids.isactive(og, i...)
             λ, φ = FlowGeometries.Grids.coords(grid, i...)
             l = FlowGeometries.Geometry.vector_from_cartesian(
                 geo, pθ[1][I], pθ[2][I], pθ[3][I], λ, φ,
@@ -312,8 +324,8 @@ function tracer_variance_flux!(
         end
     end
 
-    _grad2!(ws.gx, ws.gy, ws.θ̄, grid, dplan)
-    mask = FlowGeometries.Grids.mask(grid)
+    _grad2!(ws.gx, ws.gy, ws.θ̄, og, dplan)
+    mask = FlowGeometries.Grids.mask(og)
     @. Πθ = ifelse(mask, -(ws.τe * ws.gx + ws.τn * ws.gy), zero(T))
     return Πθ
 end
@@ -381,24 +393,28 @@ function tracer_variance_flux!(
     for c in 1:3
         @. pθ[c] = ws.g[c] - bp[c] * ws.θ̄
     end
-    _localize_triple!(ws.loc, pθ, grid, T)
+    og = output_grid(grid, plan)
+    _localize_triple!(ws.loc, pθ, og, T)
 
-    Derivatives.ddx!(ws.g[1], ws.θ̄, grid, dplan)
-    Derivatives.ddy!(ws.g[2], ws.θ̄, grid, dplan)
-    Derivatives.ddz!(ws.g[3], ws.θ̄, grid, dplan)
-    mask = FlowGeometries.Grids.mask(grid)
+    Derivatives.ddx!(ws.g[1], ws.θ̄, og, dplan)
+    Derivatives.ddy!(ws.g[2], ws.θ̄, og, dplan)
+    Derivatives.ddz!(ws.g[3], ws.θ̄, og, dplan)
+    mask = FlowGeometries.Grids.mask(og)
     @. Πθ = ifelse(mask,
         -(ws.loc[1] * ws.g[1] + ws.loc[2] * ws.g[2] + ws.loc[3] * ws.g[3]), zero(T))
     return Πθ
 end
 
 """
-    tracer_variance_flux(u, v, w, θ, grid::StructuredGrid{T,Cartesian,3}, kernel, scale; backend=AutoBackend(), mask_strategy=ZeroFill())
+    tracer_variance_flux(u, v, w, θ, grid::StructuredGrid{T,G,3}, kernel, scale; backend=AutoBackend(), mask_strategy=ZeroFill())
         -> Πθ
 
 True three-dimensional analog of the 2D [`tracer_variance_flux`](@ref) above: the subfilter tracer
 flux gets a genuine vertical component `τ_z = ⟨wθ⟩ - w̄θ̄`, contracted against the resolved 3D
 tracer gradient `∂_j θ̄` (all three components, including the real vertical derivative `∂θ̄/∂z`).
+
+On a spherical shell the velocity is rotated to planetary Cartesian for filtering and the filtered flux
+back to local (east, north, radial), the convention the true-3D [`compute_Π!`](@ref) uses.
 """
 function tracer_variance_flux(
     u::AbstractArray{<:Any,3},
@@ -410,98 +426,14 @@ function tracer_variance_flux(
     scale::T;
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    # One stencil table for every derivative below; they differ only in direction and field.
-    dplan = Derivatives.StencilPlan(grid)
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     gsz = FlowGeometries.Grids.size_tuple(grid)
-    size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
-    size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
-    size(w) == gsz || throw(DimensionMismatch("w has size $(size(w)), grid expects $gsz"))
-    size(θ) == gsz || throw(DimensionMismatch("θ has size $(size(θ)), grid expects $gsz"))
-    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
-
-    uθ = u .* θ; vθ = v .* θ; wθ = w .* θ
-    ū = zeros(T, gsz); v̄ = zeros(T, gsz); w̄ = zeros(T, gsz); θ̄ = zeros(T, gsz)
-    τx = zeros(T, gsz); τy = zeros(T, gsz); τz = zeros(T, gsz)
-    Filtering.filter_apply_batch!((ū, v̄, w̄, θ̄, τx, τy, τz), (u, v, w, θ, uθ, vθ, wθ), plan)
-
-    # Subfilter tracer flux τ_j = ⟨u_j θ⟩ - ū_j θ̄, now with a genuine vertical component.
-    @. τx -= ū * θ̄
-    @. τy -= v̄ * θ̄
-    @. τz -= w̄ * θ̄
-
-    # Resolved tracer gradient ∂_j θ̄, including the real vertical derivative.
-    gx = similar(θ̄); Derivatives.ddx!(gx, θ̄, grid, dplan)
-    gy = similar(θ̄); Derivatives.ddy!(gy, θ̄, grid, dplan)
-    gz = similar(θ̄); Derivatives.ddz!(gz, θ̄, grid, dplan)
-
-    mask = FlowGeometries.Grids.mask(grid)
-    return ifelse.(mask, .-(τx .* gx .+ τy .* gy .+ τz .* gz), zero(T))
-end
-
-"""
-    tracer_variance_flux(u, v, w, θ, grid::StructuredGrid{T,<:SphericalGeometry,3}, kernel, scale; ...) -> Πθ
-
-Volumetric spherical shell (lon, lat, radius): the 3D counterpart of the spherical 2D method, keeping
-the radial component of both the subfilter tracer flux and the resolved gradient. Velocities are
-rotated to planetary Cartesian for filtering and the filtered flux is rotated back to local (east,
-north, radial), the same convention the true-3D [`compute_Π!`](@ref) uses.
-"""
-function tracer_variance_flux(
-    u::AbstractArray{<:Any,3},
-    v::AbstractArray{<:Any,3},
-    w::AbstractArray{<:Any,3},
-    θ::AbstractArray{<:Any,3},
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
-    kernel::Kernels.AbstractFilterKernel,
-    scale::T;
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
-    # One stencil table for every derivative below; they differ only in direction and field.
-    dplan = Derivatives.StencilPlan(grid)
-    gsz = FlowGeometries.Grids.size_tuple(grid)
-    size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
-    size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
-    size(w) == gsz || throw(DimensionMismatch("w has size $(size(w)), grid expects $gsz"))
-    size(θ) == gsz || throw(DimensionMismatch("θ has size $(size(θ)), grid expects $gsz"))
-    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
-    geo = FlowGeometries.Grids.grid_geometry(grid)
-
-    ux = zeros(T, gsz); uy = zeros(T, gsz); uz = zeros(T, gsz)
-    uxθ = zeros(T, gsz); uyθ = zeros(T, gsz); uzθ = zeros(T, gsz)
-    @inbounds for I in CartesianIndices(u)
-        i = Tuple(I)
-        FlowGeometries.Grids.isactive(grid, i...) || continue
-        λ, φ = FlowGeometries.Grids.coords(grid, i...)
-        p = FlowGeometries.Geometry.vector_to_cartesian(geo, u[I], v[I], w[I], λ, φ)
-        ux[I] = p[1]; uy[I] = p[2]; uz[I] = p[3]
-        uxθ[I] = p[1] * θ[I]; uyθ[I] = p[2] * θ[I]; uzθ[I] = p[3] * θ[I]
+    for (nm, a) in (("u", u), ("v", v), ("w", w), ("θ", θ))
+        size(a) == gsz || throw(DimensionMismatch("$nm has size $(size(a)), grid expects $gsz"))
     end
-
-    θ̄ = zeros(T, gsz)
-    ūx = zeros(T, gsz); ūy = zeros(T, gsz); ūz = zeros(T, gsz)
-    τX = zeros(T, gsz); τY = zeros(T, gsz); τZ = zeros(T, gsz)
-    Filtering.filter_apply_batch!(
-        (ūx, ūy, ūz, θ̄, τX, τY, τZ), (ux, uy, uz, θ, uxθ, uyθ, uzθ), plan,
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
+    return tracer_variance_flux!(
+        zeros(T, gsz), TracerFlux3DWorkspace(grid), u, v, w, θ, grid, kernel, scale;
+        filter_plan = plan, deriv_plan = Derivatives.StencilPlan(grid),
     )
-    @. τX -= ūx * θ̄
-    @. τY -= ūy * θ̄
-    @. τZ -= ūz * θ̄
-
-    τe = zeros(T, gsz); τn = zeros(T, gsz); τr = zeros(T, gsz)
-    @inbounds for I in CartesianIndices(u)
-        i = Tuple(I)
-        FlowGeometries.Grids.isactive(grid, i...) || continue
-        λ, φ = FlowGeometries.Grids.coords(grid, i...)
-        l = FlowGeometries.Geometry.vector_from_cartesian(geo, τX[I], τY[I], τZ[I], λ, φ)
-        τe[I] = l[1]; τn[I] = l[2]; τr[I] = l[3]
-    end
-
-    gx = similar(θ̄); Derivatives.ddx!(gx, θ̄, grid, dplan)
-    gy = similar(θ̄); Derivatives.ddy!(gy, θ̄, grid, dplan)
-    gz = similar(θ̄); Derivatives.ddz!(gz, θ̄, grid, dplan)
-
-    mask = FlowGeometries.Grids.mask(grid)
-    return ifelse.(mask, .-(τe .* gx .+ τn .* gy .+ τr .* gz), zero(T))
 end

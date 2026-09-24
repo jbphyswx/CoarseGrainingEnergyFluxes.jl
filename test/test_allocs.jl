@@ -580,7 +580,7 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
         # rescaled to the window the Gaussian spanned, since both radii are linear in it.
         ker = CGEF.SharpSpectralKernel()
         _rescale(s0) = s0 * CGEF.Kernels.kernel_radius(CGEF.GaussianKernel(), s0) /
-                       CGEF.Kernels.kernel_radius(ker, s0)
+                       CGEF.Kernels.kernel_radius(ker, s0, Val(2))
         geom = FG.Geometry.CartesianGeometry()
         dx = 1000.0
         N = 60
@@ -596,41 +596,48 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
 
         bytes_cached = Base.summarysize(fp_always)
         bytes_streaming = Base.summarysize(fp_never)
-        # Streaming carries only scalar metadata (kernel, scale, rad, window limits, periodicity/
-        # period, geometry flag) — a handful of Float64/Int/Bool fields, not O(N·M) data.
-        Test.@test bytes_streaming < 512
+        # Streaming carries scalar metadata (kernel, scale, rad, window limits, periodicity, geometry
+        # flag) and, where a window leaves a bounded grid, `ZeroFill`'s mass past the edge: one number
+        # per cell. Neither grows with the window; a cache holds a neighbour list per cell.
+        ext_bytes(fp) = fp.exterior === nothing ? 0 : Base.summarysize(fp.exterior)
+        Test.@test size(fp_never.exterior) == (N, N)
+        Test.@test bytes_streaming - ext_bytes(fp_never) < 512
         # The cached plan holds a per-point neighbour list, so at this N/M it must be orders of
         # magnitude larger — that size is exactly why caching is opt-in.
         Test.@test bytes_cached > 1000 * bytes_streaming
 
-        # Size INVARIANCE: the streaming footprint's size must not grow with N at fixed relative
-        # kernel radius/spacing — this, not "smaller than caching," is the actual O(1) proof.
+        # Size invariance: past the per-cell exterior mass, the streaming footprint does not grow with N
+        # at fixed relative kernel radius/spacing.
         N2 = 4 * N
         xsV2 = collect(0.0:dx:(N2 - 1) * dx) .+ [0.3 * dx * sin(2.7i) for i in 1:N2]
         grid2 = FG.Grids.StructuredGrid(geom, xsV2, xsV2, trues(N2, N2))
         fp_never2 = CGEF.Filtering.build_footprint(grid2, ker, scale; cache_strategy = CGEF.Filtering.NeverCache())
-        Test.@test Base.summarysize(fp_never2) == Base.summarysize(fp_never)
+        Test.@test Base.summarysize(fp_never2) - ext_bytes(fp_never2) == bytes_streaming - ext_bytes(fp_never)
 
-        # NDScatteredFilterPlan (1D): the same O(1)-vs-O(N) contrast.
+        # NDScatteredFilterPlan (1D): the same contrast.
         grid1 = FG.Grids.StructuredGrid(geom, xsV, trues(N))
         fp1_always = CGEF.Filtering.build_footprint(grid1, ker, scale; cache_strategy = CGEF.Filtering.AlwaysCache())
         fp1_never = CGEF.Filtering.build_footprint(grid1, ker, scale; cache_strategy = CGEF.Filtering.NeverCache())
         Test.@test fp1_always isa CGEF.Filtering.NDScatteredFilterPlan
-        Test.@test Base.summarysize(fp1_never) < 512
+        Test.@test Base.summarysize(fp1_never) - ext_bytes(fp1_never) < 512
         Test.@test Base.summarysize(fp1_always) > 100 * Base.summarysize(fp1_never)
 
-        # Construction itself (not just the finished result) must not transiently allocate O(N·M) —
-        # `NeverCache` must skip the fill loop entirely, not build-then-discard the neighbour list.
-        CGEF.Filtering.build_footprint(grid, ker, scale; cache_strategy = CGEF.Filtering.NeverCache())  # warm up
-        bytes_build_never = @allocated CGEF.Filtering.build_footprint(grid, ker, scale; cache_strategy = CGEF.Filtering.NeverCache())
+        # Construction under `NeverCache` allocates no neighbour list, even transiently, so its cost does
+        # not grow with the window, which halving the scale shrinks four-fold in 2-D and two-fold in 1-D.
+        NC = CGEF.Filtering.NeverCache()
+        for (g, s) in ((grid, scale), (grid, scale / 2), (grid1, scale), (grid1, scale / 2))
+            CGEF.Filtering.build_footprint(g, ker, s; cache_strategy = NC)   # warm up
+        end
+        bytes_build_never = @allocated CGEF.Filtering.build_footprint(grid, ker, scale; cache_strategy = NC)
+        bytes_build_never_half = @allocated CGEF.Filtering.build_footprint(grid, ker, scale / 2; cache_strategy = NC)
         CGEF.Filtering.build_footprint(grid, ker, scale; cache_strategy = CGEF.Filtering.AlwaysCache())  # warm up
         bytes_build_always = @allocated CGEF.Filtering.build_footprint(grid, ker, scale; cache_strategy = CGEF.Filtering.AlwaysCache())
-        Test.@test bytes_build_never < 1024
+        Test.@test bytes_build_never < 1.5 * bytes_build_never_half
         Test.@test bytes_build_always > 100 * bytes_build_never
 
-        CGEF.Filtering.build_footprint(grid1, ker, scale; cache_strategy = CGEF.Filtering.NeverCache())  # warm up
-        bytes_build1_never = @allocated CGEF.Filtering.build_footprint(grid1, ker, scale; cache_strategy = CGEF.Filtering.NeverCache())
-        Test.@test bytes_build1_never < 1024
+        bytes_build1_never = @allocated CGEF.Filtering.build_footprint(grid1, ker, scale; cache_strategy = NC)
+        bytes_build1_never_half = @allocated CGEF.Filtering.build_footprint(grid1, ker, scale / 2; cache_strategy = NC)
+        Test.@test bytes_build1_never < 1.5 * bytes_build1_never_half
     end
 
     # -----------------------------------------------------------------------
@@ -741,7 +748,7 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
         # does — see the cache-size testset above for why a Gaussian no longer reaches it.
         ker = CGEF.SharpSpectralKernel()
         _rescale(s0) = s0 * CGEF.Kernels.kernel_radius(CGEF.GaussianKernel(), s0) /
-                       CGEF.Kernels.kernel_radius(ker, s0)
+                       CGEF.Kernels.kernel_radius(ker, s0, Val(2))
         geom = FG.Geometry.CartesianGeometry()
         N = 90
         x_nu = collect(0.0:800.0:(N - 1) * 800.0) .+ [iseven(i) ? 4.0 : -3.5 for i in 1:N]

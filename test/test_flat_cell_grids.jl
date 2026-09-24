@@ -5,8 +5,9 @@
 # whole pipeline without naming itself anywhere in this package.
 
 # The operator, assembled from the kernel and the grid's own distance and measure: a weighted mean over
-# every cell inside the kernel radius. `ZeroFill` leaves inactive cells in the denominator, `Deformable`
-# renormalizes over the active part of the window, so the two differ only where a window meets the mask.
+# every cell inside the kernel radius. `ZeroFill` leaves inactive cells in the denominator and filters
+# at an inactive target too; `Deformable` renormalizes over the active part of the window and zeroes an
+# inactive target, so the two differ only where a window meets the mask.
 function _flatcell_reference(grid, f, kernel, scale, strategy)
     geo = FG.Grids.grid_geometry(grid)
     rad = CGEF.Kernels.kernel_radius(kernel, scale)
@@ -14,19 +15,20 @@ function _flatcell_reference(grid, f, kernel, scale, strategy)
     pts = [FG.Grids.coords(Tuple, grid, i) for i in 1:n]
     meas = [FG.Grids.measure(grid, j) for j in 1:n]
     act = [FG.Grids.isactive(grid, j) for j in 1:n]
+    dim = Val(FG.Grids.ncoordinates(grid))
     out = zeros(n)
     for i in 1:n
-        act[i] || continue
+        (strategy isa CGEF.Filtering.ZeroFill || act[i]) || continue
         num = 0.0
         den = 0.0
         for j in 1:n
             d = FG.Geometry.distance(geo, pts[i], pts[j])
             d <= rad || continue
-            w = CGEF.Kernels.kernel_weight(kernel, d, scale) * meas[j]
+            w = CGEF.Kernels.kernel_weight(kernel, d, scale, dim) * meas[j]
             act[j] && (num += w * f[j])
             den += (strategy isa CGEF.Filtering.ZeroFill || act[j]) ? w : 0.0
         end
-        out[i] = den > 1e-15 ? num / den : 0.0
+        out[i] = num / den
     end
     return out
 end

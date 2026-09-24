@@ -31,8 +31,10 @@ using Quickhull: Quickhull
 using FlowGeometries: FlowGeometries as FG
 
 # Each file owns one topic and opens its own top-level testset, so a single one can be run on its
-# own — `include("test/test_filtering.jl")` into a session that has already loaded the preamble —
-# instead of the whole suite for every change.
+# own: `include("test/test_filtering.jl")` into a session that has already loaded the preamble and
+# `reference_filters.jl`.
+
+include("reference_filters.jl")
 
 include("test_quality.jl")
 include("test_geometry.jl")

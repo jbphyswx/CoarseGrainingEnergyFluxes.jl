@@ -4,6 +4,16 @@
 # where the redundancy is. Orthogonal to caching, which changes only how the weights are derived.
 # ---------------------------------------------------------------------------
 
+# A footprint whose denominator is fixed at build time accepts only the strategy it was built for where
+# the two differ; one that accumulates its denominator per point takes either. Every backend's entry
+# point calls this before its first row or point.
+_check_strategy(fp::FilterFootprint, s::AbstractMaskStrategy) = _banded_check_strategy(fp, s)
+_check_strategy(fp::Union{SeparableFootprint,SeparableFootprintND}, s::AbstractMaskStrategy) =
+    _separable_check_strategy(fp, s)
+_check_strategy(fp::PrefixSumTopHatPlan, s::AbstractMaskStrategy) = _prefixsum_check_strategy(fp, s)
+_check_strategy(fp::PrefixSumTopHat3DPlan, s::AbstractMaskStrategy) = _prefixsum3d_check_strategy(fp, s)
+_check_strategy(_, ::AbstractMaskStrategy) = nothing
+
 # Homogeneous-`NTuple` batches (compile-time-known K): `MVector` accumulators are stack-allocated,
 # not heap — genuinely zero-allocation. `Vector` batches (runtime-known K, e.g. a variable number of
 # quadratic-product terms): a small `Vector{T}` accumulator, allocated ONCE per row/point-loop (not
@@ -116,9 +126,10 @@ function apply_footprint_row_batch!(
     acc_ws = _batch_zeros(outs, T)
     acc_wn = _batch_zeros(outs, T)
     cache = fp.cache
+    zerofill = strategy isa ZeroFill
     if cache !== nothing
         for i in 1:Nx
-            FlowGeometries.Grids.isactive(grid, i, j) || continue
+            _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
             t = i + (j - 1) * Nx
             lo = cache.ptr[t]
             hi = cache.ptr[t+1] - 1
@@ -129,7 +140,7 @@ function apply_footprint_row_batch!(
                 jj = cache.jj[k]
                 active = FlowGeometries.Grids.isactive(grid, ii, jj)
                 w = cache.w[k]
-                if strategy isa ZeroFill
+                if zerofill
                     for m in eachindex(fields)
                         acc_wn[m] += w
                     end
@@ -146,12 +157,14 @@ function apply_footprint_row_batch!(
                 end
             end
             for m in eachindex(outs)
-                outs[m][i, j] = acc_wn[m] > T(1e-15) ? acc_ws[m] / acc_wn[m] : zero(T)
+                wn = zerofill ? _add_exterior(acc_wn[m], fp.exterior, i, j) : acc_wn[m]
+                outs[m][i, j] = _normalized(acc_ws[m], wn)
             end
         end
     else
         kernel = fp.kernel
         scale = fp.scale
+        dim = _kernel_dim(grid)
         di_lim, dj_lim = fp.di_lim, fp.dj_lim
         fp_periodic_x, fp_periodic_y = fp.periodic_x, fp.periodic_y
         x_period, y_period = fp.x_period, fp.y_period
@@ -159,7 +172,7 @@ function apply_footprint_row_batch!(
         rad = fp.rad
         sc = FlowGeometries.Connectivity.ball_scratch()   # per row; see the single-field row apply
         for i in 1:Nx
-            FlowGeometries.Grids.isactive(grid, i, j) || continue
+            _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
             target = FlowGeometries.Grids.coords(SA.SVector, grid, i, j)
             fill!(acc_ws, zero(T))
             fill!(acc_wn, zero(T))
@@ -168,8 +181,8 @@ function apply_footprint_row_batch!(
                 fp_periodic_x, fp_periodic_y, x_period, y_period, is_cartesian, rad, fp.topology, sc,
             ) do _, iin, jjn, d
                 active = FlowGeometries.Grids.isactive(grid, iin, jjn)
-                w = Kernels.kernel_weight(kernel, d, scale) * FlowGeometries.Grids.area(grid, iin, jjn)
-                if strategy isa ZeroFill
+                w = Kernels.kernel_weight(kernel, d, scale, dim) * FlowGeometries.Grids.area(grid, iin, jjn)
+                if zerofill
                     for m in eachindex(fields)
                         acc_wn[m] += w
                     end
@@ -187,7 +200,8 @@ function apply_footprint_row_batch!(
                 nothing
             end
             for m in eachindex(outs)
-                outs[m][i, j] = acc_wn[m] > T(1e-15) ? acc_ws[m] / acc_wn[m] : zero(T)
+                wn = zerofill ? _add_exterior(acc_wn[m], fp.exterior, i, j) : acc_wn[m]
+                outs[m][i, j] = _normalized(acc_ws[m], wn)
             end
         end
     end
@@ -227,8 +241,9 @@ function apply_footprint_nd_batch_over!(
     mask = FlowGeometries.Grids.mask(grid)
     acc_ws = _batch_zeros(outs, T)
     acc_wn = _batch_zeros(outs, T)
+    zerofill = strategy isa ZeroFill
     @inbounds for I in indices
-        mask[I] || continue
+        _filters_target(strategy, mask[I]) || continue
         Ti = Tuple(I)
         fill!(acc_ws, zero(T))
         fill!(acc_wn, zero(T))
@@ -237,7 +252,7 @@ function apply_footprint_nd_batch_over!(
             valid || continue
             active = mask[J...]
             wk = fp.w[k]
-            if strategy isa ZeroFill
+            if zerofill
                 for m in eachindex(fields)
                     acc_wn[m] += wk
                 end
@@ -254,7 +269,8 @@ function apply_footprint_nd_batch_over!(
             end
         end
         for m in eachindex(outs)
-            outs[m][I] = acc_wn[m] > T(1e-15) ? acc_ws[m] / acc_wn[m] : zero(T)
+            wn = zerofill ? _add_exterior(acc_wn[m], fp.exterior, I) : acc_wn[m]
+            outs[m][I] = _normalized(acc_ws[m], wn)
         end
     end
     return outs
@@ -273,7 +289,7 @@ end
     ws, wn = _nd_foldl((z, z), grid, Tuple(I), fp.rad, fp.topology) do a, J, d
         aws, awn = a
         active = mask[J...]
-        wk = Kernels.kernel_weight(kernel, d, scale) * FlowGeometries.Grids.area(grid, J...)
+        wk = Kernels.kernel_weight(kernel, d, scale, Val(N)) * FlowGeometries.Grids.area(grid, J...)
         if strategy isa ZeroFill
             awn = awn .+ wk
             active && (aws = aws .+ wk .* SA.SVector{K,T}(ntuple(m -> fields[m][J...], Val(K))))
@@ -283,8 +299,10 @@ end
         end
         (aws, awn)
     end
+    zerofill = strategy isa ZeroFill
     @inbounds for m in 1:K
-        outs[m][I] = wn[m] > T(1e-15) ? ws[m] / wn[m] : zero(T)
+        n = zerofill ? _add_exterior(wn[m], fp.exterior, I) : wn[m]
+        outs[m][I] = _normalized(ws[m], n)
     end
     return nothing
 end
@@ -298,7 +316,7 @@ end
     fill!(acc_wn, zero(T))
     _nd_foldl(nothing, grid, Tuple(I), fp.rad, fp.topology) do _, J, d
         active = mask[J...]
-        wk = Kernels.kernel_weight(kernel, d, scale) * FlowGeometries.Grids.area(grid, J...)
+        wk = Kernels.kernel_weight(kernel, d, scale, Val(N)) * FlowGeometries.Grids.area(grid, J...)
         if strategy isa ZeroFill
             for m in eachindex(fields)
                 acc_wn[m] += wk
@@ -316,8 +334,10 @@ end
         end
         nothing
     end
+    zerofill = strategy isa ZeroFill
     @inbounds for m in eachindex(outs)
-        outs[m][I] = acc_wn[m] > T(1e-15) ? acc_ws[m] / acc_wn[m] : zero(T)
+        n = zerofill ? _add_exterior(acc_wn[m], fp.exterior, I) : acc_wn[m]
+        outs[m][I] = _normalized(acc_ws[m], n)
     end
     return nothing
 end
@@ -330,11 +350,12 @@ function apply_footprint_nd_batch_over!(
     mask = FlowGeometries.Grids.mask(grid)
     acc_ws = _batch_zeros(outs, T)
     acc_wn = _batch_zeros(outs, T)
+    zerofill = strategy isa ZeroFill
     if fp.cache !== nothing
         cache = fp.cache
         lin = LinearIndices(dims)
         @inbounds for I in indices
-            mask[I] || continue
+            _filters_target(strategy, mask[I]) || continue
             t = lin[I]
             lo = cache.ptr[t]
             hi = cache.ptr[t+1] - 1
@@ -344,7 +365,7 @@ function apply_footprint_nd_batch_over!(
                 J = cache.nbrs[k]
                 active = mask[J...]
                 wk = cache.w[k]
-                if strategy isa ZeroFill
+                if zerofill
                     for m in eachindex(fields)
                         acc_wn[m] += wk
                     end
@@ -361,13 +382,14 @@ function apply_footprint_nd_batch_over!(
                 end
             end
             for m in eachindex(outs)
-                outs[m][I] = acc_wn[m] > T(1e-15) ? acc_ws[m] / acc_wn[m] : zero(T)
+                n = zerofill ? _add_exterior(acc_wn[m], fp.exterior, I) : acc_wn[m]
+                outs[m][I] = _normalized(acc_ws[m], n)
             end
         end
     else
         kernel, scale = fp.kernel, fp.scale
         @inbounds for I in indices
-            mask[I] || continue
+            _filters_target(strategy, mask[I]) || continue
             _nd_stream_point!(outs, fields, grid, fp, strategy, mask, I, kernel, scale, acc_ws, acc_wn)
         end
     end

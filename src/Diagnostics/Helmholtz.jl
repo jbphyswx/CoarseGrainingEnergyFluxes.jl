@@ -32,7 +32,8 @@ directly (not as a residual), yet the identity holds by the same bilinearity/lin
 Contracting the split stress against the *full*, undecomposed strain S̄ — a one-sided split — is only
 correct when S̄ᵈ ≡ 0, and silently wrong whenever the divergent part carries strain of its own.
 
-Returns a named tuple of flux maps (W m⁻³): `rotational` = Π_RR, `divergent` = Π_DD, `cross` = Π_X.
+Returns a named tuple of specific flux maps (m² s⁻³): `rotational` = Π_RR, `divergent` = Π_DD,
+`cross` = Π_X.
 """
 function compute_Π_decomposed(
     u::AbstractVecOrMat,
@@ -45,14 +46,14 @@ function compute_Π_decomposed(
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    # One derivative object for every gradient below; they differ only in the field.
-    dplan = _default_deriv_plan(grid)
     gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
     size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
     size(u_rot) == gsz || throw(DimensionMismatch("u_rot has size $(size(u_rot)), grid expects $gsz"))
     size(v_rot) == gsz || throw(DimensionMismatch("v_rot has size $(size(v_rot)), grid expects $gsz"))
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+    # One derivative object for every gradient below, over the cells the filtered fields are read on.
+    dplan = _default_deriv_plan(output_grid(grid, plan))
     return compute_Π_decomposed!(
         PiDecomposedWorkspace(grid), u, v, u_rot, v_rot, grid, kernel, scale;
         filter_plan = plan, deriv_plan = dplan,
@@ -159,9 +160,7 @@ end
     compute_Π_decomposed(u, v, u_rot, v_rot, grid::AbstractGrid{<:SphericalGeometry}, kernel, scale; ...)
         -> (; total, rotational, cross, divergent)
 
-Spherical form of the rotational/divergent split, on any grid resolving two tangent directions — the
-configuration of Buzzicotti et al. (2023), where the Helmholtz parts come from scalar potentials
-filtered as scalars.
+Spherical form of the rotational/divergent split, on any grid resolving two tangent directions.
 
 Both sides of the bilinear contraction split exactly as they do on a plane; what the sphere changes is
 how each side is built. The stress is bilinear, so its three pieces `τʳʳ`, `τᵈᵈ` and `τ_X` are formed
@@ -188,7 +187,7 @@ function compute_Π_decomposed(
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
     return compute_Π_decomposed!(
         SphericalPiDecomposedWorkspace(grid), u, v, u_rot, v_rot, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = _default_deriv_plan(grid),
+        filter_plan = plan, deriv_plan = _default_deriv_plan(output_grid(grid, plan)),
     )
 end
 
@@ -217,7 +216,8 @@ function compute_Π_decomposed!(
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
         filter_plan
-    dplan = _resolve_deriv_plan(deriv_plan, grid)
+    og = output_grid(grid, plan)
+    dplan = _resolve_deriv_plan(deriv_plan, og)
     geo = FlowGeometries.Grids.grid_geometry(grid)
     pr, pd, br, bd, loc = ws.pr, ws.pd, ws.br, ws.bd, ws.loc
 
@@ -241,12 +241,12 @@ function compute_Π_decomposed!(
     end
 
     Filtering.filter_apply_batch!((br..., bd...), (pr..., pd...), plan)
-    _sph_pair_moments!(ws.τRR, ws.τX, ws.τDD, pr, pd, br, bd, ws.prod, plan, grid, geo)
+    _sph_pair_moments!(ws.τRR, ws.τX, ws.τDD, pr, pd, br, bd, ws.prod, plan, og, geo)
 
     # Each part's filtered velocity back in the local frame, where its strain is taken.
     @inbounds for I in CartesianIndices(ws.total)
         i = Tuple(I)
-        if FlowGeometries.Grids.isactive(grid, i...)
+        if FlowGeometries.Grids.isactive(og, i...)
             λ, φ = FlowGeometries.Grids.coords(grid, i...)
             lr = FlowGeometries.Geometry.vector_from_cartesian(geo, br[1][I], br[2][I], br[3][I], λ, φ)
             ld = FlowGeometries.Geometry.vector_from_cartesian(geo, bd[1][I], bd[2][I], bd[3][I], λ, φ)
@@ -259,10 +259,10 @@ function compute_Π_decomposed!(
         end
     end
 
-    _strain_into!(ws.SR[1], ws.SR[2], ws.SR[3], loc[1], loc[2], ws.tmp, grid, dplan, T)
-    _strain_into!(ws.SD[1], ws.SD[2], ws.SD[3], loc[3], loc[4], ws.tmp, grid, dplan, T)
+    _strain_into!(ws.SR[1], ws.SR[2], ws.SR[3], loc[1], loc[2], ws.tmp, og, dplan, T)
+    _strain_into!(ws.SD[1], ws.SD[2], ws.SD[3], loc[3], loc[4], ws.tmp, og, dplan, T)
 
-    mask = FlowGeometries.Grids.mask(grid)
+    mask = FlowGeometries.Grids.mask(og)
     SR, SD, τRR, τX, τDD = ws.SR, ws.SD, ws.τRR, ws.τX, ws.τDD
     @inbounds for I in CartesianIndices(ws.total)
         if mask[I]
@@ -310,7 +310,8 @@ function compute_Π_decomposed!(
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
         filter_plan
-    dplan = _resolve_deriv_plan(deriv_plan, grid)
+    og = output_grid(grid, plan)
+    dplan = _resolve_deriv_plan(deriv_plan, og)
 
     # Divergent (irrotational) part is the complement of the supplied rotational part.
     @. ws.u_div = u - u_rot
@@ -340,10 +341,10 @@ function compute_Π_decomposed!(
     _second_moment!(ws.scratch, ws.u_div, v_rot, ws.ūd, ws.v̄r, ws.prod, ws.fbuf, plan)
     @. ws.τX_xy += ws.scratch
 
-    _strain_into!(ws.SR_xx, ws.SR_xy, ws.SR_yy, ws.ūr, ws.v̄r, ws.scratch, grid, dplan, T)
-    _strain_into!(ws.SD_xx, ws.SD_xy, ws.SD_yy, ws.ūd, ws.v̄d, ws.scratch, grid, dplan, T)
+    _strain_into!(ws.SR_xx, ws.SR_xy, ws.SR_yy, ws.ūr, ws.v̄r, ws.scratch, og, dplan, T)
+    _strain_into!(ws.SD_xx, ws.SD_xy, ws.SD_yy, ws.ūd, ws.v̄d, ws.scratch, og, dplan, T)
 
-    mask = FlowGeometries.Grids.mask(grid)
+    mask = FlowGeometries.Grids.mask(og)
     @. ws.Πrr = ifelse(mask,
         -(ws.SR_xx * ws.τRR_xx + T(2) * ws.SR_xy * ws.τRR_xy + ws.SR_yy * ws.τRR_yy), zero(T))
     @. ws.Πdd = ifelse(mask,

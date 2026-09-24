@@ -294,16 +294,23 @@ Test.@testset "Π strain/convergence decomposition equals the direct −S̄:τ̄
             # Both terms carry real signal, so `total` is not one of them plus noise.
             Test.@test maximum(abs, d.strain) > 0.05 * scl
             Test.@test maximum(abs, d.convergence) > 0.05 * scl
-            # Masked cells are zero in every returned field, as everywhere else in the package.
+            # `Deformable` zeroes an inactive target. Under `ZeroFill` land is fluid at rest, so the flux
+            # reaches over it by the kernel radius and one derivative stencil (Aluie et al. 2018) and is
+            # zero beyond.
+            far = _cgef_beyond_reach(grid, CGEF.Kernels.kernel_radius(kern, ℓ) + dx)
+            dead = strat isa CGEF.Filtering.Deformable ? .!mask : far
             for f in (d.total, d.strain, d.convergence, d.divergence, d.strain_magnitude)
-                Test.@test all(iszero, f[.!mask])
+                Test.@test all(iszero, f[dead])
             end
-            # ᾱ ≥ 0 by construction, and the paper's bound |Π_α| ≤ ᾱ E′ with E′ = (τ_uu + τ_vv)/2.
+            if strat isa CGEF.Filtering.ZeroFill && mname == "masked"
+                Test.@test any(!iszero, d.total[.!mask .& .!far])
+            end
+            # ᾱ ≥ 0 by construction, and the paper's bound |Π_α| ≤ ᾱ E′ with E′ = (τ_uu + τ_vv)/2. A
+            # non-negative kernel makes τ a variance on every cell it is defined on, land included.
             Test.@test all(>=(0), d.strain_magnitude)
             L, C, R = CGEF.Diagnostics.tau_decomposition(u, v, grid, kern, ℓ; mask_strategy = strat)
             E′ = ((L.xx .+ C.xx .+ R.xx) .+ (L.yy .+ C.yy .+ R.yy)) ./ 2
-            Test.@test all(I -> !mask[I] ||
-                                abs(d.strain[I]) <= abs(d.strain_magnitude[I] * E′[I]) + 1e-12 * scl,
+            Test.@test all(I -> abs(d.strain[I]) <= abs(d.strain_magnitude[I] * E′[I]) + 1e-12 * scl,
                            CartesianIndices(d.strain))
         end
     end
@@ -399,12 +406,20 @@ Test.@testset "Enstrophy flux: vorticity, deformation gauge, and Π's dual" begi
         Test.@test maximum(abs, Z .- uns) > 0.05 * maximum(abs, Z)
     end
 
-    # Masked cells are zero, and the mask is honoured through both stages.
-    let m = trues(N, N); m[12:18, 10:16] .= false
+    # The vorticity differences the velocity on the input grid, so a masked cell reads zero. Under
+    # `ZeroFill` the flux reaches over land by the kernel radius and one derivative stencil and is zero
+    # beyond; `Deformable` zeroes every inactive target.
+    let m = trues(N, N); m[10:22, 8:20] .= false
         gm = FG.Grids.StructuredGrid(geom, xs, xs, m)
-        Zm = CGEF.Diagnostics.enstrophy_flux(u, v, gm, CGEF.GaussianKernel(), ℓ)
-        Test.@test all(iszero, Zm[.!m])
         Test.@test all(iszero, CGEF.Diagnostics.vorticity(u, v, gm)[.!m])
+        Zm = CGEF.Diagnostics.enstrophy_flux(u, v, gm, CGEF.TopHatKernel(), ℓ)
+        far = _cgef_beyond_reach(gm, CGEF.Kernels.kernel_radius(CGEF.TopHatKernel(), ℓ) + dx)
+        Test.@test any(far)
+        Test.@test all(iszero, Zm[far])
+        Test.@test any(!iszero, Zm[.!m .& .!far])
+        Zd = CGEF.Diagnostics.enstrophy_flux(u, v, gm, CGEF.GaussianKernel(), ℓ;
+                                             mask_strategy = CGEF.Filtering.Deformable())
+        Test.@test all(iszero, Zd[.!m])
     end
 
     # The in-place form matches the allocating one and reuses its buffers.
@@ -421,10 +436,10 @@ Test.@testset "Enstrophy flux: vorticity, deformation gauge, and Π's dual" begi
     end
 end
 
-# The scale-band decomposition. Its correctness rests on the SAME property `ZeroFill` was made the
-# default for — each filter conserving the domain mean — which holds exactly only where the footprint
-# is not truncated. So the identity is asserted EXACT on a periodic unmasked grid, and bounded by the
-# measured `O(ℓ/L)` boundary residual elsewhere.
+# The scale-band decomposition. Its correctness rests on each filter conserving the domain integral,
+# which `ZeroFill` does on a periodic grid, masked or not. So the identity is asserted exact there, and
+# past a bounded edge, where the filtered field leaves the grid, its residual is asserted equal to the
+# integral the filters lose.
 Test.@testset "Band energies: repeated-filter Germano identity sums to the total" begin
     geom = FG.Geometry.CartesianGeometry()
     N = 48; dx = 1000.0
@@ -466,33 +481,42 @@ Test.@testset "Band energies: repeated-filter Germano identity sums to the total
         Test.@test abs(r.bands[1] - naive1) > 1e-3 * r.bands[1]
     end
 
-    # Where the footprint IS truncated the identity carries a boundary residual, and the residual
-    # tracks the filter's own failure to conserve the mean — which is the mechanism, not a fudge.
+    # Past a bounded edge the filtered field leaves the grid. The sum still telescopes, to the integral
+    # each filter loses there: `total − ½⟨|u|²⟩ = ½ Σₙ (⟨(|f_{n-1}|²)‾⟩ − ⟨|f_{n-1}|²⟩)`.
     let gb = FG.Grids.StructuredGrid(geom, 0.0:dx:(N - 1) * dx, 0.0:dx:(N - 1) * dx, trues(N, N)),
         kern = CGEF.GaussianKernel()
         rb = CGEF.Diagnostics.band_energies(u, v, gb, kern, scales)
-        o = zeros(N, N)
-        CGEF.Filtering.filter_apply!(o, u, CGEF.Filtering.plan_filter(gb, kern, 6 * dx))
-        drift = abs(sum(o) - sum(u)) / sum(abs, u)
-        Test.@test 1e-3 < abs(rb.total - Etot) / Etot < 3e-2      # O(ℓ/L), not round-off
-        Test.@test abs(rb.total - Etot) / Etot < 5 * drift        # and it is that drift, not more
+        fu, fv = copy(u), copy(v)
+        loss = 0.0
+        for s in scales
+            p = CGEF.Filtering.plan_filter(gb, kern, s)
+            sq = fu .^ 2 .+ fv .^ 2
+            loss += (sum(CGEF.Filtering.filter_apply!(zeros(N, N), sq, p)) - sum(sq)) / (2N^2)
+            fu = CGEF.Filtering.filter_apply!(zeros(N, N), fu, p)
+            fv = CGEF.Filtering.filter_apply!(zeros(N, N), fv, p)
+        end
+        Test.@test abs(loss) > 1e-3 * Etot
+        Test.@test rb.total - Etot ≈ loss rtol = 1e-10
     end
 
-    # On a MASKED domain both strategies leak, in opposite ways: `ZeroFill` smears energy onto masked
-    # cells that then report zero, `Deformable` renormalizes it away and tracks the active-cell
-    # integral better. Measured 1.1e-2 against 4.8e-4 — the trade the default makes, asserted.
+    # On a masked periodic grid `ZeroFill` still conserves the integral: every cell is summed, land
+    # included, over the water area, so the identity closes on the water energy exactly. `Deformable`
+    # renormalizes over the active cells, which does not conserve it, and zeroes the land.
     let m = trues(N, N); m[12:20, 10:18] .= false
         gm = FG.Grids.StructuredGrid(geom, xp, xp, m; periodic = (true, true))
         area = CGEF.Diagnostics.active_area(gm)
         Em = 0.5 * sum((u[I]^2 + v[I]^2) * FG.Grids.area(gm, Tuple(I)...)
                        for I in CartesianIndices(m) if m[I]) / area
-        rz = CGEF.Diagnostics.band_energies(u, v, gm, CGEF.GaussianKernel(), scales;
-                                            mask_strategy = CGEF.Filtering.ZeroFill())
-        rd = CGEF.Diagnostics.band_energies(u, v, gm, CGEF.GaussianKernel(), scales;
-                                            mask_strategy = CGEF.Filtering.Deformable())
-        Test.@test abs(rz.total - Em) / Em > 1e-3
-        Test.@test abs(rd.total - Em) / Em < 0.2 * (abs(rz.total - Em) / Em)
-        Test.@test all(iszero, rz.resolved_map[.!m])
+        for kern in (CGEF.TopHatKernel(), CGEF.GaussianKernel())
+            rz = CGEF.Diagnostics.band_energies(u, v, gm, kern, scales;
+                                                mask_strategy = CGEF.Filtering.ZeroFill())
+            rd = CGEF.Diagnostics.band_energies(u, v, gm, kern, scales;
+                                                mask_strategy = CGEF.Filtering.Deformable())
+            Test.@test rz.total ≈ Em rtol = 1e-12
+            Test.@test any(!iszero, rz.resolved_map[.!m])
+            Test.@test abs(rd.total - Em) / Em > 1e-5
+            Test.@test all(iszero, rd.resolved_map[.!m])
+        end
     end
 
     # A signed kernel breaks the pointwise positivity, hence the non-negative-kernel requirement.
@@ -558,8 +582,8 @@ Test.@testset "check_setup reports what will run, and every capability it claims
         Test.@test rr.supports_spectral_method == got_spectral
         # supports_flux ⇔ the kernel is non-negative on its support
         if CGEF.Kernels.is_radial(kern)
-            rad = CGEF.Kernels.kernel_radius(kern, 8 * dx)
-            nonneg = all(t -> CGEF.Kernels.kernel_weight(kern, t, 8 * dx) >= 0,
+            rad = CGEF.Kernels.kernel_radius(kern, 8 * dx, Val(2))
+            nonneg = all(t -> CGEF.Kernels.kernel_weight(kern, t, 8 * dx, Val(2)) >= 0,
                          range(0.0, rad; length = 2000))
             Test.@test rr.supports_flux == nonneg
         else
@@ -810,42 +834,9 @@ Test.@testset "AutoMethod's transform engines equal the direct engine on every h
     end
 end
 
-# The filter's definition summed directly: every source cell and, on a periodic Cartesian direction,
-# every image of it inside the support, at the geometry's own distance, weighted `G(d)·A` and normalized
-# by the weight that falls on the grid. A spherical longitude identifies, so its cells come once.
-function _cgef_direct_filter(grid, kernel, ℓ, f)
-    geo = FG.Grids.grid_geometry(grid)
-    cart = geo isa FG.Geometry.CartesianGeometry
-    sz = FG.Grids.size_tuple(grid)
-    N = length(sz)
-    rad = CGEF.Kernels.kernel_radius(kernel, ℓ)
-    tiles = ntuple(d -> cart && FG.Grids.isperiodic(grid, d), N)
-    P = ntuple(d -> tiles[d] ? FG.Grids.period(grid, d) : 0.0, N)
-    M = ntuple(d -> tiles[d] ? ceil(Int, rad / P[d]) + 1 : 0, N)
-    out = zeros(sz)
-    for I in CartesianIndices(sz)
-        xi = FG.Grids.coords(grid, Tuple(I)...)
-        num = 0.0
-        den = 0.0
-        for J in CartesianIndices(sz), m in CartesianIndices(ntuple(d -> (-M[d]):M[d], N))
-            xj = FG.Grids.coords(grid, Tuple(J)...)
-            xm = ntuple(d -> xj[d] + m[d] * P[d], N)
-            dist = FG.Geometry.distance(geo, xi, xm)
-            dist <= rad || continue
-            w = CGEF.Kernels.kernel_weight(kernel, dist, ℓ) * FG.Grids.measure(grid, Tuple(J)...)
-            num += w * f[J]
-            den += w
-        end
-        out[I] = num / den
-    end
-    return out
-end
-
-_cgef_relerr(a, b) = maximum(abs, a .- b) / maximum(abs, b)
-
 # A support wider than half the domain reaches cells through several images on a periodic Cartesian
 # direction, and more than half the rows on a bounded one. Every real-space engine must still equal the
-# definition, on every host and device path.
+# definition under both strategies, masked or not, on every host and device path.
 Test.@testset "Real-space engines equal the direct sum at supports past half the domain" begin
     SER = CGEF.ComputationalBackends.SerialBackend()
     THR = CGEF.ComputationalBackends.ThreadedBackend()
@@ -856,15 +847,18 @@ Test.@testset "Real-space engines equal the direct sum at supports past half the
                  for I in CartesianIndices(sz)]
     function check(g, k, ℓ, engine; backends = (SER, THR, DEV), method = CGEF.Filtering.RealSpace(), kw...)
         f = field(FG.Grids.size_tuple(g))
-        ref = _cgef_direct_filter(g, k, ℓ, f)
-        for b in backends
-            p = CGEF.Filtering.plan_filter(g, k, ℓ; method = method, backend = b, kw...)
-            # A device plan holds its footprint's resident copy, which wraps the host plan.
-            fp = b isa CGEF.ComputationalBackends.GPUBackend ? p.footprint.fp : p.footprint
-            Test.@test nameof(typeof(fp)) === engine
-            Test.@test _cgef_relerr(CGEF.Filtering.filter_apply!(zero(f), f, p), ref) < 1e-11
+        for s in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
+            ref = _cgef_direct_filter(g, k, ℓ, f, s)
+            for b in backends
+                p = CGEF.Filtering.plan_filter(g, k, ℓ; method = method, backend = b, mask_strategy = s, kw...)
+                # A device plan holds its footprint's resident copy, which wraps the host plan.
+                fp = b isa CGEF.ComputationalBackends.GPUBackend ? p.footprint.fp : p.footprint
+                Test.@test nameof(typeof(fp)) === engine
+                Test.@test _cgef_relerr(CGEF.Filtering.filter_apply!(zero(f), f, p), ref) < 1e-11
+            end
         end
     end
+    hole(sz) = (m = trues(sz); m[5:8, 3:5] .= false; m)
 
     # Periodic in both directions, periods 16 and 8.4; ℓ/Lx = 0.3, 0.6, 1.2, 2.55. No cell sits on the
     # support boundary: `i² + 0.49 j²` never equals `rad²` for these radii.
@@ -881,12 +875,21 @@ Test.@testset "Real-space engines equal the direct sum at supports past half the
     for ℓ in (5.1462, 14.3874, 29.9226)
         check(gs, TH, ℓ, :PrefixSumTopHatPlan)
     end
-    # Bounded, with the support reaching more than half the rows.
+    # Bounded, with the support reaching more than half the rows and past both ends, with and without
+    # a mask.
     gb = FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:2.8)
-    for ℓ in (4.8, 9.6)
-        check(gb, TH, ℓ, :PrefixSumTopHatPlan)
-        check(gb, SH, ℓ, :FilterFootprint; backends = (SER, THR))
-        check(gb, SH, ℓ, :PaddedFFTFootprint; backends = (SER, THR), method = CGEF.Filtering.AutoMethod())
+    gbm = FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:4.9, hole((16, 8)))
+    for g in (gb, gbm), ℓ in (4.8, 9.6)
+        check(g, TH, ℓ, :PrefixSumTopHatPlan)
+        check(g, SH, ℓ, :FilterFootprint; backends = (SER, THR))
+        check(g, SH, ℓ, :PaddedFFTFootprint; backends = (SER, THR), method = CGEF.Filtering.AutoMethod())
+    end
+    # A stretched bounded axis continues at its edge gaps, and the scattered engine carries that mass.
+    let gsb = FG.Grids.StructuredGrid(cart, xs, collect(0.0:0.7:4.9), hole((13, 8)))
+        for ℓ in (2.9, 6.13)
+            check(gsb, TH, ℓ, :PrefixSumTopHatPlan)
+            check(gsb, SH, ℓ, :ScatteredFilterPlan; backends = (SER, THR))
+        end
     end
 
     # Periodic volume: whole turns of axis 1 and images along axes 2 and 3.
@@ -900,6 +903,15 @@ Test.@testset "Real-space engines equal the direct sum at supports past half the
                                   periodic = (true, true, true), period = (6.2, 3.5, 3.6))
     for ℓ in (4.8, 13.3), cs in (CGEF.Filtering.NeverCache(), CGEF.Filtering.AlwaysCache())
         check(g3s, SH, ℓ, :NDScatteredFilterPlan; backends = (SER, THR), cache_strategy = cs)
+    end
+    # A bounded masked volume: the support leaves the grid on every face.
+    let m3 = trues(6, 5, 4)
+        m3[2:3, 2:3, 2] .= false
+        g3b = FG.Grids.StructuredGrid(cart, 0.0:1.0:5.0, 0.0:0.7:2.8, 0.0:0.9:2.7, m3)
+        for ℓ in (2.9, 5.3)
+            check(g3b, TH, ℓ, :PrefixSumTopHat3DPlan)
+            check(g3b, SH, ℓ, :FilterFootprintND)
+        end
     end
 
     # Sphere: latitude reaching more than half the rows, and a regional box whose longitude support is
@@ -917,6 +929,13 @@ Test.@testset "Real-space engines equal the direct sum at supports past half the
     check(gr, SH, 1000e3, :FilterFootprint; backends = (SER, THR))
     check(grv, SH, 1000e3, :ScatteredFilterPlan; backends = (SER, THR))
     check(gr, TH, 1000e3, :PrefixSumTopHatPlan)
+    # The same box with a hole: the kernel reaches the pole and around the rest of the ring.
+    let sm = (m = trues(20, 11); m[4:6, 3:4] .= false; m),
+        grm = FG.Grids.StructuredGrid(sph, range(0.0, deg2rad(38.0); length = 20),
+                                      range(deg2rad(60.0), deg2rad(80.0); length = 11), sm)
+        check(grm, SH, 1500e3, :FilterFootprint; backends = (SER, THR))
+        check(grm, TH, 600e3, :PrefixSumTopHatPlan)
+    end
 end
 
 Test.@testset "Sphere: the energy diagnostics filter the planetary velocity, as the flux does" begin
@@ -947,6 +966,34 @@ Test.@testset "Sphere: the energy diagnostics filter the planetary velocity, as 
     rows = findall(φ -> abs(φ) <= deg2rad(50.0) + 1e-9, lat)
     ratio = CGEF.Diagnostics.band_energies(ub, zero(ub), g, k, [1200e3]; backend = SER).resolved_map ./ c2
     Test.@test (maximum(ratio[:, rows]) - minimum(ratio[:, rows])) < 1e-8 * ratio[1, rows[1]]
+end
+
+# A `ZeroFill` sweep's energy sums `|ū|²` over every cell, land included, and divides by the water area
+# (Storer et al. 2022); its `Π` over land is the flux of the zero-extended field, zero beyond the
+# kernel's reach (Aluie et al. 2018). Land values are never read.
+Test.@testset "coarse_grain on a masked grid: energy over the water area, Π over land" begin
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    N = 24
+    xs = 0.0:1.0:(N - 1)
+    m = trues(N, N); m[8:14, 6:12] .= false
+    g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs, m; periodic = (true, true))
+    u = [m[i, j] ? sin(2π * 2 * i / N) * cos(2π * 3 * j / N) + 0.3 : NaN for i in 1:N, j in 1:N]
+    v = [m[i, j] ? cos(2π * 3 * i / N) * sin(2π * 1 * j / N) - 0.2 : NaN for i in 1:N, j in 1:N]
+    k = CGEF.TopHatKernel()
+    scales = [2.9, 6.13]       # radii off every lattice distance
+    r = CGEF.coarse_grain(u, v, g; scales, kernel = k, backend = SER, spectrum = CGEF.Diagnostics.NoSpectrum())
+    water = count(m) * 1.0
+    for (s, ℓ) in enumerate(scales)
+        ū = _cgef_direct_filter(g, k, ℓ, u)
+        v̄ = _cgef_direct_filter(g, k, ℓ, v)
+        Test.@test r.cumulative_energy[s] ≈ 0.5 * sum(ū .^ 2 .+ v̄ .^ 2) / water rtol = 1e-12
+    end
+    Π1 = r.Π[:, :, 1]
+    Test.@test all(isfinite, r.Π)
+    far = _cgef_beyond_reach(g, CGEF.Kernels.kernel_radius(k, scales[1]) + 1.0)
+    Test.@test any(far)
+    Test.@test all(iszero, Π1[far])
+    Test.@test any(!iszero, Π1[.!m .& .!far])
 end
 
 _cgef_alloc_favre(ws, u, v, ρ, P, g, k, ℓ, fp, dp) =
@@ -987,7 +1034,10 @@ Test.@testset "Favre budget: Π, Λ and P̄∇·ū are three distinct terms" beg
         τyy = f(ρ .* v .* v) ./ ρ̄ .- ṽ .^ 2
         # τ̄(ρ,u_j) is the UNWEIGHTED subscale mass flux — the framework needs both moment types.
         mx = f(ρ .* u) .- ρ̄ .* ū; my = f(ρ .* v) .- ρ̄ .* v̄
-        Πr = -ρ̄ .* (d(ũ, 1) .* τxx .+ (d(ũ, 2) .+ d(ṽ, 1)) .* τxy .+ d(ṽ, 2) .* τyy)
+        # ρ̄ ∂_j ũ_i = ∂_j (ρu_i)‾ − ũ_i ∂_j ρ̄, the product rule differencing only filtered fields.
+        A(m, ũi, j) = d(m, j) .- ũi .* d(ρ̄, j)
+        Πr = -(A(f(ρ .* u), ũ, 1) .* τxx .+ (A(f(ρ .* u), ũ, 2) .+ A(f(ρ .* v), ṽ, 1)) .* τxy .+
+               A(f(ρ .* v), ṽ, 2) .* τyy)
         Λr = (d(P̄, 1) .* mx .+ d(P̄, 2) .* my) ./ ρ̄
         PDr = P̄ .* (d(ū, 1) .+ d(v̄, 2))
         Test.@test r.Π == Πr
@@ -1048,4 +1098,59 @@ Test.@testset "Favre budget: Π, Λ and P̄∇·ū are three distinct terms" beg
     Test.@test_throws ArgumentError CGEF.Diagnostics.compressible_flux(u, v, fill(-1.0, N, N), P, grid, ker, ℓ)
     Test.@test_throws ArgumentError CGEF.Diagnostics.compressible_flux(u, v, zeros(N, N), P, grid, ker, ℓ)
     Test.@test_throws DimensionMismatch CGEF.Diagnostics.compressible_flux(u, v, ρ, zeros(N + 1, N), grid, ker, ℓ)
+end
+
+# Under `ZeroFill` land holds no fluid, so `ρ̄` is the fluid mass under the kernel and the Favre fields
+# are density-weighted means over the fluid, zero where none lies under it. Land values are never read.
+Test.@testset "Favre budget on a masked grid" begin
+    geom = FG.Geometry.CartesianGeometry()
+    N = 48; dx = 1000.0
+    xs = 0.0:dx:(N - 1) * dx
+    m = trues(N, N); m[18:34, 14:30] .= false
+    ker = CGEF.TopHatKernel(); ℓ = 6 * dx
+    rad = CGEF.Kernels.kernel_radius(ker, ℓ)
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    ZF, DF = CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable()
+    u = [sin(2π * 3 * i / N) * cos(2π * 2 * j / N) + 0.4cos(2π * 5 * i / N) for i in 1:N, j in 1:N]
+    v = [cos(2π * 2 * i / N) * sin(2π * 4 * j / N) + 0.3sin(2π * 6 * j / N) for i in 1:N, j in 1:N]
+    ρ = [1.0 + 0.3sin(2π * 2 * i / N) * cos(2π * 3 * j / N) for i in 1:N, j in 1:N]
+    P = [10.0 + 2.0cos(2π * 3 * i / N) * sin(2π * 2 * j / N) for i in 1:N, j in 1:N]
+    for A in (u, v, ρ, P)
+        A[.!m] .= NaN
+    end
+    grids = (FG.Grids.StructuredGrid(geom, xs, xs, m),
+             FG.Grids.CurvilinearGrid(geom, [xs[i] for i in 1:N, j in 1:N], [xs[j] for i in 1:N, j in 1:N], m))
+
+    for g in grids
+        far = _cgef_beyond_reach(g, rad)
+        Test.@test any(far)
+        for strat in (ZF, DF)
+            r = CGEF.Diagnostics.compressible_flux(u, v, ρ, P, g, ker, ℓ; mask_strategy = strat, backend = SER)
+            for f in (r.Π, r.Λ, r.pressure_dilatation, r.ρ̄, r.P̄, r.ũ, r.ṽ)
+                Test.@test all(isfinite, f)
+            end
+            dead = strat isa CGEF.Filtering.ZeroFill ? far : .!m
+            for f in (r.Π, r.Λ, r.pressure_dilatation, r.ũ, r.ṽ)
+                Test.@test all(iszero, f[dead])
+            end
+            strat isa CGEF.Filtering.ZeroFill && Test.@test any(!iszero, r.Π[.!m .& .!far])
+        end
+    end
+
+    # Constant density, on the fluid cells whose kernel and derivative stencil hold only fluid: there
+    # the fluid fills the kernel, so the Favre filter is the unweighted one, `Π = ρ₀·Π_incompressible`
+    # and `Λ = 0`.
+    let g = grids[1], ρ₀ = 1.3,
+        ρc = [m[I] ? ρ₀ : NaN for I in CartesianIndices(m)],
+        land = [FG.Grids.coords(g, Tuple(J)...) for J in CartesianIndices(m) if !m[J]],
+        inner = [m[I] && all(x -> FG.Geometry.distance(geom, FG.Grids.coords(g, Tuple(I)...), x) > rad + dx, land) &&
+                 all(d -> min(I[d] - 1, N - I[d]) * dx > rad + dx, 1:2) for I in CartesianIndices(m)]
+        Test.@test count(inner) > 100
+        rc = CGEF.Diagnostics.compressible_flux(u, v, ρc, P, g, ker, ℓ; backend = SER)
+        Πi = zeros(N, N)
+        CGEF.Diagnostics.compute_Π!(Πi, u, v, nothing, g, ker, ℓ; backend = SER)
+        Test.@test maximum(abs, rc.Π[inner] ./ ρ₀ .- Πi[inner]) < 1e-12 * maximum(abs, Πi[inner])
+        gP = 2.0 * 2π * (3 + 2) / (N * dx)          # bounds |∇P| for the P above
+        Test.@test maximum(abs, rc.Λ[inner]) < 1e-12 * gP * maximum(abs, u[m])
+    end
 end

@@ -98,13 +98,17 @@ Cached FFT filter plan: the shared [`FFTWGridPlan`](@ref), the precomputed trans
 through. Built by `plan_filter(...; method = Spectral())`.
 """
 struct FFTWFilterPlan{
-    T<:AbstractFloat, GP<:FFTWGridPlan{T}, A<:AbstractMatrix{T}, R, SC<:FFTWScratch{T},
+    T<:AbstractFloat, GP<:FFTWGridPlan{T}, A<:AbstractMatrix{T}, R,
+    MS<:CGEF.Filtering.AbstractMaskStrategy, SC<:FFTWScratch{T},
 } <: CGEF.Filtering.AbstractFilterPlan
     grid_plan::GP
     transfer::A    # Ĝ(|k|, ℓ) on the rfft transform grid  (Px÷2+1, Py)
-    invrenorm::R   # precomputed 1/filter(mask) for Deformable, or nothing (ZeroFill / fully active)
+    invrenorm::R   # 1/filter(mask) for Deformable, zero at a masked cell; or nothing
+    strategy::MS
     scratch::SC
 end
+
+CGEF.Filtering.plan_strategy(plan::FFTWFilterPlan) = plan.strategy
 
 CGEF.Filtering._batched_fields(outs, plan::FFTWFilterPlan) =
     plan.grid_plan.batched !== nothing && ndims(first(outs)) == 3
@@ -288,12 +292,14 @@ function CGEF.Filtering.spectral_filter_plan(
         _fftw_inverse!(renorm, gp.inv, sc.cbuf, sc.pad_out, gp)
         threshold = T(0.01)
         ir = similar(renorm)
-        @. ir = ifelse(abs(renorm) >= threshold, one(T) / renorm, zero(T))
+        # A masked cell is zero under `Deformable`, as in the real-space engines.
+        active = mask === nothing ? trues(gp.dims) : mask
+        @. ir = ifelse(active & (abs(renorm) >= threshold), one(T) / renorm, zero(T))
         ir
     else
         nothing   # ZeroFill: already exactly `filter(mask .* field)`, no renormalization
     end
-    return FFTWFilterPlan(gp, transfer, invrenorm, sc)
+    return FFTWFilterPlan(gp, transfer, invrenorm, mask_strategy, sc)
 end
 
 function CGEF.Filtering.filter_apply!(
@@ -350,7 +356,7 @@ function CGEF.Filtering.padded_fft_footprint(
     dy = abs(step(FlowGeometries.Grids.coordinates(grid, 2)))
     px = FlowGeometries.Grids.isperiodic(grid, 1)
     py = FlowGeometries.Grids.isperiodic(grid, 2)
-    rad = CGEF.Kernels.kernel_radius(kernel, scale)
+    rad = CGEF.Kernels.kernel_radius(kernel, scale, Val(2))
     # A periodic axis reaches every image inside the support; a bounded one no farther than its extent.
     wx = px ? ceil(Int, rad / dx) : min(ceil(Int, rad / dx), Nx - 1)
     wy = py ? ceil(Int, rad / dy) : min(ceil(Int, rad / dy), Ny - 1)
@@ -365,7 +371,7 @@ function CGEF.Filtering.padded_fft_footprint(
     for dj in (-wy):wy, di in (-wx):wx
         d = hypot(di * dx, dj * dy)
         d <= rad || continue
-        wt = CGEF.Kernels.kernel_weight(kernel, d, scale) * A
+        wt = CGEF.Kernels.kernel_weight(kernel, d, scale, Val(2)) * A
         iszero(wt) && continue
         gpad[mod1(1 + di, Px), mod1(1 + dj, Py)] += wt
     end
@@ -375,13 +381,14 @@ function CGEF.Filtering.padded_fft_footprint(
     spec = similar(Ĝ)
     inv = FFTW.plan_irfft(spec, Px)
 
-    # The denominator differs by strategy, exactly as it does in the direct engine: `Deformable`
-    # renormalizes over ACTIVE cells, `ZeroFill` keeps a masked neighbour in the denominator and
-    # contributes nothing for it, so its denominator is the in-domain kernel mass.
+    # The denominator differs by strategy, as it does in the direct engine: `Deformable` renormalizes
+    # over the active cells, and `ZeroFill` divides by the kernel's full mass, its in-domain part through
+    # the transform and the part past a bounded edge from `_exterior_mass`.
+    zerofill = mask_strategy isa CGEF.Filtering.ZeroFill
     maskv = FlowGeometries.Grids.mask(grid)
     dpad = zeros(T, Px, Py)
     @inbounds for j in 1:Ny, i in 1:Nx
-        dpad[i, j] = (mask_strategy isa CGEF.Filtering.ZeroFill || maskv[i, j]) ? one(T) : zero(T)
+        dpad[i, j] = (zerofill || maskv[i, j]) ? one(T) : zero(T)
     end
     spec = fwd * dpad
     spec .*= Ĝ
@@ -390,6 +397,8 @@ function CGEF.Filtering.padded_fft_footprint(
     @inbounds for j in 1:Ny, i in 1:Nx
         den[i, j] = denfull[i, j]
     end
+    exterior = zerofill ? CGEF.Filtering._exterior_mass(grid, kernel, scale) : nothing
+    exterior === nothing || (den .+= exterior)
 
     return PaddedFFTFootprint(
         Ĝ, den, zeros(T, Px, Py), zeros(T, Px, Py), similar(Ĝ), fwd, inv, mask_strategy, (Nx, Ny),
@@ -429,7 +438,7 @@ struct ZonalFFTFootprint{
     Ŵ::R3           # (Nx÷2+1, 2·dj_lim+1, Ny) real kernel spectra, per (band offset, target row)
     invden::A       # (Nx, Ny) reciprocal window mass, built through this same transform
     dj_lim::Int
-    masked::Bool
+    bound::Bool     # the strategies' denominators differ: a cell is inactive or a window leaves the grid
     strategy::MS    # the strategy `invden` was built for
     src::A          # (Nx, Ny) scratch for `mask · field`
     F::C            # (Nx÷2+1, Ny) scratch: every source row's spectrum
@@ -480,7 +489,7 @@ function CGEF.Filtering.zonal_fft_footprint(
     R = FlowGeometries.Geometry.radius(geo)
     lat = FlowGeometries.Grids.coordinates(grid, 2)
     dλ = step(FlowGeometries.Grids.coordinates(grid, 1))
-    rad = CGEF.Kernels.kernel_radius(kernel, scale)
+    rad = CGEF.Kernels.kernel_radius(kernel, scale, Val(2))
 
     # Latitude band bound, from the axis's own minimum gap converted to a physical distance — the same
     # rule the banded builder uses, so the two engines cover the same set of source rows.
@@ -519,7 +528,7 @@ function CGEF.Filtering.zonal_fft_footprint(
                 cd = A0 + B0 * cosΔλ[di + 1]
                 cd >= cos_rad || continue
                 d = R * acos(clamp(cd, -one(T), one(T)))
-                gcol[di + 1, b] = CGEF.Kernels.kernel_weight(kernel, d, scale) * area
+                gcol[di + 1, b] = CGEF.Kernels.kernel_weight(kernel, d, scale, Val(2)) * area
             end
         end
         Ĝ = gplan * gcol
@@ -528,22 +537,26 @@ function CGEF.Filtering.zonal_fft_footprint(
         end
     end
 
-    masked = !all(FlowGeometries.Grids.mask(grid))
+    bound = !all(FlowGeometries.Grids.mask(grid)) || CGEF.Filtering._reaches_exterior(grid, kernel, scale)
     fp = ZonalFFTFootprint(
-        Ŵ, zeros(T, Nx, Ny), dj_lim, masked, mask_strategy,
+        Ŵ, zeros(T, Nx, Ny), dj_lim, bound, mask_strategy,
         zeros(T, Nx, Ny), Fbuf, similar(Fbuf), fwd, iplan,
     )
 
-    # Window mass through the same operator: `ZeroFill` counts every in-support cell, `Deformable` only
-    # the active ones.
+    # Window mass through the same operator: `ZeroFill` counts every in-support cell and the rows past a
+    # bounded latitude, as far as the poles; `Deformable` only the active in-domain cells, and gives an
+    # inactive target zero.
+    zerofill = mask_strategy isa CGEF.Filtering.ZeroFill
     maskv = FlowGeometries.Grids.mask(grid)
     @inbounds for j in 1:Ny, i in 1:Nx
-        fp.src[i, j] = (mask_strategy isa CGEF.Filtering.ZeroFill || maskv[i, j]) ? one(T) : zero(T)
+        fp.src[i, j] = (zerofill || maskv[i, j]) ? one(T) : zero(T)
     end
     den = zeros(T, Nx, Ny)
     _zonal_accumulate!(den, fp.src, fp, Ny)
+    exterior = zerofill ? CGEF.Filtering._exterior_mass(grid, kernel, scale) : nothing
+    exterior === nothing || (den .+= exterior)
     @inbounds for j in 1:Ny, i in 1:Nx
-        fp.invden[i, j] = (maskv[i, j] && den[i, j] > T(1e-15)) ? one(T) / den[i, j] : zero(T)
+        fp.invden[i, j] = (zerofill || maskv[i, j]) ? CGEF.Filtering._inv_mass(den[i, j]) : zero(T)
     end
     return fp
 end
@@ -557,8 +570,9 @@ function CGEF.Filtering.apply_footprint!(
     fp::ZonalFFTFootprint{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
     rows::D = CGEF.Filtering._sep_serial,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}, D}
-    (!fp.masked || typeof(strategy) === typeof(fp.strategy)) || throw(ArgumentError(
-        "this zonal-FFT footprint was built for $(nameof(typeof(fp.strategy))) on a masked grid; its " *
+    (!fp.bound || typeof(strategy) === typeof(fp.strategy)) || throw(ArgumentError(
+        "this zonal-FFT footprint was built for $(nameof(typeof(fp.strategy))) on a grid where the " *
+        "strategies normalize differently (a masked cell, or a window past a bounded latitude); its " *
         "normalization is not the one $(nameof(typeof(strategy))) needs. Rebuild the plan with the " *
         "strategy you intend to apply with.",
     ))
@@ -599,6 +613,7 @@ function CGEF.Filtering.apply_footprint!(
     Nx, Ny = fp.N
     maskv = FlowGeometries.Grids.mask(grid)
     pad, num, den = fp.pad, fp.num, fp.den
+    zerofill = strategy isa CGEF.Filtering.ZeroFill
     fill!(pad, zero(T))
     rows(1:Ny) do j
         @inbounds @simd for i in 1:Nx
@@ -612,8 +627,7 @@ function CGEF.Filtering.apply_footprint!(
     LA.mul!(num, fp.inv, fp.spec)
     rows(1:Ny) do j
         @inbounds @simd for i in 1:Nx
-            d = den[i, j]
-            out[i, j] = (maskv[i, j] && d > T(1e-15)) ? num[i, j] / d : zero(T)
+            out[i, j] = (zerofill || maskv[i, j]) ? CGEF.Filtering._normalized(num[i, j], den[i, j]) : zero(T)
         end
         return nothing
     end

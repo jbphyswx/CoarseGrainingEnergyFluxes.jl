@@ -256,7 +256,8 @@ result. A genuinely coupled, all-nine-strain-component 3D method exists separate
 for the true-3D Cartesian case (see the `AbstractArray{T,3}` `compute_Π!` method).
 
 # Returns
-- `Π`: Energy flux array (same as input), units of W/m³
+- `Π`: the specific flux, per unit mass, in m² s⁻³ (velocity in m s⁻¹, lengths in m); `ρ₀·Π` is the
+  flux per unit volume, W m⁻³
 
 # Examples
 ```julia

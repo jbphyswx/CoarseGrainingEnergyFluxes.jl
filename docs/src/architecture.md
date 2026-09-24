@@ -48,7 +48,7 @@ Input: u(x,y), v(x,y) [, w], grid, kernel, scales
    ddx! / ddy! / ddz!                resolved strain rate S̄_ℓ = ½(∇ū + ∇ūᵀ)
                     │
                     ▼
-   compute_Π!                        Π_ℓ = −ρ₀ S̄_ℓ : τ_ℓ   (τ_ℓ = ⟨u⊗u⟩̄ − ū⊗ū)
+   compute_Π!                        Π_ℓ = −S̄_ℓ : τ_ℓ, per unit mass   (τ_ℓ = ⟨u⊗u⟩̄ − ū⊗ū)
                     │
                     ▼
 Output: Π(x) per scale, cumulative_energy E(ℓ), filtering spectrum Ẽ(k_ℓ)

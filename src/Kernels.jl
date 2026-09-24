@@ -64,9 +64,22 @@ GaussianKernel(; α::Real = 6.0) = GaussianKernel(α)
 """
     SharpSpectralKernel <: AbstractFilterKernel
 
-Sharp-spectral (brick-wall) filter: `Ĝ_ℓ(k) = 1` for `k ≤ k_c`, else `0`, with `k_c = π/ℓ`. Best
-applied in spectral space (FFTW / FINUFFT / spherical-harmonic extensions); the physical-space
-form below is a slowly-decaying `sinc` fallback.
+Sharp-spectral (brick-wall) filter: `Ĝ_ℓ(k) = 1` for `k ≤ k_c`, else `0`, with `k_c = π/ℓ`.
+
+`method = Spectral()` multiplies by that transfer function. `RealSpace()` convolves with its inverse
+transform in the grid's `D` dimensions, `G(r) ∝ J_{D/2}(k_c r)/(k_c r)^{D/2}`, normalized to 1 at `r = 0`:
+
+| `D` | weight at `x = k_c r` |
+|---|---|
+| 1 | `sin x / x` |
+| 2 | `2 J₁(x)/x`, from `SpecialFunctions` (run `using SpecialFunctions`) |
+| 3 | `3 (sin x − x cos x)/x³` |
+
+`G` decays as `r^{-(D+1)/2}`, so `∫|G|` diverges and a truncated footprint's transfer function ripples
+about the brick wall, most near `k_c`, at any truncation radius. The footprint ends near `10ℓ`, at the
+radius where the truncated kernel's mass equals the full kernel's ([`kernel_radius`](@ref)), so the
+passband is centred on 1. The weights change sign, so under `Deformable` a window mass beside a coast
+is a sum of signed weights and can approach zero.
 """
 struct SharpSpectralKernel <: AbstractFilterKernel end
 
@@ -312,9 +325,15 @@ const GAUSSIAN_TRUNCATION_TOL = 1e-10
 
 """
     kernel_weight(kernel::AbstractFilterKernel, d::T, ℓ::T) where {T<:AbstractFloat}
+    kernel_weight(kernel::AbstractFilterKernel, d::T, ℓ::T, ::Val{D}) where {T<:AbstractFloat, D}
 
-Evaluate the unnormalized kernel weight at distance `d` for filter width `ℓ`.
+Evaluate the unnormalized kernel weight at distance `d` for filter width `ℓ`, in `D` dimensions. A kernel
+given by a radial profile has the same weight in every dimension; [`SharpSpectralKernel`](@ref)'s is
+the inverse transform of its transfer function, which depends on `D`.
 """
+@inline kernel_weight(k::AbstractFilterKernel, d::T, ℓ::T, ::Val) where {T<:AbstractFloat} =
+    kernel_weight(k, d, ℓ)
+
 @inline function kernel_weight(::TopHatKernel, d::T, ℓ::T) where {T<:AbstractFloat}
     return d <= ℓ / T(2) ? one(T) : zero(T)
 end
@@ -331,14 +350,35 @@ end
     return exp(-T(k.α) * (T(2) * d / ℓ)^4)
 end
 
-@inline function kernel_weight(::SharpSpectralKernel, d::T, ℓ::T) where {T<:AbstractFloat}
-    # Physical-space fallback: sinc(π d / ℓ). Spectral filters are best applied in spectral space.
-    if iszero(d)
-        return one(T)
-    else
-        val = T(π) * d / ℓ
-        return sin(val) / val
+@noinline kernel_weight(::SharpSpectralKernel, ::AbstractFloat, ::AbstractFloat) = throw(ArgumentError(
+    "SharpSpectralKernel's real-space weight is the inverse transform of its brick wall, which depends " *
+    "on the dimension: call `kernel_weight(kernel, d, ℓ, Val(D))`.",
+))
+
+@inline function kernel_weight(::SharpSpectralKernel, d::T, ℓ::T, ::Val{1}) where {T<:AbstractFloat}
+    x = T(π) * d / ℓ
+    return iszero(x) ? one(T) : sin(x) / x
+end
+
+# `3j₁(x)/x`. Below `x = 0.2` its Taylor series to `x⁸` is exact to round-off, where the closed form
+# loses `log₁₀(1/x²)` digits to the cancellation in `sin x − x cos x`.
+@inline function kernel_weight(::SharpSpectralKernel, d::T, ℓ::T, ::Val{3}) where {T<:AbstractFloat}
+    x = T(π) * d / ℓ
+    if x < T(0.2)
+        x2 = x * x
+        return one(T) - x2 * (inv(T(10)) - x2 * (inv(T(280)) - x2 * (inv(T(15120)) - x2 / T(1330560))))
     end
+    s, c = sincos(x)
+    return T(3) * (s - x * c) / x^3
+end
+
+# `D = 2` is `2J₁(x)/x`, defined by the SpecialFunctions extension as the more specific `Val{2}` method.
+@noinline function kernel_weight(::SharpSpectralKernel, ::T, ::T, ::Val{D}) where {T<:AbstractFloat, D}
+    throw(ArgumentError(D == 2 ?
+        "SharpSpectralKernel's real-space weight in two dimensions is the jinc `2J₁(x)/x`, provided by " *
+        "the SpecialFunctions weak dependency. Run `using SpecialFunctions`, or filter with " *
+        "`method = Spectral()`." :
+        "SharpSpectralKernel's real-space weight is defined in 1, 2 and 3 dimensions; got $D."))
 end
 
 # ---------------------------------------------------------------------------
@@ -347,9 +387,11 @@ end
 
 """
     kernel_radius(kernel::AbstractFilterKernel, ℓ::T) where {T<:AbstractFloat}
+    kernel_radius(kernel::AbstractFilterKernel, ℓ::T, ::Val{D}) where {T<:AbstractFloat, D}
 
-Distance beyond which the kernel weight is negligible, used to truncate physical-space
-convolution footprints.
+Distance at which a physical-space convolution footprint is truncated, in `D` dimensions: where the
+weight is negligible, or, for [`SharpSpectralKernel`](@ref), where the truncated kernel keeps its full
+mass.
 """
 @inline kernel_radius(::TopHatKernel, ℓ::T) where {T<:AbstractFloat} = ℓ / T(2)
 
@@ -370,8 +412,23 @@ end
     return ℓ / T(2) * (-log(T(GAUSSIAN_TRUNCATION_TOL)) / T(k.α))^(one(T) / T(4))
 end
 
-# Sinc decays only as O(1/d), so the physical-space fallback needs a wide footprint.
-@inline kernel_radius(::SharpSpectralKernel, ℓ::T) where {T<:AbstractFloat} = T(10) * ℓ
+@inline kernel_radius(k::AbstractFilterKernel, ℓ::T, ::Val) where {T<:AbstractFloat} = kernel_radius(k, ℓ)
+
+@noinline kernel_radius(::SharpSpectralKernel, ::AbstractFloat) = throw(ArgumentError(
+    "SharpSpectralKernel's truncation radius depends on the dimension: call " *
+    "`kernel_radius(kernel, ℓ, Val(D))`.",
+))
+
+# `k_c R` where the kernel's mass inside radius `R` equals its mass over all space, nearest `10π`: the
+# roots of `(2/π)Si(x) = 1`, `J₀(x) = 0` and `(2/π)(Si(x) − sin x) = 1` in one, two and three dimensions.
+# Truncated there, the filter keeps `Ĝ(0) = 1`, and normalizing it leaves the passband at 1.
+const _SHARP_TRUNCATION = (29.87844038878343, 30.634606468431976, 31.384170011211985)
+
+@inline function kernel_radius(::SharpSpectralKernel, ℓ::T, ::Val{D}) where {T<:AbstractFloat, D}
+    1 <= D <= 3 || throw(ArgumentError(
+        "SharpSpectralKernel's real-space weight is defined in 1, 2 and 3 dimensions; got $D."))
+    return T(_SHARP_TRUNCATION[D]) * ℓ / T(π)
+end
 
 # Compact by construction: body ℓ/2 plus one limb per vanishing-moment pair. This is the PER-AXIS
 # half-width, which is what a separable apply needs; the full support is the square of side 2× this.

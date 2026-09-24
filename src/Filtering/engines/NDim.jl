@@ -24,13 +24,16 @@ struct SeparableFootprintND{
     PVT<:Union{Nothing,NTuple{N,AbstractVector{T}}},
     AT<:AbstractArray{T,N},
     IAT<:Union{Nothing,AbstractArray{T,N}},
+    MS<:AbstractMaskStrategy,
 }
     g::GT
     lim::NTuple{N,Int}
     periodic::NTuple{N,Bool}
-    profiles::PVT      # rank-1 ZeroFill denominator, one factor per axis
-    invrenorm::IAT     # dense Deformable denominator, or nothing
+    profiles::PVT      # rank-1 denominator, one factor per axis
+    invrenorm::IAT     # dense Deformable denominator on a masked grid, or nothing
+    strategy::MS       # the strategy the denominator was built for
     masked::Bool
+    bound::Bool        # the strategies' denominators differ: a cell is inactive or a window leaves the grid
     masked_input::AT
     scratch::AT
 end
@@ -190,15 +193,21 @@ function _build_separable_nd(
     masked_input = zeros(T, dims)
     scratch = zeros(T, dims)
     fully_active = all(FlowGeometries.Grids.mask(grid))
+    zerofill = mask_strategy isa ZeroFill
+    bound = !fully_active || _reaches_exterior(grid, kernel, scale)
     fp_partial = SeparableFootprintND(
-        g, lim, periodic, nothing, nothing, !fully_active, masked_input, scratch,
+        g, lim, periodic, nothing, nothing, mask_strategy, !fully_active, bound, masked_input, scratch,
     )
-    if fully_active || mask_strategy isa ZeroFill
-        # Mask-independent denominator: `Σ w` over geometrically valid offsets, which depends only on
-        # the index and the wrapping, so it stays a product of one factor per axis.
-        profiles = ntuple(d -> _separable_profile(lim[d], g[d], dims[d], periodic[d]), Val(N))
+    if zerofill || fully_active
+        # Mask-independent denominator, a product of one factor per axis: `ZeroFill` counts the offsets
+        # past a bounded edge, `Deformable` on a fully active grid only the in-domain ones.
+        profiles = ntuple(Val(N)) do d
+            _separable_profile(
+                FlowGeometries.Grids.coordinates(grid, d), lim[d], g[d], periodic[d], kernel, scale, zerofill,
+            )
+        end
         return SeparableFootprintND(
-            g, lim, periodic, profiles, nothing, !fully_active, masked_input, scratch,
+            g, lim, periodic, profiles, nothing, mask_strategy, !fully_active, bound, masked_input, scratch,
         )
     end
     maskf = T.(FlowGeometries.Grids.mask(grid))
@@ -206,18 +215,16 @@ function _build_separable_nd(
     copyto!(masked_input, maskf)
     _sep_pass_chain!(denom, masked_input, fp_partial, dims, Val(N), Val(1))
     invrenorm = similar(denom)
-    @. invrenorm = ifelse(denom > T(1e-15), one(T) / denom, zero(T))
+    @. invrenorm = _inv_mass(denom)
     return SeparableFootprintND(
-        g, lim, periodic, nothing, invrenorm, !fully_active, masked_input, scratch,
+        g, lim, periodic, nothing, invrenorm, mask_strategy, !fully_active, bound, masked_input, scratch,
     )
 end
 
 @inline function _separable_check_strategy(
     fp::SeparableFootprintND, strategy::AbstractMaskStrategy,
 )
-    if !(strategy isa ZeroFill) && fp.masked && fp.invrenorm === nothing
-        _separable_strategy_mismatch()
-    end
+    (!fp.bound || typeof(strategy) === typeof(fp.strategy)) || _separable_strategy_mismatch()
     return nothing
 end
 
@@ -227,15 +234,12 @@ end
 Run the `N` separable passes and the pointwise normalization. `driver` supplies the per-pass index
 sweep — see [`_sep_serial`](@ref); a threaded backend passes its own and gets the same answer, since
 every point within a pass is independent and the passes themselves stay ordered.
+
+`out` and `field` may carry trailing batch axes beyond the grid's rank `R`: each pass is driven over the
+array's shape, so a whole batch is one pass (one launch on a device), and the pass count stays `R`. The
+profile tables, the renormalization array and the mask are spatial, indexed by the leading `R`
+components of the driven index.
 """
-#
-# The array rank is free while the footprint stays at the grid's rank `R`, so `out`/`field` may carry
-# trailing batch axes. Everything below is driven over the ARRAY's shape, which is what folds a batch into
-# the driven index space — one pass over the whole batch instead of one per slice, and on a device one
-# launch instead of `Nb`. The pass count stays `R`, so no pass differences along a batch axis.
-#
-# The profile tables, the renormalization array and the mask are all spatial-only, so they are indexed with
-# the leading `R` components of the driven index rather than the index itself.
 function apply_separable_nd!(
     out::AbstractArray{T}, field::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid,
     fp::SeparableFootprintND{R,T}, strategy::AbstractMaskStrategy, driver::D = _sep_serial,
@@ -244,7 +248,7 @@ function apply_separable_nd!(
     dims = size(out)
     mask = FlowGeometries.Grids.mask(grid)
     b1, b2 = _sep_nd_buffers(fp, out, Val(R))
-    @. b2 = T(mask) * field
+    @. b2 = mask * field   # a `Bool` strong zero: an inactive cell contributes nothing, whatever it holds
     _sep_pass_chain!(out, b2, fp, dims, Val(R), Val(1), driver, b1, b2)
     prof = fp.profiles
     inv = fp.invrenorm
@@ -252,12 +256,11 @@ function apply_separable_nd!(
         @inbounds begin
             Is = CartesianIndex(ntuple(d -> I[d], Val(R)))
             if inv === nothing
-                den = prod(ntuple(d -> prof[d][I[d]], Val(R)))
-                out[I] = den > T(1e-15) ? out[I] / den : zero(T)
+                out[I] = _normalized(out[I], prod(ntuple(d -> prof[d][I[d]], Val(R))))
             else
-                out[I] *= inv[Is]
+                # Deformable on a masked grid: an inactive target is zero.
+                out[I] = mask[Is] ? out[I] * inv[Is] : zero(T)
             end
-            mask[Is] || (out[I] = zero(T))
         end
     end
     return out

@@ -23,8 +23,9 @@ using FlowGeometries: FlowGeometries as FG
 ## Start here: `check_setup`
 
 Before running anything, ask what will actually happen. [`check_setup`](@ref) reports the engine, the
-backend, what the kernel can and cannot support, and how wide the contaminated band along a coast is —
-without building a plan, so it is safe even on a configuration whose plan would be enormous.
+backend, what the kernel can and cannot support, and how far from a coast or domain edge the result
+depends on the mask strategy. It builds no plan, so it is cheap on a configuration whose plan runs to
+gigabytes.
 
 ```julia
 julia> CGEF.check_setup(grid, CGEF.TopHatKernel(), 6_000.0)
@@ -40,10 +41,11 @@ CoarseGrainingEnergyFluxes setup check
   supports Π      : yes
   spectrum ≥ 0    : NO
   supports Spectral(): NO
-  boundary buffer : (3, 3) cells (contaminated)
+  boundary buffer : (3, 3) cells
   notes:
-    1. points within (3, 3) cells of a coast or domain edge are contaminated by footprint
-       truncation, under either mask strategy — exclude them before averaging.
+    1. within (3, 3) cells of a coast or domain edge the result depends on the mask strategy:
+       ZeroFill treats land and the domain exterior as fluid at rest, Deformable renormalizes the
+       kernel over active cells.
     2. TopHatKernel's |Ĝ|² is not monotone, so a spectral density is not guaranteed
        non-negative: `coarse_grain` needs `kernel = GaussianKernel()`, or
        `spectrum = Diagnostics.ForceSpectrum()` to compute it anyway, or
@@ -81,8 +83,11 @@ What every result field's axes mean. `Ns = length(scales)`; the spatial rank `R`
 Two conventions worth stating outright, because getting either wrong changes the numbers:
 
 - **`ℓ` is a diameter, not a radius.** The top-hat spans the disk of radius `ℓ/2`.
-- **Masked cells are zero in every output**, never `NaN` and never left uninitialized. Points within
-  the `boundary_buffer_cells` reported above are computed but contaminated.
+- **Under the default `ZeroFill`, land and the domain exterior are fluid at rest** (Aluie et al. 2018;
+  Grooms et al. 2021). Every output is defined on every cell, land included: `Π` over land is the flux
+  of the zero-extended field, nonzero within the kernel's reach of the coast and zero beyond it, and a
+  domain mean sums every cell and divides by the water area (Storer et al. 2022). Under `Deformable`
+  masked cells are zero. No output is `NaN`, whatever the input holds on land.
 
 ## Visual Results
 
@@ -117,11 +122,10 @@ Two conventions worth stating outright, because getting either wrong changes the
 ![Tracer flux](assets/tracer_flux.png)
 
 ### Masking: zero-fill vs deformable
-`ZeroFill` is the default: masked cells contribute nothing and the kernel stays position-independent,
-so filtering commutes with spatial derivatives — the step the flux budget is derived by. `Deformable`
-renormalizes over the locally-active area, reproducing constants exactly next to a boundary at the cost
-of that commutation. On a masked domain `Deformable` conserves better (measured 4.8e-4 vs 1.1e-2
-relative imbalance); under either choice, points within ≈ℓ of the mask are contaminated.
+`ZeroFill` is the default: land and the domain exterior count as fluid at rest and the kernel keeps its
+full mass at every cell, so filtering commutes with spatial derivatives — the step the flux budget is
+derived by — and conserves the domain integral. `Deformable` renormalizes over the locally-active area,
+reproducing constants exactly next to a boundary at the cost of both.
 
 ![Masking](assets/masking.png)
 
@@ -166,7 +170,7 @@ scales = collect(5e3:5e3:50e3)
 result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel(),
                            spectrum = CGEF.Diagnostics.NoSpectrum())
 @view result.Π[:, :, 3]      # flux map at scales[3] — result.Π is a stacked (Nx,Ny,Nscales) array
-result.cumulative_energy     # ½ρ₀⟨|ū_ℓ|²⟩ per scale (Sadek–Aluie Eq. 15)
+result.cumulative_energy     # ½⟨|ū_ℓ|²⟩ per scale, per unit mass (Sadek–Aluie Eq. 15)
 result.wavenumber            # k_ℓ = L/ℓ
 
 # The spectral density needs a kernel whose |Ĝ|² is monotone — see the note below.
@@ -209,13 +213,14 @@ result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKern
                            spectrum = CGEF.Diagnostics.NoSpectrum())
 ```
 
-The `ZeroFill` mask strategy (default) treats excluded cells as zeros, keeping the kernel
-position-independent so that filtering commutes with spatial derivatives — the property the Π budget
-is derived by. Pass `mask_strategy = CGEF.Filtering.Deformable()` to renormalize the kernel over
-active points near the boundary instead: that reproduces a constant field exactly there, but the
-kernel changes shape, so it neither commutes with derivatives nor conserves the domain average.
-Either way, points within `≈ℓ` of a mask boundary are contaminated — see
-[`Filtering.filter_field!`](@ref) for the measured artifacts.
+The `ZeroFill` mask strategy (default) treats land as fluid at rest and keeps the kernel's full mass,
+so filtering commutes with spatial derivatives — the property the Π budget is derived by — and `Π`
+over land is the flux of the zero-extended field. A latitude edge short of a pole continues to the
+pole, so a regional grid's kernel mass is the same as a global one's. Pass
+`mask_strategy = CGEF.Filtering.Deformable()` to renormalize the kernel over active points near the
+boundary instead: that reproduces a constant field exactly there, but the kernel changes shape, so it
+neither commutes with derivatives nor conserves the domain average. See
+[`Filtering.filter_field!`](@ref).
 
 ## Curvilinear (model-native) grids
 
@@ -465,9 +470,10 @@ Spectral filtering multiplies by Ĝ(k) and is selected by the grid type (FFTW / 
 FastSphericalHarmonics / NUFSHT). A bounded Cartesian direction is zero-padded, so the result is the
 filter of the field extended by zero beyond the domain; the spherical-harmonic transforms need the whole
 sphere. A partial mask is supported by normalized convolution, `ZeroFill`/`Deformable` defined as for
-`RealSpace()`. `GaussianKernel`/`SharpSpectralKernel`
-work with no extra dependency; `TopHatKernel` needs `using SpecialFunctions` (for its exact planar
-Bessel-`J₁` transfer function — the spherical-cap analog needs no extra dependency).
+`RealSpace()`. `GaussianKernel`/`SharpSpectralKernel` filter spectrally with no extra dependency;
+`TopHatKernel` needs `using SpecialFunctions` (for its exact planar Bessel-`J₁` transfer function — the
+spherical-cap analog needs no extra dependency), as does `SharpSpectralKernel` in real space on a
+two-dimensional grid.
 
 ```julia
 using FlowGeometries: FlowGeometries as FG

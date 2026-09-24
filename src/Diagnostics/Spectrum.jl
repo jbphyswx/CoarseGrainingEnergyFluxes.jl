@@ -5,7 +5,9 @@
 """
     active_area(grid) -> T
 
-Total area of the active cells: the denominator of every spatial average here.
+Total area of the active cells: the denominator of every spatial average here. A `ZeroFill` output is
+summed over every cell of the grid, land included, and divided by this water area (Storer et al.
+2022); a `Deformable` one over the active cells.
 """
 function active_area(grid::FlowGeometries.Grids.AbstractGrid{G,T}) where {G, T<:AbstractFloat}
     total = zero(T)
@@ -20,8 +22,9 @@ end
 """
     _area_mean(field, grid, total_area) -> T
 
-Area-weighted mean of `field` over the ACTIVE cells, sharing `active_area`'s denominator so every
-spatial average in this module is normalized the same way.
+`Σ field · area` over the active cells of `grid`, divided by `total_area`. Pass the
+[`output_grid`](@ref) and [`active_area`](@ref) of the input grid, so every spatial average in this
+module is normalized the same way.
 """
 function _area_mean(
     field::AbstractArray{T}, grid::FlowGeometries.Grids.AbstractGrid, total_area::T,
@@ -38,9 +41,9 @@ end
 """
     energy_from_filtered(ws, grid, has_w, total_area) -> E(ℓ)
 
-`E(ℓ) = ½⟨|ū_ℓ|²⟩` read from the filtered velocities already in `ws`. [`compute_Π!`](@ref) leaves
-exactly those there, so calling this straight after it filters `u`/`v` once per scale rather than
-twice.
+`E(ℓ) = ½⟨|ū_ℓ|²⟩` read from the filtered velocities already in `ws`, summed over the active cells of
+`grid` (the [`output_grid`](@ref)) and divided by `total_area`. [`compute_Π!`](@ref) leaves
+exactly those there, so calling this straight after it filters `u`/`v` once per scale.
 """
 function energy_from_filtered(
     ws::ΠWorkspace{T}, grid::FlowGeometries.Grids.AbstractGrid, has_w::Bool, total_area::T,
@@ -155,15 +158,7 @@ function cumulative_energy!(
     # Dimension-generic active-cell iteration: `Tuple(I)...` splats to (i,) for a 1D UnstructuredGrid
     # or (i,j) for a 2D Structured/CurvilinearGrid, matching each grid's own `isactive`/`area` arity.
     idxs = CartesianIndices(u)
-
-    # Precompute total active-cell area for spatial averaging
-    total_area = zero(T)
-    for I in idxs
-        if FlowGeometries.Grids.isactive(grid, Tuple(I)...)
-            total_area += FlowGeometries.Grids.area(grid, Tuple(I)...)
-        end
-    end
-    total_area > zero(T) || throw(ArgumentError("grid has no active cells (all masked out)"))
+    total_area = active_area(grid)
 
     # Sweep through scales. When the caller (typically `coarse_grain!`, which already builds one
     # plan per scale for its own `compute_Π!` loop) supplies `filter_plans`, reuse those instead of
@@ -177,6 +172,7 @@ function cumulative_energy!(
             grid, kernel, scales;
             mask_strategy = mask_strategy, backend = backend, method = method,
         ) : filter_plans
+    og = output_grid(grid, plans[1])
 
     for s_idx in 1:Nscales
         plan = plans[s_idx]
@@ -184,17 +180,18 @@ function cumulative_energy!(
         # Filter velocity fields at this scale — batched (one derivation per point, not one per field).
         if planetary
             Filtering.filter_apply_batch!(pout, pin, plan)
-            _planetary_to_local!(loc, pout, grid)
+            _planetary_to_local!(loc, pout, og)
         elseif w !== nothing
             Filtering.filter_apply_batch!((u_filt, v_filt, w_filt), (u, v, w), plan)
         else
             Filtering.filter_apply_batch!((u_filt, v_filt), (u, v), plan)
         end
 
-        # Compute spatial average specific energy: E(ℓ) = 0.5 * ∫ |ū_ℓ|² dA / ∫ dA
+        # Spatial average specific energy: E(ℓ) = 0.5 ∫ |ū_ℓ|² dA over the output grid, per unit water
+        # area.
         integrated_energy = zero(T)
         for I in idxs
-            if FlowGeometries.Grids.isactive(grid, Tuple(I)...)
+            if FlowGeometries.Grids.isactive(og, Tuple(I)...)
                 vel2 = u_filt[I]^2 + v_filt[I]^2
                 if w !== nothing
                     vel2 += w_filt[I]^2

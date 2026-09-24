@@ -220,8 +220,8 @@ _backend_supported(grid::FlowGeometries.Grids.AbstractGrid, ::ComputationalBacke
 @inline _resolve_method(::AutoMethod) = RealSpace()
 @inline _resolve_method(method::AbstractFilterMethod) = method
 
-# Which kernels have a factored real-space engine. A `SharpSpectralKernel` has none — its radial `sinc`
-# does not separate — so it falls to the banded disk sum at O(N·w²) with a 10ℓ radius.
+# Which kernels have a factored real-space engine. A `SharpSpectralKernel` has none — the inverse
+# transform of a disk does not separate — so it falls to the banded disk sum at O(N·w²) with a 10ℓ radius.
 _has_fast_real_space_engine(::Kernels.TopHatKernel) = true       # O(N) prefix sum
 _has_fast_real_space_engine(::SeparableKernel) = true            # O(N·(wx+wy)) separable
 _has_fast_real_space_engine(::Kernels.AbstractFilterKernel) = false
@@ -337,7 +337,8 @@ function _build_footprint_flat(
     scale::T;
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    rad = Kernels.kernel_radius(kernel, scale)
+    dim = _kernel_dim(grid)
+    rad = Kernels.kernel_radius(kernel, scale, dim)
     n = length(FlowGeometries.Grids.mask(grid))
     ptr = Vector{Int}(undef, n + 1)
     nbrs = Int[]
@@ -354,7 +355,7 @@ function _build_footprint_flat(
             topology = mt, scratch = scratch,
         ) do _, j, d
             push!(nbrs, j)
-            push!(w, Kernels.kernel_weight(kernel, T(d), scale) * FlowGeometries.Grids.measure(grid, j))
+            push!(w, Kernels.kernel_weight(kernel, T(d), scale, dim) * FlowGeometries.Grids.measure(grid, j))
             return nothing
         end
         ptr[t+1] = length(nbrs) + 1
@@ -366,8 +367,8 @@ end
     apply_footprint!(out, field, grid, fp::NodeFilterPlan, strategy) -> out
 
 Weighted mean over each node's stored neighbourhood, with the same two mask conventions the structured
-engines use: `ZeroFill` keeps a masked neighbour in the denominator and contributes nothing for it,
-`Deformable` drops it from both.
+engines use: `ZeroFill` keeps a masked neighbour in the denominator, contributes nothing for it and
+filters a masked node too; `Deformable` drops it from both sums and leaves a masked node at zero.
 """
 function apply_footprint!(
     out::AbstractVector{T}, field::AbstractVector, grid::FlowGeometries.Grids.AbstractGrid,
@@ -379,14 +380,15 @@ function apply_footprint!(
     return out
 end
 
-# Per-node kernel, factored out of the loop above so a parallel driver reuses the exact same
-# arithmetic rather than duplicating it — node `t` reads neighbours and writes only its own cell, so
-# the threaded result is bit-identical. Mirrors `_footprint_nd_point`'s role for the ND engines.
+# Per-node kernel, factored out of the loop above so a parallel driver reuses the same arithmetic —
+# node `t` reads neighbours and writes only its own cell, so the threaded result is bit-identical.
+# Mirrors `_footprint_nd_point`'s role for the ND engines. A flat-cell grid carries no lattice past its
+# cells, so its windows are normalized over the cells it has.
 @inline function _footprint_node_point(
     field::AbstractVector, grid::FlowGeometries.Grids.AbstractGrid,
     fp::NodeFilterPlan{T}, strategy::AbstractMaskStrategy, t::Integer,
 ) where {T<:AbstractFloat}
-    FlowGeometries.Grids.isactive(grid, t) || return zero(T)
+    _filters_target(strategy, FlowGeometries.Grids.isactive(grid, t)) || return zero(T)
     ws = zero(T)
     wn = zero(T)
     @inbounds for k in fp.ptr[t]:(fp.ptr[t+1] - 1)
@@ -402,7 +404,7 @@ end
             ws += wj * field[j]
         end
     end
-    return wn > T(1e-15) ? ws / wn : zero(T)
+    return _normalized(ws, wn)
 end
 
 """

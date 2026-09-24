@@ -7,9 +7,11 @@
 # The assertions here are identities that hold on any grid, so none of them needs a per-architecture
 # reference: `L + C + R = τ` (Germano), `Π_α − Π_δ = −S̄:τ̄`, the Helmholtz channels summing to the
 # total, the enstrophy flux being the tracer flux of `ω`, and the Favre budget collapsing to `ρ·Π` at
-# constant density.
+# constant density. That last one holds at every cell where the fluid fills the kernel, which under
+# `Deformable` is every cell; under `ZeroFill` the domain exterior holds no fluid.
 
 _dg_relerr(a, b) = maximum(abs, a .- b) / max(maximum(abs, b), eps())
+const _DG_DF = CGEF.Filtering.Deformable()
 
 # τ on a Cartesian metric: the components filter as they stand.
 function _dg_reference_tau(grid, u, v, plan, ::FG.Geometry.CartesianGeometry)
@@ -252,10 +254,12 @@ Test.@testset "Diagnostics across grid architectures: Cartesian" begin
 
             # Constant density collapses the Favre budget: ũ = ū, τ̃ = τ, so Π_Favre = ρ·Π.
             ρ0 = 2.5
+            ΠD = zeros(size(u))
+            CGEF.Diagnostics.compute_Π!(ΠD, u, v, nothing, grid, ker, ℓ; backend = SER, mask_strategy = _DG_DF)
             fav = CGEF.Diagnostics.compressible_flux(
-                u, v, fill(ρ0, size(u)), fill(1.0e5, size(u)), grid, ker, ℓ,
+                u, v, fill(ρ0, size(u)), fill(1.0e5, size(u)), grid, ker, ℓ; mask_strategy = _DG_DF,
             )
-            Test.@test _dg_relerr(fav.Π, ρ0 .* Π) < 1e-10
+            Test.@test _dg_relerr(fav.Π, ρ0 .* ΠD) < 1e-10
             # Uniform pressure carries no pressure gradient, so baropycnal work vanishes to the
             # round-off of the derivative operator.
             Test.@test maximum(abs, fav.Λ) < 1e-12 * maximum(abs, fav.Π)
@@ -300,13 +304,13 @@ Test.@testset "Diagnostics in true 3D" begin
             Test.@test _dg_relerr(s, τk) < 1e-10
         end
 
-        Π = zeros(n, n, n)
-        CGEF.Diagnostics.compute_Π!(Π, u, v, w, grid, ker, ℓ; backend = SER)
+        ΠD = zeros(n, n, n)
+        CGEF.Diagnostics.compute_Π!(ΠD, u, v, w, grid, ker, ℓ; backend = SER, mask_strategy = _DG_DF)
         ρ0 = 2.5
         fav = CGEF.Diagnostics.compressible_flux(
-            u, v, w, fill(ρ0, n, n, n), fill(1.0e5, n, n, n), grid, ker, ℓ,
+            u, v, w, fill(ρ0, n, n, n), fill(1.0e5, n, n, n), grid, ker, ℓ; mask_strategy = _DG_DF,
         )
-        Test.@test _dg_relerr(fav.Π, ρ0 .* Π) < 1e-10
+        Test.@test _dg_relerr(fav.Π, ρ0 .* ΠD) < 1e-10
         Test.@test maximum(abs, fav.Λ) < 1e-12 * maximum(abs, fav.Π)
 
         tout = zeros(n, n, n)
@@ -342,10 +346,12 @@ Test.@testset "Diagnostics in true 3D" begin
         end
 
         ρ0 = 2.5
+        ΠD = zeros(gsz)
+        CGEF.Diagnostics.compute_Π!(ΠD, u, v, w, grid, ker, ℓ; backend = SER, mask_strategy = _DG_DF)
         fav = CGEF.Diagnostics.compressible_flux(
-            u, v, w, fill(ρ0, gsz), fill(1.0e5, gsz), grid, ker, ℓ,
+            u, v, w, fill(ρ0, gsz), fill(1.0e5, gsz), grid, ker, ℓ; mask_strategy = _DG_DF,
         )
-        Test.@test _dg_relerr(fav.Π, ρ0 .* Π) < 1e-9
+        Test.@test _dg_relerr(fav.Π, ρ0 .* ΠD) < 1e-9
         Test.@test maximum(abs, fav.Λ) < 1e-12 * maximum(abs, fav.Π)
 
         tout = zeros(gsz)
@@ -451,10 +457,13 @@ Test.@testset "Diagnostics across grid architectures: spherical" begin
             # Constant density collapses the Favre budget to ρ·Π, which the spherical path reaches
             # only if its stress rotation and its curvature-carrying strain both match `compute_Π!`.
             ρ0 = 2.5
+            ΠD = zeros(gsz)
+            CGEF.Diagnostics.compute_Π!(ΠD, u, v, nothing, grid, ker, ℓ;
+                backend = CGEF.ComputationalBackends.SerialBackend(), mask_strategy = _DG_DF)
             fav = CGEF.Diagnostics.compressible_flux(
-                u, v, fill(ρ0, gsz), fill(1.0e5, gsz), grid, ker, ℓ,
+                u, v, fill(ρ0, gsz), fill(1.0e5, gsz), grid, ker, ℓ; mask_strategy = _DG_DF,
             )
-            Test.@test _dg_relerr(fav.Π, ρ0 .* Π) < 1e-10
+            Test.@test _dg_relerr(fav.Π, ρ0 .* ΠD) < 1e-10
             Test.@test maximum(abs, fav.Λ) < 1e-12 * maximum(abs, fav.Π)
 
             # Each in-place form reproduces its allocating one bit for bit, so a workspace can never
@@ -474,7 +483,8 @@ Test.@testset "Diagnostics across grid architectures: spherical" begin
                 Test.@test CGEF.Diagnostics.compute_Π_decomposed!(
                     dws, u, v, u, v, grid, ker, ℓ).total == dec.total
                 Test.@test CGEF.Diagnostics.compressible_flux!(
-                    fws, u, v, fill(ρ0, gsz), fill(1.0e5, gsz), grid, ker, ℓ).Π == fav.Π
+                    fws, u, v, fill(ρ0, gsz), fill(1.0e5, gsz), grid, ker, ℓ;
+                    mask_strategy = _DG_DF).Π == fav.Π
             end
 
             # The rotation into planetary Cartesian depends on the inputs and the grid, never on the

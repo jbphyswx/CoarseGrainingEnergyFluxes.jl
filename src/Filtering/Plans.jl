@@ -18,6 +18,24 @@ struct PhysicalFilterPlan{FP, G<:FlowGeometries.Grids.AbstractGrid, S<:AbstractM
 end
 
 """
+    plan_strategy(plan) -> AbstractMaskStrategy
+
+The mask strategy `plan` filters under. Every plan type carries one: a diagnostic reads its filtered
+fields on the grid that strategy defines them on.
+"""
+function plan_strategy end
+plan_strategy(plan::PhysicalFilterPlan) = plan.strategy
+
+"""
+    plan_method(plan) -> AbstractFilterMethod
+
+The method a plan evaluates: `RealSpace()` for a real-space engine, `AutoMethod()` for one of its
+transform evaluators, `Spectral()` for a transfer-function plan.
+"""
+plan_method(plan::PhysicalFilterPlan) = _transform_footprint(plan.footprint) ? AutoMethod() : RealSpace()
+plan_method(::AbstractFilterPlan) = Spectral()
+
+"""
     prepare_workspace(backend, grid, footprint) -> workspace
 
 Backend hook run ONCE by [`plan_filter`](@ref), whose result becomes the plan's stored workspace. The

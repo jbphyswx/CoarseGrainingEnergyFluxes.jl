@@ -49,19 +49,11 @@ Test.@testset "Spectral FFTW filtering" begin
     CGEF.Filtering.filter_field!(thout_ds, field, grid, th, ℓ; method = CGEF.Filtering.RealSpace())
     Test.@test thout ≈ thout_ds rtol = 0.02
 
-    # Masked spectral filtering (normalized convolution, Knutsson & Westin 1993): both
-    # mask_strategy branches must reproduce the corresponding RealSpace result on the SAME
-    # doubly-periodic grid — the two are the same normalized-convolution identity, evaluated in
-    # Fourier space instead of real space. Compare ACTIVE cells only: RealSpace leaves a masked
-    # cell untouched (its `fill!(out,0)` initial value, by convention — see `apply_footprint_row!`'s
-    # docstring), while a spectral method is a global transform that computes a real, meaningful
-    # normalized-convolution value EVERYWHERE, including at masked points — the two are expected to
-    # differ there, by design, not by bug. A smooth Gaussian kernel's real-space quadrature agrees with
-    # the exact spectral result far more tightly than TopHat's (no sharp-edge discretization error),
-    # measured ~2e-5 relative (2-norm) here — `rtol`, not `atol`, since `≈` on arrays compares the
-    # aggregate 2-norm of the difference against the array, and this same active-cell selection is
-    # ~1000 elements wide (an `atol` sized by eye against a single point's expected error silently
-    # fails once aggregated over that many elements).
+    # Masked spectral filtering (normalized convolution, Knutsson & Westin 1993): both strategies
+    # reproduce the RealSpace result on the same doubly-periodic grid, at every cell — `ZeroFill`
+    # defines the filtered field on masked cells too, and `Deformable` zeroes them under either method.
+    # The Gaussian's sampled kernel and its transfer function differ at the 1e-5 level here; `rtol`
+    # compares the aggregate 2-norm.
     mask = trues(N, N)
     mask[10:14, 10:14] .= false
     mgrid = FG.Grids.StructuredGrid(geom, x, y, mask; periodic = (true, true))
@@ -71,14 +63,16 @@ Test.@testset "Spectral FFTW filtering" begin
         CGEF.Filtering.filter_field!(out_spec, rfield, mgrid, g, ℓ; method = CGEF.Filtering.Spectral(), mask_strategy = strat)
         out_ds = zeros(N, N)
         CGEF.Filtering.filter_field!(out_ds, rfield, mgrid, g, ℓ; method = CGEF.Filtering.RealSpace(), mask_strategy = strat)
-        Test.@test out_spec[mask] ≈ out_ds[mask] rtol = 1e-4
+        Test.@test out_spec ≈ out_ds rtol = 1e-4
     end
-    # Constant field over active cells stays constant under Deformable (mask mass cancels exactly).
+    # Constant field over active cells stays constant under Deformable (mask mass cancels exactly), and
+    # masked cells read zero.
     cfield_m = fill(1.7, N, N)
     cout_m = zeros(N, N)
     CGEF.Filtering.filter_field!(cout_m, cfield_m, mgrid, g, ℓ; method = CGEF.Filtering.Spectral(),
                                  mask_strategy = CGEF.Filtering.Deformable())
-    Test.@test all(x -> isapprox(x, 1.7; atol = 1e-6), cout_m)
+    Test.@test all(x -> isapprox(x, 1.7; rtol = 1e-12), cout_m[mask])
+    Test.@test all(iszero, cout_m[.!mask])
 
     # Under the default, ZeroFill, the excluded cells stay in the denominator, so the same constant
     # comes back scaled by the locally-included mass — identically `1.7 · filter(mask)`, which is the
@@ -130,7 +124,8 @@ Test.@testset "Spectral FFTW filtering on bounded axes" begin
         grid = FG.Grids.StructuredGrid(geom, x, y, mask; periodic = periodic)
         num, den = direct(mask, periodic[1])
         Test.@test relerr(spectral(grid), num) < 1e-12
-        Test.@test relerr(spectral(grid; mask_strategy = CGEF.Filtering.Deformable()), num ./ den) < 1e-12
+        Test.@test relerr(spectral(grid; mask_strategy = CGEF.Filtering.Deformable()),
+                          ifelse.(mask, num ./ den, 0.0)) < 1e-12
     end
 
     # The same plan through a batch axis and through a sweep's shared analysis.
@@ -316,18 +311,9 @@ Test.@testset "Spectral spherical-harmonic filtering" begin
     CGEF.Filtering.filter_field!(cout, fill(2.3, M, N), grid, ker, ℓ; method = CGEF.Filtering.Spectral())
     Test.@test all(≈(2.3; atol = 1e-10), cout)
 
-    # Masked spectral filtering (normalized convolution, Knutsson & Westin 1993): both
-    # mask_strategy branches must reproduce RealSpace on the SAME masked grid, over ACTIVE cells
-    # only (RealSpace leaves a masked cell at its untouched `fill!(out,0)` initial value, by
-    # convention, while a global spectral transform computes a real value everywhere — the two are
-    # expected to differ at masked points, by design). A modest ℓ (well inside the grid's resolved
-    # range, unlike the ℓ = R used for the eigenfunction checks above) keeps this focused on
-    # validating the masking logic itself; the ~3% active-cell relative error matches the same N=24
-    # RealSpace discretization error already measured (and shown convergent under refinement) for
-    # the unmasked case elsewhere in this file, not a masking-specific slack. `rtol`, not `atol`: `≈`
-    # on arrays compares the aggregate 2-norm of the difference, and this active-cell selection is
-    # ~1100 elements wide, so an `atol` sized against a single point's expected error silently fails
-    # once aggregated over that many elements.
+    # Masked spectral filtering (normalized convolution, Knutsson & Westin 1993): both strategies
+    # reproduce RealSpace on the same masked grid at every cell, as on the plane. The tolerance is the
+    # N = 24 RealSpace discretization error of the unmasked case; `rtol` compares the aggregate 2-norm.
     mask = trues(M, N)
     mask[5:8, 5:8] .= false
     mgrid = FG.Grids.StructuredGrid(geom, collect(Φ), π/2 .- collect(Θ), mask)
@@ -339,7 +325,7 @@ Test.@testset "Spectral spherical-harmonic filtering" begin
         CGEF.Filtering.filter_field!(out_spec, rfield, mgrid, ker, ℓ_m; method = CGEF.Filtering.Spectral(), mask_strategy = strat)
         out_ds = zeros(M, N)
         CGEF.Filtering.filter_field!(out_ds, rfield, mgrid, ker, ℓ_m; method = CGEF.Filtering.RealSpace(), mask_strategy = strat)
-        Test.@test out_spec[mask] ≈ out_ds[mask] rtol = 0.06
+        Test.@test out_spec ≈ out_ds rtol = 0.06
     end
 
     # TopHatKernel spherical-cap filtering: exact eigenfunction scaling by the Legendre-based
@@ -445,10 +431,11 @@ end
 
 # Cumulative coarse KE (Sadek-Aluie Eq.15) vs the filtering spectral density (Eq.14)
 Test.@testset "Filtering spectrum" begin
+    # Periodic, so a uniform field has no edge to fall off at any scale.
     geom = FG.Geometry.CartesianGeometry()
     x = 0.0:2000.0:100e3
     y = 0.0:2000.0:100e3
-    grid = FG.Grids.StructuredGrid(geom, x, y, trues(length(x), length(y)))
+    grid = FG.Grids.StructuredGrid(geom, x, y, trues(length(x), length(y)); periodic = (true, true))
 
     U = 0.5  # m/s
     V = 0.3  # m/s
@@ -485,7 +472,9 @@ Test.@testset "Filtering spectrum" begin
 end
 
 # The padded-FFT engine computes the LINEAR convolution, so it is the real-space answer on a bounded,
-# masked grid — the configuration a periodic transform cannot serve. Reference is a direct disk sum.
+# masked grid — the configuration a periodic transform cannot serve. Reference is a direct disk sum
+# over the lattice continued past each edge: `ZeroFill` counts every tap in its denominator and keeps
+# masked targets, `Deformable` counts the active in-domain taps and zeroes masked targets.
 Test.@testset "Padded-FFT real-space engine" begin
     geom = FG.Geometry.CartesianGeometry()
     N = 64
@@ -496,7 +485,7 @@ Test.@testset "Padded-FFT real-space engine" begin
     u = randn(N, N)
     ker = CGEF.SharpSpectralKernel()           # non-separable: no factored engine exists for it
     sc = 2000.0
-    rad = CGEF.Kernels.kernel_radius(ker, sc)
+    rad = CGEF.Kernels.kernel_radius(ker, sc, Val(2))
     w = ceil(Int, rad / dx)
 
     # `RealSpace` must stay the direct sum, whatever extensions are loaded.
@@ -507,22 +496,18 @@ Test.@testset "Padded-FFT real-space engine" begin
     for (strat, zerofill) in ((CGEF.Filtering.Deformable(), false), (CGEF.Filtering.ZeroFill(), true))
         ref = zeros(N, N)
         for j in 1:N, i in 1:N
-            m[i, j] || continue
+            (zerofill || m[i, j]) || continue
             ws = 0.0; wn = 0.0
             for dj in -w:w, di in -w:w
-                ii = i + di; jj = j + dj
-                (1 <= ii <= N && 1 <= jj <= N) || continue
                 d = hypot(di * dx, dj * dx)
                 d <= rad || continue
-                wt = CGEF.Kernels.kernel_weight(ker, d, sc)
-                if zerofill
-                    wn += wt; m[ii, jj] && (ws += wt * u[ii, jj])
-                else
-                    m[ii, jj] || continue
-                    wn += wt; ws += wt * u[ii, jj]
-                end
+                ii = i + di; jj = j + dj
+                active = 1 <= ii <= N && 1 <= jj <= N && m[ii, jj]
+                wt = CGEF.Kernels.kernel_weight(ker, d, sc, Val(2))
+                (zerofill || active) && (wn += wt)
+                active && (ws += wt * u[ii, jj])
             end
-            ref[i, j] = wn > 1e-15 ? ws / wn : 0.0
+            ref[i, j] = ws / wn
         end
         p = CGEF.Filtering.plan_filter(grid, ker, sc;
             backend = CGEF.ComputationalBackends.SerialBackend(),

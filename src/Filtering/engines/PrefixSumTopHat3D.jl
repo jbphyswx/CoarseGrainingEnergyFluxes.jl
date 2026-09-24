@@ -50,9 +50,10 @@ struct PrefixSumTopHat3DPlan{
     dk_lim::Int
     periodic::NTuple{3,Bool}
     masked::Bool
+    bound::Bool    # the strategies' denominators differ: a cell is inactive or a window leaves the grid
     strategy::MS
     wcell::WT      # axis-1 half-width per (dj, dk); -1 where that slice of the ball is empty
-    invden::A      # 1/(window mass); zero where the target is inactive or the window empty
+    invden::A      # 1/(window mass); zero where empty or, under Deformable, at an inactive target
 end
 
 _prefixsum3d_scratch(grid::FlowGeometries.Grids.StructuredGrid{T,G,3}) where {T,G} =
@@ -185,9 +186,11 @@ function _build_prefixsum_tophat_3d(
     sc = scratch === nothing ? _prefixsum3d_scratch(grid) : scratch
     masked = !all(FlowGeometries.Grids.mask(grid))
 
-    # Window mass: `ZeroFill` counts every in-support cell, `Deformable` only the active ones.
+    # Window mass, in cells: `ZeroFill` counts every in-support cell and the exterior ones past a bounded
+    # edge, `Deformable` only the active in-domain ones.
+    zerofill = mask_strategy isa ZeroFill
     mass = Array{T,3}(undef, Nx, Ny, Nz)
-    if mask_strategy isa ZeroFill
+    if zerofill
         fill!(mass, one(T))
     else
         @inbounds for k in 1:Nz, j in 1:Ny, i in 1:Nx
@@ -201,24 +204,29 @@ function _build_prefixsum_tophat_3d(
         oc = view(den, :, j, k)
         _prefixsum3d_plane!(oc, P, wcell, dj_lim, dk_lim, periodic, Nx, Ny, Nz, j, k)
     end
+    exterior = zerofill ? _exterior_mass(grid, kernel, scale) : nothing
+    # The scan sums cells, and the exterior mass is a measure, so it enters divided by the cell volume.
+    exterior === nothing || (den .+= exterior ./ FlowGeometries.Grids.area(grid, 1, 1, 1))
     @inbounds for k in 1:Nz, j in 1:Ny, i in 1:Nx
-        den[i, j, k] = (FlowGeometries.Grids.isactive(grid, i, j, k) && den[i, j, k] > T(1e-15)) ?
-            inv(den[i, j, k]) : zero(T)
+        keep = zerofill || FlowGeometries.Grids.isactive(grid, i, j, k)
+        den[i, j, k] = keep ? _inv_mass(den[i, j, k]) : zero(T)
     end
 
-    return PrefixSumTopHat3DPlan(sc, rad, dj_lim, dk_lim, periodic, masked, mask_strategy, wcell, den)
+    bound = masked || _reaches_exterior(grid, kernel, scale)
+    return PrefixSumTopHat3DPlan(sc, rad, dj_lim, dk_lim, periodic, masked, bound, mask_strategy, wcell, den)
 end
 
 @noinline function _prefixsum3d_strategy_mismatch()
     throw(ArgumentError(
-        "PrefixSumTopHat3DPlan is being applied to a MASKED grid with a different mask strategy than " *
-        "it was built for. Its normalization is precomputed per scale from the grid, the mask and the " *
+        "PrefixSumTopHat3DPlan is being applied with a different mask strategy than it was built for, " *
+        "on a grid where the two normalize differently: a cell is inactive, or a window reaches past a " *
+        "bounded edge. Its normalization is precomputed per scale from the grid, the mask and the " *
         "strategy, so one plan cannot serve both. Rebuild it with the `mask_strategy` you will apply with.",
     ))
 end
 
 @inline function _prefixsum3d_check_strategy(fp::PrefixSumTopHat3DPlan, strategy::AbstractMaskStrategy)
-    (!fp.masked || typeof(strategy) === typeof(fp.strategy)) || _prefixsum3d_strategy_mismatch()
+    (!fp.bound || typeof(strategy) === typeof(fp.strategy)) || _prefixsum3d_strategy_mismatch()
     return nothing
 end
 
@@ -272,7 +280,7 @@ function _build_footprint_nd(
     kernel::Kernels.AbstractFilterKernel,
     scale::T,
 ) where {N, T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    rad = Kernels.kernel_radius(kernel, scale)
+    rad = Kernels.kernel_radius(kernel, scale, Val(N))
     # Real per-axis step, read from the axis itself (already proven uniform by its Range type via
     # the calling method's dispatch constraint) — not the geometry's separately-stored dx/dy/dz,
     # so there's no possibility of the two disagreeing.
@@ -294,10 +302,10 @@ function _build_footprint_nd(
         dist = sqrt(d2)
         if dist <= rad
             push!(offsets, o)
-            push!(w, Kernels.kernel_weight(kernel, dist, scale) * A)
+            push!(w, Kernels.kernel_weight(kernel, dist, scale, Val(N)) * A)
         end
     end
-    return FilterFootprintND(offsets, w)
+    return FilterFootprintND(offsets, w, _exterior_mass(grid, kernel, scale))
 end
 
 """
@@ -319,10 +327,12 @@ N-D (1D or 3D) analog of [`ScatteredFilterPlan`](@ref), for when at least one of
 `AbstractVector` (no type-level uniformity proof): the kernel, the support radius, the per-axis window
 the cache size is estimated from, and the grid's ball-query topology. No translation invariance is
 assumed. `cache` holds the materialized [`NDScatteredCache`](@ref) only when the plan's cache strategy
-decided to build it, `nothing` otherwise (apply-time recomputation).
+decided to build it, `nothing` otherwise (apply-time recomputation). `exterior` is the mass past a
+bounded edge that `ZeroFill` adds to each point's denominator, or `nothing`.
 """
 struct NDScatteredFilterPlan{
     N, T<:AbstractFloat, K<:Kernels.AbstractFilterKernel, C<:Union{Nothing,NDScatteredCache{N,T}}, MT,
+    EX<:Union{Nothing,AbstractArray{T,N}},
 }
     kernel::K
     scale::T
@@ -330,6 +340,7 @@ struct NDScatteredFilterPlan{
     lim::NTuple{N,Int}
     cache::C
     topology::MT   # built once; the cache build and the streaming apply both query through it
+    exterior::EX
 end
 
 # Ball-gated, as in 2-D. The 1-D case needs no correction (a 1-D ball IS the interval).
@@ -347,7 +358,7 @@ function _build_footprint_nd_scattered(
     kwargs...,   # accepts (and ignores) mask_strategy — only the 2D separable-Gaussian path needs it
 ) where {N, T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     dims = FlowGeometries.Grids.size_tuple(grid)
-    rad = Kernels.kernel_radius(kernel, scale)
+    rad = Kernels.kernel_radius(kernel, scale, Val(N))
     # Per-axis index bound at the worst cell, for the cache estimate only; the traversal is the grid's.
     lim = FlowGeometries.Connectivity.metric_window(grid, rad)
     mt = _query_topology(grid, rad)
@@ -364,7 +375,7 @@ function _build_footprint_nd_scattered(
             t = lin[I]
             _nd_foldl(nothing, grid, Tuple(I), rad, mt) do _, J, d
                 push!(nbrs, J)
-                push!(w, Kernels.kernel_weight(kernel, d, scale) * FlowGeometries.Grids.area(grid, J...))
+                push!(w, Kernels.kernel_weight(kernel, d, scale, Val(N)) * FlowGeometries.Grids.area(grid, J...))
                 nothing
             end
             ptr[t+1] = length(nbrs) + 1
@@ -373,7 +384,7 @@ function _build_footprint_nd_scattered(
     else
         nothing
     end
-    return NDScatteredFilterPlan(kernel, scale, rad, lim, cache, mt)
+    return NDScatteredFilterPlan(kernel, scale, rad, lim, cache, mt, _exterior_mass(grid, kernel, scale))
 end
 
 # Folds `acc = f(acc, J, d)` over every in-support neighbour of `Ti`, the centre included, through the
@@ -404,21 +415,24 @@ end
 end
 
 # Per-point kernel factored out of `apply_footprint_nd!` so a parallel (per-point-independent) loop
-# can reuse the EXACT same arithmetic instead of duplicating it — see
-# `CoarseGrainingEnergyFluxesOhMyThreadsExt`'s ND threaded hook.
+# reuses the same arithmetic — see `CoarseGrainingEnergyFluxesOhMyThreadsExt`'s ND threaded hook. The
+# three point functions below decide the target themselves (`_filters_target`) and return zero for one
+# they skip, so a caller calls them at every point.
 @inline function _footprint_nd_point(
     field::AbstractArray, fp::FilterFootprintND{N,T}, strategy::AbstractMaskStrategy,
     dims::NTuple{N,Int}, periodic::NTuple{N,Bool}, mask, I::CartesianIndex{N},
 ) where {N, T<:AbstractFloat}
+    _filters_target(strategy, @inbounds mask[I]) || return zero(T)
     Ti = Tuple(I)
     ws = zero(T)
     wn = zero(T)
+    zerofill = strategy isa ZeroFill
     @inbounds for k in eachindex(fp.offsets)
         J, valid = _shift_index(Ti, fp.offsets[k], dims, periodic)
         valid || continue
         active = mask[J...]
         wk = fp.w[k]
-        if strategy isa ZeroFill
+        if zerofill
             wn += wk
             active && (ws += wk * field[J...])
         elseif active
@@ -426,7 +440,8 @@ end
             ws += wk * field[J...]
         end
     end
-    return wn > T(1e-15) ? ws / wn : zero(T)
+    zerofill && (wn = _add_exterior(wn, fp.exterior, I))
+    return _normalized(ws, wn)
 end
 
 function apply_footprint_nd!(
@@ -439,28 +454,28 @@ function apply_footprint_nd!(
     dims = FlowGeometries.Grids.size_tuple(grid)
     periodic = FlowGeometries.Grids.periodic_flags(grid)
     mask = FlowGeometries.Grids.mask(grid)
-    fill!(out, zero(T))
     @inbounds for I in CartesianIndices(out)
-        mask[I] || continue
         out[I] = _footprint_nd_point(field, fp, strategy, dims, periodic, mask, I)
     end
     return out
 end
 
 @inline function _footprint_nd_point_cached(
-    field::AbstractArray, cache::NDScatteredCache{N,T}, strategy::AbstractMaskStrategy,
+    field::AbstractArray, cache::NDScatteredCache{N,T}, exterior, strategy::AbstractMaskStrategy,
     mask, lin::LinearIndices{N}, I::CartesianIndex{N},
 ) where {N, T<:AbstractFloat}
+    _filters_target(strategy, @inbounds mask[I]) || return zero(T)
     t = lin[I]
     lo = cache.ptr[t]
     hi = cache.ptr[t+1] - 1
     ws = zero(T)
     wn = zero(T)
+    zerofill = strategy isa ZeroFill
     @inbounds for k in lo:hi
         J = cache.nbrs[k]
         active = mask[J...]
         wk = cache.w[k]
-        if strategy isa ZeroFill
+        if zerofill
             wn += wk
             active && (ws += wk * field[J...])
         elseif active
@@ -468,29 +483,32 @@ end
             ws += wk * field[J...]
         end
     end
-    return wn > T(1e-15) ? ws / wn : zero(T)
+    zerofill && (wn = _add_exterior(wn, exterior, I))
+    return _normalized(ws, wn)
 end
 
 # Streaming (no cache) per-point recompute, over the same enumeration the cache builder uses. The
-# accumulator is threaded through the fold's return value rather than captured and mutated, which is
-# what keeps this allocation-free.
+# accumulator is threaded through the fold's return value, which keeps this allocation-free.
 function _footprint_nd_point_streaming(
     field::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, fp::NDScatteredFilterPlan{N,T},
     strategy::AbstractMaskStrategy, mask, I::CartesianIndex{N},
 ) where {N, T<:AbstractFloat, G}
+    _filters_target(strategy, @inbounds mask[I]) || return zero(T)
     kernel, scale = fp.kernel, fp.scale
+    zerofill = strategy isa ZeroFill
     ws, wn = _nd_foldl((zero(T), zero(T)), grid, Tuple(I), fp.rad, fp.topology) do acc, J, d
         s, n = acc
         active = mask[J...]
-        wk = Kernels.kernel_weight(kernel, d, scale) * FlowGeometries.Grids.area(grid, J...)
-        if strategy isa ZeroFill
+        wk = Kernels.kernel_weight(kernel, d, scale, Val(N)) * FlowGeometries.Grids.area(grid, J...)
+        if zerofill
             return (active ? s + wk * field[J...] : s, n + wk)
         else
             active || return acc
             return (s + wk * field[J...], n + wk)
         end
     end
-    return wn > T(1e-15) ? ws / wn : zero(T)
+    zerofill && (wn = _add_exterior(wn, fp.exterior, I))
+    return _normalized(ws, wn)
 end
 
 function apply_footprint_nd!(
@@ -502,17 +520,14 @@ function apply_footprint_nd!(
 ) where {N, T<:AbstractFloat, G}
     dims = FlowGeometries.Grids.size_tuple(grid)
     mask = FlowGeometries.Grids.mask(grid)
-    fill!(out, zero(T))
     if fp.cache !== nothing
         lin = LinearIndices(dims)
         cache = fp.cache
         @inbounds for I in CartesianIndices(out)
-            mask[I] || continue
-            out[I] = _footprint_nd_point_cached(field, cache, strategy, mask, lin, I)
+            out[I] = _footprint_nd_point_cached(field, cache, fp.exterior, strategy, mask, lin, I)
         end
     else
         @inbounds for I in CartesianIndices(out)
-            mask[I] || continue
             out[I] = _footprint_nd_point_streaming(field, grid, fp, strategy, mask, I)
         end
     end

@@ -37,13 +37,13 @@ end
     SeparableFootprint{T}
 
 Precomputed 1D Gaussian weight vectors (`gx`,`gy`) plus preallocated scratch buffers for the
-row-pass/column-pass separable convolution. `invrenorm` (Deformable masking only) is the precomputed
-reciprocal local kernel mass over active cells — the SAME separable machinery run once, at plan-build
-time, on `Float.(mask)` instead of `field`, mirroring `FFTWFilterPlan`/`SHTFilterPlan`'s established
-`invrenorm` pattern. `Nx_profile`/`Ny_profile` (ZeroFill masking) are the mask-INDEPENDENT denominator
-profiles: `Σ w` over valid (in-bounds/periodic) offsets is itself separable into one Nx-length and
-one Ny-length vector, since which offsets are valid depends only on `i` (resp. `j`) and periodicity,
-never on the mask.
+row-pass/column-pass separable convolution. `invrenorm` (Deformable on a masked grid) is the
+precomputed reciprocal local kernel mass over active cells — the separable machinery run once, at
+plan-build time, on `Float.(mask)` in place of `field`. `Nx_profile`/`Ny_profile` are the
+mask-independent denominator profiles otherwise: `ZeroFill`'s full kernel mass, its in-domain offsets
+and those past a bounded edge, and `Deformable`'s in-domain offsets on a fully active grid. Each is
+separable into one Nx-length and one Ny-length vector, since which offsets lie in the domain depends
+only on `i` (resp. `j`) and periodicity.
 
 Note: unlike the disk-truncated (`d <= rad`) non-separable footprint, this truncates each axis
 independently at the SAME per-axis `rad` (the Gaussian's own 1D marginal decays at the identical rate
@@ -61,6 +61,7 @@ struct SeparableFootprint{
     PVT<:Union{Nothing,AbstractVector{T}},
     MT<:AbstractMatrix{T},
     IMT<:Union{Nothing,AbstractMatrix{T}},
+    MS<:AbstractMaskStrategy,
 }
     gx::GX
     gy::GY
@@ -71,7 +72,9 @@ struct SeparableFootprint{
     Nx_profile::PVT
     Ny_profile::PVT
     invrenorm::IMT
+    strategy::MS          # the strategy the denominator was built for
     masked::Bool          # whether the grid had any inactive cell when this was built
+    bound::Bool           # the strategies' denominators differ: a cell is inactive or a window leaves the grid
     masked_input::MT
     row_pass::MT
 end
@@ -314,14 +317,22 @@ function _build_separable_footprint(
     masked_input = sc.masked_input
     row_pass = sc.row_pass
     fully_active = all(FlowGeometries.Grids.mask(grid))
-    fp_partial = SeparableFootprint(gx, gy, di_lim, dj_lim, periodic_x, periodic_y, nothing, nothing, nothing, !fully_active, masked_input, row_pass)
+    zerofill = mask_strategy isa ZeroFill
+    bound = !fully_active || _reaches_exterior(grid, kernel, scale)
+    fp_partial = SeparableFootprint(
+        gx, gy, di_lim, dj_lim, periodic_x, periodic_y, nothing, nothing, nothing,
+        mask_strategy, !fully_active, bound, masked_input, row_pass,
+    )
 
-    if fully_active || mask_strategy isa ZeroFill
-        # `ZeroFill`'s denominator is the mask-independent geometric profile. A fully-active grid takes
-        # the same branch whatever its strategy: with nothing excluded, `Deformable` coincides with it.
-        Nx_profile = _separable_profile(di_lim, gx, Nx, periodic_x)
-        Ny_profile = _separable_profile(dj_lim, gy, Ny, periodic_y)
-        return SeparableFootprint(gx, gy, di_lim, dj_lim, periodic_x, periodic_y, Nx_profile, Ny_profile, nothing, !fully_active, masked_input, row_pass)
+    if zerofill || fully_active
+        # Rank-1: `ZeroFill` counts the offsets past a bounded edge, `Deformable` on a fully active grid
+        # only the in-domain ones.
+        Nx_profile = _separable_profile(FlowGeometries.Grids.coordinates(grid, 1), di_lim, gx, periodic_x, kernel, scale, zerofill)
+        Ny_profile = _separable_profile(FlowGeometries.Grids.coordinates(grid, 2), dj_lim, gy, periodic_y, kernel, scale, zerofill)
+        return SeparableFootprint(
+            gx, gy, di_lim, dj_lim, periodic_x, periodic_y, Nx_profile, Ny_profile, nothing,
+            mask_strategy, !fully_active, bound, masked_input, row_pass,
+        )
     else
         # Deformable: precompute invrenorm = 1/separable_convolve(Float.(mask)) ONCE — the mask never
         # changes across repeated `filter_apply!` calls on a fixed plan.
@@ -329,25 +340,53 @@ function _build_separable_footprint(
         denom = zeros(T, Nx, Ny)
         _separable_convolve!(denom, maskf, fp_partial, Nx, Ny)
         invrenorm = similar(denom)
-        @. invrenorm = ifelse(denom > T(1e-15), one(T) / denom, zero(T))
-        return SeparableFootprint(gx, gy, di_lim, dj_lim, periodic_x, periodic_y, nothing, nothing, invrenorm, !fully_active, masked_input, row_pass)
+        @. invrenorm = _inv_mass(denom)
+        return SeparableFootprint(
+            gx, gy, di_lim, dj_lim, periodic_x, periodic_y, nothing, nothing, invrenorm,
+            mask_strategy, !fully_active, bound, masked_input, row_pass,
+        )
     end
 end
 
-# ZeroFill's mask-independent denominator profile: Σ w over geometrically-valid offsets at each
-# index — separable since validity depends only on the index/periodicity, never on the mask.
-function _separable_profile(lim::Int, g::AbstractVecOrMat{T}, N::Int, periodic::Bool) where {T<:AbstractFloat}
+"""
+    _separable_profile(x, lim, g, periodic, kernel, scale, exterior) -> profile
+
+The denominator profile along one axis: `Σ w` over the stencil's in-domain offsets at each index and,
+with `exterior`, over the offsets past a bounded edge too, on the lattice continued at its edge gap.
+"""
+function _separable_profile(
+    x::AbstractVector, lim::Int, g::AbstractVecOrMat{T}, periodic::Bool,
+    kernel::Kernels.AbstractFilterKernel, scale::T, exterior::Bool,
+) where {T<:AbstractFloat}
+    N = length(x)
     profile = zeros(T, N)
     @inbounds for i in 1:N
         s = zero(T)
         for dd in -lim:lim
             ii = i + dd
-            valid = (ii >= 1 && ii <= N) || periodic
-            valid && (s += _sepw(g, i, dd + lim + 1))
+            if (ii >= 1 && ii <= N) || periodic
+                s += _sepw(g, i, dd + lim + 1)
+            elseif exterior
+                s += _separable_exterior_weight(g, x, i, ii, dd + lim + 1, kernel, scale)
+            end
         end
         profile[i] = s
     end
     return profile
+end
+
+# A uniform axis's weight depends on the offset alone. A stretched axis continues at its edge gap, and
+# the cell there carries the weight `_separable_axis_weights` gives a cell of that width.
+@inline _separable_exterior_weight(g::AbstractVector, _, _, _, k::Int, _, _) = @inbounds g[k]
+
+@inline function _separable_exterior_weight(
+    ::AbstractMatrix{T}, x::AbstractVector, i::Int, ii::Int, ::Int,
+    kernel::Kernels.AbstractFilterKernel, scale::T,
+) where {T<:AbstractFloat}
+    n = length(x)
+    s = ii < 1 ? T(x[2] - x[1]) : T(x[n] - x[n - 1])
+    xe = ii < 1 ? T(x[1]) + (ii - 1) * s : T(x[n]) + (ii - n) * s
+    return Kernels.profile_cell_average(kernel, xe - T(x[i]), abs(s), scale) * abs(s)
 end
 
 """
@@ -363,7 +402,8 @@ function apply_separable!(
     _separable_check_strategy(fp, strategy)
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     mask = FlowGeometries.Grids.mask(grid)
-    @. fp.masked_input = T(mask) * field
+    # A `Bool` is a strong zero: an inactive cell contributes nothing, whatever it holds.
+    @. fp.masked_input = mask * field
     _separable_convolve!(out, fp.masked_input, fp, Nx, Ny)
     _separable_normalize_and_mask!(out, fp, mask, Nx, Ny)
     return out
@@ -371,42 +411,37 @@ end
 
 @noinline function _separable_strategy_mismatch()
     throw(ArgumentError(
-        "SeparableFootprint was built for ZeroFill masking, so it holds only the rank-1 " *
-        "profiles and no renormalization field, but is being applied with a renormalizing " *
-        "(non-ZeroFill) mask strategy on a masked grid. Rebuild the plan with the same " *
-        "`mask_strategy` you intend to apply with.",
+        "A separable footprint is being applied with a different mask strategy than it was built for, " *
+        "on a grid where the two normalize differently: a cell is inactive, or a window reaches past a " *
+        "bounded edge. Its denominator is fixed at build time, so one plan cannot serve both. Rebuild " *
+        "the plan with the `mask_strategy` you intend to apply with.",
     ))
 end
 
-# The denominator is fixed at build time — rank-1 profiles for ZeroFill, a dense `invrenorm` for
-# Deformable — so the apply cannot honour a strategy the plan was not built for.
-#
-# `invrenorm === nothing` does not by itself mean ZeroFill: on a fully-active grid both strategies
-# coincide and take the profiles. Hence the stored `masked` flag, rather than an `all(mask)` scan.
+# The denominator is fixed at build time — rank-1 profiles, or a dense `invrenorm` for Deformable on a
+# masked grid — so where the strategies differ (`fp.bound`) the apply accepts only the one it was built
+# for.
 @inline function _separable_check_strategy(fp::SeparableFootprint, strategy::AbstractMaskStrategy)
-    if !(strategy isa ZeroFill) && fp.masked && fp.invrenorm === nothing
-        _separable_strategy_mismatch()
-    end
+    (!fp.bound || typeof(strategy) === typeof(fp.strategy)) || _separable_strategy_mismatch()
     return nothing
 end
 
-# Shared denominator-normalize + mask-zero epilogue, used identically by the serial path above and
-# the ThreadedBackend extension's parallel-row-pass/column-pass path — kept in one place so they can
-# never drift out of sync (mirrors `_separable_convolve!`'s own "single shared primitive" role).
+# Shared denominator-normalize epilogue, used identically by the serial path above and the
+# ThreadedBackend extension's parallel-row-pass/column-pass path. `Deformable` on a masked grid zeroes
+# an inactive target; `ZeroFill` keeps its value, the filter of the zero-extended field there.
 function _separable_normalize_and_mask!(
     out::AbstractMatrix{T}, fp::SeparableFootprint{T}, mask::AbstractMatrix{Bool}, Nx::Int, Ny::Int,
 ) where {T<:AbstractFloat}
     if fp.invrenorm !== nothing
         @. out *= fp.invrenorm
+        @inbounds for j in 1:Ny, i in 1:Nx
+            mask[i, j] || (out[i, j] = zero(T))
+        end
     else
         Nx_profile, Ny_profile = fp.Nx_profile, fp.Ny_profile
         @inbounds for j in 1:Ny, i in 1:Nx
-            denom = Nx_profile[i] * Ny_profile[j]
-            out[i, j] = denom > T(1e-15) ? out[i, j] / denom : zero(T)
+            out[i, j] = _normalized(out[i, j], Nx_profile[i] * Ny_profile[j])
         end
-    end
-    @inbounds for j in 1:Ny, i in 1:Nx
-        mask[i, j] || (out[i, j] = zero(T))
     end
     return out
 end
@@ -472,21 +507,21 @@ function apply_footprint!(
     return out
 end
 
-# A plan's `invden` was accumulated under one mask strategy, so it cannot serve another. On an
-# UNMASKED grid the two coincide exactly — `ZeroFill` divides by the total in-support mass and
-# `Deformable` by the mass of the active taps, the same number when every cell is active — so the
-# restriction bites only where the denominators genuinely differ.
+# A plan's `invden` was accumulated under one mask strategy. `ZeroFill` divides by the kernel's full
+# mass and `Deformable` by the mass of the active in-domain taps: one number where every cell is active
+# and no window leaves the grid, which is when `fp.bound` is false and either strategy may apply.
 @noinline function _banded_strategy_mismatch()
     throw(ArgumentError(
-        "FilterFootprint is being applied to a MASKED grid with a different mask strategy than it was " *
-        "built for. Its normalization is precomputed per scale from the grid, the mask and the " *
-        "strategy, and the two strategies divide by different masses wherever a cell is inactive, so " *
-        "one plan cannot serve both. Rebuild the plan with the `mask_strategy` you intend to apply with.",
+        "FilterFootprint is being applied with a different mask strategy than it was built for, on a " *
+        "grid where the two normalize differently: a cell is inactive, or a window reaches past a " *
+        "bounded edge. Its normalization is precomputed per scale from the grid, the mask and the " *
+        "strategy, so one plan cannot serve both. Rebuild the plan with the `mask_strategy` you intend " *
+        "to apply with.",
     ))
 end
 
 @inline function _banded_check_strategy(fp::FilterFootprint, strategy::AbstractMaskStrategy)
-    (!fp.masked || typeof(strategy) === typeof(fp.strategy)) || _banded_strategy_mismatch()
+    (!fp.bound || typeof(strategy) === typeof(fp.strategy)) || _banded_strategy_mismatch()
     return nothing
 end
 
@@ -578,7 +613,7 @@ function apply_footprint_row!(
         oc, _banded_source(fp, field), fp.di, fp.dj, fp.w, fp.ptr[b], fp.ptr[b + 1] - 1,
         fp.periodic_x, fp.periodic_y, Nx, Ny, j,
     )
-    # `invden` carries the target-activity test and the degeneracy floor, so no branch is needed here.
+    # `invden` carries the target test, so no branch is needed here.
     invden = fp.invden
     @inbounds @simd for i in 1:Nx
         oc[i] *= invden[i, j]
@@ -633,9 +668,10 @@ function apply_footprint_row!(
 ) where {T<:AbstractFloat}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     cache = fp.cache
+    zerofill = strategy isa ZeroFill
     if cache !== nothing
         for i in 1:Nx
-            FlowGeometries.Grids.isactive(grid, i, j) || continue
+            _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
             t = i + (j - 1) * Nx
             lo = cache.ptr[t]
             hi = cache.ptr[t+1] - 1
@@ -646,7 +682,7 @@ function apply_footprint_row!(
                 jj = cache.jj[k]
                 active = FlowGeometries.Grids.isactive(grid, ii, jj)
                 w = cache.w[k]
-                if strategy isa ZeroFill
+                if zerofill
                     weight_norm += w
                     active && (weighted_sum += w * field[ii, jj])
                 else
@@ -655,11 +691,13 @@ function apply_footprint_row!(
                     weighted_sum += w * field[ii, jj]
                 end
             end
-            out[i, j] = weight_norm > T(1e-15) ? weighted_sum / weight_norm : zero(T)
+            zerofill && (weight_norm = _add_exterior(weight_norm, fp.exterior, i, j))
+            out[i, j] = _normalized(weighted_sum, weight_norm)
         end
     else
         kernel = fp.kernel
         scale = fp.scale
+        dim = _kernel_dim(grid)
         di_lim, dj_lim = fp.di_lim, fp.dj_lim
         fp_periodic_x, fp_periodic_y = fp.periodic_x, fp.periodic_y
         x_period, y_period = fp.x_period, fp.y_period
@@ -669,7 +707,7 @@ function apply_footprint_row!(
         # is its own task under a row-parallel backend, so nothing is shared across tasks.
         sc = FlowGeometries.Connectivity.ball_scratch()
         for i in 1:Nx
-            FlowGeometries.Grids.isactive(grid, i, j) || continue
+            _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
             target = FlowGeometries.Grids.coords(SA.SVector, grid, i, j)
             weighted_sum, weight_norm = _scattered_foldl(
                 (zero(T), zero(T)), grid, target, i, j, Nx, Ny, di_lim, dj_lim,
@@ -677,15 +715,16 @@ function apply_footprint_row!(
             ) do acc, iin, jjn, d
                 ws, wn = acc
                 active = FlowGeometries.Grids.isactive(grid, iin, jjn)
-                w = Kernels.kernel_weight(kernel, d, scale) * FlowGeometries.Grids.area(grid, iin, jjn)
-                if strategy isa ZeroFill
+                w = Kernels.kernel_weight(kernel, d, scale, dim) * FlowGeometries.Grids.area(grid, iin, jjn)
+                if zerofill
                     return (active ? ws + w * field[iin, jjn] : ws, wn + w)
                 else
                     active || return acc
                     return (ws + w * field[iin, jjn], wn + w)
                 end
             end
-            out[i, j] = weight_norm > T(1e-15) ? weighted_sum / weight_norm : zero(T)
+            zerofill && (weight_norm = _add_exterior(weight_norm, fp.exterior, i, j))
+            out[i, j] = _normalized(weighted_sum, weight_norm)
         end
     end
     return out

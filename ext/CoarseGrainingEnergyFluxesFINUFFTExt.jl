@@ -73,13 +73,17 @@ renormalization (or `nothing`), and the [`FINUFFTScratch`](@ref) the apply write
 `plan_filter(unstructured_grid, kernel, scale; method = Spectral())`.
 """
 struct FINUFFTFilterPlan{
-    T<:AbstractFloat, GP<:FINUFFTGridPlan{T}, A<:AbstractMatrix{T}, R, SC<:FINUFFTScratch{T},
+    T<:AbstractFloat, GP<:FINUFFTGridPlan{T}, A<:AbstractMatrix{T}, R,
+    MS<:CGEF.Filtering.AbstractMaskStrategy, SC<:FINUFFTScratch{T},
 } <: CGEF.Filtering.AbstractFilterPlan
     grid_plan::GP
     transfer::A    # Ĝ(|k|, ℓ) on the M × N CMCL-ordered mode grid
-    invrenorm::R   # precomputed 1/filter(mask) for Deformable, or nothing (ZeroFill / fully active)
+    invrenorm::R   # 1/filter(mask) for Deformable, zero at a masked point; or nothing
+    strategy::MS
     scratch::SC
 end
+
+CGEF.Filtering.plan_strategy(plan::FINUFFTFilterPlan) = plan.strategy
 
 function _finufft_grid_plan(
     grid::FlowGeometries.Grids.UnstructuredGrid{T,G}; finufft_nthreads::Integer = 1,
@@ -214,12 +218,14 @@ function CGEF.Filtering.spectral_filter_plan(
         renorm = real.(sc.c_scratch)
         threshold = T(0.01)
         ir = similar(renorm)
-        @. ir = ifelse(abs(renorm) >= threshold, one(T) / renorm, zero(T))
+        # A masked point is zero under `Deformable`, as in the real-space engines.
+        active = gp.mask === nothing ? trues(length(renorm)) : gp.mask
+        @. ir = ifelse(active & (abs(renorm) >= threshold), one(T) / renorm, zero(T))
         ir
     else
         nothing   # ZeroFill: already exactly `filter(mask .* field)`, no renormalization
     end
-    return FINUFFTFilterPlan(gp, transfer, invrenorm, sc)
+    return FINUFFTFilterPlan(gp, transfer, invrenorm, mask_strategy, sc)
 end
 
 # Analysis (pts → modes) depends on the field alone, so a sweep runs it once and each scale only applies

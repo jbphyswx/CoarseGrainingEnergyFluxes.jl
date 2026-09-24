@@ -40,9 +40,8 @@ programmatically so a script can gate on it.
   `Diagnostics.ForceSpectrum()` computes it regardless.
 - `supports_spectral_method::Bool`: the kernel has an isotropic transfer function, so
   `method = Spectral()` is available
-- `boundary_buffer_cells::Tuple`: how many cells in from a coast or domain edge are contaminated —
-  the kernel radius over the smallest spacing. Results inside this band are not trustworthy under any
-  mask strategy.
+- `boundary_buffer_cells::Tuple`: the kernel radius over the smallest spacing — how many cells from a
+  coast or domain edge the result depends on the mask strategy
 - `notes::Vector{String}`: everything above that needs acting on, in words
 """
 struct SetupReport
@@ -83,7 +82,7 @@ function Base.show(io::IO, ::MIME"text/plain", r::SetupReport)
     println(io, "  supports Π      : ", yn(r.supports_flux))
     println(io, "  spectrum ≥ 0    : ", yn(r.supports_spectrum))
     println(io, "  supports Spectral(): ", yn(r.supports_spectral_method))
-    println(io, "  boundary buffer : ", r.boundary_buffer_cells, " cells (contaminated)")
+    println(io, "  boundary buffer : ", r.boundary_buffer_cells, " cells")
     if isempty(r.notes)
         print(io, "  nothing to flag.")
     else
@@ -241,11 +240,13 @@ function check_setup(
         "where the grid is coarsest, ℓ spans $(map(x -> round(x; digits = 2), cps)) cells; below ~2 " *
         "cells on an axis the filter is a no-op on that axis there. Increase ℓ or coarsen the grid.")
 
-    rad = Kernels.kernel_radius(kernel, ℓ)
+    dim = Filtering._kernel_dim(grid)
+    rad = Kernels.kernel_radius(kernel, ℓ, dim)
     buf = map(s -> (isfinite(s) && s > 0) ? ceil(Int, rad / s) : 0, sp)
     isempty(buf) || push!(notes,
-        "points within $(buf) cells of a coast or domain edge are contaminated by footprint " *
-        "truncation, under either mask strategy — exclude them before averaging.")
+        "within $(buf) cells of a coast or domain edge the result depends on the mask strategy: " *
+        "ZeroFill treats land and the domain exterior as fluid at rest, Deformable renormalizes the " *
+        "kernel over active cells.")
 
     resolved_backend = try
         Filtering._resolve_backend(backend, grid)
@@ -257,9 +258,17 @@ function check_setup(
     resolved = resolved_backend === nothing ? "UNAVAILABLE" : string(nameof(typeof(resolved_backend)))
     host = resolved_backend !== nothing && Filtering._host_backend(resolved_backend)
 
-    flux_ok = Kernels.is_radial(kernel) ?
-        all(r -> Kernels.kernel_weight(kernel, T(r), ℓ) >= 0, range(zero(T), rad; length = 512)) :
-        all(>=(0), Kernels.limb_amplitudes(kernel, T))
+    # The weight in the grid's own dimension: `SharpSpectralKernel`'s real-space form depends on it, and
+    # its 2-D form comes from a weak dependency, whose absence is reported here as a note.
+    flux_ok = try
+        Kernels.is_radial(kernel) ?
+            all(r -> Kernels.kernel_weight(kernel, T(r), ℓ, dim) >= 0, range(zero(T), rad; length = 512)) :
+            all(>=(0), Kernels.limb_amplitudes(kernel, T))
+    catch e
+        e isa ArgumentError || rethrow()
+        push!(notes, sprint(showerror, e))
+        true
+    end
     flux_ok || push!(notes,
         "$(_kname(kernel)) takes NEGATIVE values, so τ is not realizable and Π is not a pointwise " *
         "energy transfer. Use TopHatKernel or GaussianKernel for a flux.")
@@ -340,7 +349,7 @@ annotation.
 
 # Fields
 - `scales::AbstractVector{T}`: filter scales ℓ in meters
-- `Π::A`: energy-flux maps stacked into ONE contiguous `(spatial dims..., Nscales)` array (W/m³) —
+- `Π::A`: specific energy-flux maps (m² s⁻³) stacked into one contiguous `(spatial dims..., Nscales)` array —
   not a `Vector` of separately-allocated per-scale matrices, so the whole sweep is a single allocation
   and each scale's map is a zero-copy view (`compute_Π!` writes directly into its slice).
 - `cumulative_energy::AbstractArray{T}`: cumulative coarse specific KE ½⟨|ū_ℓ|²⟩ per scale (Sadek–Aluie Eq.
@@ -488,6 +497,18 @@ end
     return policy
 end
 
+# The flux reads the strategy off each plan and the energy off `mask_strategy`, so prebuilt plans must
+# have been built for the strategy the keyword names.
+function _check_plan_strategy(plans, strategy::Filtering.AbstractMaskStrategy)
+    isempty(plans) && return nothing
+    s = Filtering.plan_strategy(first(plans))
+    typeof(s) === typeof(strategy) || throw(ArgumentError(
+        "filter_plans were built for $(nameof(typeof(s))) but mask_strategy is " *
+        "$(nameof(typeof(strategy))); pass the mask_strategy the plans were built with",
+    ))
+    return nothing
+end
+
 @inline _fill_spectrum!(g, C, k, ::Diagnostics.NoSpectrum) = fill!(g, convert(eltype(g), NaN))
 @inline _fill_spectrum!(g, C, k, ::Diagnostics.AbstractSpectrumPolicy) =
     Diagnostics.spectral_density!(g, C, k)
@@ -529,21 +550,17 @@ function coarse_grain!(
     _check_result_shape(result, grid, scales)
     policy = _check_spectrum(kernel, spectrum)
     ws = workspace === nothing ? Diagnostics.ΠWorkspace(grid; has_w = w !== nothing) : workspace
-    dplan = _deriv_plan(grid, deriv_plan)
-    # Each scale's plan is shared by `compute_Π!` and `cumulative_energy!`. A sweep repeated over many
-    # timesteps of the same grid, kernel and scales should pass a prebuilt `filter_plans`, so neither
-    # the vector nor the plans are reallocated.
-# Built as a comprehension so the element type is the plans' own concrete type. An
-# `AbstractFilterPlan` element type makes every `plans[s_idx]` a dynamic dispatch: measured at 3.1% of
-# a 256x256 8-scale sweep and 21 kB, against 0 B concrete. Plan types that genuinely differ across
-# scales (a cache strategy that flips with window width) still work — the comprehension then infers
-# their union or supertype instead, exactly as before.
+    # The filtered fields are read, differenced and averaged on the grid the strategy defines them on.
+    og = Diagnostics.output_grid(grid, mask_strategy)
+    dplan = _deriv_plan(og, deriv_plan)
+    # Each scale's plan is shared by `compute_Π!` and the energy. A sweep repeated over many timesteps
+    # of the same grid, kernel and scales should pass a prebuilt `filter_plans`, so neither the vector
+    # nor the plans are reallocated.
     plans = filter_plans === nothing ?
         _plan_filter_sweep(grid, kernel, scales, mask_strategy, backend, method) : filter_plans
+    _check_plan_strategy(plans, mask_strategy)
     # `E(ℓ)` is read from the filtered velocities `compute_Π!` has just left in the workspace, in the
-    # same pass. Running the energy sweep afterwards instead would filter `u` and `v` a second time at
-    # every scale — two of the seven applies per scale — because the buffers holding them are
-    # overwritten by the next scale.
+    # same pass, so `u` and `v` are filtered once per scale. Its denominator is the water area.
     total_area = Diagnostics.active_area(grid)
     # A spectral filter's forward transform depends on the field, not the scale, and every field the flux
     # computation filters is raw — the velocities and their products. Transforming them once here rather
@@ -558,7 +575,7 @@ function coarse_grain!(
             ws, plans[s_idx], backend, mask_strategy, dplan, analyzed,
         )
         result.cumulative_energy[s_idx] =
-            Diagnostics.energy_from_filtered(ws, grid, w !== nothing, total_area)
+            Diagnostics.energy_from_filtered(ws, og, w !== nothing, total_area)
     end
     result.wavenumber .= T(L) ./ result.scales
     _fill_spectrum!(result.filtering_spectrum, result.cumulative_energy, result.wavenumber, policy)
@@ -630,10 +647,12 @@ function _batch_driver!(
             "$(_batch_ws_shape(ws)), expected $((FlowGeometries.Grids.size_tuple(grid)..., batch.batch_size...)). " *
             "Build it with `ΠWorkspace(grid, batch_size)`.",
         ))
-    dplan = _deriv_plan(grid, _pool_get(ctx.deriv_plans, 1))
+    og = Diagnostics.output_grid(grid, ctx.mask_strategy)
+    dplan = _deriv_plan(og, _pool_get(ctx.deriv_plans, 1))
     plans = ctx.filter_plans === nothing ?
         _plan_filter_sweep(grid, ctx.kernel, ctx.scales, ctx.mask_strategy, be, ctx.method) :
         _pool_get(ctx.filter_plans, 1)
+    _check_plan_strategy(plans, ctx.mask_strategy)
     total_area = Diagnostics.active_area(grid)
     has_w = w !== nothing
     # The same scale-independent half the scalar driver hoists: the spherical rotation, or a spectral
@@ -649,7 +668,7 @@ function _batch_driver!(
             mask_strategy = ctx.mask_strategy, deriv_plan = dplan, analyzed = analyzed,
         )
         Diagnostics.energy_from_filtered!(
-            selectdim(batch.cumulative_energy, 1, s_idx), ws, grid, has_w, total_area,
+            selectdim(batch.cumulative_energy, 1, s_idx), ws, og, has_w, total_area,
         )
     end
     batch.wavenumber .= T(ctx.L) ./ batch.scales
@@ -1175,16 +1194,13 @@ function coarse_grain!(
     _check_result_shape(result, grid, scales)
     policy = _check_spectrum(kernel, spectrum)
     ws = workspace === nothing ? Diagnostics.ΠWorkspace(grid) : workspace   # 1-D: no vertical component
-# Built as a comprehension so the element type is the plans' own concrete type. An
-# `AbstractFilterPlan` element type makes every `plans[s_idx]` a dynamic dispatch: measured at 3.1% of
-# a 256x256 8-scale sweep and 21 kB, against 0 B concrete. Plan types that genuinely differ across
-# scales (a cache strategy that flips with window width) still work — the comprehension then infers
-# their union or supertype instead, exactly as before.
     plans = filter_plans === nothing ?
         _plan_filter_sweep(grid, kernel, scales, mask_strategy, backend, method) : filter_plans
+    _check_plan_strategy(plans, mask_strategy)
     Nx = FlowGeometries.Grids.size_tuple(grid)[1]
+    og = Diagnostics.output_grid(grid, mask_strategy)
 
-    total_area = sum(FlowGeometries.Grids.area(grid, i) for i in 1:Nx if FlowGeometries.Grids.isactive(grid, i))
+    total_area = Diagnostics.active_area(grid)
 
     for s_idx in eachindex(scales)
         scale = T(scales[s_idx])
@@ -1192,13 +1208,13 @@ function coarse_grain!(
         # One plan per scale, shared by the flux and the energy integral below, and reusable across
         # calls through `filter_plans` — as every other grid type's method already allows.
         plan = plans[s_idx]
+        # `compute_Π!` leaves `ū` in `ws.u_filt`.
         Diagnostics.compute_Π!(
             view(result.Π, :, s_idx),
             u, grid, kernel, scale;
             workspace = ws, filter_plan = plan, backend = backend, mask_strategy = mask_strategy,
         )
-        Filtering.filter_apply!(ws.u_filt, u, plan)
-        integrated_energy = sum(ws.u_filt[i]^2 * FlowGeometries.Grids.area(grid, i) for i in 1:Nx if FlowGeometries.Grids.isactive(grid, i))
+        integrated_energy = sum(ws.u_filt[i]^2 * FlowGeometries.Grids.area(grid, i) for i in 1:Nx if FlowGeometries.Grids.isactive(og, i))
         result.cumulative_energy[s_idx] = T(0.5) * integrated_energy / total_area
     end
 
@@ -1255,7 +1271,7 @@ function coarse_grain(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid; has_w = w !== nothing)
-    deriv_plan = Derivatives.gradient_plan(grid)
+    deriv_plan = Derivatives.gradient_plan(Diagnostics.output_grid(grid, mask_strategy))
     return coarse_grain!(
         result, u, v, w, grid;
         scales = scales, kernel = kernel, workspace = workspace, deriv_plan = deriv_plan,
@@ -1319,7 +1335,7 @@ function coarse_grain(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
     workspace = Diagnostics.ΠWorkspace(grid; has_w = w !== nothing)
-    deriv_plan = Derivatives.gradient_plan(grid)
+    deriv_plan = Derivatives.gradient_plan(Diagnostics.output_grid(grid, mask_strategy))
     return coarse_grain!(
         result, u, v, w, grid;
         scales = scales, kernel = kernel, workspace = workspace, deriv_plan = deriv_plan,

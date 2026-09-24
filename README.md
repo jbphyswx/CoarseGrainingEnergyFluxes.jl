@@ -18,10 +18,11 @@ and measures the energy transferred between them. Given the filtered velocity ū
 stress τ_ℓ = (u⊗u)̄_ℓ − ū_ℓ⊗ū_ℓ, the cross-scale kinetic-energy flux is
 
 ```
-Π(x, ℓ) = −ρ₀ τ_ℓ : S̄_ℓ
+Π(x, ℓ) = −τ_ℓ : S̄_ℓ
 ```
 
-(Π > 0 forward cascade, Π < 0 inverse cascade). Alongside Π the package computes:
+per unit mass, in m² s⁻³; `ρ₀ Π` is the flux per unit volume (Π > 0 forward cascade, Π < 0 inverse
+cascade). Alongside Π the package computes:
 
 | Diagnostic | Function |
 |---|---|
@@ -109,7 +110,7 @@ The scalar analogue of Π (buoyancy ⇒ available-potential-energy transfer).
 ![Tracer flux](docs/src/assets/tracer_flux.png)
 
 ### Masking: zero-fill vs deformable
-`ZeroFill` is the default: masked cells contribute nothing and the kernel stays position-independent, so filtering commutes with spatial derivatives — the step the flux budget is derived by. `Deformable` renormalizes over the locally-active area instead, reproducing constants exactly next to a boundary at the cost of that commutation. The two differ only within ≈ℓ of the mask, where results are contaminated under either choice.
+`ZeroFill` is the default: land and the domain exterior count as fluid at rest (Aluie et al. 2018; Grooms et al. 2021), and the kernel keeps its full mass at every cell, so filtering commutes with spatial derivatives — the step the flux budget is derived by. Every output is defined on every cell: `Π` over land is nonzero within the kernel's reach of the coast and zero beyond it, and domain means sum every cell over the water area. `Deformable` renormalizes over the locally-active area, reproducing constants exactly next to a boundary at the cost of that commutation, and zeroes masked cells. The two differ within the kernel's reach of a coast or bounded edge.
 
 ![Masking](docs/src/assets/masking.png)
 
@@ -163,7 +164,7 @@ result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKern
                            spectrum = CGEF.Diagnostics.NoSpectrum())
 
 # result.Π                 — (Nlon, Nlat, Nscales) stacked flux array; result.Π[:, :, i] at scales[i]
-# result.cumulative_energy — ½ρ₀⟨|ū_ℓ|²⟩ per scale (Sadek–Aluie Eq. 15)
+# result.cumulative_energy — ½⟨|ū_ℓ|²⟩ per scale, per unit mass (Sadek–Aluie Eq. 15)
 # result.wavenumber        — k_ℓ = L/ℓ
 
 # The top-hat's |Ĝ|² is not monotone, so it cannot carry a filtering spectral density (Sadek & Aluie
@@ -174,7 +175,8 @@ spec = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKern
 
 Not sure what a given `(grid, kernel, ℓ)` will actually do? `CGEF.check_setup(grid, kernel, ℓ)` reports
 the engine, the resolved backend, whether the kernel can carry `Π` and a spectrum, whether `ℓ` is
-resolvable on that grid, and how wide the contaminated band along a coast is — without building a plan.
+resolvable on that grid, and how far from a coast or domain edge the result depends on the mask
+strategy — without building a plan.
 
 Only a minimal set of names is exported at the top level: the sweep entry points (`coarse_grain`,
 `coarse_grain!`, `coarse_grain_profile`, `coarse_grain_batch!`, `coarse_grain_slices!`), their result
@@ -257,7 +259,7 @@ ug = FlowGeometries.Grids.UnstructuredGrid(geom, x, y, mask; k = 8)  # k-nearest
 |--------|-------------|----------|
 | `TopHatKernel()` | Uniform weight within radius ℓ/2 | Standard, most common (spectral transfer needs `using SpecialFunctions`) |
 | `GaussianKernel(; α = 6)` | Gaussian, variance-matched to a box of width ℓ (`σ² = ℓ²/12`) | Smooth, differentiable, has an exact spectral transfer |
-| `SharpSpectralKernel()` | Ideal low-pass in spectral space | Perfect scale separation for spectral filtering |
+| `SharpSpectralKernel()` | Ideal low-pass, `Ĝ = 1` for `k ≤ π/ℓ`; in real space its inverse transform in the grid's dimension (sinc, jinc, spherical Bessel), truncated near `10ℓ` | Scale separation with `method = Spectral()`; in real space the 2-D form needs `using SpecialFunctions` |
 | `SmoothHatKernel(; steepness = 10)` | Tanh-tapered top-hat (Storer et al.) | A box without the discontinuity; real space only |
 | `HyperGaussianKernel(; α = 1)` | Super-Gaussian, `exp(-α(2d/ℓ)⁴)` | Flatter core, steeper skirt than a Gaussian; real space only |
 | `HighOrderKernel{P}(; b_over_ℓ = 1/8)` | `P` vanishing moments, `P ∈ (3, 5)` (Sadek & Aluie `M^I`/`M^II`) | Lifts the filtering spectrum's `k⁻³` slope ceiling. **Separable, not radial**, and signed — needs axes, `ℓ ≥ 8Δx`, and is not for Π |

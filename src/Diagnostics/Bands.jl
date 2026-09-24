@@ -28,16 +28,12 @@ and the decomposition is exact:
 ½⟨|u|²⟩ = Σ_{n=1}^N ⟨k_n⟩ + ½⟨|f_N|²⟩ .
 ```
 
-The sum telescopes because each `⟨G * x⟩ = ⟨x⟩` — i.e. **because the filter conserves the domain
-mean**. Measured, that holds to round-off on a periodic, unmasked grid (relative error 5e-16 for the
-top-hat, 2e-15 for the Gaussian) and the identity is exact there.
-
-Anywhere the footprint is truncated, it is not, and the identity carries a residual of order `ℓ/L`:
-measured on the same field, **1.1e-2 relative on a BOUNDED grid** (the footprint runs off the domain
-edge) and **1.1e-2 on a masked periodic grid under `ZeroFill`** (energy is smeared onto masked cells,
-which report zero). `Deformable` renormalizes that leakage away and does better on a masked domain —
-4.8e-4 — at the cost of the commutation property `ZeroFill` is the default for. So: read the bands as
-exact on a periodic unmasked domain, and as carrying an `O(ℓ/L)` boundary residual otherwise.
+The sum telescopes because each `⟨G * x⟩ = ⟨x⟩`: the filter conserves the integral over the grid its
+output is read on. Under `ZeroFill` every cell of that grid is summed, land included, and divided by
+the water area, so on a periodic grid, masked or not, the identity holds to the accuracy the discrete
+kernel conserves its mass. Past a bounded edge the filtered field leaves the grid, and the identity
+carries a residual, `½ Σₙ (⟨(|f_{n-1}|²)‾⟩ − ⟨|f_{n-1}|²⟩)`, of order `ℓ/L`. `Deformable` renormalizes
+over the active cells, which does not conserve the integral.
 
 On a grid of non-Cartesian geometry `f_n` is the local part of the filtered planetary Cartesian
 components of `f_{n-1}` (Aluie 2019) — the filtered velocity [`compute_Π!`](@ref) uses — and `|f|²`
@@ -91,13 +87,18 @@ function band_energies(
         Filtering.plan_filter_sweep(grid, kernel, scales;
                                     mask_strategy = mask_strategy, backend = backend, method = method) :
         filter_plans
+    # Band 1 filters `u`; every later band filters the previous band's output, defined on `og`.
+    og = output_grid(grid, plans[1])
+    dplans = _same_cells(grid, og) ? plans :
+        Filtering.plan_filter_sweep(og, kernel, scales; mask_strategy = Filtering.ZeroFill(),
+                                    backend = backend, method = Filtering.plan_method(plans[1]))
 
     # Per-band maps are `N` full fields and most callers want only the scalars they reduce to, so they
     # are opt-in. Without them one scratch map is reused for every band.
     band_maps = maps ? [zeros(T, gsz) for _ in eachindex(scales)] : nothing
     scratch_map = maps ? nothing : zeros(T, gsz)
     bands = zeros(T, length(scales))
-    mask = FlowGeometries.Grids.mask(grid)
+    mask = FlowGeometries.Grids.mask(og)
 
     # `f` is the running repeatedly-filtered field in local components. Each band filters it and
     # `|f|²`, and the band energy is the second moment `(|f|²)‾ − |f̄|²`.
@@ -110,22 +111,23 @@ function band_energies(
         # is given — the filtered velocity `compute_Π!` uses. `|f|²` is a scalar and is filtered as one.
         P = ntuple(_ -> zeros(T, gsz), 3)
         GP = ntuple(_ -> zeros(T, gsz), 3)
-        sq = zeros(T, gsz); fsq = zeros(T, gsz)
+        sq = zeros(T, gsz)
         for n in eachindex(scales)
             km = maps ? band_maps[n] : scratch_map
-            _fill_planetary!(P, f[1], f[2], has_w ? f[3] : nothing, grid)
+            _fill_planetary!(P, f[1], f[2], has_w ? f[3] : nothing, n == 1 ? grid : og)
             @. sq = P[1]^2 + P[2]^2 + P[3]^2
-            Filtering.filter_apply_batch!((GP[1], GP[2], GP[3], fsq), (P[1], P[2], P[3], sq), plans[n])
-            _planetary_to_local!(loc, GP, grid)
-            copyto!(km, fsq)
+            Filtering.filter_apply_batch!(
+                (GP[1], GP[2], GP[3], km), (P[1], P[2], P[3], sq), n == 1 ? plans[1] : dplans[n],
+            )
+            _planetary_to_local!(loc, GP, og)
             for c in eachindex(loc)
                 fc = loc[c]
                 @. km -= fc * fc
             end
             @. km = ifelse(mask, T(0.5) * km, zero(T))
-            bands[n] = _area_mean(km, grid, total_area)
+            bands[n] = _area_mean(km, og, total_area)
         end
-        return _band_result(bands, band_maps, loc, mask, grid, total_area)
+        return _band_result(bands, band_maps, loc, mask, og, total_area)
     end
 
     # `nxt` receives each next application.
@@ -146,18 +148,18 @@ function band_energies(
                          (nxt[1], nxt[2], nxt[3], fsqs[1], fsqs[2], fsqs[3])
         srcs = nc == 2 ? (f[1], f[2], sqs[1], sqs[2]) :
                          (f[1], f[2], f[3], sqs[1], sqs[2], sqs[3])
-        Filtering.filter_apply_batch!(outs, srcs, plans[n])
+        Filtering.filter_apply_batch!(outs, srcs, n == 1 ? plans[1] : dplans[n])
         for c in 1:nc
             # τ(f;f) = (f²)‾ − (f̄)², summed over components; the ½ is applied once at the end.
             @. km += fsqs[c] - nxt[c] * nxt[c]
         end
         @. km = ifelse(mask, T(0.5) * km, zero(T))
-        bands[n] = _area_mean(km, grid, total_area)
+        bands[n] = _area_mean(km, og, total_area)
         for c in 1:nc
             copyto!(f[c], nxt[c])
         end
     end
-    return _band_result(bands, band_maps, loc, mask, grid, total_area)
+    return _band_result(bands, band_maps, loc, mask, og, total_area)
 end
 
 # The resolved energy `½⟨|f_N|²⟩` of the final field and the returned named tuple.

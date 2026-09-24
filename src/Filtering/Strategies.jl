@@ -12,18 +12,24 @@ abstract type AbstractMaskStrategy end
 """
     ZeroFill <: AbstractMaskStrategy
 
-Excluded cells are treated as zero-valued: they contribute to the denominator (kernel weight) but
-zero to the numerator. The kernel is homogeneous (same shape everywhere), which preserves domain
-averages and commutation with derivatives (the Storer 2022 / Aluie 2019 "fixed kernel" mode).
+Masked cells and the domain's exterior are zero-velocity water (Aluie et al. 2018; Storer et al.
+2022): they contribute nothing to the numerator, and the kernel keeps its full mass, the cells past a
+bounded edge included. The kernel is then the same everywhere, so filtering commutes with derivatives
+and conserves the integral over all space, which on a periodic grid is the grid (Aluie 2019; Grooms
+et al. 2021, eq. 7).
+
+The filtered field is defined at every cell, a masked one too: within the kernel's reach of an active
+cell it is nonzero over land.
 """
 struct ZeroFill <: AbstractMaskStrategy end
 
 """
     Deformable <: AbstractMaskStrategy
 
-Masked cells are excluded from BOTH numerator and denominator, so the kernel is renormalized over the
-locally-included area only ("deformable kernel"). Excluded cells are genuinely dropped, but the kernel
-becomes inhomogeneous near a mask boundary (breaks the strict commutation theorems).
+Masked cells and the exterior are excluded from both numerator and denominator, so the kernel is
+renormalized over the active cells in its window ("deformable kernel"), and a masked cell is zero. A
+constant is reproduced exactly next to a boundary, but the kernel changes shape there, so filtering
+neither commutes with derivatives nor conserves the domain integral.
 """
 struct Deformable <: AbstractMaskStrategy end
 

@@ -120,12 +120,18 @@ Test.@testset "Nonuniform axes" begin
         Test.@test ∂f∂y_nu[i, j] ≈ 2 * y_nu[j] atol=1e-10
     end
 
-    # Filtering a constant field must return the constant unchanged even on a nonuniform grid
-    # (this exercises the scattered/per-point footprint path end to end).
+    # On a nonuniform grid `Deformable` returns a constant unchanged. `ZeroFill` filters it extended by
+    # zero over the lattice continued at each edge gap, which the direct sum reproduces.
     field_const = fill(7.5, Nx_nu, Ny_nu)
     out_const = zeros(Nx_nu, Ny_nu)
-    CGEF.Filtering.filter_field!(out_const, field_const, grid_nu, CGEF.TopHatKernel(), 3.0)
+    CGEF.Filtering.filter_field!(out_const, field_const, grid_nu, CGEF.TopHatKernel(), 3.0;
+                                 mask_strategy = CGEF.Filtering.Deformable())
     Test.@test all(x -> isapprox(x, 7.5; atol=1e-10), out_const)
+    # A radius of 1.55 matches no distance between cells of the continued lattice.
+    CGEF.Filtering.filter_field!(out_const, field_const, grid_nu, CGEF.TopHatKernel(), 3.1)
+    Test.@test out_const ≈ _cgef_direct_filter(grid_nu, CGEF.TopHatKernel(), 3.1, field_const) rtol = 1e-12
+    Test.@test out_const[4, 4] ≈ 7.5 rtol = 1e-12       # window on the grid
+    Test.@test out_const[1, 1] < 7.5 / 2                 # window mostly past the corner
 
     # --- Spherical: nonuniform lon/lat. f(λ,φ)=λ has EXACT physical x-derivative 1/(R cosφ)
     # and f(λ,φ)=φ has EXACT physical y-derivative 1/R, on ANY spacing pattern (verified
@@ -209,29 +215,29 @@ Test.@testset "Separable engine on a mixed uniform/stretched axis pair" begin
             # The operator, assembled from the kernel primitives and the grid's own axis measures: a
             # product of two 1-D cell-averaged profiles, truncated per axis. The Gaussian's radius is a
             # tolerance, so the window itself comes from the engine; every weight and both
-            # normalizations are derived here.
+            # normalizations are derived here. Past a bounded edge each axis continues at its edge gap,
+            # a cell there as wide as that gap.
             wy = FG.Grids.measure_factors(grid)[2]
             Δx = step(xr)
             gxr(ddi) = CGEF.Kernels.profile_cell_average(ker, ddi * Δx, Δx, scale)
-            gyr(j, ddj) = CGEF.Kernels.profile_cell_average(ker, yv[j+ddj] - yv[j], wy[j+ddj], scale) *
-                          wy[j+ddj]
+            ye(jj) = jj < 1 ? yv[1] + (jj - 1) * (yv[2] - yv[1]) :
+                     jj > N ? yv[N] + (jj - N) * (yv[N] - yv[N-1]) : yv[jj]
+            we(jj) = jj < 1 ? yv[2] - yv[1] : jj > N ? yv[N] - yv[N-1] : wy[jj]
+            gyr(j, jj) = CGEF.Kernels.profile_cell_average(ker, ye(jj) - yv[j], we(jj), scale) * we(jj)
+            zf = strat isa CGEF.Filtering.ZeroFill
             ref = zeros(N, N)
             for j in 1:N, i in 1:N
-                if !FG.Grids.isactive(grid, i, j)
-                    ref[i, j] = 0.0
-                    continue
-                end
+                (zf || FG.Grids.isactive(grid, i, j)) || continue
                 num = 0.0; den = 0.0
                 for ddj in (-fp.dj_lim):(fp.dj_lim), ddi in (-fp.di_lim):(fp.di_lim)
                     ii = i + ddi; jj = j + ddj
-                    (1 <= ii <= N && 1 <= jj <= N) || continue    # bounded axes: outside is zero
-                    wt = gxr(ddi) * gyr(j, ddj)
-                    active = FG.Grids.isactive(grid, ii, jj)
+                    wt = gxr(ddi) * gyr(j, jj)
+                    active = 1 <= ii <= N && 1 <= jj <= N && FG.Grids.isactive(grid, ii, jj)
                     active && (num += wt * f[ii, jj])
                     # `ZeroFill` divides by the whole window's mass; `Deformable` by the active part.
-                    den += (strat isa CGEF.Filtering.ZeroFill || active) ? wt : 0.0
+                    (zf || active) && (den += wt)
                 end
-                ref[i, j] = den > 1e-15 ? num / den : 0.0
+                ref[i, j] = num / den
             end
             Test.@test maximum(abs, out .- ref) / maximum(abs, ref) < 1e-12
         end
@@ -293,28 +299,11 @@ end
 # Filtering a degenerate spherical grid. A transect's measure is an ARC LENGTH — `R·Δλ` along a
 # parallel, `R·Δφ` along a meridian — not the `R²cosφ·Δλ·Δφ` area form with the missing differential
 # replaced by a placeholder. Any engine that factorizes the measure has to reproduce the grid's own
-# factors, and the reference here is weighted by `Grids.measure` directly so it cannot share the
-# mistake.
+# factors, and the reference (`_cgef_direct_filter`) is weighted by `Grids.measure` directly so it
+# cannot share the mistake. A single-point axis is not continued; the meridian's latitude is.
 # -----------------------------------------------------------------------
 Test.@testset "Degenerate spherical grids: the filter weights by the grid's own measure" begin
-    function measure_weighted_reference(grid, f, ker, scale)
-        geo = FG.Grids.grid_geometry(grid)
-        rad = CGEF.Kernels.kernel_radius(ker, scale)
-        Nx, Ny = FG.Grids.size_tuple(grid)
-        out = zeros(Nx, Ny)
-        for j in 1:Ny, i in 1:Nx
-            p = FG.Grids.coords(grid, i, j)
-            ws = 0.0; wn = 0.0
-            for jn in 1:Ny, in_ in 1:Nx
-                d = FG.Geometry.distance(geo, p, FG.Grids.coords(grid, in_, jn))
-                d <= rad || continue
-                w = CGEF.Kernels.kernel_weight(ker, d, scale) * FG.Grids.measure(grid, in_, jn)
-                wn += w; ws += w * f[in_, jn]
-            end
-            out[i, j] = wn > 1e-15 ? ws / wn : 0.0
-        end
-        return out
-    end
+    measure_weighted_reference(grid, f, ker, scale) = _cgef_direct_filter(grid, ker, scale, f)
 
     sgeo = FG.Geometry.SphericalGeometry(6.371e6)
     lat = deg2rad.(collect(-60.0:5.0:60.0))

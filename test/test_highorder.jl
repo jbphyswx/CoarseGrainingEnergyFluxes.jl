@@ -168,17 +168,27 @@ Test.@testset "HighOrderKernel: cell-averaged weights are what make it work off 
         xv = collect(xs) .+ [30.0 * sin(2.3i) for i in 1:N]        # ±3% jitter
         for order in (3, 5), (nm, ax) in (("uniform", xs), ("stretched", xv))
             g = FG.Grids.StructuredGrid(geom, ax, ax, trues(N, N))
-            fp = CGEF.Filtering.plan_filter(g, CGEF.Kernels.HighOrderKernel(; order = order), ℓ).footprint
-            Test.@test fp isa CGEF.Filtering.SeparableFootprint
-            # The normalization denominator is strictly positive everywhere — the property that fails
-            # under point sampling.
-            Test.@test all(>(0), fp.Nx_profile)
-            Test.@test all(>(0), fp.Ny_profile)
-            # ... so a constant comes back exactly, on a stretched axis as much as a uniform one.
-            out = zeros(N, N)
-            CGEF.Filtering.filter_field!(out, fill(2.5, N, N), g,
-                                         CGEF.Kernels.HighOrderKernel(; order = order), ℓ)
-            Test.@test all(≈(2.5; rtol = 1e-12), out)
+            k = CGEF.Kernels.HighOrderKernel(; order = order)
+            # Compact support: past `rad` plus one cell average the profile is exactly zero.
+            rad = CGEF.Kernels.kernel_radius(k, ℓ)
+            inside = [min(ax[i] - ax[1], ax[end] - ax[i], ax[j] - ax[1], ax[end] - ax[j]) > rad + 2dx
+                      for i in 1:N, j in 1:N]
+            Test.@test any(inside)
+            for strat in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
+                fp = CGEF.Filtering.plan_filter(g, k, ℓ; mask_strategy = strat).footprint
+                Test.@test fp isa CGEF.Filtering.SeparableFootprint
+                # The normalization denominator is strictly positive everywhere — the property that
+                # fails under point sampling.
+                Test.@test all(>(0), fp.Nx_profile)
+                Test.@test all(>(0), fp.Ny_profile)
+                # ... so a constant comes back exactly, on a stretched axis as much as a uniform one:
+                # everywhere under `Deformable`, and under `ZeroFill` wherever the support stays on the
+                # grid.
+                out = zeros(N, N)
+                CGEF.Filtering.filter_field!(out, fill(2.5, N, N), g, k, ℓ; mask_strategy = strat)
+                sel = strat isa CGEF.Filtering.Deformable ? trues(N, N) : inside
+                Test.@test all(≈(2.5; rtol = 1e-12), out[sel])
+            end
         end
     end
 end

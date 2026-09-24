@@ -146,14 +146,14 @@ Test.@testset "Periodic Cartesian grid: no boundary weight corruption" begin
     # A low-pass filter is a normalized weighted average: it can never amplify beyond the input's
     # range. This is the invariant the bug violated (output reached ~4.8x the input's peak).
     Test.@test maximum(abs, out) <= maximum(abs, field) + 1e-9
-    # Constant field ⇒ Ĝ(0)=1 ⇒ preserved exactly, independent of the boundary-wrap bug.
-    out_const = zeros(Nx, Nx)
-    CGEF.Filtering.filter_field!(out_const, fill(3.7, Nx, Nx), grid, CGEF.GaussianKernel(), scale)
-    Test.@test all(x -> isapprox(x, 3.7; atol = 1e-6), out_const)
-    # Away from the (genuinely non-periodic) y-boundary, the periodic-in-x wrap must reproduce
-    # the analytic single-mode eigenfunction relation closely.
+    # Away from the (genuinely non-periodic) y-boundary, where the window stays on the grid, a
+    # constant is preserved (Ĝ(0) = 1) and the periodic-in-x wrap reproduces the analytic single-mode
+    # eigenfunction relation closely.
     rad = CGEF.Kernels.kernel_radius(CGEF.GaussianKernel(), scale)
     interior = [(rad < xs[j] < xs[end] - rad) for _ in 1:Nx, j in 1:Nx]
+    out_const = zeros(Nx, Nx)
+    CGEF.Filtering.filter_field!(out_const, fill(3.7, Nx, Nx), grid, CGEF.GaussianKernel(), scale)
+    Test.@test all(x -> isapprox(x, 3.7; atol = 1e-6), out_const[interior])
     reldiff = abs.(out[interior] .- analytic[interior]) ./ maximum(abs, analytic)
     Test.@test maximum(reldiff) < 0.3
     Test.@test sum(reldiff) / length(reldiff) < 0.05
@@ -315,7 +315,7 @@ Test.@testset "Periodic conventions past one turn: angular identifies, translati
     # most once however far the window reaches. Counting the repeats put the polar rows 7.6% out.
     function ref_spherical(grid, f, ker, scale)
         geo = FG.Grids.grid_geometry(grid)
-        rad = CGEF.Kernels.kernel_radius(ker, scale)
+        rad = CGEF.Kernels.kernel_radius(ker, scale, Val(2))
         Nx, Ny = FG.Grids.size_tuple(grid)
         out = zeros(Nx, Ny)
         for j in 1:Ny, i in 1:Nx
@@ -324,10 +324,10 @@ Test.@testset "Periodic conventions past one turn: angular identifies, translati
             for jn in 1:Ny, in_ in 1:Nx        # every cell once; great-circle distance is 2π-periodic
                 d = FG.Geometry.distance(geo, p, FG.Grids.coords(grid, in_, jn))
                 d <= rad || continue
-                w = CGEF.Kernels.kernel_weight(ker, d, scale) * FG.Grids.area(grid, in_, jn)
+                w = CGEF.Kernels.kernel_weight(ker, d, scale, Val(2)) * FG.Grids.area(grid, in_, jn)
                 wn += w; ws += w * f[in_, jn]
             end
-            out[i, j] = wn > 1e-15 ? ws / wn : 0.0
+            out[i, j] = ws / wn
         end
         return out
     end
@@ -349,7 +349,7 @@ Test.@testset "Periodic conventions past one turn: angular identifies, translati
     # image inside the radius, each at its own displacement.
     function ref_tiled(grid, f, ker, scale, L)
         geo = FG.Grids.grid_geometry(grid)
-        rad = CGEF.Kernels.kernel_radius(ker, scale)
+        rad = CGEF.Kernels.kernel_radius(ker, scale, Val(2))
         Nx, Ny = FG.Grids.size_tuple(grid)
         kmax = ceil(Int, rad / L) + 1
         out = zeros(Nx, Ny)
@@ -360,10 +360,10 @@ Test.@testset "Periodic conventions past one turn: angular identifies, translati
                 q = FG.Grids.coords(SA.SVector, grid, in_, jn) + SA.SVector(ki * L, kj * L)
                 d = FG.Geometry.distance(geo, p, q)
                 d <= rad || continue
-                w = CGEF.Kernels.kernel_weight(ker, d, scale) * FG.Grids.area(grid, in_, jn)
+                w = CGEF.Kernels.kernel_weight(ker, d, scale, Val(2)) * FG.Grids.area(grid, in_, jn)
                 wn += w; ws += w * f[in_, jn]
             end
-            out[i, j] = wn > 1e-15 ? ws / wn : 0.0
+            out[i, j] = ws / wn
         end
         return out
     end
@@ -380,7 +380,7 @@ Test.@testset "Periodic conventions past one turn: angular identifies, translati
     o_ts = zeros(tN, tN)
     CGEF.Filtering.filter_field!(o_ts, tu, tgrid, tker, tscale;
         backend = CGEF.ComputationalBackends.SerialBackend())
-    # A sinc kernel over this many images sums with heavy cancellation, so the reference's summation
-    # order and the engine's cannot agree to the last bit.
+    # The sharp-spectral kernel's signed weights over this many images sum with heavy cancellation, so
+    # the reference's summation order and the engine's cannot agree to the last bit.
     Test.@test maximum(abs, o_ts .- ref_tiled(tgrid, tu, tker, tscale, tL)) < 1e-6
 end

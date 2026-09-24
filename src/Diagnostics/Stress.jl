@@ -65,11 +65,12 @@ end
 end
 
 """
-    tau_decomposition!(ws::TauWorkspace, u, v, grid, kernel, scale; filter_plan=nothing, ...) -> (; L, C, R)
+    tau_decomposition!(ws::TauWorkspace, u, v, grid, kernel, scale; filter_plan=nothing, derived_plan=nothing, ...) -> (; L, C, R)
 
 In-place [`tau_decomposition`](@ref). Writes into `ws` and returns views of its component buffers, so
-the result is valid until the next call on the same workspace. Supplying `filter_plan` as well makes a
-repeated decomposition allocation-free.
+the result is valid until the next call on the same workspace. `filter_plan` filters `u` and `v`;
+`derived_plan` filters what that produces, which under `ZeroFill` is defined over land too (see
+`_derived_plan`). Supplying both makes a repeated decomposition allocation-free.
 """
 function tau_decomposition!(
     ws::TauWorkspace{T},
@@ -79,6 +80,7 @@ function tau_decomposition!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
+    derived_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
@@ -86,30 +88,33 @@ function tau_decomposition!(
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
         filter_plan
+    og = output_grid(grid, plan)
+    dplan = derived_plan === nothing ? _derived_plan(plan, grid, og, kernel, scale, backend) : derived_plan
+    mask = FlowGeometries.Grids.mask(grid)
 
     Filtering.filter_apply_batch!((ws.ub, ws.vb), (u, v), plan)      # ū, v̄
-    @. ws.up = u - ws.ub                                             # residuals u', v'
-    @. ws.vp = v - ws.vb
+    @. ws.up = mask * u - ws.ub                                      # residuals u', v'; land is at rest
+    @. ws.vp = mask * v - ws.vb
     Filtering.filter_apply_batch!(                                   # ū̄, v̄̄, ū', v̄'
-        (ws.ubb, ws.vbb, ws.upb, ws.vpb), (ws.ub, ws.vb, ws.up, ws.vp), plan,
+        (ws.ubb, ws.vbb, ws.upb, ws.vpb), (ws.ub, ws.vb, ws.up, ws.vp), dplan,
     )
 
-    _second_moment!(ws.Lxx, ws.ub, ws.ub, ws.ubb, ws.ubb, ws.prod, ws.fprod, plan)
-    _second_moment!(ws.Lxy, ws.ub, ws.vb, ws.ubb, ws.vbb, ws.prod, ws.fprod, plan)
-    _second_moment!(ws.Lyy, ws.vb, ws.vb, ws.vbb, ws.vbb, ws.prod, ws.fprod, plan)
+    _second_moment!(ws.Lxx, ws.ub, ws.ub, ws.ubb, ws.ubb, ws.prod, ws.fprod, dplan)
+    _second_moment!(ws.Lxy, ws.ub, ws.vb, ws.ubb, ws.vbb, ws.prod, ws.fprod, dplan)
+    _second_moment!(ws.Lyy, ws.vb, ws.vb, ws.vbb, ws.vbb, ws.prod, ws.fprod, dplan)
 
-    _second_moment!(ws.Cxx, ws.ub, ws.up, ws.ubb, ws.upb, ws.prod, ws.fprod, plan)
+    _second_moment!(ws.Cxx, ws.ub, ws.up, ws.ubb, ws.upb, ws.prod, ws.fprod, dplan)
     @. ws.Cxx *= T(2)
     # The cross term is the sum of both orderings, so the second lands in `fprod2` before adding.
-    _second_moment!(ws.Cxy, ws.ub, ws.vp, ws.ubb, ws.vpb, ws.prod, ws.fprod, plan)
-    _second_moment!(ws.fprod2, ws.up, ws.vb, ws.upb, ws.vbb, ws.prod, ws.fprod, plan)
+    _second_moment!(ws.Cxy, ws.ub, ws.vp, ws.ubb, ws.vpb, ws.prod, ws.fprod, dplan)
+    _second_moment!(ws.fprod2, ws.up, ws.vb, ws.upb, ws.vbb, ws.prod, ws.fprod, dplan)
     @. ws.Cxy += ws.fprod2
-    _second_moment!(ws.Cyy, ws.vb, ws.vp, ws.vbb, ws.vpb, ws.prod, ws.fprod, plan)
+    _second_moment!(ws.Cyy, ws.vb, ws.vp, ws.vbb, ws.vpb, ws.prod, ws.fprod, dplan)
     @. ws.Cyy *= T(2)
 
-    _second_moment!(ws.Rxx, ws.up, ws.up, ws.upb, ws.upb, ws.prod, ws.fprod, plan)
-    _second_moment!(ws.Rxy, ws.up, ws.vp, ws.upb, ws.vpb, ws.prod, ws.fprod, plan)
-    _second_moment!(ws.Ryy, ws.vp, ws.vp, ws.vpb, ws.vpb, ws.prod, ws.fprod, plan)
+    _second_moment!(ws.Rxx, ws.up, ws.up, ws.upb, ws.upb, ws.prod, ws.fprod, dplan)
+    _second_moment!(ws.Rxy, ws.up, ws.vp, ws.upb, ws.vpb, ws.prod, ws.fprod, dplan)
+    _second_moment!(ws.Ryy, ws.vp, ws.vp, ws.vpb, ws.vpb, ws.prod, ws.fprod, dplan)
 
     return (
         L = (xx = ws.Lxx, xy = ws.Lxy, yy = ws.Lyy),
@@ -296,6 +301,7 @@ function tau_decomposition!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
+    derived_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
@@ -303,6 +309,8 @@ function tau_decomposition!(
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
         filter_plan
+    og = output_grid(grid, plan)
+    dplan = derived_plan === nothing ? _derived_plan(plan, grid, og, kernel, scale, backend) : derived_plan
     geo = FlowGeometries.Grids.grid_geometry(grid)
     up, ub, ubb, upb, pr = ws.up, ws.ub, ws.ubb, ws.upb, ws.prod
 
@@ -322,9 +330,9 @@ function tau_decomposition!(
     for c in 1:3
         @. up[c] = up[c] - ub[c]                                      # residual u', in place
     end
-    Filtering.filter_apply_batch!((ubb..., upb...), (ub..., up...), plan)   # ū̄ and ū'
+    Filtering.filter_apply_batch!((ubb..., upb...), (ub..., up...), dplan)  # ū̄ and ū'
 
-    _sph_pair_moments!(ws.L, ws.C, ws.R, ub, up, ubb, upb, pr, plan, grid, geo)
+    _sph_pair_moments!(ws.L, ws.C, ws.R, ub, up, ubb, upb, pr, dplan, og, geo)
 
     return (;
         L = (xx = ws.L[1], xy = ws.L[2], yy = ws.L[3]),
@@ -363,7 +371,7 @@ function tau_decomposition(
     end
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
     return tau_decomposition!(
-        Sym3TauWorkspace(grid), u, v, w, grid, kernel, scale; filter_plan = plan,
+        Sym3TauWorkspace(grid), u, v, w, grid, kernel, scale; filter_plan = plan, backend = backend,
     )
 end
 
@@ -382,33 +390,37 @@ function tau_decomposition!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
+    derived_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
         filter_plan
+    og = output_grid(grid, plan)
+    dplan = derived_plan === nothing ? _derived_plan(plan, grid, og, kernel, scale, backend) : derived_plan
     up, ub, ubb, upb, pr = ws.up, ws.ub, ws.ubb, ws.upb, ws.prod
 
     _fill_tau3_velocity!(up, u, v, w, grid, T)
-    Filtering.filter_apply_batch!(ub, up, plan)                            # ū
+    Filtering.filter_apply_batch!(ub, up, plan)                             # ū
     for c in 1:3
-        @. up[c] = up[c] - ub[c]                                           # residual u', in place
+        @. up[c] = up[c] - ub[c]                                            # residual u', in place
     end
-    Filtering.filter_apply_batch!((ubb..., upb...), (ub..., up...), plan)  # ū̄ and ū'
-    _pair_moments!(ws.L, ws.C, ws.R, ub, up, ubb, upb, pr, plan)
-    _rotate_tau3_to_local!((ws.L, ws.C, ws.R), grid)
+    Filtering.filter_apply_batch!((ubb..., upb...), (ub..., up...), dplan)  # ū̄ and ū'
+    _pair_moments!(ws.L, ws.C, ws.R, ub, up, ubb, upb, pr, dplan)
+    _rotate_tau3_to_local!((ws.L, ws.C, ws.R), og)
 
     return (; L = _sym3_named(ws.L), C = _sym3_named(ws.C), R = _sym3_named(ws.R))
 end
 
-# A Cartesian volume's components are the ones supplied.
+# A Cartesian volume's components are the ones supplied, at rest on an inactive cell.
 function _fill_tau3_velocity!(
     up, u, v, w, grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, ::Type{T},
 ) where {T, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    @. up[1] = u
-    @. up[2] = v
-    @. up[3] = w
+    mask = FlowGeometries.Grids.mask(grid)
+    @. up[1] = mask * u
+    @. up[2] = mask * v
+    @. up[3] = mask * w
     return nothing
 end
 

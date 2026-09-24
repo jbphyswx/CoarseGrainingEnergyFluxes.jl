@@ -120,8 +120,9 @@ Two field-independent quantities are built here, once per scale, so that the app
   constant cell half-width it implies. `hw` calls the geometry's `metric_band`, a transcendental on
   the sphere, and `wcell` is found by a linear walk, so both are worth tabulating.
 
-`invden` is built for one mask strategy, so the apply asserts the strategy it is handed matches
-`grid_plan.strategy`. Build the plan with the strategy you intend to apply with.
+`invden` is built for one mask strategy, so where the two strategies differ (`bound`) the apply asserts
+the strategy it is handed matches `grid_plan.strategy`. Build the plan with the strategy you intend to
+apply with.
 """
 struct PrefixSumTopHatPlan{
     T<:AbstractFloat,
@@ -135,7 +136,8 @@ struct PrefixSumTopHatPlan{
     rad::T
     dj_lim::Int
     uniform_axis::Bool  # axis 1 is a bounded ascending Range: every interval is O(1), no walk anywhere
-    invden::MT          # 1/(window mass) per point (Nx × Ny), zero where the point is inactive/empty
+    bound::Bool         # the strategies' denominators differ: a cell is inactive or a window leaves the grid
+    invden::MT          # 1/(window mass) per point (Nx × Ny); zero where empty or, under Deformable, inactive
     hw::MT              # support half-width per (band, row); negative ⇒ band empty
     wcell::WT           # uniform-axis constant cell half-width per (band, row), else -1
 end
@@ -335,20 +337,24 @@ function _build_prefixsum_tophat(
         end
     end
 
-    invden = _prefixsum_build_invden(grid, gp, dj_lim, hw, wcell)
+    zerofill = gp.strategy isa ZeroFill
+    exterior = zerofill ? _exterior_mass(grid, kernel, scale) : nothing
+    invden = _prefixsum_build_invden(grid, gp, dj_lim, hw, wcell, exterior)
+    bound = gp.masked || _reaches_exterior(grid, kernel, scale)
 
-    return PrefixSumTopHatPlan(gp, sc, rad, dj_lim, uniform, invden, hw, wcell)
+    return PrefixSumTopHatPlan(gp, sc, rad, dj_lim, uniform, bound, invden, hw, wcell)
 end
 
 """
-    _prefixsum_build_invden(grid, gp, dj_lim, hw, wcell) -> invden
+    _prefixsum_build_invden(grid, gp, dj_lim, hw, wcell, exterior) -> invden
 
 Accumulate the window mass once per scale and store its reciprocal.
 
 The mass depends on the grid, the mask, the mask strategy and ℓ — never on the field — so it belongs
 here rather than in the apply, where accumulating it would double the inner loop's arithmetic and be
-repeated for every field. Folding `isactive` and the degeneracy floor into the same table turns the
-apply's epilogue from a branch and a division into one multiply.
+repeated for every field. `ZeroFill` adds `exterior`, the mass past a bounded edge, and keeps every
+target; `Deformable` zeroes an inactive one. With the target test folded in too, the apply's epilogue
+is one multiply.
 """
 function _prefixsum_build_invden(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
@@ -356,6 +362,7 @@ function _prefixsum_build_invden(
     dj_lim::Int,
     hw::AbstractMatrix{T},
     wcell::AbstractMatrix{Int},
+    exterior::Union{Nothing,AbstractMatrix{T}},
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     x = FlowGeometries.Grids.coordinates(grid, 1)
@@ -409,9 +416,11 @@ function _prefixsum_build_invden(
         end
     end
 
+    zerofill = gp.strategy isa ZeroFill
+    zerofill && exterior !== nothing && (den .+= exterior)
     @inbounds for j in 1:Ny, i in 1:Nx
-        den[i, j] = (FlowGeometries.Grids.isactive(grid, i, j) && den[i, j] > T(1e-15)) ?
-            inv(den[i, j]) : zero(T)
+        keep = zerofill || FlowGeometries.Grids.isactive(grid, i, j)
+        den[i, j] = keep ? _inv_mass(den[i, j]) : zero(T)
     end
     return den
 end
@@ -492,30 +501,26 @@ function prefixsum_fill_numerator_batch!(
     return nothing
 end
 
-# The plan's reciprocal window mass `invden` is accumulated at build time under ONE mask strategy, so
-# applying it under another would silently normalize by the wrong denominator. Checked once per apply,
-# not per row.
-#
-# On an UNMASKED grid the strategies coincide exactly — `ZeroFill` divides by the total window mass and
-# `Deformable` by the mass of the active cells, which is the same number when every cell is active — so
-# one table serves both and any strategy is accepted. The restriction is therefore exactly as narrow as
-# the mathematics requires: it bites only where the two denominators genuinely differ.
+# The plan's reciprocal window mass `invden` is accumulated at build time under one mask strategy.
+# `ZeroFill` divides by the kernel's full mass and `Deformable` by the mass of the active in-domain
+# cells: one number where every cell is active and no window leaves the grid, which is when `fp.bound`
+# is false and either strategy may apply. The check runs once per apply.
 #
 # `@noinline`, and the message interpolates nothing: interpolating `typeof(strategy)` pulls Base's
 # dynamically-dispatched `show(::DataType)` into the call graph, so `JET.@test_opt` on any caller
 # reports runtime dispatch even though the throw never executes.
 @noinline function _prefixsum_strategy_mismatch()
     throw(ArgumentError(
-        "PrefixSumTopHatPlan is being applied to a MASKED grid with a different mask strategy than it " *
-        "was built for. Its normalization is precomputed per scale from the grid, the mask and the " *
-        "strategy, and the two strategies divide by different masses wherever a cell is inactive, so " *
-        "one plan cannot serve both. Rebuild the plan with the `mask_strategy` you intend to apply with.",
+        "PrefixSumTopHatPlan is being applied with a different mask strategy than it was built for, on " *
+        "a grid where the two normalize differently: a cell is inactive, or a window reaches past a " *
+        "bounded edge. Its normalization is precomputed per scale from the grid, the mask and the " *
+        "strategy, so one plan cannot serve both. Rebuild the plan with the `mask_strategy` you intend " *
+        "to apply with.",
     ))
 end
 
 @inline function _prefixsum_check_strategy(fp::PrefixSumTopHatPlan, strategy::AbstractMaskStrategy)
-    gp = fp.grid_plan
-    (!gp.masked || typeof(strategy) === typeof(gp.strategy)) || _prefixsum_strategy_mismatch()
+    (!fp.bound || typeof(strategy) === typeof(fp.grid_plan.strategy)) || _prefixsum_strategy_mismatch()
     return nothing
 end
 
@@ -611,8 +616,7 @@ function _prefixsum_row!(
         end
     end
 
-    # `invden` already carries the `isactive` test and the degeneracy floor, so an inactive or empty
-    # point holds exactly zero there and needs no branch here.
+    # `invden` carries the strategy's target test and the degeneracy floor, so no branch is needed here.
     @inbounds @simd for i in 1:Nx
         out[i, j] *= invden[i, j]
     end

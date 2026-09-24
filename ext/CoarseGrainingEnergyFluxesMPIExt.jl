@@ -29,8 +29,8 @@ function CGEF.Filtering.mpi_filter_field!(
     # `workspace`, when supplied by a cached `PhysicalFilterPlan`, IS the already-built footprint —
     # reused instead of rebuilding it on every call (and every rank, in this backend's case).
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    CGEF.Filtering._check_strategy(fp, mask_strategy)
     if fp isa CGEF.Filtering.SeparableFootprint
-        CGEF.Filtering._separable_check_strategy(fp, mask_strategy)
         return _mpi_apply_separable!(out, field, grid, fp, rank, nproc, comm)
     elseif fp isa CGEF.Filtering.PrefixSumTopHatPlan
         return _mpi_apply_prefixsum_tophat!(out, field, grid, fp, mask_strategy, rank, nproc, comm)
@@ -69,7 +69,7 @@ function _mpi_apply_separable!(
     # copy with no message, and a repeated sweep then allocates nothing here.
     masked_input = fp.masked_input
     row_pass = fp.row_pass
-    @. masked_input = T(mask) * field
+    @. masked_input = mask * field
     for j in 1:Ny   # redundant across ranks -- zero communication, `field` already replicated
         CGEF.Filtering._separable_row_pass_at!(row_pass, masked_input, gx, di_lim, periodic_x, Nx, j)
     end
@@ -125,6 +125,7 @@ function CGEF.Filtering.mpi_filter_field!(
     rank = MPI.Comm_rank(comm)
     nproc = MPI.Comm_size(comm)
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    CGEF.Filtering._check_strategy(fp, mask_strategy)
     dims = FlowGeometries.Grids.size_tuple(grid)
     mask = FlowGeometries.Grids.mask(grid)
 
@@ -141,24 +142,22 @@ function CGEF.Filtering.mpi_filter_field!(
 
     fill!(out, zero(T))
     cart = CartesianIndices(dims)
+    # The point functions decide which targets the strategy filters.
     if fp isa CGEF.Filtering.FilterFootprintND
         periodic = FlowGeometries.Grids.periodic_flags(grid)
         for lin in (rank + 1):nproc:length(out)
             I = cart[lin]
-            mask[I] || continue
             out[I] = CGEF.Filtering._footprint_nd_point(field, fp, mask_strategy, dims, periodic, mask, I)
         end
     elseif fp.cache !== nothing
         lin_idx = LinearIndices(dims)
         for lin in (rank + 1):nproc:length(out)
             I = cart[lin]
-            mask[I] || continue
-            out[I] = CGEF.Filtering._footprint_nd_point_cached(field, fp.cache, mask_strategy, mask, lin_idx, I)
+            out[I] = CGEF.Filtering._footprint_nd_point_cached(field, fp.cache, fp.exterior, mask_strategy, mask, lin_idx, I)
         end
     else
         for lin in (rank + 1):nproc:length(out)
             I = cart[lin]
-            mask[I] || continue
             out[I] = CGEF.Filtering._footprint_nd_point_streaming(field, grid, fp, mask_strategy, mask, I)
         end
     end
