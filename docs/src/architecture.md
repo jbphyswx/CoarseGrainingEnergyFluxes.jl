@@ -223,8 +223,7 @@ its own family; grid and scale plans are freely shared.
 
 Two spectral backends narrow that: `FastSphericalHarmonics`' `SphPlanCache` is a memo table its
 transform populates on first use, and a FINUFFT/NUFSHT guru plan carries the working state of its own
-execution. Those grid plans are written during an apply, so they too go one per worker — which the
-underlying transforms require in any case, `FastTransforms` being restricted to the root task.
+execution. Those grid plans are written during an apply, so they too go one per worker.
 
 ## Plan reuse & workspace pre-allocation
 

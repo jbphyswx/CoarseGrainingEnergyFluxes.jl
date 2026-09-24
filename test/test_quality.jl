@@ -11,7 +11,8 @@ Test.@testset "Explicit imports (core)" begin
     # Core module + submodules: no bare `using` (no implicit imports) and no stale explicit
     # imports — the strict qualified-import policy.
     Test.@test (EI.check_no_implicit_imports(CGEF); true)
-    Test.@test (EI.check_no_stale_explicit_imports(CGEF); true)
+    # The core imports FlowTransformBindings only so its `__init__` runs before FastTransforms loads.
+    Test.@test (EI.check_no_stale_explicit_imports(CGEF; ignore = (:FlowTransformBindings,)); true)
     # Per-extension checks (each loaded backend extension must also be import-clean).
     for extname in (
         :CoarseGrainingEnergyFluxesFFTWExt,

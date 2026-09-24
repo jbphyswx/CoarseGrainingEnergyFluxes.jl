@@ -133,7 +133,8 @@ end
 # The forward transform (points → harmonic coefficients) depends on the field alone, so a sweep runs it
 # once and each scale only applies its own transfer function and evaluates back to points.
 # `nusht_synthesize!` leaves `C` intact, so the same coefficients serve every scale.
-CGEF.Filtering.analyze_buffer(plan::NUFSHTFilterPlan, ::AbstractVector) = similar(plan.grid_plan.plan.C)
+CGEF.Filtering.analyze_buffer(plan::NUFSHTFilterPlan, ::AbstractVector) =
+    NUFSHT.allocate_coefficients(plan.grid_plan.plan)
 
 function CGEF.Filtering.filter_analyze!(
     Ĉ::AbstractArray, field::AbstractVector, plan::NUFSHTFilterPlan{T},

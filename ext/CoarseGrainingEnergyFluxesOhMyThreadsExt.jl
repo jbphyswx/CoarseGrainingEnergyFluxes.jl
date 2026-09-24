@@ -3,6 +3,7 @@ module CoarseGrainingEnergyFluxesOhMyThreadsExt
 using OhMyThreads: OhMyThreads
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries
+using FlowTransformBindings: FlowTransformBindings as FTB
 
 # Dynamic scheduling balances the uneven per-row cost that masking creates. Constructed as an object
 # rather than passed as the `:dynamic` symbol: the symbol form resolves the scheduler type at runtime,
@@ -318,6 +319,10 @@ function CGEF.Filtering.threaded_filter_fields!(
 end
 
 
+# The farms below run a whole serial apply or sweep per task, which may be a spherical-harmonic
+# transform; its FastTransforms calls run on one OpenMP thread, the tasks carrying the parallelism.
+_farm(f) = Base.ScopedValues.with(f, FTB.FASTTRANSFORMS_THREADS => 1)
+
 # Slice-parallel apply. Slices are independent and each writes only its own output, so this needs no
 # synchronization; the inner apply is forced serial so the two levels of threading never nest.
 #
@@ -327,8 +332,10 @@ end
 # is the standard remedy and bounds the makespan at 4/3 of optimal.
 function CGEF.Filtering.threaded_filter_slices!(outs, fields, plans)
     order = sortperm(CGEF.Filtering.slice_costs(plans); rev = true)
-    OhMyThreads.tforeach(order; scheduler = OhMyThreads.DynamicScheduler()) do t
-        CGEF.Filtering.apply_slice_serial!(outs[t], fields[t], plans[t])
+    _farm() do
+        OhMyThreads.tforeach(order; scheduler = OhMyThreads.DynamicScheduler()) do t
+            CGEF.Filtering.apply_slice_serial!(outs[t], fields[t], plans[t])
+        end
     end
     return outs
 end
@@ -343,9 +350,11 @@ end
 function CGEF.Pipeline.threaded_coarse_grain_batch!(batch, u, v, w, grid, valR, ctx)
     n = length(batch.slices)
     groups = OhMyThreads.chunks(1:n; n = CGEF.Pipeline.batch_concurrency(ctx, n))
-    OhMyThreads.tforeach(enumerate(groups); scheduler = _sched()) do (ci, group)
-        for t in group
-            CGEF.Pipeline.coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, t, ci)
+    _farm() do
+        OhMyThreads.tforeach(enumerate(groups); scheduler = _sched()) do (ci, group)
+            for t in group
+                CGEF.Pipeline.coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, t, ci)
+            end
         end
     end
     return batch
@@ -359,8 +368,10 @@ end
 # one worker holding the largest sweep after the others have drained.
 function CGEF.Pipeline.threaded_coarse_grain_slices!(results, us, vs, ws, grids, ctx)
     order = sortperm(CGEF.Pipeline.slice_pipeline_costs(grids, length(ctx.scales)); rev = true)
-    OhMyThreads.tforeach(order; scheduler = _sched()) do t
-        CGEF.Pipeline.coarse_grain_slice_serial!(results, us, vs, ws, grids, ctx, t)
+    _farm() do
+        OhMyThreads.tforeach(order; scheduler = _sched()) do t
+            CGEF.Pipeline.coarse_grain_slice_serial!(results, us, vs, ws, grids, ctx, t)
+        end
     end
     return results
 end

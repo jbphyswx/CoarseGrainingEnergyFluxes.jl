@@ -3,6 +3,7 @@ module CoarseGrainingEnergyFluxesFastSphericalHarmonicsExt
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries
+using FlowTransformBindings: FlowTransformBindings as FTB
 
 # Spectral filtering for uniform spherical grids, via the scalar spherical-harmonic transform. The
 # wavenumber of degree `l` is the Laplace–Beltrami eigenvalue `k_l = √(l(l+1))/R`, so a degree-`l`
@@ -14,6 +15,11 @@ using FlowGeometries: FlowGeometries
 #
 # Masking follows the same normalized-convolution identity as the other spectral backends, with the
 # `Deformable` denominator computed once at plan-build time.
+#
+# Each transform runs through `FTB.with_fasttransforms_threads`, which sets FastTransforms' OpenMP count
+# on the calling OS thread and restores it after.
+_transform!(C, cache) = FTB.with_fasttransforms_threads(() -> FSH.sph_transform!(C; cache = cache))
+_evaluate!(C, cache) = FTB.with_fasttransforms_threads(() -> FSH.sph_evaluate!(C; cache = cache))
 
 """
     SHTGridPlan
@@ -27,8 +33,7 @@ fresh `SphPlanCache` per scale means the transform rebuilds its internal plans t
 each one, and the node validation below re-derives and re-compares the quadrature nodes every time.
 
 The cache is a memo table the transform populates on first use, so unlike the other spectral grid
-plans this one is written to during an apply. FastSphericalHarmonics' underlying transform is itself
-restricted to the root task, so a concurrent driver needs its own plan per worker in any case.
+plans this one is written to during an apply, and a concurrent driver needs its own plan per worker.
 """
 struct SHTGridPlan{T<:AbstractFloat, MK} <: CGEF.Filtering.AbstractGridPlan
     cache::FSH.SphPlanCache{T}
@@ -150,9 +155,9 @@ function CGEF.Filtering.spectral_filter_plan(
         # and stored inverted.
         sc.masked_input .= mask                         # [lon,lat] (M×N)
         permutedims!(sc.scratch, sc.masked_input, (2, 1))  # → FSH [θ,φ] (N×M)
-        FSH.sph_transform!(sc.scratch; cache = cache)
+        _transform!(sc.scratch, cache)
         sc.scratch .*= mult
-        FSH.sph_evaluate!(sc.scratch; cache = cache)
+        _evaluate!(sc.scratch, cache)
         renorm = zeros(T, M, N)
         permutedims!(renorm, sc.scratch, (2, 1))        # back to [lon,lat]
         threshold = T(0.01)
@@ -179,7 +184,7 @@ function CGEF.Filtering.filter_analyze!(
         @. sc.masked_input = gp.mask * field
         permutedims!(Ĉ, sc.masked_input, (2, 1))
     end
-    FSH.sph_transform!(Ĉ; cache = gp.cache)
+    _transform!(Ĉ, gp.cache)
     return Ĉ
 end
 
@@ -189,7 +194,7 @@ function CGEF.Filtering.filter_synthesize!(
     # `sph_evaluate!` works in place, and `Ĉ` is reused by every later scale, so evaluate a scaled copy.
     sc = plan.scratch
     sc.scratch .= Ĉ .* plan.mult
-    FSH.sph_evaluate!(sc.scratch; cache = plan.grid_plan.cache)
+    _evaluate!(sc.scratch, plan.grid_plan.cache)
     permutedims!(out, sc.scratch, (2, 1))
     plan.invrenorm === nothing || (out .*= plan.invrenorm)
     return out
@@ -207,9 +212,9 @@ function CGEF.Filtering.filter_apply!(
         @. sc.masked_input = gp.mask * field
         permutedims!(sc.scratch, sc.masked_input, (2, 1))
     end
-    FSH.sph_transform!(sc.scratch; cache = gp.cache)   # in place: scratch now holds coefficients
+    _transform!(sc.scratch, gp.cache)               # in place: scratch now holds coefficients
     sc.scratch .*= plan.mult                        # Ĝ(k_l, ℓ) per coefficient
-    FSH.sph_evaluate!(sc.scratch; cache = gp.cache)    # in place: scratch now holds point values
+    _evaluate!(sc.scratch, gp.cache)                # in place: scratch now holds point values
     permutedims!(out, sc.scratch, (2, 1))           # back to [lon, lat]
     plan.invrenorm === nothing || (out .*= plan.invrenorm)
     return out

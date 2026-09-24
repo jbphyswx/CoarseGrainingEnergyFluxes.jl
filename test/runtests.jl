@@ -1,6 +1,9 @@
 module CoarseGrainingEnergyFluxesTests
 
 using Test: Test
+# Before FastSphericalHarmonics and FINUFFT: CGEF loads FlowTransformBindings, which selects the OpenMP
+# runtime's thread-local mode before either loads that runtime.
+using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using Logging: Logging  # `@test_logs min_level = Logging.Warn`, for asserting the ABSENCE of a warning
 using StaticArrays: StaticArrays as SA
 using Aqua: Aqua
@@ -25,7 +28,6 @@ using KernelAbstractions: KernelAbstractions as KA  # triggers the GPU backend e
 using NearestNeighbors: NearestNeighbors
 using DelaunayTriangulation: DelaunayTriangulation
 using Quickhull: Quickhull
-using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries as FG
 
 # Each file owns one topic and opens its own top-level testset, so a single one can be run on its

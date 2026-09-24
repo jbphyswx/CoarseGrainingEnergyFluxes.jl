@@ -4,6 +4,7 @@ using Distributed: Distributed
 using SharedArrays: SharedArrays
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries
+using FlowTransformBindings: FlowTransformBindings as FTB
 
 # DistributedBackend: build the footprint once, then fill output rows across worker processes into a
 # SharedArray — a single shared-memory node, not a multi-node decomposition. Rows write disjoint
@@ -178,6 +179,10 @@ end
 CGEF.Pipeline.batch_alloc_shared(::Type{T}, dims::Integer...) where {T} =
     (sh = SharedArrays.SharedArray{T}(dims); fill!(sh, zero(T)); sh)
 
+# A sweep on a worker runs FastTransforms on one OpenMP thread there, the processes carrying the
+# parallelism. The scope is set inside the loop body because a scoped value does not cross processes.
+_serial_ft(f) = Base.ScopedValues.with(f, FTB.FASTTRANSFORMS_THREADS => 1)
+
 # Batch-parallel PIPELINE sweeps across worker processes — one shared-memory node, not a multi-node
 # decomposition. Slices write disjoint views of the batched result, so no synchronization is needed and
 # the assembled result is identical to serial.
@@ -188,7 +193,7 @@ function CGEF.Pipeline.distributed_coarse_grain_batch!(batch, u, v, w, grid, val
     _require_shared(batch.Π, "coarse_grain_batch!")
     n = length(batch.slices)
     @sync Distributed.@distributed for t in 1:n
-        CGEF.Pipeline.coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, t, 1)
+        _serial_ft(() -> CGEF.Pipeline.coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, t, 1))
     end
     return batch
 end
@@ -201,7 +206,7 @@ function CGEF.Pipeline.distributed_coarse_grain_slices!(results, us, vs, ws, gri
     end
     n = length(results)
     @sync Distributed.@distributed for t in 1:n
-        CGEF.Pipeline.coarse_grain_slice_serial!(results, us, vs, ws, grids, ctx, t)
+        _serial_ft(() -> CGEF.Pipeline.coarse_grain_slice_serial!(results, us, vs, ws, grids, ctx, t))
     end
     return results
 end
