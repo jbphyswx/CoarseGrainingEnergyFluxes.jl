@@ -22,17 +22,20 @@
     NodeSetGridPlan
 
 The scale-independent half of a node-set spectral plan: the node set built from the grid's cells, its
-completion to the whole sphere where the grid is regional, and the nonuniform transform's own grid plan
-over it. The grid's cells come first, in linear order. `batch` is the trailing batch extent the
-transform was planned for, or `nothing`.
+completion to the whole sphere where the grid is regional, the nonuniform transform's own grid plan
+over it, and the execution backend whose memory the transform runs in. The grid's cells come first, in
+linear order. `batch` is the trailing batch extent the transform was planned for, or `nothing`.
 """
-struct NodeSetGridPlan{NG<:FlowGeometries.Grids.UnstructuredGrid, GP<:AbstractGridPlan, N, B<:Union{Nothing,Int}} <:
-       AbstractGridPlan
+struct NodeSetGridPlan{
+    NG<:FlowGeometries.Grids.UnstructuredGrid, GP<:AbstractGridPlan, N, B<:Union{Nothing,Int},
+    BE<:ComputationalBackends.AbstractExecutionBackend,
+} <: AbstractGridPlan
     nodes::NG
     inner::GP
     ncells::Int
     dims::NTuple{N,Int}
     batch::B
+    backend::BE
 end
 
 """
@@ -124,22 +127,25 @@ transforms it.
 """
 function _node_set_grid_plan(
     spectral_backend::SpectralBackends.AbstractSpectralBackend, grid::FlowGeometries.Grids.AbstractGrid,
-    kernel::Kernels.AbstractFilterKernel; batch::Union{Nothing,Integer} = nothing, kwargs...,
+    kernel::Kernels.AbstractFilterKernel;
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    batch::Union{Nothing,Integer} = nothing, kwargs...,
 )
     _node_route(spectral_backend) || return nothing
     nodes = _node_set(grid)
-    inner = spectral_grid_plan(spectral_backend, nodes, kernel; batch = batch, kwargs...)
+    inner = spectral_grid_plan(spectral_backend, nodes, kernel; backend = backend, batch = batch, kwargs...)
     inner === nothing && return nothing
     return NodeSetGridPlan(nodes, inner, length(FlowGeometries.Grids.mask(grid)),
-                           FlowGeometries.Grids.size_tuple(grid), batch === nothing ? nothing : Int(batch))
+                           FlowGeometries.Grids.size_tuple(grid), batch === nothing ? nothing : Int(batch),
+                           backend)
 end
 
 function _node_set_scratch(gp::NodeSetGridPlan, inner_scratch)
     T = eltype(FlowGeometries.Grids.measure(gp.nodes))
     n = length(FlowGeometries.Grids.mask(gp.nodes))
     b = gp.batch
-    return NodeSetScratch(zeros(T, n), zeros(T, n),
-                          b === nothing ? nothing : (field = zeros(T, n, b), out = zeros(T, n, b)),
+    zs(dims...) = _allocate(gp.backend, T, dims)
+    return NodeSetScratch(zs(n), zs(n), b === nothing ? nothing : (field = zs(n, b), out = zs(n, b)),
                           inner_scratch)
 end
 
@@ -154,6 +160,7 @@ loaded extension transforms it.
 function _node_set_filter_plan(
     spectral_backend::SpectralBackends.AbstractSpectralBackend, grid::FlowGeometries.Grids.AbstractGrid,
     kernel::Kernels.AbstractFilterKernel, scale::AbstractFloat;
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     grid_plan::Union{Nothing,NodeSetGridPlan} = nothing,
     scratch::Union{Nothing,NodeSetScratch} = nothing,
     batch::Union{Nothing,Integer} = nothing,
@@ -164,12 +171,12 @@ function _node_set_filter_plan(
     nb = grid_plan === nothing ? (batch === nothing ? nothing : Int(batch)) : grid_plan.batch
     inner = spectral_filter_plan(
         spectral_backend, nodes, kernel, scale;
-        grid_plan = grid_plan === nothing ? nothing : grid_plan.inner,
+        backend = backend, grid_plan = grid_plan === nothing ? nothing : grid_plan.inner,
         scratch = scratch === nothing ? nothing : scratch.inner, batch = nb, kwargs...,
     )
     gp = grid_plan === nothing ?
         NodeSetGridPlan(nodes, inner.grid_plan, length(FlowGeometries.Grids.mask(grid)),
-                        FlowGeometries.Grids.size_tuple(grid), nb) : grid_plan
+                        FlowGeometries.Grids.size_tuple(grid), nb, backend) : grid_plan
     sc = scratch === nothing ? _node_set_scratch(gp, inner.scratch) : scratch
     return NodeSetPlan(inner, gp, sc)
 end

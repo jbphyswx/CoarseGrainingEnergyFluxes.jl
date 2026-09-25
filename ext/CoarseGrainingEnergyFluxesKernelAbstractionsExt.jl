@@ -380,6 +380,10 @@ end
 
 move(dev, x) = (y = KA.allocate(dev, eltype(x), size(x)); copyto!(y, x); y)
 
+CGEF.Filtering._allocate(b::CGEF.ComputationalBackends.GPUBackend, ::Type{T}, dims::Dims) where {T} =
+    KA.zeros(b.backend, T, dims...)
+CGEF.Filtering._host_memory(b::CGEF.ComputationalBackends.GPUBackend) = b.backend isa KA.CPU
+
 # ---------------------------------------------------------------------------
 # Prefix-sum top-hat, on the device
 # ---------------------------------------------------------------------------

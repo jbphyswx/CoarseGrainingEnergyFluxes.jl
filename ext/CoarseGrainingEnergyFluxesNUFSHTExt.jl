@@ -25,10 +25,13 @@ end
 """
     NUFSHTGridPlan
 
-The half of a scattered-spherical plan the filter scale does not reach: the `NUFSHT.NUSHTplan` over the
-grid's nodes, the sphere radius, the mask, and the mask's fitted coefficients. A plan built for a
-trailing batch axis of `nb` fields also holds a `NUSHTplan` with `ntrans = nb` over the same nodes, whose
-fit and synthesis carry every field of the batch at once.
+The half of a scattered-spherical plan the filter scale does not reach: the NUSHT plan over the grid's
+nodes this process transforms (under `MPIBackend` its share of them, under `DistributedBackend` a plan
+NUFSHT divides among the worker processes), the sphere radius, the mask over those nodes, the mask's
+fitted coefficients, the execution backend whose memory holds them, and the nodes owned (`nothing` for
+all). A plan built for a trailing batch axis of `nb` fields also holds a
+`NUSHTplan` with `ntrans = nb` over the same nodes, whose fit and synthesis carry every field of the
+batch at once.
 
 The band limit is the largest `L` with `(L+1)(2L+1) ≤ npts`: the `(L+1)²` coefficients are fitted from
 about twice as many points, and a Clenshaw–Curtis grid of degree `L` gets exactly `L`.
@@ -36,28 +39,33 @@ about twice as many points, and a Clenshaw–Curtis grid of degree `L` gets exac
 A `NUSHTplan` holds buffers every transform overwrites, so two tasks may not execute one grid plan
 concurrently; a concurrent driver needs its own grid plan per worker.
 """
-struct NUFSHTGridPlan{P, T<:AbstractFloat, M, CM, BP} <: CGEF.Filtering.AbstractGridPlan
+struct NUFSHTGridPlan{P, T<:AbstractFloat, M, CM, BP, B<:CGEF.ComputationalBackends.AbstractExecutionBackend, O} <:
+       CGEF.Filtering.AbstractGridPlan
     plan::P
     radius::T
-    mask::M          # the grid's mask, or nothing when fully active
+    mask::M          # the grid's mask over this process's nodes, or nothing when fully active
     C_mask::CM       # the mask's fitted coefficients, or nothing when unmasked
-    npts::Int
+    npts::Int        # the grid's node count
     batched::BP      # a `NUSHTplan` with `ntrans = nb`, or nothing
+    backend::B
+    own::O           # this process's nodes, or nothing for all of them
 end
 
 """
     NUFSHTScratch
 
 The transient half of a scattered-spherical plan: the staging array for `mask .* field`, the fitted
-coefficients and the least-squares workspace, and the same set for the batched plan, so an apply
-allocates nothing. One per concurrent worker.
+coefficients, the least-squares workspace, and the synthesis of this process's nodes where it holds
+only some of them; and the same set for the batched plan, so an apply allocates nothing. One per
+concurrent worker.
 """
-struct NUFSHTScratch{T<:AbstractFloat, SV<:AbstractVector{T}, CA<:AbstractArray, W, BT} <:
+struct NUFSHTScratch{T<:AbstractFloat, SV<:AbstractVector{T}, CA<:AbstractArray, W, LO, BT} <:
        CGEF.Filtering.AbstractFilterScratch
     masked_input::SV   # unused when mask === nothing
     coeffs::CA
     ws::W              # NUFSHT.LSMRWorkspace
-    batched::BT        # (; masked_input, coeffs, ws) for the batched plan, or nothing
+    local_out::LO      # this process's synthesized values, or nothing when it holds every node
+    batched::BT        # (; masked_input, coeffs, ws, local_out) for the batched plan, or nothing
 end
 
 """
@@ -80,55 +88,99 @@ end
 CGEF.Filtering.plan_strategy(plan::NUFSHTFilterPlan) = plan.strategy
 
 # The fit cannot resolve a relative residual finer than the transform it is built on.
-_fit_rtol(plan::NUFSHT.NUSHTplan{T}) where {T} = max(T(10 * plan.tol), sqrt(eps(T)))
+_fit_rtol(tol, ::Type{T}) where {T<:AbstractFloat} = max(T(10 * tol), sqrt(eps(T)))
 
-function _fit!(C, f, plan::NUFSHT.NUSHTplan, ws)
-    rtol = _fit_rtol(plan)
-    _, iters, rel, converged = NUFSHT.nusht_solve!(C, f, plan; ws = ws, rtol = rtol)
+# Under `MPIBackend` each rank holds a plan over its own nodes, and the fit is NUFSHT's MPI solve: one
+# least-squares problem over every rank's nodes, with the coefficients replicated on every rank. A plan
+# divided among `DistributedBackend` workers carries its own solve.
+_solve!(C, f, plan, ws, rtol, ::CGEF.ComputationalBackends.AbstractExecutionBackend) =
+    NUFSHT.nusht_solve!(C, f, plan; ws = ws, rtol = rtol)
+_solve!(C, f, plan, ws, rtol, b::CGEF.ComputationalBackends.AbstractMPIBackend) =
+    NUFSHT.nusht_solve!(C, f, plan, b; ws = ws, rtol = rtol)
+
+function _fit!(C, f, plan, ws, backend)
+    rtol = _fit_rtol(plan.tol, real(eltype(C)))
+    _, iters, rel, converged = _solve!(C, f, plan, ws, rtol, backend)
     converged || throw(ErrorException(
         "NUFSHT spectral filtering: the least-squares fit of the degree-$(plan.lmax) harmonic " *
         "coefficients stopped at relative residual $rel after $iters iterations, above the tolerance " *
-        "$rtol. The $(size(f, 1)) points do not determine those coefficients.",
+        "$rtol. The nodes do not determine those coefficients.",
     ))
     return C
 end
 
+# This process's plan at `_library_threads(backend)` threads, or under `DistributedBackend` one whose
+# points NUFSHT divides among the workers, each at the inner backend's count.
+_make_plan(T, θ, φ, lmax, backend::CGEF.ComputationalBackends.AbstractDistributedBackend; kwargs...) =
+    NUFSHT.make_plan(T, θ, φ, lmax, backend; kwargs...)
+_make_plan(T, θ, φ, lmax, backend::CGEF.ComputationalBackends.AbstractExecutionBackend; kwargs...) =
+    NUFSHT.make_plan(T, θ, φ, lmax; nthreads = CGEF.Filtering._library_threads(backend), kwargs...)
+
+# `nufft` is the NUFFT library NUFSHT runs: a FlowTransformBindings tag, or `AutoSpectralBackend()` for
+# NUFSHT's own choice.
 function _nufsht_grid_plan(
-    grid::FlowGeometries.Grids.UnstructuredGrid{T,G,2}; batch::Union{Nothing,Integer} = nothing,
+    grid::FlowGeometries.Grids.UnstructuredGrid{T,G,2};
+    backend::CGEF.ComputationalBackends.AbstractExecutionBackend = CGEF.ComputationalBackends.AutoBackend(),
+    batch::Union{Nothing,Integer} = nothing,
+    nufft::CGEF.SpectralBackends.AbstractSpectralBackend = CGEF.SpectralBackends.AutoSpectralBackend(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     npts = length(FlowGeometries.Grids.coordinates(grid, 1))
     npts > 0 || throw(ArgumentError("NUFSHT spectral filtering needs at least one point."))
     lmax = max(1, floor(Int, (sqrt(1 + 8 * npts) - 3) / 4))
-    θ = collect(T, T(π) / 2 .- FlowGeometries.Grids.coordinates(grid, 2))   # colatitude from latitude
-    φ = collect(T, FlowGeometries.Grids.coordinates(grid, 1))
-    nplan = NUFSHT.make_plan(T, θ, φ, lmax)
-    bplan = batch === nothing ? nothing : NUFSHT.make_plan(T, θ, φ, lmax; ntrans = Int(batch))
-    mask = all(FlowGeometries.Grids.mask(grid)) ? nothing : FlowGeometries.Grids.mask(grid)
+    # This process's nodes go where `backend` runs, and NUFSHT plans in the memory they are in.
+    own = CGEF.Filtering._owned(backend, npts)
+    part(v) = own === nothing ? v : v[own]
+    θ = CGEF.Filtering._on_backend(backend, T(π) / 2 .- T.(part(FlowGeometries.Grids.coordinates(grid, 2))))  # colatitude
+    φ = CGEF.Filtering._on_backend(backend, T.(part(FlowGeometries.Grids.coordinates(grid, 1))))
+    nplan = _make_plan(T, θ, φ, lmax, backend; nufft = nufft)
+    bplan = batch === nothing ? nothing : _make_plan(T, θ, φ, lmax, backend; ntrans = Int(batch), nufft = nufft)
+    m = FlowGeometries.Grids.mask(grid)
+    mask = all(m) ? nothing : CGEF.Filtering._on_backend(backend, part(m))
     C_mask = mask === nothing ? nothing :
-             _fit!(NUFSHT.allocate_coefficients(nplan), mask, nplan, NUFSHT.LSMRWorkspace(nplan))
+             _fit!(NUFSHT.allocate_coefficients(nplan), CGEF.Filtering._on_backend(backend, T.(part(m))), nplan,
+                   NUFSHT.LSMRWorkspace(nplan), backend)
     return NUFSHTGridPlan(
         nplan, T(FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid))), mask,
-        C_mask, npts, bplan,
+        C_mask, npts, bplan, backend, own === nothing ? nothing : CGEF.Filtering._on_backend(backend, own),
     )
 end
 
 function _nufsht_scratch(gp::NUFSHTGridPlan{P,T}) where {P, T<:AbstractFloat}
     bp = gp.batched
+    n = gp.own === nothing ? gp.npts : length(gp.own)
+    zs(dims...) = CGEF.Filtering._allocate(gp.backend, T, dims)
     return NUFSHTScratch(
-        zeros(T, gp.npts), NUFSHT.allocate_coefficients(gp.plan), NUFSHT.LSMRWorkspace(gp.plan),
+        zs(n), NUFSHT.allocate_coefficients(gp.plan), NUFSHT.LSMRWorkspace(gp.plan),
+        gp.own === nothing ? nothing : zs(n),
         bp === nothing ? nothing :
-            (masked_input = zeros(T, gp.npts, bp.B), coeffs = NUFSHT.allocate_coefficients(bp),
-             ws = NUFSHT.LSMRWorkspace(bp)),
+            (masked_input = zs(n, bp.B), coeffs = NUFSHT.allocate_coefficients(bp),
+             ws = NUFSHT.LSMRWorkspace(bp), local_out = gp.own === nothing ? nothing : zs(n, bp.B)),
     )
+end
+
+# The synthesis of this process's nodes into `out`, which every process then holds whole.
+function _synthesize_into!(out, _, Ĉ, plan::NUFSHTFilterPlan, nplan, ::Nothing)
+    NUFSHT.nusht_synthesize!(out, Ĉ, plan.filter, nplan)
+    plan.invrenorm === nothing || (out .*= plan.invrenorm)
+    return out
+end
+function _synthesize_into!(out, local_out, Ĉ, plan::NUFSHTFilterPlan, nplan, own)
+    _synthesize_into!(local_out, nothing, Ĉ, plan, nplan, nothing)
+    fill!(out, zero(eltype(out)))
+    CGEF.Filtering._local(out, own) .= local_out
+    return CGEF.Filtering._sum_across!(plan.grid_plan.backend, out)
 end
 
 CGEF.Filtering.spectral_grid_plan(
     ::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractNUFSHTSpectralBackend},
     grid::FlowGeometries.Grids.UnstructuredGrid{T,G,2},
     kernel::CGEF.Kernels.AbstractFilterKernel;
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy = CGEF.Filtering.ZeroFill(),
+    backend::CGEF.ComputationalBackends.AbstractExecutionBackend = CGEF.ComputationalBackends.AutoBackend(),
     batch::Union{Nothing,Integer} = nothing,
-    kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}} = _nufsht_grid_plan(grid; batch = batch)
+    nufft::CGEF.SpectralBackends.AbstractSpectralBackend = CGEF.SpectralBackends.AutoSpectralBackend(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}} =
+    _nufsht_grid_plan(grid; backend = backend, batch = batch, nufft = nufft)
 
 CGEF.Filtering.spectral_scratch(gp::NUFSHTGridPlan) = _nufsht_scratch(gp)
 
@@ -137,21 +189,22 @@ function CGEF.Filtering.spectral_filter_plan(
     grid::FlowGeometries.Grids.UnstructuredGrid{T,G,2},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy = CGEF.Filtering.ZeroFill(),
-    backend = CGEF.ComputationalBackends.AutoBackend(),
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy = CGEF.Filtering.ZeroFill(),
+    backend::CGEF.ComputationalBackends.AbstractExecutionBackend = CGEF.ComputationalBackends.AutoBackend(),
     # Extent of the trailing batch axis this plan will be applied over, or `nothing` for single fields.
     batch::Union{Nothing,Integer} = nothing,
+    nufft::CGEF.SpectralBackends.AbstractSpectralBackend = CGEF.SpectralBackends.AutoSpectralBackend(),
     grid_plan::Union{Nothing,NUFSHTGridPlan} = nothing,
     scratch::Union{Nothing,NUFSHTScratch} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
-    gp = grid_plan === nothing ? _nufsht_grid_plan(grid; batch = batch) : grid_plan
+    gp = grid_plan === nothing ? _nufsht_grid_plan(grid; backend = backend, batch = batch, nufft = nufft) : grid_plan
     sc = scratch === nothing ? _nufsht_scratch(gp) : scratch
     filter = _CGEFTransfer(kernel, scale, gp.radius)
     # `ZeroFill` is already exactly `filter(mask .* field)`; only `Deformable` divides by the local mass,
     # the mask's fit synthesized through this scale's transfer. The mask is fixed for the plan, so it is
     # formed once here and stored inverted.
     invrenorm = if gp.mask !== nothing && mask_strategy isa CGEF.Filtering.Deformable
-        mf = zeros(T, gp.npts)
+        mf = CGEF.Filtering._allocate(gp.backend, T, (gp.own === nothing ? gp.npts : length(gp.own),))
         NUFSHT.nusht_synthesize!(mf, gp.C_mask, filter, gp.plan)
         @. ifelse(gp.mask, CGEF.Filtering._inv_mass(mf), zero(T))
     else
@@ -174,15 +227,15 @@ function CGEF.Filtering.filter_analyze!(
     Ĉ::AbstractArray, field::AbstractVector, plan::NUFSHTFilterPlan{T},
 ) where {T<:AbstractFloat}
     gp, sc = plan.grid_plan, plan.scratch
-    return _fit!(Ĉ, _masked(sc.masked_input, field, gp.mask), gp.plan, sc.ws)
+    f = CGEF.Filtering._local(field, gp.own)
+    return _fit!(Ĉ, _masked(sc.masked_input, f, gp.mask), gp.plan, sc.ws, gp.backend)
 end
 
 function CGEF.Filtering.filter_synthesize!(
     out::AbstractVector{T}, Ĉ::AbstractArray, plan::NUFSHTFilterPlan{T},
 ) where {T<:AbstractFloat}
-    NUFSHT.nusht_synthesize!(out, Ĉ, plan.filter, plan.grid_plan.plan)
-    plan.invrenorm === nothing || (out .*= plan.invrenorm)
-    return out
+    gp = plan.grid_plan
+    return _synthesize_into!(out, plan.scratch.local_out, Ĉ, plan, gp.plan, gp.own)
 end
 
 function CGEF.Filtering.filter_apply!(
@@ -221,17 +274,17 @@ CGEF.Filtering.analyze_buffer(plan::NUFSHTFilterPlan, field::AbstractMatrix) =
 function CGEF.Filtering.filter_analyze!(
     Ĉ::AbstractArray, field::AbstractMatrix, plan::NUFSHTFilterPlan{T},
 ) where {T<:AbstractFloat}
+    gp = plan.grid_plan
     bp, p = _batch_parts(plan, field)
-    return _fit!(Ĉ, _masked(p.masked_input, field, plan.grid_plan.mask), bp, p.ws)
+    f = CGEF.Filtering._local(field, gp.own)
+    return _fit!(Ĉ, _masked(p.masked_input, f, gp.mask), bp, p.ws, gp.backend)
 end
 
 function CGEF.Filtering.filter_synthesize!(
     out::AbstractMatrix{T}, Ĉ::AbstractArray, plan::NUFSHTFilterPlan{T},
 ) where {T<:AbstractFloat}
-    bp, _ = _batch_parts(plan, out)
-    NUFSHT.nusht_synthesize!(out, Ĉ, plan.filter, bp)
-    plan.invrenorm === nothing || (out .*= plan.invrenorm)
-    return out
+    bp, p = _batch_parts(plan, out)
+    return _synthesize_into!(out, p.local_out, Ĉ, plan, bp, plan.grid_plan.own)
 end
 
 function CGEF.Filtering.filter_apply_batched!(

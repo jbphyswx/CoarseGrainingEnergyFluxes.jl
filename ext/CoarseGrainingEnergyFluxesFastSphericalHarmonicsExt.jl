@@ -17,16 +17,21 @@ using FlowTransformBindings: FlowTransformBindings as FTB
 # Masking follows the same normalized-convolution identity as the other spectral backends, with the
 # `Deformable` denominator computed once at plan-build time.
 #
+# FastSphericalHarmonics transforms host memory. A plan for a backend on a device reads each field
+# through a host buffer and writes its output back through it. Under `MPIBackend` every rank holds the
+# field and transforms it whole.
+#
 # Each transform runs through `FTB.with_fasttransforms_threads`, which sets FastTransforms' OpenMP count
-# on the calling OS thread and restores it after.
-_transform!(C, cache) = FTB.with_fasttransforms_threads(() -> FSH.sph_transform!(C; cache = cache))
-_evaluate!(C, cache) = FTB.with_fasttransforms_threads(() -> FSH.sph_evaluate!(C; cache = cache))
+# on the calling OS thread to the grid plan's count and restores it after.
+_transform!(C, gp) = FTB.with_fasttransforms_threads(() -> FSH.sph_transform!(C; cache = gp.cache), gp.nthreads)
+_evaluate!(C, gp) = FTB.with_fasttransforms_threads(() -> FSH.sph_evaluate!(C; cache = gp.cache), gp.nthreads)
 
 """
     SHTGridPlan
 
 The half of a spherical-harmonic plan the filter scale does not reach: the `SphPlanCache` holding the
-transform's internal FFT plans, the mask, and the grid's validated mode limits.
+transform's internal FFT plans, the mask, the grid's validated mode limits, the OpenMP thread count the
+transforms run at, and whether fields arrive in device memory.
 
 Only `mult` — the per-degree transfer multiplier — and the `Deformable` renormalization computed
 through it depend on ℓ. Sharing the rest across a sweep matters more here than for a plain FFT: a
@@ -44,23 +49,23 @@ struct SHTGridPlan{T<:AbstractFloat, MK} <: CGEF.Filtering.AbstractGridPlan
     mmax::Int
     radius::T
     mask::MK
+    nthreads::Int
+    staged::Bool
 end
 
 """
     SHTScratch
 
 The transient half of a spherical-harmonic plan: the `N × M` buffer carrying the [lon,lat] ↔ FSH [θ,φ]
-transpose and, in place, the coefficients and the evaluated points; plus the `M × N` `mask · field`
-staging array. One per concurrent worker.
-
-The transpose goes through `permutedims!` into this buffer, so no `permutedims` allocation happens per
-call. It is a concrete `Array` in practice — FSH's `sph_transform!`/`sph_evaluate!` require
-`Array{T,2}` — while the field type itself stays free.
+transpose and, in place, the coefficients and the evaluated points; the `M × N` `mask · field` array;
+and for a device plan the `M × N` host buffer a field and its output pass through. One per concurrent
+worker. FSH's `sph_transform!`/`sph_evaluate!` take `Array{T,2}`.
 """
-struct SHTScratch{T<:AbstractFloat, S<:AbstractMatrix{T}, MV<:AbstractMatrix{T}} <:
+struct SHTScratch{T<:AbstractFloat, S<:AbstractMatrix{T}, MV<:AbstractMatrix{T}, ST<:Union{Nothing,Matrix{T}}} <:
        CGEF.Filtering.AbstractFilterScratch
     scratch::S        # N × M, FSH layout
     masked_input::MV  # M × N [lon,lat]; unused when mask === nothing
+    stage::ST         # M × N host buffer, or nothing for a host plan
 end
 
 """
@@ -94,7 +99,14 @@ const _SphericalGrid = FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Ge
 
 _sht_shape(grid::_CCGrid) = ((M, N) = size(FlowGeometries.Grids.mask(grid)); M == 2N - 1)
 
-function _sht_grid_plan(grid::_CCGrid)
+# FSH transforms one field at a time, so a plan serves a trailing batch of any extent and `batch` plans
+# nothing.
+function _sht_grid_plan(
+    grid::_CCGrid;
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy = CGEF.Filtering.ZeroFill(),
+    backend::CGEF.ComputationalBackends.AbstractExecutionBackend = CGEF.ComputationalBackends.AutoBackend(),
+    batch::Union{Nothing,Integer} = nothing,
+)
     M, N = size(FlowGeometries.Grids.mask(grid))   # CGEF layout is [x, y] = [longitude, latitude] = [M, N]
     _sht_shape(grid) || throw(ArgumentError(
         "FastSphericalHarmonics transforms a ClenshawCurtisSampling grid of 2N-1 longitudes by N " *
@@ -106,6 +118,7 @@ function _sht_grid_plan(grid::_CCGrid)
         FSH.SphPlanCache{Float64}(), N, M, N - 1, M ÷ 2,
         Float64(FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid))),
         all(FlowGeometries.Grids.mask(grid)) ? nothing : FlowGeometries.Grids.mask(grid),
+        CGEF.Filtering._library_threads(backend), !CGEF.Filtering._host_memory(backend),
     )
 end
 
@@ -118,14 +131,14 @@ end
 
 # FSH works in [θ,φ] (N×M) and this package stores [lon,lat] (M×N), so the scratch carries one of each.
 _sht_scratch(gp::SHTGridPlan{T}) where {T<:AbstractFloat} =
-    SHTScratch(zeros(T, gp.N, gp.M), zeros(T, gp.M, gp.N))
+    SHTScratch(zeros(T, gp.N, gp.M), zeros(T, gp.M, gp.N), gp.staged ? zeros(T, gp.M, gp.N) : nothing)
 
 # `FSHTSpectralBackend` is honoured on the grids FSH samples and refused on every other spherical grid;
 # `Auto` takes the harmonic transform on a grid of FSH's shape and filters any other over its cells.
 CGEF.Filtering.spectral_grid_plan(
     ::CGEF.SpectralBackends.AbstractFSHTSpectralBackend, grid::_CCGrid, ::CGEF.Kernels.AbstractFilterKernel;
     kwargs...,
-) = _sht_grid_plan(grid)
+) = _sht_grid_plan(grid; kwargs...)
 
 CGEF.Filtering.spectral_grid_plan(
     ::CGEF.SpectralBackends.AbstractFSHTSpectralBackend, grid::_SphericalGrid, ::CGEF.Kernels.AbstractFilterKernel;
@@ -135,7 +148,8 @@ CGEF.Filtering.spectral_grid_plan(
 CGEF.Filtering.spectral_grid_plan(
     auto::CGEF.SpectralBackends.AbstractAutoSpectralBackend, grid::_CCGrid,
     kernel::CGEF.Kernels.AbstractFilterKernel; kwargs...,
-) = _sht_shape(grid) ? _sht_grid_plan(grid) : CGEF.Filtering._node_set_grid_plan(auto, grid, kernel; kwargs...)
+) = _sht_shape(grid) ? _sht_grid_plan(grid; kwargs...) :
+    CGEF.Filtering._node_set_grid_plan(auto, grid, kernel; kwargs...)
 
 CGEF.Filtering.spectral_scratch(gp::SHTGridPlan) = _sht_scratch(gp)
 
@@ -159,16 +173,16 @@ function _sht_filter_plan(
     grid::_CCGrid,
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::Float64;
-    mask_strategy = CGEF.Filtering.ZeroFill(),
-    backend = CGEF.ComputationalBackends.AutoBackend(),
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy = CGEF.Filtering.ZeroFill(),
+    backend::CGEF.ComputationalBackends.AbstractExecutionBackend = CGEF.ComputationalBackends.AutoBackend(),
+    batch::Union{Nothing,Integer} = nothing,
     grid_plan::Union{Nothing,SHTGridPlan} = nothing,
     scratch::Union{Nothing,SHTScratch} = nothing,
 )
     T = Float64
-    gp = grid_plan === nothing ? _sht_grid_plan(grid) : grid_plan
+    gp = grid_plan === nothing ? _sht_grid_plan(grid; backend = backend) : grid_plan
     sc = scratch === nothing ? _sht_scratch(gp) : scratch
     N, M, R = gp.N, gp.M, gp.radius
-    cache = gp.cache
 
     # Mirror FastSphericalHarmonics' own coefficient-iteration (see `sph_laplace!`): the packed layout
     # stores degrees up to lmax + mmax for high |m|. The transfer value depends only on l, not m, so
@@ -191,9 +205,9 @@ function _sht_filter_plan(
         # and stored inverted.
         sc.masked_input .= mask                         # [lon,lat] (M×N)
         permutedims!(sc.scratch, sc.masked_input, (2, 1))  # → FSH [θ,φ] (N×M)
-        _transform!(sc.scratch, cache)
+        _transform!(sc.scratch, gp)
         sc.scratch .*= mult
-        _evaluate!(sc.scratch, cache)
+        _evaluate!(sc.scratch, gp)
         renorm = zeros(T, M, N)
         permutedims!(renorm, sc.scratch, (2, 1))        # back to [lon,lat]
         ir = similar(renorm)
@@ -210,9 +224,16 @@ end
 # scales the coefficients by its own `Ĝ(k_l, ℓ)` and evaluates back to points.
 CGEF.Filtering.analyze_buffer(plan::SHTFilterPlan, ::AbstractMatrix) = similar(plan.scratch.scratch)
 
-function CGEF.Filtering.filter_analyze!(
-    Ĉ::AbstractMatrix{T}, field::AbstractMatrix{T}, plan::SHTFilterPlan{T},
-) where {T<:AbstractFloat}
+# The field in host memory: itself for a host plan, copied into the stage buffer for a device plan.
+@inline _host_field(::Nothing, field) = field
+@inline _host_field(stage::Matrix, field) = copyto!(stage, field)
+# Where a host routine writes an output bound for `out`, and the copy back into `out`.
+@inline _host_out(::Nothing, out) = out
+@inline _host_out(stage::Matrix, _) = stage
+@inline _store!(::Nothing, out, _) = out
+@inline _store!(::Matrix, out, host) = copyto!(out, host)
+
+function _sht_analyze!(Ĉ, field, plan::SHTFilterPlan)
     gp, sc = plan.grid_plan, plan.scratch
     if gp.mask === nothing
         permutedims!(Ĉ, field, (2, 1))
@@ -220,27 +241,22 @@ function CGEF.Filtering.filter_analyze!(
         @. sc.masked_input = gp.mask * field
         permutedims!(Ĉ, sc.masked_input, (2, 1))
     end
-    _transform!(Ĉ, gp.cache)
+    _transform!(Ĉ, gp)
     return Ĉ
 end
 
-function CGEF.Filtering.filter_synthesize!(
-    out::AbstractMatrix{T}, Ĉ::AbstractMatrix{T}, plan::SHTFilterPlan{T},
-) where {T<:AbstractFloat}
+function _sht_synthesize!(out, Ĉ, plan::SHTFilterPlan)
     # `sph_evaluate!` works in place, and `Ĉ` is reused by every later scale, so evaluate a scaled copy.
     sc = plan.scratch
     sc.scratch .= Ĉ .* plan.mult
-    _evaluate!(sc.scratch, plan.grid_plan.cache)
+    _evaluate!(sc.scratch, plan.grid_plan)
     permutedims!(out, sc.scratch, (2, 1))
     plan.invrenorm === nothing || (out .*= plan.invrenorm)
     return out
 end
 
-function CGEF.Filtering.filter_apply!(
-    out::AbstractMatrix{T},
-    field::AbstractMatrix{T},
-    plan::SHTFilterPlan{T},
-) where {T<:AbstractFloat}
+# Host memory in and out; `out` may be `field`, which is read before `out` is written.
+function _sht_apply!(out, field, plan::SHTFilterPlan)
     gp, sc = plan.grid_plan, plan.scratch
     if gp.mask === nothing
         permutedims!(sc.scratch, field, (2, 1))     # [lon, lat] (M×N) → FSH [θ, φ] (N×M), in place
@@ -248,11 +264,55 @@ function CGEF.Filtering.filter_apply!(
         @. sc.masked_input = gp.mask * field
         permutedims!(sc.scratch, sc.masked_input, (2, 1))
     end
-    _transform!(sc.scratch, gp.cache)               # in place: scratch now holds coefficients
+    _transform!(sc.scratch, gp)                     # in place: scratch now holds coefficients
     sc.scratch .*= plan.mult                        # Ĝ(k_l, ℓ) per coefficient
-    _evaluate!(sc.scratch, gp.cache)                # in place: scratch now holds point values
+    _evaluate!(sc.scratch, gp)                      # in place: scratch now holds point values
     permutedims!(out, sc.scratch, (2, 1))           # back to [lon, lat]
     plan.invrenorm === nothing || (out .*= plan.invrenorm)
+    return out
+end
+
+CGEF.Filtering.filter_analyze!(Ĉ::AbstractMatrix{T}, field::AbstractMatrix{T}, plan::SHTFilterPlan{T}) where {T<:AbstractFloat} =
+    _sht_analyze!(Ĉ, _host_field(plan.scratch.stage, field), plan)
+
+function CGEF.Filtering.filter_synthesize!(
+    out::AbstractMatrix{T}, Ĉ::AbstractMatrix{T}, plan::SHTFilterPlan{T},
+) where {T<:AbstractFloat}
+    stage = plan.scratch.stage
+    return _store!(stage, out, _sht_synthesize!(_host_out(stage, out), Ĉ, plan))
+end
+
+function CGEF.Filtering.filter_apply!(
+    out::AbstractMatrix{T}, field::AbstractMatrix{T}, plan::SHTFilterPlan{T},
+) where {T<:AbstractFloat}
+    stage = plan.scratch.stage
+    return _store!(stage, out, _sht_apply!(_host_out(stage, out), _host_field(stage, field), plan))
+end
+
+# A trailing batch axis: FSH transforms one field at a time, so each field of the batch takes the
+# single-field apply, a device field's slice passing through the stage buffer by linear offset.
+CGEF.Filtering._batched_fields(outs, ::SHTFilterPlan) = ndims(first(outs)) == 3
+
+function CGEF.Filtering.filter_apply_batched!(
+    out::AbstractArray{T,3}, field::AbstractArray{T,3}, plan::SHTFilterPlan{T},
+) where {T<:AbstractFloat}
+    gp, stage = plan.grid_plan, plan.scratch.stage
+    size(out) == size(field) || throw(DimensionMismatch(
+        "filter_apply_batched! got out $(size(out)) and field $(size(field))",
+    ))
+    (size(out, 1), size(out, 2)) == (gp.M, gp.N) || throw(DimensionMismatch(
+        "field's leading axes $((size(out, 1), size(out, 2))) do not match the plan's $((gp.M, gp.N))",
+    ))
+    n = gp.M * gp.N
+    for b in axes(out, 3)
+        if stage === nothing
+            _sht_apply!(view(out, :, :, b), view(field, :, :, b), plan)
+        else
+            copyto!(stage, 1, field, (b - 1) * n + 1, n)
+            _sht_apply!(stage, stage, plan)
+            copyto!(out, (b - 1) * n + 1, stage, 1, n)
+        end
+    end
     return out
 end
 

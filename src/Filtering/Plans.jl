@@ -56,12 +56,31 @@ prepare_workspace(
     return nothing
 end
 
-"""
-    plan_filter(grid, kernel, scale; mask_strategy=ZeroFill(), backend=AutoBackend()) -> AbstractFilterPlan
+# A keyword the plan's method does not take is refused.
+@noinline _unused_keywords(kwargs, method) = throw(ArgumentError(
+    "plan_filter with method = $(nameof(typeof(method)))() takes no keyword " *
+    "$(join(map(k -> "`$k`", collect(keys(kwargs))), ", "))",
+))
 
-Build a reusable filter plan: the footprint is precomputed ONCE regardless of backend (serial,
-threaded, distributed, GPU, or MPI) and reused across every subsequent `filter_apply!` call — no
-backend rebuilds it per call. Apply with `filter_apply!(out, field, plan)`.
+"""
+    plan_filter(grid, kernel, scale; mask_strategy = ZeroFill(), backend = AutoBackend(),
+                method = RealSpace(), spectral_backend = AutoSpectralBackend(),
+                cache_strategy = AutoCache(), cache_byte_budget) -> AbstractFilterPlan
+
+A reusable filter plan for `backend`, applied by `filter_apply!(out, field, plan)`: the real-space
+footprint, or under `method = Spectral()` the transform plan, which also takes `batch = nb` for a
+trailing batch axis and, over a spherical node set, `nufft`, the NUFFT library NUFSHT runs. A keyword
+the method does not take is refused.
+
+A transform runs on 1 thread under `SerialBackend()` and on `Threads.nthreads()` under
+`ThreadedBackend()`, `AutoBackend()` and `GPUBackend()`, in the device's memory under the last.
+Under `MPIBackend(inner)` every rank holds the field and the output. A nonuniform transform (NUFFT,
+NUFSHT) gives each rank a disjoint share of the points: the analysis `F_k = Σⱼ wⱼ cⱼ exp(−i k⋅xⱼ)` is a
+sum over points, so the ranks' partial sums add to it exactly, and each rank evaluates the filtered
+series at its own points. An FFT or FastSphericalHarmonics transform runs whole on every rank. Under
+`DistributedBackend(inner)` the worker processes share the transform: a nonuniform transform gives
+each a block of the points, and an FFT a block of the columns and then of the rows; each worker runs its
+share at `inner`'s thread count. A FastSphericalHarmonics transform runs in the calling process.
 """
 function plan_filter(
     grid::FlowGeometries.Grids.StructuredGrid{T,G},
@@ -85,15 +104,16 @@ function plan_filter(
             grid_plan = grid_plan, scratch = scratch, kwargs...,
         )
     end
+    isempty(kwargs) || _unused_keywords(kwargs, method)
     resolved = _resolve_backend(backend, grid)
     _check_backend_compatible(grid, backend)
     # The transform engines run on the host (see `_transform_footprint`), so `AutoMethod` takes them only
     # there; a device, distributed or MPI plan keeps the direct engine.
     host = _host_backend(resolved)
     fp = if host && _padded_fft_applicable(grid, kernel, method)
-        padded_fft_footprint(grid, kernel, scale; mask_strategy = mask_strategy)
+        padded_fft_footprint(grid, kernel, scale; mask_strategy = mask_strategy, threads = _library_threads(resolved))
     elseif host && _zonal_fft_applicable(grid, kernel, method)
-        zonal_fft_footprint(grid, kernel, scale; mask_strategy = mask_strategy)
+        zonal_fft_footprint(grid, kernel, scale; mask_strategy = mask_strategy, threads = _library_threads(resolved))
     else
         build_footprint(grid, kernel, scale; mask_strategy = mask_strategy,
             cache_strategy = cache_strategy, cache_byte_budget = cache_byte_budget,

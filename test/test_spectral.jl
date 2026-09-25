@@ -476,6 +476,102 @@ Test.@testset "Spectral NUFSHT filtering" begin
 end
 
 
+# A spectral plan runs its transform library on one thread under `SerialBackend()` and on every Julia
+# thread under `ThreadedBackend()`, `AutoBackend()` and `GPUBackend()`. On KernelAbstractions' CPU device
+# the plan holds the same host arrays at the same thread count, so it returns the threaded result, to the
+# rounding of a library's threaded accumulation, whose order may vary between runs. `nufft` names the
+# library NUFSHT runs, on a scattered sphere and through a grid's node set.
+Test.@testset "Spectral plans run at the backend's thread count and on the device" begin
+    CB = CGEF.ComputationalBackends
+    S = CGEF.Filtering.Spectral()
+    gpu = CB.GPUBackend(KA.CPU())
+    counts = ((CB.SerialBackend(), 1), (CB.ThreadedBackend(), Threads.nthreads()), (CB.AutoBackend(), Threads.nthreads()),
+              (gpu, Threads.nthreads()))
+    g = CGEF.GaussianKernel()
+    mask(sz) = (m = trues(sz); m[2:3] .= false; m)
+    # The device plan against the threaded one, applied to one field and to a batch of two.
+    function device_matches_threaded(grid, f, ℓ; kw...)
+        pt = CGEF.Filtering.plan_filter(grid, g, ℓ; method = S, backend = CB.ThreadedBackend(), batch = 2, kw...)
+        pg = CGEF.Filtering.plan_filter(grid, g, ℓ; method = S, backend = gpu, batch = 2, kw...)
+        F = cat(f, 2 .* f; dims = ndims(f) + 1)
+        same(a, b) = isapprox(a, b; rtol = 1e-12)
+        return same(CGEF.Filtering.filter_apply!(similar(f), f, pg), CGEF.Filtering.filter_apply!(similar(f), f, pt)) &&
+               same(CGEF.Filtering.filter_apply_batched!(similar(F), F, pg),
+                    CGEF.Filtering.filter_apply_batched!(similar(F), F, pt))
+    end
+
+    geom = FG.Geometry.CartesianGeometry()
+    ptsx = vec([Float64(i) for i in 0:7, _ in 0:5]); ptsy = vec([Float64(j) for _ in 0:7, j in 0:5])
+    ug = FG.Grids.UnstructuredGrid(geom, ptsx, ptsy, ones(48), mask(48))
+    for lib in NUFFT_LIBRARIES
+        for (be, n) in counts
+            p = CGEF.Filtering.plan_filter(ug, g, 2.0; method = S, spectral_backend = lib, backend = be, batch = 2)
+            Test.@test FTB.nthreads(p.grid_plan.plan) == n
+            Test.@test FTB.nthreads(p.grid_plan.batched) == n
+        end
+        for st in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
+            Test.@test device_matches_threaded(ug, sin.(ptsx) .+ cos.(ptsy), 2.0; spectral_backend = lib, mask_strategy = st)
+        end
+    end
+
+    N = 9
+    Θ, Φ = FSH.sph_points(N)
+    sgeom = FG.Geometry.SphericalGeometry(1.0)
+    lat = vec([π/2 - θ for θ in Θ, φ in Φ]); lon = vec([φ for θ in Θ, φ in Φ])
+    sg = FG.Grids.UnstructuredGrid(sgeom, lon, lat, ones(length(lat)), mask(length(lat)))
+    M = 2N - 1
+    latlon = FG.Grids.StructuredGrid(sgeom, collect(range(0.0, 2π; length = M + 1)[1:M]),
+                                     collect(range(π/2, -π/2; length = N)), trues(M, N))
+    for lib in NUFFT_LIBRARIES
+        for (be, n) in counts
+            p = CGEF.Filtering.plan_filter(sg, g, 0.5; method = S, nufft = lib, backend = be)
+            pn = CGEF.Filtering.plan_filter(latlon, g, 0.5; method = S, nufft = lib, backend = be)
+            for torus in (NUFSHT._nufft2(p.grid_plan.plan).plan, NUFSHT._nufft2(pn.grid_plan.inner.plan).plan)
+                Test.@test FTB._backend(torus) === lib
+                Test.@test FTB.nthreads(torus) == n
+            end
+        end
+        Test.@test device_matches_threaded(sg, cos.(lat) .* sin.(lon), 0.5; nufft = lib,
+                                           mask_strategy = CGEF.Filtering.Deformable())
+        Test.@test device_matches_threaded(latlon, [cos(y) * sin(x) for x in FG.Grids.coordinates(latlon, 1),
+                                                                        y in FG.Grids.coordinates(latlon, 2)], 0.5; nufft = lib)
+    end
+
+    cc = FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), N; geometry = sgeom)
+    for (be, n) in counts
+        Test.@test CGEF.Filtering.plan_filter(cc, g, 0.5; method = S, backend = be).grid_plan.nthreads == n
+    end
+    Test.@test device_matches_threaded(cc, rand(M, N), 0.5)
+
+    grid = FG.Grids.StructuredGrid(geom, 0.0:1.0:7.0, 0.0:1.0:5.0, mask((8, 6)))
+    for st in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
+        Test.@test device_matches_threaded(grid, rand(8, 6), 2.0; mask_strategy = st)
+    end
+
+    # A keyword the method does not take is refused.
+    Test.@test_throws ArgumentError CGEF.Filtering.plan_filter(grid, g, 2.0; batch = 2)
+    Test.@test_throws ArgumentError CGEF.Filtering.plan_filter(ug, g, 2.0; nufft = first(NUFFT_LIBRARIES))
+    Test.@test_throws MethodError CGEF.Filtering.plan_filter(ug, g, 2.0; method = S, nufft = first(NUFFT_LIBRARIES))
+end
+
+# FastSphericalHarmonics transforms one field at a time: a trailing batch axis is each field through the
+# single-field apply.
+Test.@testset "Spectral spherical-harmonic filtering over a batch axis" begin
+    N = 12
+    grid = FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), N;
+                                           geometry = FG.Geometry.SphericalGeometry(1.0))
+    M = 2N - 1
+    p = CGEF.Filtering.plan_filter(grid, CGEF.GaussianKernel(), 0.4; method = CGEF.Filtering.Spectral(), batch = 3)
+    F = randn(M, N, 3)
+    one_at_a_time = cat((CGEF.Filtering.filter_apply!(zeros(M, N), F[:, :, b], p) for b in 1:3)...; dims = 3)
+    Test.@test CGEF.Filtering.filter_apply_batched!(zeros(M, N, 3), F, p) == one_at_a_time
+    outs = (zeros(M, N, 3), zeros(M, N, 3))
+    CGEF.Filtering.filter_apply_batch!(outs, (F, 2 .* F), p)
+    Test.@test outs[1] == one_at_a_time
+    Test.@test outs[2] ≈ 2 .* one_at_a_time rtol = 1e-14
+end
+
+
 # Cumulative coarse KE (Sadek-Aluie Eq.15) vs the filtering spectral density (Eq.14)
 Test.@testset "Filtering spectrum" begin
     # Periodic, so a uniform field has no edge to fall off at any scale.

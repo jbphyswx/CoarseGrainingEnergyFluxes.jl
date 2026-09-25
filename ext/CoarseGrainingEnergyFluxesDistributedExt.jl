@@ -215,4 +215,277 @@ function _require_shared(A, fname::AbstractString)
     return nothing
 end
 
+# ---------------------------------------------------------------------------
+# Spectral filtering of a Cartesian node set by nonuniform FFT, across worker processes
+# ---------------------------------------------------------------------------
+#
+# Each worker holds the library plan over its block of the points in its own memory. The analysis
+# `F_k = Σⱼ wⱼ cⱼ exp(−i k⋅xⱼ)` is a sum over points, so the workers' partial analyses, written into their
+# columns of a shared array, add to the whole spectrum. The caller multiplies it by the transfer
+# function, and each worker evaluates the filtered series at its own points into the shared output.
+# A worker reads and writes its block through buffers in its inner backend's memory, one copy per field.
+
+# The block of `1:n` the `k`-th of `nw` workers transforms.
+_block(k::Int, nw::Int, n::Int) = (div((k - 1) * n, nw) + 1):div(k * n, nw)
+
+"""
+    DistributedNUFFTGridPlan
+
+The scale-independent half of a nonuniform-FFT filter plan divided among the worker processes: each
+worker's grid plan and buffers, held on that worker, its block of the points, and the arrays the
+workers and the caller share: the field, the workers' partial spectra, the filtered spectrum and the
+output, and the same set with a trailing batch axis when planned for one.
+"""
+struct DistributedNUFFTGridPlan{T, S<:SharedArrays.SharedArray{T}, P, BT, VD <: AbstractVector{Distributed.Future}, VI <: AbstractVector{<:Integer}, VU <: AbstractVector{UnitRange{Int}}} <: CGEF.Filtering.AbstractGridPlan
+    parts::VD
+    workers::VI
+    blocks::VU
+    npts::Int
+    nb::Int
+    bounded::Bool
+    masked::Bool
+    field::S
+    out::S
+    shared::P        # (; partial, spectrum): (mode_size..., nw) and mode_size
+    batched::BT      # (; field, out, partial, spectrum) with a batch axis, or nothing
+end
+
+"""
+    DistributedNUFFTFilterPlan
+
+A [`DistributedNUFFTGridPlan`](@ref) with the transfer function on the caller and, under `Deformable`,
+each worker's inverse local mass held on that worker (`nothing` otherwise).
+"""
+struct DistributedNUFFTFilterPlan{GP<:DistributedNUFFTGridPlan, TR, R, MS<:CGEF.Filtering.AbstractMaskStrategy} <:
+       CGEF.Filtering.AbstractFilterPlan
+    grid_plan::GP
+    transfer::TR
+    invrenorm::R
+    strategy::MS
+end
+
+CGEF.Filtering.plan_strategy(plan::DistributedNUFFTFilterPlan) = plan.strategy
+CGEF.Filtering.spectral_scratch(::DistributedNUFFTGridPlan) = nothing
+
+Base.show(io::IO, gp::DistributedNUFFTGridPlan) =
+    print(io, "DistributedNUFFTGridPlan(", gp.npts, " points on ", length(gp.workers), " workers)")
+Base.show(io::IO, plan::DistributedNUFFTFilterPlan) = print(io, "DistributedNUFFTFilterPlan(", plan.grid_plan, ")")
+
+# ── On each worker ──────────────────────────────────────────────────────────────────────────────────
+# A future's value lives on the worker that computed it, so `fetch` there returns the worker's own
+# grid plan and buffers.
+
+function _part_plan(nufft, grid, backend, batch, block::UnitRange{Int})
+    gp = CGEF.Filtering._nufft_grid_plan(nufft, grid; backend = backend, batch = batch, points = collect(block))
+    sc = CGEF.Filtering._nufft_scratch(gp)
+    T = eltype(gp.weights)
+    n = length(block)
+    stage = CGEF.Filtering._allocate(backend, T, (n,))
+    bstage = gp.batched === nothing ? nothing : CGEF.Filtering._allocate(backend, T, (n, gp.nb))
+    return (; gp, sc, stage, bstage, block)
+end
+
+_part_info(f) = (p = fetch(f); (FTB.mode_size(p.gp.plan), p.gp.bounded))
+_part_transfer(f, kernel, scale) = Array(CGEF.Filtering._nufft_transfer(fetch(f).gp, kernel, scale))
+
+# A worker's modes into the host memory the shared arrays live in.
+_host(A::Array) = A
+_host(A::AbstractArray) = Array(A)
+
+# The plan, values, modes and field buffer for one field or for the batch.
+_part_bufs(p, batched::Bool) = batched ? (p.gp.batched, p.sc.batched.values, p.sc.batched.modes, p.bstage) :
+                                         (p.gp.plan, p.sc.values, p.sc.modes, p.stage)
+
+# This worker's block of the shared `src` into `dst`, column by column.
+function _read_block!(dst, src::SharedArrays.SharedArray, block::UnitRange{Int})
+    s, n, N = SharedArrays.sdata(src), length(block), size(src, 1)
+    for b in 1:size(src, 2)
+        copyto!(dst, (b - 1) * n + 1, s, (b - 1) * N + first(block), n)
+    end
+    return dst
+end
+
+function _write_block!(dst::SharedArrays.SharedArray, src, block::UnitRange{Int})
+    d, n, N = SharedArrays.sdata(dst), length(block), size(dst, 1)
+    for b in 1:size(dst, 2)
+        copyto!(d, (b - 1) * N + first(block), src, (b - 1) * n + 1, n)
+    end
+    return dst
+end
+
+function _part_analysis!(f, field, partial, k::Int, batched::Bool)
+    p = fetch(f)
+    plan, values, modes, stage = _part_bufs(p, batched)
+    CGEF.Filtering._load_weighted!(values, _read_block!(stage, field, p.block), p.gp)
+    FTB.nufft_type1!(modes, plan, values)
+    copyto!(selectdim(SharedArrays.sdata(partial), ndims(partial), k), _host(modes))
+    return nothing
+end
+
+# The analysis of the quadrature weights over the active points, for `Deformable`'s local mass.
+function _part_mass!(f, partial, k::Int)
+    p = fetch(f)
+    gp, sc = p.gp, p.sc
+    gp.mask === nothing ? (sc.values .= gp.weights) : (@. sc.values = gp.mask * gp.weights)
+    FTB.nufft_type1!(sc.modes, gp.plan, sc.values)
+    copyto!(selectdim(SharedArrays.sdata(partial), ndims(partial), k), _host(sc.modes))
+    return nothing
+end
+
+# This worker's inverse local mass, from the filtered spectrum of the weights; it stays on the worker.
+function _part_invrenorm(f, spectrum)
+    p = fetch(f)
+    gp, sc = p.gp, p.sc
+    copyto!(sc.modes, SharedArrays.sdata(spectrum))
+    FTB.nufft_type2!(sc.values, gp.plan, sc.modes)
+    return gp.mask === nothing ? CGEF.Filtering._inv_mass.(sc.values) :
+           ifelse.(gp.mask, CGEF.Filtering._inv_mass.(sc.values), zero(eltype(sc.values)))
+end
+
+function _part_synthesis!(f, spectrum, out, invrenorm, batched::Bool)
+    p = fetch(f)
+    plan, values, modes, stage = _part_bufs(p, batched)
+    copyto!(modes, SharedArrays.sdata(spectrum))
+    FTB.nufft_type2!(values, plan, modes)
+    invrenorm === nothing ? (stage .= values) : (stage .= values .* fetch(invrenorm))
+    _write_block!(out, stage, p.block)
+    return nothing
+end
+
+# ── On the caller ───────────────────────────────────────────────────────────────────────────────────
+
+_shared(::Type{T}, dims, pids) where {T} =
+    (s = SharedArrays.SharedArray{T}(dims; pids = pids); fill!(s, zero(T)); s)
+
+function CGEF.Filtering.distributed_nufft_grid_plan(
+    nufft, grid::FlowGeometries.Grids.UnstructuredGrid{T};
+    backend::CGEF.ComputationalBackends.AbstractDistributedBackend,
+    batch::Union{Nothing,Integer} = nothing,
+) where {T<:AbstractFloat}
+    ws = Distributed.workers()
+    nw = length(ws)
+    npts = length(FlowGeometries.Grids.coordinates(grid, 1))
+    nw <= npts || throw(ArgumentError("$npts points cannot be divided among $nw workers"))
+    inner = CGEF.ComputationalBackends.local_backend(backend)
+    blocks = [_block(k, nw, npts) for k in 1:nw]
+    parts = [Distributed.remotecall(_part_plan, w, nufft, grid, inner, batch, blocks[k]) for (k, w) in enumerate(ws)]
+    # Every build has finished, and a worker's failure is raised here, before any array is shared.
+    infos = Vector{Any}(undef, nw)
+    @sync for (k, w) in enumerate(ws)
+        @async infos[k] = Distributed.remotecall_fetch(_part_info, w, parts[k])
+    end
+    ms, bounded = first(infos)
+    pids = union([Distributed.myid()], ws)
+    nb = batch === nothing ? 0 : Int(batch)
+    shared = (partial = _shared(Complex{T}, (ms..., nw), pids), spectrum = _shared(Complex{T}, ms, pids))
+    batched = nb == 0 ? nothing :
+        (field = _shared(T, (npts, nb), pids), out = _shared(T, (npts, nb), pids),
+         partial = _shared(Complex{T}, (ms..., nb, nw), pids), spectrum = _shared(Complex{T}, (ms..., nb), pids))
+    return DistributedNUFFTGridPlan(
+        parts, ws, blocks, npts, nb, bounded, !all(FlowGeometries.Grids.mask(grid)),
+        _shared(T, (npts,), pids), _shared(T, (npts,), pids), shared, batched,
+    )
+end
+
+# One call per worker, concurrently.
+function _each_part(fn, gp::DistributedNUFFTGridPlan, args...)
+    @sync for (k, w) in enumerate(gp.workers)
+        @async Distributed.remotecall_wait(fn, w, gp.parts[k], args..., k)
+    end
+    return nothing
+end
+
+# The whole spectrum: the sum of the workers' partial analyses.
+function _sum_partial!(spectrum, partial)
+    s = SharedArrays.sdata(spectrum)
+    sum!(reshape(s, size(s)..., 1), SharedArrays.sdata(partial))
+    return spectrum
+end
+
+function CGEF.Filtering.distributed_nufft_filter_plan(
+    gp::DistributedNUFFTGridPlan{T}, kernel::CGEF.Kernels.AbstractFilterKernel, scale::T,
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
+) where {T}
+    transfer = Distributed.remotecall_fetch(_part_transfer, first(gp.workers), first(gp.parts), kernel, scale)
+    invrenorm = if mask_strategy isa CGEF.Filtering.Deformable && (gp.masked || gp.bounded)
+        # `filter(mask)` through the same division of the points; the box beyond a bounded record is
+        # inactive.
+        _each_part(_part_mass!, gp, gp.shared.partial)
+        SharedArrays.sdata(_sum_partial!(gp.shared.spectrum, gp.shared.partial)) .*= transfer
+        [Distributed.remotecall(_part_invrenorm, w, gp.parts[k], gp.shared.spectrum) for (k, w) in enumerate(gp.workers)]
+    else
+        nothing
+    end
+    return DistributedNUFFTFilterPlan(gp, transfer, invrenorm, mask_strategy)
+end
+
+_invrenorm(plan::DistributedNUFFTFilterPlan, k::Int) = plan.invrenorm === nothing ? nothing : plan.invrenorm[k]
+
+function _synthesize_parts!(plan::DistributedNUFFTFilterPlan, sh, batched::Bool)
+    gp = plan.grid_plan
+    @sync for (k, w) in enumerate(gp.workers)
+        @async Distributed.remotecall_wait(_part_synthesis!, w, gp.parts[k], sh.spectrum, sh.out, _invrenorm(plan, k),
+                                           batched)
+    end
+    return sh.out
+end
+
+function _analyze_parts!(plan::DistributedNUFFTFilterPlan, sh, field, batched::Bool)
+    gp = plan.grid_plan
+    copyto!(sh.field, field)
+    @sync for (k, w) in enumerate(gp.workers)
+        @async Distributed.remotecall_wait(_part_analysis!, w, gp.parts[k], sh.field, sh.partial, k, batched)
+    end
+    return _sum_partial!(sh.spectrum, sh.partial)
+end
+
+_single(gp::DistributedNUFFTGridPlan) =
+    (field = gp.field, out = gp.out, partial = gp.shared.partial, spectrum = gp.shared.spectrum)
+
+function _batch(gp::DistributedNUFFTGridPlan, A::AbstractMatrix)
+    gp.batched === nothing && throw(ArgumentError(
+        "this spectral plan was not built for a batch; pass `batch = nb` to `plan_filter`"))
+    size(A) == (gp.npts, gp.nb) || throw(DimensionMismatch(
+        "the plan was built for $(gp.npts) points × a batch of $(gp.nb); got $(size(A))"))
+    return gp.batched
+end
+
+function _apply!(out, field, plan::DistributedNUFFTFilterPlan, sh, batched::Bool)
+    size(out) == size(field) || throw(DimensionMismatch("got out $(size(out)) and field $(size(field))"))
+    s = SharedArrays.sdata(_analyze_parts!(plan, sh, field, batched))
+    s .*= plan.transfer
+    return copyto!(out, _synthesize_parts!(plan, sh, batched))
+end
+
+CGEF.Filtering.filter_apply!(out::AbstractVector, field::AbstractVector, plan::DistributedNUFFTFilterPlan) =
+    _apply!(out, field, plan, _single(plan.grid_plan), false)
+
+CGEF.Filtering._batched_fields(outs, plan::DistributedNUFFTFilterPlan) =
+    plan.grid_plan.batched !== nothing && ndims(first(outs)) == 2
+
+CGEF.Filtering.filter_apply_batched!(out::AbstractMatrix, field::AbstractMatrix, plan::DistributedNUFFTFilterPlan) =
+    _apply!(out, field, plan, _batch(plan.grid_plan, field), true)
+
+# Analysis depends on the field alone, so a sweep runs it once and each scale only multiplies by its own
+# transfer function and evaluates back to the points.
+CGEF.Filtering.analyze_buffer(plan::DistributedNUFFTFilterPlan, ::AbstractVector) =
+    similar(SharedArrays.sdata(plan.grid_plan.shared.spectrum))
+CGEF.Filtering.analyze_buffer(plan::DistributedNUFFTFilterPlan, field::AbstractMatrix) =
+    (plan.grid_plan.batched === nothing || size(field) != (plan.grid_plan.npts, plan.grid_plan.nb)) ? nothing :
+        similar(SharedArrays.sdata(plan.grid_plan.batched.spectrum))
+
+_sh(plan::DistributedNUFFTFilterPlan, A::AbstractVector) = (_single(plan.grid_plan), false)
+_sh(plan::DistributedNUFFTFilterPlan, A::AbstractMatrix) = (_batch(plan.grid_plan, A), true)
+
+function CGEF.Filtering.filter_analyze!(F̂::AbstractArray, field::AbstractVecOrMat, plan::DistributedNUFFTFilterPlan)
+    sh, batched = _sh(plan, field)
+    return copyto!(F̂, SharedArrays.sdata(_analyze_parts!(plan, sh, field, batched)))
+end
+
+function CGEF.Filtering.filter_synthesize!(out::AbstractVecOrMat, F̂::AbstractArray, plan::DistributedNUFFTFilterPlan)
+    sh, batched = _sh(plan, out)
+    SharedArrays.sdata(sh.spectrum) .= F̂ .* plan.transfer
+    return copyto!(out, _synthesize_parts!(plan, sh, batched))
+end
+
 end # module

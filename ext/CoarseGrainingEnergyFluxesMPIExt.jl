@@ -4,6 +4,18 @@ using MPI: MPI
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries
 
+# The backend's communicator; `nothing` is the world.
+_comm(b::CGEF.ComputationalBackends.AbstractMPIBackend) = something(b.comm, MPI.COMM_WORLD)
+
+# A spectral transform under MPI: each rank transforms its round-robin share of the points of a field
+# every rank holds, and the partial spectra and outputs are summed across ranks.
+function CGEF.Filtering._owned(b::CGEF.ComputationalBackends.AbstractMPIBackend, n::Integer)
+    comm = _comm(b)
+    return collect((MPI.Comm_rank(comm) + 1):MPI.Comm_size(comm):Int(n))
+end
+CGEF.Filtering._sum_across!(b::CGEF.ComputationalBackends.AbstractMPIBackend, A::AbstractArray) =
+    MPI.Allreduce!(A, +, _comm(b))
+
 # MPIBackend: multi-node (distributed-memory) execution. Each rank fills a disjoint stride of output
 # latitude rows from the shared footprint (using the SAME per-row kernel as the serial backend), then
 # the partial outputs are combined with an in-place Allreduce — since ranks own disjoint rows, the

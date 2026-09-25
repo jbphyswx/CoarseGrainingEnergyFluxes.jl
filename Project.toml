@@ -37,6 +37,7 @@ SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 [extensions]
 CoarseGrainingEnergyFluxesCairoMakieExt = ["CairoMakie"]
 CoarseGrainingEnergyFluxesDistributedExt = ["Distributed", "SharedArrays"]
+CoarseGrainingEnergyFluxesFFTWDistributedExt = ["FFTW", "Distributed", "SharedArrays"]
 CoarseGrainingEnergyFluxesFFTWExt = ["FFTW"]
 CoarseGrainingEnergyFluxesFastSphericalHarmonicsExt = ["FastSphericalHarmonics"]
 CoarseGrainingEnergyFluxesKernelAbstractionsExt = ["KernelAbstractions"]

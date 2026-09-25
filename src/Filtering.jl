@@ -37,6 +37,7 @@ include("Filtering/Plans.jl")
 include("Filtering/Selection.jl")
 include("Filtering/engines/NodeSpectral.jl")
 include("Filtering/engines/NUFFTSpectral.jl")
+include("Filtering/engines/FFTSpectral.jl")
 include("Filtering/Slices.jl")
 
 end # module

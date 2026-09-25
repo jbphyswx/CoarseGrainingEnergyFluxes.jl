@@ -22,27 +22,37 @@ using FlowGeometries: FlowGeometries
 """
     FFTWGridPlan
 
-The half of an FFTW spectral plan the filter scale does not reach: the forward and inverse transforms
-over the transform grid, the mask, the angular wavenumber grids, and — when the plan was built for a
-trailing batch axis — the transforms bound to that shape. One instance serves every scale of a sweep,
-and it is immutable during an apply, so concurrent workers may share it.
+The half of an FFT spectral plan the filter scale does not reach: the forward and inverse transforms
+over the transform grid, the mask, the angular wavenumber grids, the execution backend whose memory the
+transforms run in, and — when the plan was built for a trailing batch axis — the transforms bound to that
+shape. One instance serves every scale of a sweep, and it is immutable during an apply, so concurrent
+workers may share it.
 
 Only `transfer` — and, for `Deformable`, the renormalization computed through it — depends on ℓ; every
-buffer written during an apply lives in [`FFTWScratch`](@ref). Planning an FFT means measuring, so it
-is paid once per grid.
+buffer written during an apply lives in [`FFTWScratch`](@ref).
 """
-struct FFTWGridPlan{T<:AbstractFloat, FP, IP, M, VX<:AbstractVector{T}, VY<:AbstractVector{T}, BT} <:
-       CGEF.Filtering.AbstractGridPlan
+struct FFTWGridPlan{
+    T<:AbstractFloat, FP, IP, M, VX<:AbstractVector{T}, VY<:AbstractVector{T}, BT,
+    B<:CGEF.ComputationalBackends.AbstractExecutionBackend,
+} <: CGEF.Filtering.AbstractGridPlan
     fwd::FP        # plan_rfft
     inv::IP        # plan_irfft
-    mask::M        # BitMatrix, or nothing when fully active (no masking overhead at all)
+    mask::M        # the mask in the backend's memory, or nothing when fully active
     kx::VX
     ky::VY
     dims::NTuple{2,Int}   # the grid
     P::NTuple{2,Int}      # the transform grid: `dims` along periodic axes, padded along bounded ones
     padded::Bool
     batched::BT    # (; fwd, inv, nb) for a trailing batch axis, or nothing
+    backend::B
 end
+
+# FFTW plans a host array at a planner thread count; any other array plans through the AbstractFFTs
+# provider of its own type (CUFFT for a `CuArray`).
+_plan_rfft(A::Array, nt::Int, region...) = FFTW.plan_rfft(A, region...; num_threads = nt)
+_plan_rfft(A::AbstractArray, ::Int, region...) = FFTW.plan_rfft(A, region...)
+_plan_irfft(A::Array, n::Int, nt::Int, region...) = FFTW.plan_irfft(A, n, region...; num_threads = nt)
+_plan_irfft(A::AbstractArray, n::Int, ::Int, region...) = FFTW.plan_irfft(A, n, region...)
 
 """
     FFTWScratch
@@ -207,48 +217,43 @@ const _FFTAxes = Tuple{FlowGeometries.Axes.UniformSpacing, FlowGeometries.Axes.U
     map(FlowGeometries.Axes.spacing_trait, FlowGeometries.Grids.coordinates(grid))
 
 function _fftw_grid_plan(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G}; batch::Union{Nothing,Integer} = nothing,
+    grid::FlowGeometries.Grids.StructuredGrid{T,G};
+    backend::CGEF.ComputationalBackends.AbstractExecutionBackend = CGEF.ComputationalBackends.AutoBackend(),
+    batch::Union{Nothing,Integer} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    Nx, Ny = size(FlowGeometries.Grids.mask(grid))
-    px = FlowGeometries.Grids.isperiodic(grid, 1)
-    py = FlowGeometries.Grids.isperiodic(grid, 2)
-    # A periodic axis's spacing is its period over its length; a bounded one's is its step.
-    dx = px ? T(FlowGeometries.Grids.period(grid, 1)) / Nx : abs(T(FlowGeometries.Grids.spacing(grid, 1)))
-    dy = py ? T(FlowGeometries.Grids.period(grid, 2)) / Ny : abs(T(FlowGeometries.Grids.spacing(grid, 2)))
-    Px = px ? Nx : 2 * nextprod((2, 3, 5), Nx)
-    Py = py ? Ny : 2 * nextprod((2, 3, 5), Ny)
-    padded = (Px, Py) != (Nx, Ny)
-    # Angular wavenumbers on the transform grid (rfft halves the first axis).
-    kx = T(2π) .* FFTW.rfftfreq(Px, one(T) / dx)
-    ky = T(2π) .* FFTW.fftfreq(Py, one(T) / dy)
+    nt = CGEF.Filtering._library_threads(backend)
+    (; dims, P, padded, kx, ky) = CGEF.Filtering._fft_layout(grid)
+    Nx, Ny = dims
+    Px, Py = P
 
-    sample = zeros(T, Px, Py)
-    fwd = FFTW.plan_rfft(sample)
-    cbuf = fwd * sample                 # complex spectrum (Px÷2+1, Py)
-    inv = FFTW.plan_irfft(cbuf, Px)
-    mask = all(FlowGeometries.Grids.mask(grid)) ? nothing : FlowGeometries.Grids.mask(grid)
+    sample = CGEF.Filtering._allocate(backend, T, (Px, Py))
+    fwd = _plan_rfft(sample, nt)
+    inv = _plan_irfft(CGEF.Filtering._allocate(backend, Complex{T}, (Px ÷ 2 + 1, Py)), Px, nt)
+    m = FlowGeometries.Grids.mask(grid)
+    mask = all(m) ? nothing : CGEF.Filtering._on_backend(backend, m)
     batched = if batch === nothing
         nothing
     else
         nb = Int(batch)
-        bbuf = zeros(T, Px, Py, nb)
-        bfwd = FFTW.plan_rfft(bbuf, (1, 2))
-        (fwd = bfwd, inv = FFTW.plan_irfft(bfwd * bbuf, Px, (1, 2)), nb = nb)
+        bfwd = _plan_rfft(CGEF.Filtering._allocate(backend, T, (Px, Py, nb)), nt, (1, 2))
+        binv = _plan_irfft(CGEF.Filtering._allocate(backend, Complex{T}, (Px ÷ 2 + 1, Py, nb)), Px, nt, (1, 2))
+        (fwd = bfwd, inv = binv, nb = nb)
     end
-    return FFTWGridPlan(fwd, inv, mask, kx, ky, (Nx, Ny), (Px, Py), padded, batched)
+    return FFTWGridPlan(fwd, inv, mask, kx, ky, (Nx, Ny), (Px, Py), padded, batched, backend)
 end
 
 # The buffers an apply writes through, sized from the grid plan's own shape.
 function _fftw_scratch(gp::FFTWGridPlan{T}) where {T<:AbstractFloat}
     Px, Py = gp.P
     b = gp.batched
+    zs(S, dims...) = CGEF.Filtering._allocate(gp.backend, S, dims)
     return FFTWScratch(
-        zeros(Complex{T}, Px ÷ 2 + 1, Py),
-        zeros(T, Px, Py),   # touched when masked or padded
-        gp.padded ? zeros(T, Px, Py) : nothing,
+        zs(Complex{T}, Px ÷ 2 + 1, Py),
+        zs(T, Px, Py),   # touched when masked or padded
+        gp.padded ? zs(T, Px, Py) : nothing,
         b === nothing ? nothing :
-            (cbuf = zeros(Complex{T}, Px ÷ 2 + 1, Py, b.nb), masked_input = zeros(T, Px, Py, b.nb),
-             pad_out = gp.padded ? zeros(T, Px, Py, b.nb) : nothing),
+            (cbuf = zs(Complex{T}, Px ÷ 2 + 1, Py, b.nb), masked_input = zs(T, Px, Py, b.nb),
+             pad_out = gp.padded ? zs(T, Px, Py, b.nb) : nothing),
     )
 end
 
@@ -260,11 +265,20 @@ CGEF.Filtering.spectral_grid_plan(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
     _fftw_grid_plan_for(_fft_axes(grid), sb, grid, kernel; kwargs...)
 
-_fftw_grid_plan_for(::_FFTAxes, _, grid, _; batch::Union{Nothing,Integer} = nothing, kwargs...) =
-    _fftw_grid_plan(grid; batch = batch)
+_fftw_grid_plan_for(
+    ::_FFTAxes, _, grid, _;
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy = CGEF.Filtering.ZeroFill(),
+    backend::CGEF.ComputationalBackends.AbstractExecutionBackend = CGEF.ComputationalBackends.AutoBackend(),
+    batch::Union{Nothing,Integer} = nothing,
+) = _grid_plan_for(grid, backend, batch)
 _fftw_grid_plan_for(::Tuple, sb, grid, kernel; kwargs...) =
     CGEF.Filtering._node_set_grid_plan(sb, grid, kernel; kwargs...)
 
+# In this process, or divided among the worker processes.
+_grid_plan_for(grid, backend::CGEF.ComputationalBackends.AbstractDistributedBackend, batch) =
+    CGEF.Filtering.distributed_fft_grid_plan(grid; backend = backend, batch = batch)
+_grid_plan_for(grid, backend::CGEF.ComputationalBackends.AbstractExecutionBackend, batch) =
+    _fftw_grid_plan(grid; backend = backend, batch = batch)
 CGEF.Filtering.spectral_scratch(gp::FFTWGridPlan) = _fftw_scratch(gp)
 
 CGEF.Filtering.spectral_filter_plan(
@@ -284,19 +298,30 @@ function _fftw_filter_plan(
     grid::FlowGeometries.Grids.StructuredGrid{T,G},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T;
-    mask_strategy = CGEF.Filtering.ZeroFill(),
-    backend = CGEF.ComputationalBackends.AutoBackend(),
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy = CGEF.Filtering.ZeroFill(),
+    backend::CGEF.ComputationalBackends.AbstractExecutionBackend = CGEF.ComputationalBackends.AutoBackend(),
     # Extent of the trailing batch axis this plan will be applied over, or `nothing` for single fields.
-    # A transform is bound to one field shape, so it is fixed here rather than discovered at apply time.
+    # A transform is bound to one field shape, so it is fixed at planning.
     batch::Union{Nothing,Integer} = nothing,
-    grid_plan::Union{Nothing,FFTWGridPlan} = nothing,
+    grid_plan::Union{Nothing,CGEF.Filtering.AbstractGridPlan} = nothing,
     scratch::Union{Nothing,FFTWScratch} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    gp = grid_plan === nothing ? _fftw_grid_plan(grid; batch = batch) : grid_plan
+    gp = grid_plan === nothing ? _grid_plan_for(grid, backend, batch) : grid_plan
+    return _filter_plan(gp, scratch, kernel, scale, mask_strategy)
+end
+
+_filter_plan(gp::CGEF.Filtering.AbstractGridPlan, _, kernel, scale, mask_strategy) =
+    CGEF.Filtering.distributed_fft_filter_plan(gp, kernel, scale, mask_strategy)
+
+function _filter_plan(
+    gp::FFTWGridPlan{T}, scratch, kernel::CGEF.Kernels.AbstractFilterKernel, scale::T,
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
+) where {T<:AbstractFloat}
     sc = scratch === nothing ? _fftw_scratch(gp) : scratch
     kx, ky = gp.kx, gp.ky
 
-    transfer = T[CGEF.Kernels.spectral_transfer(kernel, sqrt(kx[i]^2 + ky[j]^2), scale) for i in eachindex(kx), j in eachindex(ky)]
+    transfer = CGEF.Filtering._on_backend(gp.backend,
+        T[CGEF.Kernels.spectral_transfer(kernel, sqrt(kx[i]^2 + ky[j]^2), scale) for i in eachindex(kx), j in eachindex(ky)])
 
     mask = gp.mask
     invrenorm = if mask_strategy isa CGEF.Filtering.Deformable && (mask !== nothing || gp.padded)
@@ -307,13 +332,11 @@ function _fftw_filter_plan(
         mask === nothing ? fill!(region, one(T)) : (region .= mask)
         LA.mul!(sc.cbuf, gp.fwd, sc.masked_input)
         sc.cbuf .*= transfer
-        renorm = zeros(T, gp.dims)
+        renorm = CGEF.Filtering._allocate(gp.backend, T, gp.dims)
         _fftw_inverse!(renorm, gp.inv, sc.cbuf, sc.pad_out, gp)
-        ir = similar(renorm)
         # A masked cell is zero under `Deformable`, as in the real-space engines.
-        active = mask === nothing ? trues(gp.dims) : mask
-        @. ir = ifelse(active, CGEF.Filtering._inv_mass(renorm), zero(T))
-        ir
+        mask === nothing ? CGEF.Filtering._inv_mass.(renorm) :
+            ifelse.(mask, CGEF.Filtering._inv_mass.(renorm), zero(T))
     else
         nothing   # ZeroFill: already exactly `filter(mask .* field)`, no renormalization
     end
@@ -367,7 +390,7 @@ function CGEF.Filtering.padded_fft_footprint(
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T;
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy = CGEF.Filtering.ZeroFill(),
-    kwargs...,
+    threads::Integer = 1,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     dx = abs(step(FlowGeometries.Grids.coordinates(grid, 1)))
@@ -394,10 +417,10 @@ function CGEF.Filtering.padded_fft_footprint(
         gpad[mod1(1 + di, Px), mod1(1 + dj, Py)] += wt
     end
 
-    fwd = FFTW.plan_rfft(gpad)
+    fwd = FFTW.plan_rfft(gpad; num_threads = threads)
     Ĝ = fwd * gpad
     spec = similar(Ĝ)
-    inv = FFTW.plan_irfft(spec, Px)
+    inv = FFTW.plan_irfft(spec, Px; num_threads = threads)
 
     # The denominator differs by strategy, as it does in the direct engine: `Deformable` renormalizes
     # over the active cells, and `ZeroFill` divides by the kernel's full mass, its in-domain part through
@@ -500,7 +523,7 @@ function CGEF.Filtering.zonal_fft_footprint(
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T;
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy = CGEF.Filtering.ZeroFill(),
-    kwargs...,
+    threads::Integer = 1,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     geo = FlowGeometries.Grids.grid_geometry(grid)
@@ -522,14 +545,14 @@ function CGEF.Filtering.zonal_fft_footprint(
     cos_rad = cos(min(rad / R, T(π)))
 
     sample = zeros(T, Nx, Ny)
-    fwd = FFTW.plan_rfft(sample, 1)
+    fwd = FFTW.plan_rfft(sample, 1; num_threads = threads)
     Fbuf = fwd * sample
-    iplan = FFTW.plan_irfft(Fbuf, Nx, 1)
+    iplan = FFTW.plan_irfft(Fbuf, Nx, 1; num_threads = threads)
     nk = size(Fbuf, 1)
 
     Ŵ = zeros(T, nk, nb, Ny)
     gcol = zeros(T, Nx, nb)
-    gplan = FFTW.plan_rfft(gcol, 1)
+    gplan = FFTW.plan_rfft(gcol, 1; num_threads = threads)
     for j in 1:Ny
         φj = lat[j]
         sj, cj = sin(φj), cos(φj)

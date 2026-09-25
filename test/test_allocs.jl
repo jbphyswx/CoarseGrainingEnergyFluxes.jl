@@ -275,7 +275,7 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
         # The same fit and synthesis, driven directly through the plan, transfer adapter, workspace and
         # tolerance the extension holds.
         gp, sc = nushtplan.grid_plan, nushtplan.scratch
-        rtol = Base.get_extension(CGEF, :CoarseGrainingEnergyFluxesNUFSHTExt)._fit_rtol(gp.plan)
+        rtol = Base.get_extension(CGEF, :CoarseGrainingEnergyFluxesNUFSHTExt)._fit_rtol(gp.plan.tol, Float64)
         NUFSHT.nusht_filter!(outnu, nuf, nushtplan.filter, gp.plan; ws = sc.ws, rtol = rtol)
         a_upstream = _cgef_alloc_nusht_filter!(outnu, nuf, nushtplan.filter, gp.plan, sc.ws, rtol)
         Test.@test a_through <= a_upstream + TASK_SLACK

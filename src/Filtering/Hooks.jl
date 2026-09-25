@@ -41,6 +41,54 @@ end
 # driver of `_sep_serial`'s shape.
 _transform_footprint(::Any) = false
 
+const _DistributedBackends =
+    Union{ComputationalBackends.AbstractDistributedBackend, ComputationalBackends.AbstractMPIBackend}
+
+"""
+    _library_threads(backend) -> Int
+
+The thread count a transform library runs at in a plan built for `backend`: 1 under `SerialBackend`,
+the backend a threaded slice or batch loop builds its plans with; `Threads.nthreads()` under
+`ThreadedBackend`, `AutoBackend` and `GPUBackend`. A distributed backend runs each process's share at
+the count of its inner backend.
+"""
+_library_threads(::ComputationalBackends.AbstractSerialBackend) = 1
+_library_threads(
+    ::Union{ComputationalBackends.AbstractThreadedBackend, ComputationalBackends.AbstractAutoBackend,
+            ComputationalBackends.AbstractGPUBackend},
+) = Threads.nthreads()
+_library_threads(b::_DistributedBackends) = _library_threads(ComputationalBackends.local_backend(b))
+
+"""
+    _allocate(backend, T, dims) -> array
+    _on_backend(backend, x) -> array
+    _host_memory(backend) -> Bool
+
+Zeroed storage of element type `T`, and a copy of the host array `x`, in the memory `backend` runs in,
+and whether that memory is the host's. It is host memory for every backend but a `GPUBackend` on a
+device other than KernelAbstractions' CPU, whose memory the KernelAbstractions extension allocates. An
+MPI rank runs in its inner backend's memory; a `DistributedBackend` plan's caller holds host memory,
+and its workers their inner backend's.
+"""
+_allocate(::ComputationalBackends.AbstractExecutionBackend, ::Type{T}, dims::Dims) where {T} = zeros(T, dims)
+_allocate(b::ComputationalBackends.AbstractMPIBackend, ::Type{T}, dims::Dims) where {T} =
+    _allocate(ComputationalBackends.local_backend(b), T, dims)
+_on_backend(backend::ComputationalBackends.AbstractExecutionBackend, x::AbstractArray) =
+    copyto!(_allocate(backend, eltype(x), size(x)), Array(x))
+_host_memory(::ComputationalBackends.AbstractExecutionBackend) = true
+_host_memory(b::ComputationalBackends.AbstractMPIBackend) = _host_memory(ComputationalBackends.local_backend(b))
+
+"""
+    _owned(backend, n) -> Vector{Int} or nothing
+    _sum_across!(backend, A) -> A
+
+The points of `n` this process transforms, `nothing` for all of them, and the sum of `A` over the
+processes that share the transform, in place. Under `MPIBackend` (MPI extension) each rank owns the
+points `rank + 1, rank + 1 + nproc, …` of a field every rank holds, and the sum is an `Allreduce`.
+"""
+_owned(::ComputationalBackends.AbstractExecutionBackend, ::Integer) = nothing
+_sum_across!(::ComputationalBackends.AbstractExecutionBackend, A::AbstractArray) = A
+
 function distributed_filter_field!(args...; kwargs...)
     throw(ArgumentError("DistributedBackend is unavailable — run `using Distributed` (or use SerialBackend())."))
 end
@@ -70,11 +118,12 @@ function spectral_filter_plan(spectral_backend, grid, kernel, scale; kwargs...)
 end
 
 """
-    spectral_grid_plan(spectral_backend, grid, kernel; mask_strategy, batch) -> AbstractGridPlan or nothing
+    spectral_grid_plan(spectral_backend, grid, kernel; mask_strategy, backend, batch) -> AbstractGridPlan or nothing
 
 The scale-independent half of a spectral plan: the transform objects themselves, the wavenumber grids,
 and the mask. Only the transfer function `Ĝ(|k|, ℓ)` and the `Deformable` renormalization depend on
-the filter scale, so a sweep builds this once and each scale keeps only those two.
+the filter scale, so a sweep builds this once and each scale keeps only those two. The transforms run on
+`_library_threads(backend)` threads.
 
 Planning a transform is not cheap — FFTW measures, and a nonuniform transform additionally sorts its
 points — so paying it once per grid rather than once per scale is the whole reason this hook exists.

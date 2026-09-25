@@ -439,6 +439,7 @@ function plan_filter(
     method isa Spectral && return spectral_filter_plan(
         spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend, kwargs...,
     )
+    isempty(kwargs) || _unused_keywords(kwargs, method)
     _check_backend_compatible(grid, backend)
     return PhysicalFilterPlan(
         build_footprint(grid, kernel, scale), grid, mask_strategy, kernel, scale,
@@ -466,6 +467,7 @@ function plan_filter(
         # Over its cells as a node set (engines/NodeSpectral).
         return spectral_filter_plan(spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend, kwargs...)
     end
+    isempty(kwargs) || _unused_keywords(kwargs, method)
     resolved = _resolve_backend(backend, grid)
     _check_backend_compatible(grid, backend)
     fp = build_footprint(grid, kernel, scale; cache_strategy = cache_strategy, cache_byte_budget = cache_byte_budget)

@@ -60,6 +60,21 @@ jobs:
               run(`$exe -n 2 julia --project=test test/mpi_runtests.jl`)
           end
 
+  distributed:
+    name: Distributed backend (2 workers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v3
+      - name: Instantiate test env
+        run: julia --project=test -e 'using Pkg; Pkg.instantiate()'
+      - name: Run test/distributed_runtests.jl
+        run: julia --project=test test/distributed_runtests.jl
+
   examples:
     name: Run examples
     runs-on: ubuntu-latest

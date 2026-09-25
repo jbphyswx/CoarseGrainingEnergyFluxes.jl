@@ -30,18 +30,24 @@ const _NUFFTRoute = Union{SpectralBackends.AbstractAutoSpectralBackend, Spectral
 
 The half of a nonuniform-FFT filter plan the filter scale does not reach: the transform over the
 node set (and one over a trailing batch of `nb` fields when planned for it), the box periods, the
-record's mode count per direction, the quadrature weights and the mask. A transform holds the working
-state of its own execution, so a concurrent driver needs its own grid plan per worker.
+record's mode count per direction, the quadrature weights, the mask, the execution backend whose
+memory holds them, and the points this process transforms (`nothing` for all). A transform holds the
+working state of its own execution, so a concurrent driver needs its own grid plan per worker.
 """
-struct NUFFTGridPlan{T<:AbstractFloat, D, P, PB, VT<:AbstractVector{T}, MK} <: AbstractGridPlan
+struct NUFFTGridPlan{
+    T<:AbstractFloat, D, P, PB, VT<:AbstractVector{T}, MK, B<:ComputationalBackends.AbstractExecutionBackend, O,
+} <: AbstractGridPlan
     plan::P
     batched::PB          # the plan with `ntrans = nb`, or nothing
     nb::Int
     period::NTuple{D,T}
     counts::NTuple{D,Int}
-    weights::VT          # Aⱼ / ∏ L_d
-    mask::MK             # the grid's mask, or nothing when fully active
+    weights::VT          # Aⱼ / ∏ L_d over this process's points
+    mask::MK             # the grid's mask over this process's points, or nothing when fully active
     bounded::Bool
+    backend::B
+    own::O               # this process's points, or nothing for all of them
+    npts::Int            # the grid's point count
 end
 
 """
@@ -92,9 +98,12 @@ end
 _mode_count(N::Int) = isodd(N) ? N : N + 1
 _edge_weight(::Type{T}, f::Int, N::Int) where {T} = (iseven(N) && abs(f) == N ÷ 2) ? T(1 // 2) : one(T)
 
+# `points` is the share of the points this plan transforms, `_owned(backend, npts)` unless given.
 function _nufft_grid_plan(
-    backend, grid::FlowGeometries.Grids.UnstructuredGrid{T,G,D};
-    nufft_nthreads::Integer = 1, batch::Union{Nothing,Integer} = nothing, kwargs...,
+    nufft, grid::FlowGeometries.Grids.UnstructuredGrid{T,G,D};
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    batch::Union{Nothing,Integer} = nothing,
+    points::Union{Nothing,AbstractVector{Int}} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}, D}
     1 <= D <= 3 || throw(ArgumentError(
         "nonuniform-FFT spectral filtering takes 1, 2 or 3 coordinates; this grid has $D"))
@@ -114,14 +123,31 @@ function _nufft_grid_plan(
     counts = ntuple(d -> periodic[d] ? record[d] : 2 * nextprod((2, 3, 5), record[d]), Val(D))
     L = ntuple(d -> periodic[d] ? spans[d] : counts[d] * extent[d] / (record[d] - 1), Val(D))
     nmodes = map(_mode_count, counts)
-    kw = (; period = L, origin = lo, nthreads = Int(nufft_nthreads))
-    plan = FlowTransformBindings.plan_nufft(backend, T, x, nmodes; kw...)
+    # This process's points, their weights and mask go where `backend` runs, and the library plans in
+    # that memory. Type 1 is a sum over points, so the processes' partial spectra sum to the whole one.
+    own = points === nothing ? _owned(backend, npts) : points
+    part(v) = own === nothing ? v : v[own]
+    xb = map(v -> _on_backend(backend, T.(part(v))), x)
+    kw = (; period = L, origin = lo, nthreads = _library_threads(backend))
+    plan = FlowTransformBindings.plan_nufft(nufft, T, xb, nmodes; kw...)
     nb = batch === nothing ? 0 : Int(batch)
-    batched = nb == 0 ? nothing : FlowTransformBindings.plan_nufft(backend, T, x, nmodes; ntrans = nb, kw...)
-    A = FlowGeometries.Grids.measure(grid)
-    weights = T.(A ./ prod(L))
+    batched = nb == 0 ? nothing : FlowTransformBindings.plan_nufft(nufft, T, xb, nmodes; ntrans = nb, kw...)
+    weights = _on_backend(backend, T.(part(FlowGeometries.Grids.measure(grid)) ./ prod(L)))
     m = FlowGeometries.Grids.mask(grid)
-    return NUFFTGridPlan(plan, batched, nb, L, counts, weights, all(m) ? nothing : m, !all(periodic))
+    return NUFFTGridPlan(plan, batched, nb, L, counts, weights, all(m) ? nothing : _on_backend(backend, part(m)),
+                         !all(periodic), backend, own === nothing ? nothing : _on_backend(backend, own), npts)
+end
+
+# This process's points of a field every process holds.
+@inline _local(field::AbstractVector, ::Nothing) = field
+@inline _local(field::AbstractVector, own) = view(field, own)
+@inline _local(field::AbstractMatrix, ::Nothing) = field
+@inline _local(field::AbstractMatrix, own) = view(field, own, :)
+
+# Type 1 of this process's points, summed over the processes into the whole spectrum.
+function _analysis!(modes, p, values, gp::NUFFTGridPlan)
+    FlowTransformBindings.nufft_type1!(modes, p, values)
+    return _sum_across!(gp.backend, modes)
 end
 
 function _nufft_scratch(gp::NUFFTGridPlan)
@@ -148,7 +174,7 @@ function _nufft_transfer(gp::NUFFTGridPlan{T,D}, kernel::Kernels.AbstractFilterK
         end
         transfer[I] = w * Kernels.spectral_transfer(kernel, sqrt(k2), scale, Val(D))
     end
-    return transfer
+    return _on_backend(gp.backend, transfer)
 end
 
 # `w .* field`, or `mask .* (w .* field)`: a `Bool` is a strong zero, so a masked point adds nothing
@@ -162,45 +188,77 @@ function _load_weighted!(c::AbstractArray, field::AbstractArray, gp::NUFFTGridPl
     return c
 end
 
-_store_filtered!(out, c, ::Nothing) = (out .= c; out)
-_store_filtered!(out, c, invrenorm::AbstractVector) = (out .= c .* invrenorm; out)
+# This process's filtered values into `out`, which each process then holds whole.
+_store_filtered!(out, c, invrenorm, gp::NUFFTGridPlan) = _store_filtered!(out, c, invrenorm, gp.own, gp.backend)
+_store_filtered!(out, c, ::Nothing, ::Nothing, _) = (out .= c; out)
+_store_filtered!(out, c, invrenorm::AbstractVector, ::Nothing, _) = (out .= c .* invrenorm; out)
+function _store_filtered!(out, c, invrenorm, own, backend)
+    fill!(out, zero(eltype(out)))
+    _store_filtered!(_local(out, own), c, invrenorm, nothing, backend)
+    return _sum_across!(backend, out)
+end
 
-# The order `AutoSpectralBackend` tries the libraries in: execution time per apply, measured across
-# point counts by FlowTransformBindings' `benchmark/nufft_libraries.jl`.
+# The order `AutoSpectralBackend` tries the libraries in.
 const _NUFFT_LIBRARY_ORDER = (FlowTransformBindings.NonuniformFFTsBackend(), FlowTransformBindings.FINUFFTBackend())
 
 """
     _nufft_library(spectral_backend) -> tag or nothing
 
 The FlowTransformBindings tag that runs a nonuniform-FFT filter: the one named, or for
-`AutoSpectralBackend` and the generic `NUFFTSpectralBackend` the first loaded of the two libraries in
-this package's order; `nothing` when neither is loaded.
+`AutoSpectralBackend` NonuniformFFTs when it is loaded and FINUFFT when only it is; `nothing` when
+neither is loaded.
 """
 _nufft_library(b::Union{FlowTransformBindings.FINUFFTBackend, FlowTransformBindings.NonuniformFFTsBackend}) = b
-function _nufft_library(::_NUFFTRoute)
+function _nufft_library(::SpectralBackends.AbstractAutoSpectralBackend)
     for b in _NUFFT_LIBRARY_ORDER
         FlowTransformBindings.is_available(b) && return b
     end
     return nothing
 end
+_nufft_library(t::SpectralBackends.AbstractNUFFTSpectralBackend) = throw(ArgumentError(
+    "$(nameof(typeof(t))) names no NUFFT library; pass FlowTransformBindings.NonuniformFFTsBackend() " *
+    "(`using NonuniformFFTs`) or FlowTransformBindings.FINUFFTBackend() (`using FINUFFT`)."))
 
 spectral_scratch(gp::NUFFTGridPlan) = _nufft_scratch(gp)
 
+"""
+    distributed_nufft_grid_plan(nufft, grid; backend::DistributedBackend, batch) -> AbstractGridPlan
+    distributed_nufft_filter_plan(grid_plan, kernel, scale, mask_strategy) -> AbstractFilterPlan
+
+A nonuniform-FFT spectral plan whose points are divided among the worker processes, each holding the
+library plan over its block. Methods in the Distributed extension.
+"""
+function distributed_nufft_grid_plan end
+function distributed_nufft_filter_plan end
+
+distributed_nufft_grid_plan(args...; kwargs...) = throw(ArgumentError(
+    "DistributedBackend is unavailable — run `using Distributed, SharedArrays` (or use SerialBackend())."))
+
+# The grid plan for `backend`: over this process's points, or divided among the worker processes.
+_nufft_grid_plan_for(nufft, grid, backend::ComputationalBackends.AbstractDistributedBackend, batch) =
+    distributed_nufft_grid_plan(nufft, grid; backend = backend, batch = batch)
+_nufft_grid_plan_for(nufft, grid, backend::ComputationalBackends.AbstractExecutionBackend, batch) =
+    _nufft_grid_plan(nufft, grid; backend = backend, batch = batch)
+
 function spectral_grid_plan(
     spectral_backend::_NUFFTRoute, grid::FlowGeometries.Grids.UnstructuredGrid{T,G},
-    ::Kernels.AbstractFilterKernel; kwargs...,
+    ::Kernels.AbstractFilterKernel;
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    batch::Union{Nothing,Integer} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}}
-    lib = _nufft_library(spectral_backend)
-    lib === nothing && return nothing
-    return _nufft_grid_plan(lib, grid; kwargs...)
+    nufft = _nufft_library(spectral_backend)
+    nufft === nothing && return nothing
+    return _nufft_grid_plan_for(nufft, grid, backend, batch)
 end
 
 """
-    spectral_filter_plan(backend, grid::UnstructuredGrid{Cartesian}, kernel, scale; nufft_nthreads = 1, batch = nothing)
+    spectral_filter_plan(spectral_backend, grid::UnstructuredGrid{Cartesian}, kernel, scale;
+                         mask_strategy = ZeroFill(), backend = AutoBackend(), batch = nothing)
 
 `batch = nb` adds a transform with `ntrans = nb`, which `filter_apply_batched!` runs over an
-`(npts, nb)` array in one execution per direction. `nufft_nthreads` is the library's own thread count;
-a threaded slice or batch loop keeps it at 1.
+`(npts, nb)` array in one execution per direction. The library runs on `_library_threads(backend)`
+threads.
 """
 function spectral_filter_plan(
     spectral_backend::_NUFFTRoute,
@@ -208,18 +266,27 @@ function spectral_filter_plan(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     mask_strategy::AbstractMaskStrategy = ZeroFill(),
-    backend = ComputationalBackends.AutoBackend(),
-    grid_plan::Union{Nothing,NUFFTGridPlan} = nothing,
+    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    batch::Union{Nothing,Integer} = nothing,
+    grid_plan::Union{Nothing,AbstractGridPlan} = nothing,
     scratch::Union{Nothing,NUFFTScratch} = nothing,
-    kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}}
     gp = if grid_plan === nothing
-        lib = _nufft_library(spectral_backend)
-        lib === nothing && _no_spectral_backend(spectral_backend, grid)
-        _nufft_grid_plan(lib, grid; kwargs...)
+        nufft = _nufft_library(spectral_backend)
+        nufft === nothing && _no_spectral_backend(spectral_backend, grid)
+        _nufft_grid_plan_for(nufft, grid, backend, batch)
     else
         grid_plan
     end
+    return _nufft_filter_plan(gp, scratch, kernel, scale, mask_strategy)
+end
+
+_nufft_filter_plan(gp::AbstractGridPlan, _, kernel, scale, mask_strategy) =
+    distributed_nufft_filter_plan(gp, kernel, scale, mask_strategy)
+
+function _nufft_filter_plan(
+    gp::NUFFTGridPlan{T}, scratch, kernel::Kernels.AbstractFilterKernel, scale::T, mask_strategy::AbstractMaskStrategy,
+) where {T}
     sc = scratch === nothing ? _nufft_scratch(gp) : scratch
     transfer = _nufft_transfer(gp, kernel, scale)
     invrenorm = if mask_strategy isa Deformable && (gp.mask !== nothing || gp.bounded)
@@ -229,11 +296,10 @@ function spectral_filter_plan(
         else
             @. sc.values = gp.mask * gp.weights
         end
-        FlowTransformBindings.nufft_type1!(sc.modes, gp.plan, sc.values)
+        _analysis!(sc.modes, gp.plan, sc.values, gp)
         sc.modes .*= transfer
         FlowTransformBindings.nufft_type2!(sc.values, gp.plan, sc.modes)
-        active = gp.mask === nothing ? trues(length(sc.values)) : gp.mask
-        ifelse.(active, _inv_mass.(sc.values), zero(T))
+        gp.mask === nothing ? _inv_mass.(sc.values) : ifelse.(gp.mask, _inv_mass.(sc.values), zero(T))
     else
         nothing
     end
@@ -242,11 +308,11 @@ end
 
 function filter_apply!(out::AbstractVector{T}, field::AbstractVector, plan::NUFFTFilterPlan{T}) where {T}
     gp, sc = plan.grid_plan, plan.scratch
-    _load_weighted!(sc.values, field, gp)
-    FlowTransformBindings.nufft_type1!(sc.modes, gp.plan, sc.values)
+    _load_weighted!(sc.values, _local(field, gp.own), gp)
+    _analysis!(sc.modes, gp.plan, sc.values, gp)
     sc.modes .*= plan.transfer
     FlowTransformBindings.nufft_type2!(sc.values, gp.plan, sc.modes)
-    return _store_filtered!(out, sc.values, plan.invrenorm)
+    return _store_filtered!(out, sc.values, plan.invrenorm, gp)
 end
 
 # Analysis depends on the field alone, so a sweep runs it once and each scale only multiplies by its own
@@ -255,16 +321,15 @@ analyze_buffer(plan::NUFFTFilterPlan, ::AbstractVector) = similar(plan.scratch.m
 
 function filter_analyze!(F̂::AbstractArray, field::AbstractVector, plan::NUFFTFilterPlan)
     gp, sc = plan.grid_plan, plan.scratch
-    _load_weighted!(sc.values, field, gp)
-    FlowTransformBindings.nufft_type1!(F̂, gp.plan, sc.values)
-    return F̂
+    _load_weighted!(sc.values, _local(field, gp.own), gp)
+    return _analysis!(F̂, gp.plan, sc.values, gp)
 end
 
 function filter_synthesize!(out::AbstractVector{T}, F̂::AbstractArray, plan::NUFFTFilterPlan{T}) where {T}
     gp, sc = plan.grid_plan, plan.scratch
     sc.modes .= F̂ .* plan.transfer
     FlowTransformBindings.nufft_type2!(sc.values, gp.plan, sc.modes)
-    return _store_filtered!(out, sc.values, plan.invrenorm)
+    return _store_filtered!(out, sc.values, plan.invrenorm, gp)
 end
 
 # A trailing batch axis: `nb` fields on the same points, one `ntrans = nb` execution per direction.
@@ -275,36 +340,37 @@ function _batch_buffers(plan::NUFFTFilterPlan, field::AbstractMatrix)
     gp, p = plan.grid_plan, plan.scratch.batched
     (gp.batched === nothing || p === nothing) && throw(ArgumentError(
         "this spectral plan was not built for a batch; pass `batch = nb` to `plan_filter`"))
-    size(field) == size(p.values) || throw(DimensionMismatch(
-        "the plan was built for $(size(p.values, 1)) points × a batch of $(gp.nb); got $(size(field))"))
+    size(field) == (gp.npts, gp.nb) || throw(DimensionMismatch(
+        "the plan was built for $(gp.npts) points × a batch of $(gp.nb); got $(size(field))"))
     return gp.batched, p
 end
 
 function filter_apply_batched!(out::AbstractMatrix{T}, field::AbstractMatrix, plan::NUFFTFilterPlan{T}) where {T}
     size(out) == size(field) || throw(DimensionMismatch(
         "filter_apply_batched! got out $(size(out)) and field $(size(field))"))
+    gp = plan.grid_plan
     b, p = _batch_buffers(plan, field)
-    _load_weighted!(p.values, field, plan.grid_plan)
-    FlowTransformBindings.nufft_type1!(p.modes, b, p.values)
+    _load_weighted!(p.values, _local(field, gp.own), gp)
+    _analysis!(p.modes, b, p.values, gp)
     p.modes .*= plan.transfer
     FlowTransformBindings.nufft_type2!(p.values, b, p.modes)
-    return _store_filtered!(out, p.values, plan.invrenorm)
+    return _store_filtered!(out, p.values, plan.invrenorm, gp)
 end
 
 analyze_buffer(plan::NUFFTFilterPlan, field::AbstractMatrix) =
-    (plan.scratch.batched === nothing || size(field) != size(plan.scratch.batched.values)) ? nothing :
+    (plan.scratch.batched === nothing || size(field) != (plan.grid_plan.npts, plan.grid_plan.nb)) ? nothing :
         similar(plan.scratch.batched.modes)
 
 function filter_analyze!(F̂::AbstractArray, field::AbstractMatrix, plan::NUFFTFilterPlan)
+    gp = plan.grid_plan
     b, p = _batch_buffers(plan, field)
-    _load_weighted!(p.values, field, plan.grid_plan)
-    FlowTransformBindings.nufft_type1!(F̂, b, p.values)
-    return F̂
+    _load_weighted!(p.values, _local(field, gp.own), gp)
+    return _analysis!(F̂, b, p.values, gp)
 end
 
 function filter_synthesize!(out::AbstractMatrix{T}, F̂::AbstractArray, plan::NUFFTFilterPlan{T}) where {T}
     b, p = _batch_buffers(plan, out)
     p.modes .= F̂ .* plan.transfer
     FlowTransformBindings.nufft_type2!(p.values, b, p.modes)
-    return _store_filtered!(out, p.values, plan.invrenorm)
+    return _store_filtered!(out, p.values, plan.invrenorm, plan.grid_plan)
 end

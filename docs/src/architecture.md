@@ -154,6 +154,15 @@ transforms, multiplies by the shared `spectral_transfer`, and inverse transforms
 Any other grid is filtered over its cells as a node set, by the nonuniform transform of its geometry;
 a regional sphere is completed to the whole sphere by its lattice continued past each bounded edge.
 
+A spectral plan runs where its `backend` does. The library runs on one thread under `SerialBackend()`
+and on `Threads.nthreads()` under `ThreadedBackend()`, `AutoBackend()` and `GPUBackend()`, whose plans
+hold the device's memory; FastSphericalHarmonics transforms host memory, so its device plan passes each
+field through a host buffer. Under `MPIBackend` every rank holds the field: a nonuniform transform
+gives each rank a share of the points and adds their partial analyses, and an FFT or
+FastSphericalHarmonics transform runs whole on each rank. Under `DistributedBackend` a nonuniform
+transform gives each worker a block of the points and an FFT a block of columns and then of rows;
+FastSphericalHarmonics runs in the calling process.
+
 ## Type Hierarchy
 
 ```
