@@ -279,21 +279,14 @@ function check_setup(
         "non-negative and `coarse_grain` fills `filtering_spectrum` with NaN: pass " *
         "`kernel = GaussianKernel()`, or `spectrum = Diagnostics.ForceSpectrum()` to compute it anyway.")
 
-    # Two different reasons `Spectral()` can be unavailable, and they need different actions: a
-    # `MethodError` means the transfer function lives in an extension that is not loaded (fixable by
-    # loading it), an `ArgumentError` means the kernel genuinely has no isotropic transfer function.
+    # The transfer function in the grid's own dimension. Its refusal names the reason: a weak dependency
+    # to load, or no isotropic transfer function for this kernel.
     spectral_ok, spectral_note = try
-        Kernels.spectral_transfer(kernel, one(T) / ℓ, ℓ)
+        Kernels.spectral_transfer(kernel, one(T) / ℓ, ℓ, dim)
         true, nothing
     catch e
-        if e isa MethodError
-            false, "$(_kname(kernel))'s spectral transfer function is provided by a weak dependency " *
-                   "that is not loaded, so `method = Spectral()` is unavailable in this session — run " *
-                   "`using SpecialFunctions`. Real-space filtering is unaffected."
-        else
-            false, "$(_kname(kernel)) has no isotropic transfer function, so `method = Spectral()` " *
-                   "does not exist for it — it is a real-space kernel by construction."
-        end
+        e isa ArgumentError || rethrow()
+        false, "`method = Spectral()` is unavailable: " * sprint(showerror, e)
     end
     spectral_note === nothing || push!(notes, spectral_note)
 

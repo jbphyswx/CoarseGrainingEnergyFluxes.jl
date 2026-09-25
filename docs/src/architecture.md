@@ -144,12 +144,15 @@ involved, so the kernel keeps its compact support.
 `Spectral()` filtering dispatches on grid type to a transform adapter (a thin wrapper that forward
 transforms, multiplies by the shared `spectral_transfer`, and inverse transforms):
 
-| Grid | Sampling | Extension | Transform |
-|------|----------|-----------|-----------|
-| `StructuredGrid{Cartesian}`   | uniform           | `FFTW`                   | real FFT, zero-padded along bounded axes |
-| `UnstructuredGrid{Cartesian}` | scattered         | `FINUFFT`                | type-1/2 NUFFT |
-| `StructuredGrid{Spherical}`   | uniform (FSH grid)| `FastSphericalHarmonics` | scalar SHT |
-| `UnstructuredGrid{Spherical}` | scattered         | `NUFSHT`                 | non-uniform SHT |
+| Grid | Sampling | Library | Transform |
+|------|----------|---------|-----------|
+| `StructuredGrid{Cartesian}`   | uniform           | `FFTW`                        | real FFT, zero-padded along bounded axes |
+| `UnstructuredGrid{Cartesian}` | scattered, 1–3 D  | `NonuniformFFTs` or `FINUFFT` | type-1/2 NUFFT through FlowTransformBindings |
+| `StructuredGrid{Spherical}`   | `ClenshawCurtisSampling`, `nlon = 2·nlat − 1` | `FastSphericalHarmonics` | scalar SHT |
+| `UnstructuredGrid{Spherical}` | scattered         | `NUFSHT`                      | non-uniform SHT |
+
+Any other grid is filtered over its cells as a node set, by the nonuniform transform of its geometry;
+a regional sphere is completed to the whole sphere by its lattice continued past each bounded edge.
 
 ## Type Hierarchy
 
@@ -222,7 +225,7 @@ Scratch is the only part mutated during an apply. A driver that runs applies con
 its own family; grid and scale plans are freely shared.
 
 Two spectral backends narrow that: `FastSphericalHarmonics`' `SphPlanCache` is a memo table its
-transform populates on first use, and a FINUFFT/NUFSHT guru plan carries the working state of its own
+transform populates on first use, and a NUFFT or NUFSHT plan carries the working state of its own
 execution. Those grid plans are written during an apply, so they too go one per worker.
 
 ## Plan reuse & workspace pre-allocation

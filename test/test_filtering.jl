@@ -222,24 +222,29 @@ Test.@testset "Prefix-sum top-hat engine: masking/strategy semantics and exact p
     Test.@test all(abs.(oc[m] .- 7.25) .< 1e-12)
 
     # A filter wider than the whole sphere returns the area-weighted mean over the grid under
-    # `Deformable`. Under `ZeroFill` the latitude lattice continues to both poles, its cells tile the
-    # rest of the sphere, and the result is the grid's integral over `4πR²`.
+    # `Deformable`. Under `ZeroFill` the lattice continues to both poles and around the ring, its cells
+    # tile the rest of the sphere, and the result is the grid's integral over `4πR²`: with the latitude
+    # rows landing on the poles, with them missing the poles by half a step, and with a regional
+    # longitude whose remaining arc is not a whole number of steps.
     R = 6.371e6
-    gs = FG.Grids.StructuredGrid(
-        FG.Geometry.SphericalGeometry(R),
-        range(0.0; step = deg2rad(10.0), length = 36),
-        range(deg2rad(-80.0); step = deg2rad(5.0), length = 33),
-        trues(36, 33),
+    sph = FG.Geometry.SphericalGeometry(R)
+    for (lon, lat, periodic) in (
+        (range(0.0; step = deg2rad(10.0), length = 36), range(deg2rad(-80.0); step = deg2rad(5.0), length = 33), true),
+        (range(0.0; step = deg2rad(10.0), length = 36), range(deg2rad(-88.5); step = deg2rad(2.0), length = 89), true),
+        (range(0.0; step = deg2rad(7.0), length = 21), range(deg2rad(-60.0); step = deg2rad(5.0), length = 25), false),
     )
-    sf = [sin(2 * (i - 1) * deg2rad(10.0)) * cos((j - 17) * deg2rad(5.0)) + 2.0 for i in 1:36, j in 1:33]
-    integral = sum(sf[i, j] * FG.Grids.area(gs, i, j) for i in 1:36, j in 1:33)
-    wsum = sum(FG.Grids.area(gs, i, j) for i in 1:36, j in 1:33)
-    for (strat, expected) in ((CGEF.Filtering.Deformable(), integral / wsum),
-                              (CGEF.Filtering.ZeroFill(), integral / (4π * R^2)))
-        fps = CGEF.Filtering.build_footprint(gs, CGEF.TopHatKernel(), 4 * π * R; mask_strategy = strat)
-        os = zeros(36, 33)
-        CGEF.Filtering._apply_serial!(os, sf, gs, fps, strat)
-        Test.@test maximum(abs, os .- expected) < 1e-10 * expected
+        nl, nφ = length(lon), length(lat)
+        gs = FG.Grids.StructuredGrid(sph, lon, lat, trues(nl, nφ); periodic = (periodic, false))
+        sf = [sin(2 * lon[i]) * cos(lat[j]) + 2.0 for i in 1:nl, j in 1:nφ]
+        integral = sum(sf[i, j] * FG.Grids.area(gs, i, j) for i in 1:nl, j in 1:nφ)
+        wsum = sum(FG.Grids.area(gs, i, j) for i in 1:nl, j in 1:nφ)
+        for (strat, expected) in ((CGEF.Filtering.Deformable(), integral / wsum),
+                                  (CGEF.Filtering.ZeroFill(), integral / (4π * R^2)))
+            fps = CGEF.Filtering.build_footprint(gs, CGEF.TopHatKernel(), 4 * π * R; mask_strategy = strat)
+            os = zeros(nl, nφ)
+            CGEF.Filtering._apply_serial!(os, sf, gs, fps, strat)
+            Test.@test maximum(abs, os .- expected) < 1e-10 * expected
+        end
     end
 
     # A Deformable apply against a ZeroFill-built plan on a masked grid has no renormalization data

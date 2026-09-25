@@ -199,13 +199,16 @@ function CGEF.Filtering.filter_synthesize!(
     return out
 end
 
+# An FFT samples a direction at equal steps, which a grid states in its axis types: FG's `spacing_trait`
+# per direction. Two uniform directions take FFTW; any other grid, a stretched direction or a rank other
+# than two, is filtered over its cells as a node set.
+const _FFTAxes = Tuple{FlowGeometries.Axes.UniformSpacing, FlowGeometries.Axes.UniformSpacing}
+@inline _fft_axes(grid::FlowGeometries.Grids.StructuredGrid) =
+    map(FlowGeometries.Axes.spacing_trait, FlowGeometries.Grids.coordinates(grid))
+
 function _fftw_grid_plan(
     grid::FlowGeometries.Grids.StructuredGrid{T,G}; batch::Union{Nothing,Integer} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    (FlowGeometries.Grids.isuniform(grid, 1) && FlowGeometries.Grids.isuniform(grid, 2)) || throw(ArgumentError(
-        "Spectral FFT filtering needs uniformly spaced axes (`AbstractRange` coordinates); this grid has " *
-        "a stretched one. Use `RealSpace()`, or a node grid with `FINUFFT`.",
-    ))
     Nx, Ny = size(FlowGeometries.Grids.mask(grid))
     px = FlowGeometries.Grids.isperiodic(grid, 1)
     py = FlowGeometries.Grids.isperiodic(grid, 2)
@@ -250,18 +253,34 @@ function _fftw_scratch(gp::FFTWGridPlan{T}) where {T<:AbstractFloat}
 end
 
 CGEF.Filtering.spectral_grid_plan(
-    ::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractFFTSpectralBackend},
+    sb::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractFFTSpectralBackend},
     grid::FlowGeometries.Grids.StructuredGrid{T,G},
     kernel::CGEF.Kernels.AbstractFilterKernel;
-    batch::Union{Nothing,Integer} = nothing,
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
+    _fftw_grid_plan_for(_fft_axes(grid), sb, grid, kernel; kwargs...)
+
+_fftw_grid_plan_for(::_FFTAxes, _, grid, _; batch::Union{Nothing,Integer} = nothing, kwargs...) =
     _fftw_grid_plan(grid; batch = batch)
+_fftw_grid_plan_for(::Tuple, sb, grid, kernel; kwargs...) =
+    CGEF.Filtering._node_set_grid_plan(sb, grid, kernel; kwargs...)
 
 CGEF.Filtering.spectral_scratch(gp::FFTWGridPlan) = _fftw_scratch(gp)
 
-function CGEF.Filtering.spectral_filter_plan(
-    ::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractFFTSpectralBackend},
+CGEF.Filtering.spectral_filter_plan(
+    sb::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractFFTSpectralBackend},
+    grid::FlowGeometries.Grids.StructuredGrid{T,G},
+    kernel::CGEF.Kernels.AbstractFilterKernel,
+    scale::T;
+    kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
+    _fftw_filter_plan(_fft_axes(grid), sb, grid, kernel, scale; kwargs...)
+
+_fftw_filter_plan(::Tuple, sb, grid, kernel, scale; kwargs...) =
+    CGEF.Filtering._node_set_filter_plan(sb, grid, kernel, scale; kwargs...)
+
+function _fftw_filter_plan(
+    ::_FFTAxes, _,
     grid::FlowGeometries.Grids.StructuredGrid{T,G},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T;
@@ -290,11 +309,10 @@ function CGEF.Filtering.spectral_filter_plan(
         sc.cbuf .*= transfer
         renorm = zeros(T, gp.dims)
         _fftw_inverse!(renorm, gp.inv, sc.cbuf, sc.pad_out, gp)
-        threshold = T(0.01)
         ir = similar(renorm)
         # A masked cell is zero under `Deformable`, as in the real-space engines.
         active = mask === nothing ? trues(gp.dims) : mask
-        @. ir = ifelse(active & (abs(renorm) >= threshold), one(T) / renorm, zero(T))
+        @. ir = ifelse(active, CGEF.Filtering._inv_mass(renorm), zero(T))
         ir
     else
         nothing   # ZeroFill: already exactly `filter(mask .* field)`, no renormalization

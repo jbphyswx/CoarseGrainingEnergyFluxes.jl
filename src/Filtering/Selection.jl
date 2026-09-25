@@ -52,16 +52,18 @@ Base.show(io::IO, ::MIME"text/plain", f::FilterPlanFamily) = show(io, f)
 #
 # Derived from the same predicates `build_footprint` dispatches on, so the family cannot prepare shared
 # state the per-scale builder will not use.
-_sweep_shared(grid, kernel, mask_strategy, method) =
-    _spectral_sweep_shared(grid, kernel, mask_strategy, method)
+_sweep_shared(grid, kernel, mask_strategy, method; kwargs...) =
+    _spectral_sweep_shared(grid, kernel, mask_strategy, method; kwargs...)
 
-# A spectral engine's shared half is its transform objects, whichever backend supplies them; its
-# scratch is sized from those and shared by the sequential scales of the sweep.
-function _spectral_sweep_shared(grid, kernel, mask_strategy, method)
+# A spectral engine's shared half is its transform objects, from the sweep's own spectral backend and
+# batch; its scratch is sized from those and shared by the sequential scales of the sweep.
+function _spectral_sweep_shared(
+    grid, kernel, mask_strategy, method;
+    spectral_backend::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
+    kwargs...,
+)
     _resolve_method(method) isa Spectral || return (nothing, nothing)
-    gp = spectral_grid_plan(
-        SpectralBackends.AutoSpectralBackend(), grid, kernel; mask_strategy = mask_strategy,
-    )
+    gp = spectral_grid_plan(spectral_backend, grid, kernel; mask_strategy = mask_strategy, kwargs...)
     return (gp, gp === nothing ? nothing : spectral_scratch(gp))
 end
 
@@ -69,10 +71,11 @@ function _sweep_shared(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
     kernel::Kernels.TopHatKernel,
     mask_strategy::AbstractMaskStrategy,
-    method::AbstractFilterMethod,
+    method::AbstractFilterMethod;
+    kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     _resolve_method(method) isa Spectral &&
-        return _spectral_sweep_shared(grid, kernel, mask_strategy, method)
+        return _spectral_sweep_shared(grid, kernel, mask_strategy, method; kwargs...)
     FlowGeometries.Grids.measure_factors(grid) === nothing && return (nothing, nothing)
     gp = _build_prefixsum_grid_plan(grid; mask_strategy = mask_strategy)
     return (gp, _prefixsum_scratch(gp, grid))
@@ -82,10 +85,11 @@ function _sweep_shared(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
     kernel::SeparableKernel,
     mask_strategy::AbstractMaskStrategy,
-    method::AbstractFilterMethod,
+    method::AbstractFilterMethod;
+    kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _resolve_method(method) isa Spectral &&
-        return _spectral_sweep_shared(grid, kernel, mask_strategy, method)
+        return _spectral_sweep_shared(grid, kernel, mask_strategy, method; kwargs...)
     FlowGeometries.Grids.measure_factors(grid) === nothing && return (nothing, nothing)
     return (nothing, _separable_scratch(grid))
 end
@@ -119,7 +123,7 @@ function plan_filter_sweep(
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     meth = method === nothing ? _default_method(grid) : method
-    gp, sc = _sweep_shared(grid, kernel, mask_strategy, meth)
+    gp, sc = _sweep_shared(grid, kernel, mask_strategy, meth; kwargs...)
     # An engine with nothing to share is planned exactly as before, without the two extra keywords —
     # the spectral and node builders forward `kwargs...` onward, so handing them a keyword they do not
     # know about would surface deep inside a transform plan constructor rather than here.
@@ -459,8 +463,7 @@ function plan_filter(
 ) where {T<:AbstractFloat}
     _validate_scale(scale)
     if method isa Spectral
-        # No spectral backend targets a CurvilinearGrid (FINUFFT/NUFSHT are UnstructuredGrid-only),
-        # so this raises the standard informative "spectral unavailable" error.
+        # Over its cells as a node set (engines/NodeSpectral).
         return spectral_filter_plan(spectral_backend, grid, kernel, scale; mask_strategy = mask_strategy, backend = backend, kwargs...)
     end
     resolved = _resolve_backend(backend, grid)

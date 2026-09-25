@@ -50,9 +50,9 @@ CoarseGrainingEnergyFluxes setup check
        non-negative: `coarse_grain` needs `kernel = GaussianKernel()`, or
        `spectrum = Diagnostics.ForceSpectrum()` to compute it anyway, or
        `spectrum = Diagnostics.NoSpectrum()` to skip it.
-    3. TopHatKernel's spectral transfer function is provided by a weak dependency that is not
-       loaded, so `method = Spectral()` is unavailable in this session — run
-       `using SpecialFunctions`. Real-space filtering is unaffected.
+    3. `method = Spectral()` is unavailable: ArgumentError: the two-dimensional top-hat transfer
+       and sharp-spectral weight are the jinc `2J₁(x)/x`, provided by the SpecialFunctions weak
+       dependency. Run `using SpecialFunctions`.
 ```
 
 Every field is readable programmatically too (`r.supports_spectrum`, `r.boundary_buffer_cells`, …), so
@@ -264,7 +264,7 @@ using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries as FG
 using NearestNeighbors: NearestNeighbors        # enables k-d tree neighbor search
 using DelaunayTriangulation: DelaunayTriangulation  # enables exact Voronoi cell areas (Cartesian)
-using FINUFFT: FINUFFT                          # enables scattered-Cartesian spectral filtering
+using NonuniformFFTs: NonuniformFFTs            # enables scattered-Cartesian spectral filtering (or FINUFFT)
 
 npts = 2_000
 geom = FG.Geometry.CartesianGeometry()         # a placeholder — UnstructuredGrid has no fixed spacing
@@ -278,8 +278,7 @@ CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, grid, CGEF.GaussianKernel(), 8_0
 ```
 
 For scattered spherical observations, build `grid` with `FG.Geometry.SphericalGeometry(R)` instead and load
-`Quickhull` (Voronoi areas) and `NUFSHT` (spectral filtering) in place of `DelaunayTriangulation`/
-`FINUFFT`.
+`Quickhull` (Voronoi areas) in place of `DelaunayTriangulation`, and `NUFSHT` for spectral filtering.
 
 ## Sphere pixelizations: ring, cubed-sphere, healpix, icosahedral, Yin–Yang
 
@@ -466,14 +465,14 @@ components whether or not a vertical velocity was supplied.
 
 ## Spectral filtering (`method = Spectral()`)
 
-Spectral filtering multiplies by Ĝ(k) and is selected by the grid type (FFTW / FINUFFT /
-FastSphericalHarmonics / NUFSHT). A bounded Cartesian direction is zero-padded, so the result is the
+Spectral filtering multiplies by Ĝ(k) and is selected by the grid type (FFTW, the nonuniform FFT,
+FastSphericalHarmonics, NUFSHT). A bounded Cartesian direction is zero-padded, so the result is the
 filter of the field extended by zero beyond the domain; the spherical-harmonic transforms need the whole
 sphere. A partial mask is supported by normalized convolution, `ZeroFill`/`Deformable` defined as for
 `RealSpace()`. `GaussianKernel`/`SharpSpectralKernel` filter spectrally with no extra dependency;
-`TopHatKernel` needs `using SpecialFunctions` (for its exact planar Bessel-`J₁` transfer function — the
-spherical-cap analog needs no extra dependency), as does `SharpSpectralKernel` in real space on a
-two-dimensional grid.
+`TopHatKernel` on a two-dimensional grid needs `using SpecialFunctions` (for its exact planar
+Bessel-`J₁` transfer function — the one- and three-dimensional forms and the spherical-cap analog need
+no extra dependency), as does `SharpSpectralKernel` in real space on a two-dimensional grid.
 
 ```julia
 using FlowGeometries: FlowGeometries as FG
@@ -487,10 +486,15 @@ out = zeros(N, N)
 CGEF.Filtering.filter_field!(out, u, grid, CGEF.GaussianKernel(), 4.0; method = CGEF.Filtering.Spectral())
 ```
 
-Scattered Cartesian points use `FINUFFT` on an `UnstructuredGrid{Cartesian}`; uniform spherical grids
-use `FastSphericalHarmonics` on a `StructuredGrid{Spherical}`; scattered spherical points use `NUFSHT`
-on an `UnstructuredGrid{Spherical}`. In every case the call is the same `filter_field!(…; method =
-CGEF.Filtering.Spectral())` — only the grid type differs.
+Scattered Cartesian points in one to three dimensions use the nonuniform FFT on an
+`UnstructuredGrid{Cartesian}` (`using NonuniformFFTs` or `using FINUFFT`; with both loaded
+`spectral_backend = FlowTransformBindings.FINUFFTBackend()` or `NonuniformFFTsBackend()` picks one);
+a global sphere on `FastSphericalHarmonics`' own nodes — built with
+`FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), N)`, `N` latitudes by
+`2N − 1` longitudes — uses `FastSphericalHarmonics`; scattered spherical points use `NUFSHT` on an
+`UnstructuredGrid{Spherical}`. Any other grid is filtered over its
+cells as a node set by the transform of its geometry. In every case the call is the same
+`filter_field!(…; method = CGEF.Filtering.Spectral())` — only the grid type differs.
 
 ## Rotational / divergent (Helmholtz) flux decomposition
 

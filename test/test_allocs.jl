@@ -41,6 +41,10 @@ using Test: Test
 _cgef_alloc_filter_apply!(out, field, plan) = @allocated CGEF.Filtering.filter_apply!(out, field, plan)
 _cgef_alloc_nusht_filter!(out, field, xfer, plan, ws, rtol) =
     @allocated NUFSHT.nusht_filter!(out, field, xfer, plan; ws = ws, rtol = rtol)
+_cgef_alloc_nufft_pair(gp, sc) = @allocated begin
+    FTB.nufft_type1!(sc.modes, gp.plan, sc.values)
+    FTB.nufft_type2!(sc.values, gp.plan, sc.modes)
+end
 
 Test.@testset "Zero-/bounded-allocation hot paths" begin
 
@@ -221,8 +225,8 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
     end
 
     # -----------------------------------------------------------------------
-    # Spectral filter_apply! — exact zero for FFTW/FINUFFT/FastSphericalHarmonics; NUFSHT is an
-    # upstream (NUFSHT.jl) allocation, not something this package's extension code does.
+    # Spectral filter_apply! — exact zero for FFTW/FastSphericalHarmonics; the nonuniform transforms
+    # add nothing over their library's own calls.
     # -----------------------------------------------------------------------
     Test.@testset "filter_apply! (spectral, cached plan)" begin
         N = 48; dx = 1000.0
@@ -239,14 +243,19 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
         ulon = 60e3 .* rand(npts); ulat = 60e3 .* rand(npts)
         ugrid = FG.Grids.UnstructuredGrid(ugeom, ulon, ulat, ones(npts), trues(npts))
         uf = randn(npts); outu = zeros(npts)
-        finufftplan = CGEF.Filtering.plan_filter(ugrid, CGEF.GaussianKernel(), 5000.0; backend = SERIAL, method = CGEF.Filtering.Spectral())
-        CGEF.Filtering.filter_apply!(outu, uf, finufftplan); CGEF.Filtering.filter_apply!(outu, uf, finufftplan)
-        Test.@test (@allocated CGEF.Filtering.filter_apply!(outu, uf, finufftplan)) <= TASK_SLACK
+        for lib in (FTB.FINUFFTBackend(), FTB.NonuniformFFTsBackend())
+            nuplan = CGEF.Filtering.plan_filter(ugrid, CGEF.GaussianKernel(), 5000.0; backend = SERIAL,
+                                                method = CGEF.Filtering.Spectral(), spectral_backend = lib)
+            CGEF.Filtering.filter_apply!(outu, uf, nuplan); CGEF.Filtering.filter_apply!(outu, uf, nuplan)
+            pair = minimum(_ -> _cgef_alloc_nufft_pair(nuplan.grid_plan, nuplan.scratch), 1:3)
+            Test.@test minimum(_ -> _cgef_alloc_filter_apply!(outu, uf, nuplan), 1:3) <= pair + TASK_SLACK
+            lib isa FTB.FINUFFTBackend && Test.@test pair <= TASK_SLACK
+        end
 
         Ndeg = 16; Nsh = Ndeg + 1; Msh = 2Nsh - 1
-        Θ, Φ = FSH.sph_points(Nsh)
         R = 6.371e6
-        sgrid = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), collect(Φ), π / 2 .- collect(Θ), trues(Msh, Nsh))
+        sgrid = FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), Nsh;
+                                                geometry = FG.Geometry.SphericalGeometry(R))
         field = randn(Msh, Nsh); outsh = zeros(Msh, Nsh)
         shtplan = CGEF.Filtering.plan_filter(sgrid, CGEF.GaussianKernel(), π * R / 8; backend = SERIAL, method = CGEF.Filtering.Spectral())
         CGEF.Filtering.filter_apply!(outsh, field, shtplan); CGEF.Filtering.filter_apply!(outsh, field, shtplan)
@@ -371,7 +380,10 @@ Test.@testset "Zero-/bounded-allocation hot paths" begin
         ulon = 60e3 .* rand(npts); ulat = 60e3 .* rand(npts)
         ugrid = FG.Grids.UnstructuredGrid(ugeom, ulon, ulat, trues(npts); k = 8)
         uplan = FG.Operators.gradient_plan(ugrid)
-        ufplan = CGEF.Filtering.plan_filter(ugrid, CGEF.GaussianKernel(), 5000.0; backend = SERIAL, method = CGEF.Filtering.Spectral())
+        # FINUFFT allocates nothing per execution, so the bound is this package's own residual; the
+        # spectral testset above bounds each library against its own transforms.
+        ufplan = CGEF.Filtering.plan_filter(ugrid, CGEF.GaussianKernel(), 5000.0; backend = SERIAL,
+                                            method = CGEF.Filtering.Spectral(), spectral_backend = FTB.FINUFFTBackend())
         wsu = CGEF.Diagnostics.ΠWorkspace(ugrid)
         uu = randn(npts); vu = randn(npts); Πu = zeros(npts)
         CGEF.Diagnostics.compute_Π!(Πu, uu, vu, nothing, ugrid, CGEF.GaussianKernel(), 5000.0; workspace = wsu, filter_plan = ufplan, deriv_plan = uplan)

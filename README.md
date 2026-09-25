@@ -35,9 +35,9 @@ cascade). Alongside Π the package computes:
 | Energy per scale band, via the repeated-filter Germano identity | `band_energies` |
 | Variable-density (Favre) budget: Π, baropycnal work Λ, and pressure dilatation | `compressible_flux` |
 
-— on masked, regional, or global domains, with real-space (direct-sum) or spectral
-(FFTW / FINUFFT / spherical-harmonic / NUFSHT) backends and serial/threaded/GPU/distributed/MPI
-execution.
+— on masked, regional, or global domains, with real-space (direct-sum) or spectral (FFTW, nonuniform
+FFT through NonuniformFFTs or FINUFFT, spherical-harmonic, NUFSHT) backends and
+serial/threaded/GPU/distributed/MPI execution.
 
 Each diagnostic has an in-place form taking a workspace, so a sweep over scales or timesteps allocates
 nothing after the first call, and each workspace holds only the buffers its configuration can reach —
@@ -115,7 +115,7 @@ The scalar analogue of Π (buoyancy ⇒ available-potential-energy transfer).
 ![Masking](docs/src/assets/masking.png)
 
 ### Spectral filtering on the sphere
-Global spherical-harmonic filtering (the FFTW / FINUFFT / FastSphericalHarmonics / NUFSHT backends cover Cartesian/spherical × uniform/scattered).
+Global spherical-harmonic filtering (FFTW, the nonuniform FFT, FastSphericalHarmonics and NUFSHT cover Cartesian/spherical × uniform/scattered).
 
 ![Spherical filtering](docs/src/assets/spherical_filtering.png)
 
@@ -131,7 +131,7 @@ assumption anywhere in the pipeline.
 ![Curvilinear grid](docs/src/assets/curvilinear.png)
 
 ### Scattered / unstructured point clouds
-k-d tree neighbor search + exact Voronoi cell areas + non-uniform spectral filtering (FINUFFT), taking
+k-d tree neighbor search + exact Voronoi cell areas + nonuniform-FFT spectral filtering, taking
 `compute_Π!` all the way to a real flux map on genuinely scattered observations.
 
 ![Unstructured grid](docs/src/assets/unstructured.png)
@@ -202,8 +202,9 @@ src/
                     HighOrderKernel{P}, SharpSpectralKernel, and the spectrum policies
   Filtering.jl    — filter_field! (real-space footprint engine + spectral plan dispatch)
   Filtering/      — the module's files: Strategies, Lifetimes, CacheStrategy, Hooks, Api, Apply,
-                    Plans, Selection, Slices, and engines/ (Footprint, PrefixSumTopHat, Separable,
-                    NDim, PrefixSumTopHat3D)
+                    Plans, Selection, Slices, and engines/ (Exterior, Footprint, PrefixSumTopHat,
+                    Separable, NDim, PrefixSumTopHat3D, NodeSpectral, NUFFTSpectral — the nonuniform
+                    FFT through FlowTransformBindings)
   Derivatives.jl  — ddx!/ddy!/ddz! + StencilPlan, over FlowGeometries' discretization
                     (least-squares gradients on CurvilinearGrid/UnstructuredGrid come from
                     Operators.gradient_plan there)
@@ -217,8 +218,7 @@ src/
   Visualization.jl — plot_Π_map / plot_spectrum stubs (methods provided by the CairoMakie ext)
 ext/
   FFTWExt                       — FFT spectral filtering (uniform Cartesian StructuredGrid; bounded axes zero-padded)
-  FINUFFTExt                    — non-uniform FFT filtering (scattered Cartesian UnstructuredGrid)
-  FastSphericalHarmonicsExt     — spherical-harmonic transform (uniform spherical StructuredGrid)
+  FastSphericalHarmonicsExt     — spherical-harmonic transform (StructuredGrid on ClenshawCurtisSampling, nlon = 2·nlat − 1)
   NUFSHTExt                     — non-uniform spherical-harmonic transform (scattered spherical UnstructuredGrid)
   OhMyThreadsExt                — ThreadedBackend (2D row-parallel; also 1D/true-3D point-parallel)
   GPUExt                        — GPUBackend via KernelAbstractions
@@ -228,17 +228,20 @@ ext/
   CairoMakieExt                 — plot_Π_map / plot_spectrum implementations
 ```
 
-Backend implementations and all spectral/spatial-indexing transforms live in **package extensions**
-(weak dependencies), so the core package has no heavy dependencies.
+Backend implementations and the transform libraries are **package extensions** (weak dependencies),
+so the core package has no heavy dependencies. The nonuniform FFT runs through FlowTransformBindings,
+whose own extensions bind NonuniformFFTs and FINUFFT: `using NonuniformFFTs` or `using FINUFFT` enables
+it, and `spectral_backend = FlowTransformBindings.FINUFFTBackend()` (or `NonuniformFFTsBackend()`)
+names one.
 
 ## Grid Types
 
 | Grid | Dimensionality | Real-space filter | Spectral filter | Derivatives | `compute_Π!` |
 |------|-----------------|--------------------|-----------------|--------------|--------------|
-| `StructuredGrid` | 1D, 2D, true 3D (Cartesian or spherical-volumetric) | Yes | Yes (FFTW 2D Cartesian; FastSphericalHarmonics 2D spherical) | `ddx!`/`ddy!`/`ddz!` (+ a reusable `Derivatives.StencilPlan`) | Yes, all dimensionalities + a 2.5D vertical-profile wrapper (`compute_Π_profile!`) |
-| `CurvilinearGrid` | 2D (model-native, orthogonal curvilinear meshes) | Yes (per-point footprint, no translation invariance assumed) | Not yet (no spectral extension targets it — real-space only) | `FG.Operators.gradient_plan` + `FG.Operators.gradient!` (least-squares tangent plane) | Yes |
-| `UnstructuredGrid` | 1D (scattered points) | Yes, and the default (`RealSpace()` — ball query over the grid's own adjacency) | Yes (FINUFFT Cartesian; NUFSHT spherical) | the same, over the grid's k-d tree adjacency | Yes |
-| `RingGrid`, `CubedSphereGrid`, `HEALPixGrid`, `IcosahedralGrid`, `YinYangGrid` | 1D (sphere pixelizations: one index names a cell) | Yes, and the default — the same node CSR gather over each grid's own ball query | Not yet (no spectral extension targets them — real-space only) | `Derivatives.gradient_plan` + `FG.Operators.gradient!`, through each grid's own adjacency | Yes |
+| `StructuredGrid` | 1D, 2D, true 3D (Cartesian or spherical-volumetric) | Yes | Yes (FFTW on two uniform Cartesian axes; FastSphericalHarmonics on `structured_grid(ClenshawCurtisSampling(), N)`; any other over its cells by the nonuniform transform) | `ddx!`/`ddy!`/`ddz!` (+ a reusable `Derivatives.StencilPlan`) | Yes, all dimensionalities + a 2.5D vertical-profile wrapper (`compute_Π_profile!`) |
+| `CurvilinearGrid` | 2D (model-native, orthogonal curvilinear meshes) | Yes (per-point footprint, no translation invariance assumed) | Yes, over its cells by the nonuniform FFT | `FG.Operators.gradient_plan` + `FG.Operators.gradient!` (least-squares tangent plane) | Yes |
+| `UnstructuredGrid` | 1D (scattered points) | Yes, and the default (`RealSpace()` — ball query over the grid's own adjacency) | Yes (nonuniform FFT for 1–3 Cartesian coordinates; NUFSHT spherical) | the same, over the grid's k-d tree adjacency | Yes |
+| `RingGrid`, `CubedSphereGrid`, `HEALPixGrid`, `IcosahedralGrid`, `YinYangGrid` | 1D (sphere pixelizations: one index names a cell) | Yes, and the default — the same node CSR gather over each grid's own ball query | Yes, over its cells by NUFSHT | `Derivatives.gradient_plan` + `FG.Operators.gradient!`, through each grid's own adjacency | Yes |
 
 `CurvilinearGrid` and `UnstructuredGrid` are built genuinely from scratch, not thin wrappers: exact
 quadrilateral corner-based cell areas (curvilinear) or k-d tree adjacency + real Voronoi tessellation

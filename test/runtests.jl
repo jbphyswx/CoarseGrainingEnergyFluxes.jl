@@ -1,16 +1,19 @@
 module CoarseGrainingEnergyFluxesTests
 
 using Test: Test
-# Before FastSphericalHarmonics and FINUFFT: CGEF loads FlowTransformBindings, which selects the OpenMP
-# runtime's thread-local mode before either loads that runtime.
+# Before FastSphericalHarmonics: CGEF loads FlowTransformBindings, which selects the OpenMP runtime's
+# thread-local mode before FastTransforms loads that runtime.
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
+using FlowTransformBindings: FlowTransformBindings as FTB
 using Logging: Logging  # `@test_logs min_level = Logging.Warn`, for asserting the ABSENCE of a warning
 using StaticArrays: StaticArrays as SA
 using Aqua: Aqua
 using ExplicitImports: ExplicitImports as EI
 using JET: JET
 using FFTW: FFTW  # triggers the spectral-filtering extension
-using FINUFFT: FINUFFT  # triggers the scattered-Cartesian spectral extension
+# Each triggers a FlowTransformBindings NUFFT extension, which scattered-Cartesian spectral filtering runs on.
+using FINUFFT: FINUFFT
+using NonuniformFFTs: NonuniformFFTs
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH  # triggers the uniform-spherical spectral extension
 using NUFSHT: NUFSHT  # triggers the scattered-spherical spectral extension
 using SpecialFunctions: SpecialFunctions  # triggers the TopHatKernel spectral-transfer extension
@@ -43,6 +46,7 @@ include("test_highorder.jl")
 include("test_grids.jl")
 include("test_filtering.jl")
 include("test_spectral.jl")
+include("test_node_spectral.jl")
 include("test_backends.jl")
 include("test_periodic.jl")
 include("test_derivatives.jl")

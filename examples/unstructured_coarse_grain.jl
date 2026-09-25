@@ -3,7 +3,8 @@
 # search (NearestNeighbors) and exact Voronoi cell areas (DelaunayTriangulation)
 # are built at construction time; ddx!/ddy! use weighted-least-squares gradients over that
 # adjacency. Filtering defaults to `RealSpace()`, the compact kernel gathered over each point's own
-# metric ball, and `FINUFFT` below enables the opt-in `Spectral()` transform; both are run at the end.
+# metric ball, and a nonuniform-FFT library (FINUFFT below, or NonuniformFFTs) enables the opt-in
+# `Spectral()` transform; both are run at the end.
 
 using Random: Random
 using Statistics: Statistics

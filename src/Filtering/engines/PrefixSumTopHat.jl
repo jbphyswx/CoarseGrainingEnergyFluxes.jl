@@ -616,7 +616,7 @@ function _prefixsum_row!(
         end
     end
 
-    # `invden` carries the strategy's target test and the degeneracy floor, so no branch is needed here.
+    # `invden` carries the strategy's target test, so no branch is needed here.
     @inbounds @simd for i in 1:Nx
         out[i, j] *= invden[i, j]
     end

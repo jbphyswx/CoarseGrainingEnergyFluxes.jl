@@ -30,6 +30,7 @@ result to `out` (returned).
   pass it here on every subsequent call.
 - `backend::AbstractExecutionBackend=AutoBackend()`: execution backend (SerialBackend,
   ThreadedBackend, GPUBackend, …). Ignored when `filter_plan` is supplied.
+- `method`, `spectral_backend`: as for [`plan_filter`](@ref). Ignored when `filter_plan` is supplied.
 
 For spherical grids the longitude footprint wraps only when the grid is periodic (`isperiodic`);
 distances use the great-circle (Haversine) metric.
@@ -52,9 +53,11 @@ function filter_field!(
     filter_plan::Union{Nothing,AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     method::AbstractFilterMethod = RealSpace(),
+    spectral_backend::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
 ) where {T<:AbstractFloat}
     plan = filter_plan === nothing ?
-        plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend, method = method) : filter_plan
+        plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend, method = method,
+                    spectral_backend = spectral_backend) : filter_plan
     return filter_apply!(out, field, plan)
 end
 
@@ -71,9 +74,11 @@ function filter_field!(
     filter_plan::Union{Nothing,AbstractFilterPlan} = nothing,
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     method::AbstractFilterMethod = RealSpace(),
+    spectral_backend::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
 ) where {T<:AbstractFloat}
     plan = filter_plan === nothing ?
-        plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend, method = method) : filter_plan
+        plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend, method = method,
+                    spectral_backend = spectral_backend) : filter_plan
     for k in axes(field, 3)
         filter_apply!(view(out, :, :, k), view(field, :, :, k), plan)
     end

@@ -4,6 +4,7 @@ using FlowGeometries: FlowGeometries
 using ..Kernels: Kernels
 using ComputationalBackends: ComputationalBackends
 using SpectralBackends: SpectralBackends
+using FlowTransformBindings: FlowTransformBindings
 using StaticArrays: StaticArrays as SA
 
 export AbstractMaskStrategy, ZeroFill, Deformable
@@ -34,6 +35,8 @@ include("Filtering/engines/PrefixSumTopHat3D.jl")
 include("Filtering/Apply.jl")
 include("Filtering/Plans.jl")
 include("Filtering/Selection.jl")
+include("Filtering/engines/NodeSpectral.jl")
+include("Filtering/engines/NUFFTSpectral.jl")
 include("Filtering/Slices.jl")
 
 end # module

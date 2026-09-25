@@ -9,9 +9,10 @@ using FlowTransformBindings: FlowTransformBindings as FTB
 # wavenumber of degree `l` is the Laplace–Beltrami eigenvalue `k_l = √(l(l+1))/R`, so a degree-`l`
 # coefficient is scaled by `Ĝ(k_l, ℓ)`; `Ĝ(0) = 1` preserves the mean.
 #
-# The FSH grid is `N` colatitudes × `M = 2N−1` longitudes sampled as `F[θ, φ]`, where this package
-# stores fields as `[lon, lat]` — hence the transpose in and out. The grid must be built on the FSH
-# points (`FastSphericalHarmonics.sph_points(N)`): `θ_j = π(j−½)/N`, `φ_k = 2π(k−1)/M`.
+# FSH samples `N` colatitudes `θ_j = π(j−½)/N` by `M = 2N−1` longitudes `φ_k = 2π(k−1)/M`
+# (`FastSphericalHarmonics.sph_points(N)`), the nodes of a `ClenshawCurtisSampling` grid at
+# `nlon = 2·nlat − 1`, and stores a field as `F[θ, φ]` where this package stores `[lon, lat]` — hence
+# the transpose in and out.
 #
 # Masking follows the same normalized-convolution identity as the other spectral backends, with the
 # `Deformable` denominator computed once at plan-build time.
@@ -84,55 +85,86 @@ end
 
 CGEF.Filtering.plan_strategy(plan::SHTFilterPlan) = plan.strategy
 
-function _sht_grid_plan(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G},
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
+# The grids whose nodes FSH samples, given `nlon == 2·nlat − 1`. FSH transforms `Float64` only.
+const _CCGrid = FlowGeometries.Grids.StructuredGrid{
+    Float64, <:FlowGeometries.Geometry.SphericalGeometry{Float64}, 2,
+    <:FlowGeometries.SphericalSampling.AbstractClenshawCurtisSampling,
+}
+const _SphericalGrid = FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.SphericalGeometry{T}} where {T}
+
+_sht_shape(grid::_CCGrid) = ((M, N) = size(FlowGeometries.Grids.mask(grid)); M == 2N - 1)
+
+function _sht_grid_plan(grid::_CCGrid)
     M, N = size(FlowGeometries.Grids.mask(grid))   # CGEF layout is [x, y] = [longitude, latitude] = [M, N]
-    M == 2N - 1 || throw(ArgumentError(
-        "Spherical-harmonic filtering needs a FastSphericalHarmonics grid with M = 2N-1 longitudes " *
-        "per N latitudes (got N=$N lat, M=$M lon); build the grid on `sph_points(N)`.",
-    ))
-    # Shape alone doesn't prove the grid sits on the actual FSH quadrature nodes — a shape-correct but
-    # wrong-node grid would silently produce a meaningless transform. Check the node values themselves.
-    Θ, Φ = FSH.sph_points(N)
-    isapprox(FlowGeometries.Grids.coordinates(grid, 2), T(π) / 2 .- Θ; atol = 10 * eps(T)) || throw(ArgumentError(
-        "The grid's latitude coordinates do not match the FastSphericalHarmonics quadrature nodes for N=$N " *
-        "(expected θ = π(j-½)/N via `sph_points(N)`, lat = π/2 - θ); build the grid on `sph_points(N)`.",
-    ))
-    isapprox(FlowGeometries.Grids.coordinates(grid, 1), T.(Φ); atol = 10 * eps(T)) || throw(ArgumentError(
-        "The grid's longitude coordinates do not match the FastSphericalHarmonics quadrature nodes for M=$M " *
-        "(expected φ = 2π(k-1)/M via `sph_points(N)`); build the grid on `sph_points(N)`.",
+    _sht_shape(grid) || throw(ArgumentError(
+        "FastSphericalHarmonics transforms a ClenshawCurtisSampling grid of 2N-1 longitudes by N " *
+        "latitudes; this one has $M by $N. Build it with " *
+        "`FlowGeometries.Connectivity.structured_grid(ClenshawCurtisSampling(), N)`, or filter it over its " *
+        "cells with `spectral_backend = AutoSpectralBackend()` and `using NUFSHT`.",
     ))
     return SHTGridPlan(
-        FSH.SphPlanCache{T}(), N, M, N - 1, M ÷ 2,
-        T(FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid))),
+        FSH.SphPlanCache{Float64}(), N, M, N - 1, M ÷ 2,
+        Float64(FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid))),
         all(FlowGeometries.Grids.mask(grid)) ? nothing : FlowGeometries.Grids.mask(grid),
     )
 end
+
+@noinline _not_sht_grid(grid) = throw(ArgumentError(
+    "FastSphericalHarmonics transforms a Float64 ClenshawCurtisSampling grid of 2N-1 longitudes by N " *
+    "latitudes, built with `FlowGeometries.Connectivity.structured_grid(ClenshawCurtisSampling(), N)`; " *
+    "this grid's sampling is $(nameof(typeof(FlowGeometries.Grids.sampling(grid)))). Filter it over its " *
+    "cells with `spectral_backend = AutoSpectralBackend()` and `using NUFSHT`.",
+))
 
 # FSH works in [θ,φ] (N×M) and this package stores [lon,lat] (M×N), so the scratch carries one of each.
 _sht_scratch(gp::SHTGridPlan{T}) where {T<:AbstractFloat} =
     SHTScratch(zeros(T, gp.N, gp.M), zeros(T, gp.M, gp.N))
 
+# `FSHTSpectralBackend` is honoured on the grids FSH samples and refused on every other spherical grid;
+# `Auto` takes the harmonic transform on a grid of FSH's shape and filters any other over its cells.
 CGEF.Filtering.spectral_grid_plan(
-    ::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractFSHTSpectralBackend},
-    grid::FlowGeometries.Grids.StructuredGrid{T,G},
-    kernel::CGEF.Kernels.AbstractFilterKernel;
+    ::CGEF.SpectralBackends.AbstractFSHTSpectralBackend, grid::_CCGrid, ::CGEF.Kernels.AbstractFilterKernel;
     kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}} = _sht_grid_plan(grid)
+) = _sht_grid_plan(grid)
+
+CGEF.Filtering.spectral_grid_plan(
+    ::CGEF.SpectralBackends.AbstractFSHTSpectralBackend, grid::_SphericalGrid, ::CGEF.Kernels.AbstractFilterKernel;
+    kwargs...,
+) = _not_sht_grid(grid)
+
+CGEF.Filtering.spectral_grid_plan(
+    auto::CGEF.SpectralBackends.AbstractAutoSpectralBackend, grid::_CCGrid,
+    kernel::CGEF.Kernels.AbstractFilterKernel; kwargs...,
+) = _sht_shape(grid) ? _sht_grid_plan(grid) : CGEF.Filtering._node_set_grid_plan(auto, grid, kernel; kwargs...)
 
 CGEF.Filtering.spectral_scratch(gp::SHTGridPlan) = _sht_scratch(gp)
 
-function CGEF.Filtering.spectral_filter_plan(
-    ::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractFSHTSpectralBackend},
-    grid::FlowGeometries.Grids.StructuredGrid{T,G},
+CGEF.Filtering.spectral_filter_plan(
+    ::CGEF.SpectralBackends.AbstractFSHTSpectralBackend, grid::_CCGrid, kernel::CGEF.Kernels.AbstractFilterKernel,
+    scale::Float64; kwargs...,
+) = _sht_filter_plan(grid, kernel, scale; kwargs...)
+
+CGEF.Filtering.spectral_filter_plan(
+    ::CGEF.SpectralBackends.AbstractFSHTSpectralBackend, grid::_SphericalGrid,
+    ::CGEF.Kernels.AbstractFilterKernel, ::AbstractFloat; kwargs...,
+) = _not_sht_grid(grid)
+
+CGEF.Filtering.spectral_filter_plan(
+    auto::CGEF.SpectralBackends.AbstractAutoSpectralBackend, grid::_CCGrid,
+    kernel::CGEF.Kernels.AbstractFilterKernel, scale::Float64; kwargs...,
+) = _sht_shape(grid) ? _sht_filter_plan(grid, kernel, scale; kwargs...) :
+    CGEF.Filtering._node_set_filter_plan(auto, grid, kernel, scale; kwargs...)
+
+function _sht_filter_plan(
+    grid::_CCGrid,
     kernel::CGEF.Kernels.AbstractFilterKernel,
-    scale::T;
+    scale::Float64;
     mask_strategy = CGEF.Filtering.ZeroFill(),
     backend = CGEF.ComputationalBackends.AutoBackend(),
     grid_plan::Union{Nothing,SHTGridPlan} = nothing,
     scratch::Union{Nothing,SHTScratch} = nothing,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
+)
+    T = Float64
     gp = grid_plan === nothing ? _sht_grid_plan(grid) : grid_plan
     sc = scratch === nothing ? _sht_scratch(gp) : scratch
     N, M, R = gp.N, gp.M, gp.radius
@@ -164,10 +196,9 @@ function CGEF.Filtering.spectral_filter_plan(
         _evaluate!(sc.scratch, cache)
         renorm = zeros(T, M, N)
         permutedims!(renorm, sc.scratch, (2, 1))        # back to [lon,lat]
-        threshold = T(0.01)
         ir = similar(renorm)
         # A masked point is zero under `Deformable`, as in the real-space engines.
-        @. ir = ifelse(mask & (abs(renorm) >= threshold), one(T) / renorm, zero(T))
+        @. ir = ifelse(mask, CGEF.Filtering._inv_mass(renorm), zero(T))
         ir
     else
         nothing   # ZeroFill: already exactly `filter(mask .* field)`, no renormalization

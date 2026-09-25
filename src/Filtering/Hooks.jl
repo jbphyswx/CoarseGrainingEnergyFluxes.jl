@@ -53,19 +53,19 @@ function mpi_filter_field!(args...; kwargs...)
     throw(ArgumentError("MPIBackend is unavailable — run `using MPI` (or use SerialBackend())."))
 end
 
-# Build a spectral filter plan. Every spectral backend is a thin transform adapter that overrides
-# this for its grid type (forward transform → multiply by `spectral_transfer` → inverse transform):
-#   FFTW    StructuredGrid{…,Cartesian}     (uniform periodic Cartesian)
-#   FINUFFT UnstructuredGrid{Cartesian}   (scattered / non-uniform Cartesian)
-#   SHT     StructuredGrid{…,Spherical}     (uniform spherical, Gauss–Legendre × equiangular)
-#   NUFSHT  UnstructuredGrid{Spherical}   (scattered spherical)
-# Errors until a compatible extension is loaded.
+# Build a spectral filter plan: forward transform → multiply by `spectral_transfer` → inverse
+# transform, one method per grid type:
+#   FFTW extension        StructuredGrid{…,Cartesian}   (uniform Cartesian)
+#   engines/NUFFTSpectral UnstructuredGrid{Cartesian}   (scattered Cartesian, through FlowTransformBindings)
+#   SHT extension         StructuredGrid{…,Spherical}   (ClenshawCurtisSampling at nlon = 2·nlat − 1)
+#   NUFSHT extension      UnstructuredGrid{Spherical}   (scattered spherical)
+# Every other grid is filtered over its cells as a node set (engines/NodeSpectral).
 function spectral_filter_plan(spectral_backend, grid, kernel, scale; kwargs...)
     throw(ArgumentError(
         "Spectral filtering with $(typeof(spectral_backend)) is unavailable for $(typeof(grid)) — " *
-        "load a spectral backend (`using FFTW` uniform Cartesian, `using FINUFFT` scattered " *
-        "Cartesian, `using FastSphericalHarmonics` uniform spherical, `using NUFSHT` scattered " *
-        "spherical).",
+        "load a spectral backend (`using FFTW` uniform Cartesian, `using NonuniformFFTs` or " *
+        "`using FINUFFT` scattered Cartesian, `using FastSphericalHarmonics` uniform spherical, " *
+        "`using NUFSHT` scattered spherical).",
     ))
 end
 

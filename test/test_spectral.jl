@@ -147,9 +147,11 @@ Test.@testset "Spectral FFTW filtering on bounded axes" begin
 end
 
 
-# Scattered-Cartesian spectral filtering (FINUFFT): on a uniform lattice it reproduces the FFTW result on
-# the same grid, periodic or bounded, and on a periodic box it keeps a constant field.
-Test.@testset "Spectral FINUFFT filtering" begin
+const NUFFT_LIBRARIES = (FTB.FINUFFTBackend(), FTB.NonuniformFFTsBackend())
+
+# Scattered-Cartesian spectral filtering (nonuniform FFT): on a uniform lattice it reproduces the FFTW
+# result on the same grid, periodic or bounded, and on a periodic box it keeps a constant field.
+Test.@testset "Spectral NUFFT filtering: $(nameof(typeof(lib)))" for lib in NUFFT_LIBRARIES
     Nx, Ny = 32, 24
     dx = dy = 1.0
     geom = FG.Geometry.CartesianGeometry()
@@ -170,15 +172,16 @@ Test.@testset "Spectral FINUFFT filtering" begin
     ug = FG.Grids.UnstructuredGrid(geom, ptsx, ptsy, fill(dx*dy, Nx*Ny), trues(Nx*Ny))
     ugp = FG.Grids.UnstructuredGrid(geom, ptsx, ptsy, fill(dx*dy, Nx*Ny), trues(Nx*Ny);
                                     periodic = (true, true), period = (Nx * dx, Ny * dy))
+    nu = (method = CGEF.Filtering.Spectral(), spectral_backend = lib)
     outu = zeros(Nx*Ny)
-    CGEF.Filtering.filter_field!(outu, vec(u), ug, g, ℓ; method = CGEF.Filtering.Spectral())
+    CGEF.Filtering.filter_field!(outu, vec(u), ug, g, ℓ; nu...)
     Test.@test reshape(outu, Nx, Ny) ≈ outfb atol = 1e-7
-    CGEF.Filtering.filter_field!(outu, vec(u), ugp, g, ℓ; method = CGEF.Filtering.Spectral())
+    CGEF.Filtering.filter_field!(outu, vec(u), ugp, g, ℓ; nu...)
     Test.@test reshape(outu, Nx, Ny) ≈ outf atol = 1e-7
 
     # Constant field on the periodic box ⇒ kept (Ĝ(0)=1).
     cout = zeros(Nx*Ny)
-    CGEF.Filtering.filter_field!(cout, fill(3.7, Nx*Ny), ugp, g, ℓ; method = CGEF.Filtering.Spectral())
+    CGEF.Filtering.filter_field!(cout, fill(3.7, Nx*Ny), ugp, g, ℓ; nu...)
     Test.@test all(≈(3.7; atol = 1e-6), cout)
 
     # TopHat spectral filtering (shared transfer function with FFTW): must reproduce the FFTW
@@ -186,13 +189,13 @@ Test.@testset "Spectral FINUFFT filtering" begin
     th = CGEF.TopHatKernel()
     outf_th = CGEF.Filtering.filter_field!(zeros(Nx, Ny), u, sgb, th, ℓ; method = CGEF.Filtering.Spectral())
     outu_th = zeros(Nx*Ny)
-    CGEF.Filtering.filter_field!(outu_th, vec(u), ug, th, ℓ; method = CGEF.Filtering.Spectral())
+    CGEF.Filtering.filter_field!(outu_th, vec(u), ug, th, ℓ; nu...)
     Test.@test reshape(outu_th, Nx, Ny) ≈ outf_th atol = 1e-7
 
     # `Deformable` divides by the filtered indicator of the record, which the padding leaves inactive.
     D = CGEF.Filtering.Deformable()
     outfd = CGEF.Filtering.filter_field!(zeros(Nx, Ny), u, sgb, g, ℓ; method = CGEF.Filtering.Spectral(), mask_strategy = D)
-    outud = CGEF.Filtering.filter_field!(zeros(Nx*Ny), vec(u), ug, g, ℓ; method = CGEF.Filtering.Spectral(), mask_strategy = D)
+    outud = CGEF.Filtering.filter_field!(zeros(Nx*Ny), vec(u), ug, g, ℓ; nu..., mask_strategy = D)
     Test.@test reshape(outud, Nx, Ny) ≈ outfd atol = 1e-7
 
     # Masked spectral filtering on a node set is cross-checked against the FFTW-on-StructuredGrid
@@ -210,9 +213,51 @@ Test.@testset "Spectral FINUFFT filtering" begin
         outf_m = zeros(Nx, Ny)
         CGEF.Filtering.filter_field!(outf_m, u, smgrid, g, ℓ; method = CGEF.Filtering.Spectral(), mask_strategy = strat)
         outu_m = zeros(Nx*Ny)
-        CGEF.Filtering.filter_field!(outu_m, un, umgrid, g, ℓ; method = CGEF.Filtering.Spectral(), mask_strategy = strat)
+        CGEF.Filtering.filter_field!(outu_m, un, umgrid, g, ℓ; nu..., mask_strategy = strat)
         Test.@test reshape(outu_m, Nx, Ny) ≈ outf_m atol = 1e-6
     end
+
+    # A batch axis and a sweep's shared analysis give the single-field result.
+    pb = CGEF.Filtering.plan_filter(umgrid, g, ℓ; nu..., batch = 3)
+    U = hcat(un, 2 .* un, un .+ 1)
+    ob = CGEF.Filtering.filter_apply_batched!(zeros(Nx*Ny, 3), U, pb)
+    for b in 1:3
+        Test.@test ob[:, b] ≈ CGEF.Filtering.filter_apply!(zeros(Nx*Ny), U[:, b], pb) rtol = 1e-12
+    end
+    plans = CGEF.Filtering.plan_filter_sweep(umgrid, g, [2.0, 4.0]; nu...)
+    F̂ = CGEF.Filtering.filter_analyze!(CGEF.Filtering.analyze_buffer(plans[1], un), un, plans[1])
+    for p in plans
+        Test.@test CGEF.Filtering.filter_synthesize!(zeros(Nx*Ny), F̂, p) ≈
+                   CGEF.Filtering.filter_apply!(zeros(Nx*Ny), un, p) rtol = 1e-12
+    end
+end
+
+# In one and three dimensions a Fourier mode on a periodic lattice is filtered by the transfer function of
+# that dimension: for the top-hat of radius R = ℓ/2 the ball's transform, sin x / x in one dimension and
+# 3(sin x − x cos x)/x³ in three, x = |k|R.
+Test.@testset "Spectral NUFFT filtering in 1-D and 3-D: $(nameof(typeof(lib)))" for lib in NUFFT_LIBRARIES
+    geom = FG.Geometry.CartesianGeometry()
+    nu = (method = CGEF.Filtering.Spectral(), spectral_backend = lib)
+    th = CGEF.TopHatKernel(); ℓ = 3.0; R = ℓ / 2
+
+    n = 40; L = 40.0
+    x = collect(0.0:(L / n):(L - L / n))
+    g1 = FG.Grids.UnstructuredGrid(geom, (x,), fill(L / n, n), trues(n); periodic = (true,), period = (L,))
+    k = 2π * 3 / L
+    f = cos.(k .* x)
+    Test.@test CGEF.Filtering.filter_field!(zeros(n), f, g1, th, ℓ; nu...) ≈ sin(k * R) / (k * R) .* f atol = 1e-8
+
+    ns = (12, 10, 8); Ls = (12.0, 10.0, 8.0)
+    axes3 = ntuple(d -> collect(0.0:(Ls[d] / ns[d]):(Ls[d] - Ls[d] / ns[d])), 3)
+    pts = ntuple(d -> vec([(axes3[1][i], axes3[2][j], axes3[3][l])[d] for i in 1:ns[1], j in 1:ns[2], l in 1:ns[3]]), 3)
+    npts = prod(ns)
+    g3 = FG.Grids.UnstructuredGrid(geom, pts, fill(prod(Ls) / npts, npts), trues(npts);
+                                   periodic = (true, true, true), period = Ls)
+    k3 = (2π / Ls[1], 2 * 2π / Ls[2], 2π / Ls[3])
+    f3 = cos.(k3[1] .* pts[1]) .* cos.(k3[2] .* pts[2]) .* cos.(k3[3] .* pts[3])
+    x3 = hypot(k3...) * R
+    Test.@test CGEF.Filtering.filter_field!(zeros(npts), f3, g3, th, ℓ; nu...) ≈
+               3 * (sin(x3) - x3 * cos(x3)) / x3^3 .* f3 atol = 1e-8
 end
 
 # On scattered points the transform needs each point's share of the box: weights `A_j/(Lx·Ly)` are the
@@ -220,7 +265,7 @@ end
 # exact periodic cell areas, that rule is the trapezoid rule across a spacing jump, second order in `h`,
 # so the filtered Fourier mode converges to `Ĝ(k0)·f` at that rate. Equal areas that tile the box weigh
 # the dense half twice at any `h`.
-Test.@testset "Spectral FINUFFT filtering: points weighted by their cell areas" begin
+Test.@testset "Spectral NUFFT filtering: points weighted by their cell areas ($(nameof(typeof(lib))))" for lib in NUFFT_LIBRARIES
     geom = FG.Geometry.CartesianGeometry()
     L = 1.0
     k0 = (2π, 4π)
@@ -239,7 +284,7 @@ Test.@testset "Spectral FINUFFT filtering: points weighted by their cell areas" 
         ref = CGEF.Kernels.spectral_transfer(g, hypot(k0...), ℓ) .* f
         err(measure) = let grid = FG.Grids.UnstructuredGrid(geom, ptsx, ptsy, measure, trues(n); box...)
             maximum(abs, CGEF.Filtering.filter_field!(zeros(n), f, grid, g, ℓ;
-                                                     method = CGEF.Filtering.Spectral()) .- ref)
+                                                     method = CGEF.Filtering.Spectral(), spectral_backend = lib) .- ref)
         end
         return sum(wx), err(vec([w * h for w in wx, _ in ys])), err(fill(L^2 / n, n))
     end
@@ -257,7 +302,7 @@ end
 # unrelated to the problem size: deriving ~7000 m of extent from a nominal 1 m gave a
 # ~49-million-mode transform, 4 GiB for 64 points. The gate is the mode grid the plan actually
 # builds — an integer it already stores, so the assertion is exact and load-independent.
-Test.@testset "Spectral FINUFFT filtering: mode count follows the point count" begin
+Test.@testset "Spectral NUFFT filtering: mode count follows the point count" begin
     geom = FG.Geometry.CartesianGeometry()
     Nx, Ny = 8, 8
     dx_real = 1000.0
@@ -266,10 +311,10 @@ Test.@testset "Spectral FINUFFT filtering: mode count follows the point count" b
     ug = FG.Grids.UnstructuredGrid(geom, ptsx, ptsy, trues(Nx*Ny); k = 4, areas = fill(dx_real^2, Nx*Ny))
     g = CGEF.GaussianKernel(); ℓ = 3000.0
 
-    # `Mx·My ≈ npts` modes on the record, each rounded up to even, and twice as many along each bounded
-    # direction: at most `4(Nx + 2)(Ny + 2)` on this lattice, three orders of magnitude below a regression.
+    # A lattice keeps its own count per direction; a bounded direction holds `2·nextprod((2,3,5), 8) = 16`
+    # of them, one more for the split Nyquist, and the transforms hold the half `k₁ ≥ 0`: 9 × 17.
     plan = CGEF.Filtering.plan_filter(ug, g, ℓ; method = CGEF.Filtering.Spectral())
-    Test.@test prod(size(plan.transfer)) <= 4 * (Nx + 2) * (Ny + 2)
+    Test.@test size(plan.transfer) == (9, 17)
 
     out = zeros(Nx*Ny)
     CGEF.Filtering.filter_field!(out, fill(3.7, Nx*Ny), ug, g, ℓ; method = CGEF.Filtering.Spectral())  # warm up
@@ -292,10 +337,10 @@ end
 # exact eigenfunction, scaled by Ĝ(k_l) with k_l = √(l(l+1))/R.
 Test.@testset "Spectral spherical-harmonic filtering" begin
     N = 24; M = 2N - 1
-    Θ, Φ = FSH.sph_points(N)
     R = 1.0
     geom = FG.Geometry.SphericalGeometry(R)
-    grid = FG.Grids.StructuredGrid(geom, collect(Φ), π/2 .- collect(Θ), trues(M, N))
+    CC = FG.SphericalSampling.ClenshawCurtisSampling()
+    grid = FG.Connectivity.structured_grid(CC, N; geometry = geom)
     ker = CGEF.GaussianKernel(); ℓ = 1.0
 
     l, m = 5, 2
@@ -316,7 +361,7 @@ Test.@testset "Spectral spherical-harmonic filtering" begin
     # N = 24 RealSpace discretization error of the unmasked case; `rtol` compares the aggregate 2-norm.
     mask = trues(M, N)
     mask[5:8, 5:8] .= false
-    mgrid = FG.Grids.StructuredGrid(geom, collect(Φ), π/2 .- collect(Θ), mask)
+    mgrid = FG.Connectivity.structured_grid(CC, N; geometry = geom, mask = mask)
     ℓ_m = 0.2
     Cr = zeros(N, M); Cr[FSH.sph_mode(3, 1)] = 1.0; Cr[FSH.sph_mode(6, -2)] = 0.5
     rfield = permutedims(FSH.sph_evaluate(Cr))
@@ -354,16 +399,19 @@ Test.@testset "Spectral spherical-harmonic filtering" begin
     CGEF.Filtering.filter_field!(thout2_ds, field, grid, th, ℓ_th; method = CGEF.Filtering.RealSpace())
     Test.@test thout2 ≈ thout2_ds rtol = 0.07
 
-    # Grid that is not an FSH grid (M ≠ 2N-1) is rejected.
-    badgrid = FG.Grids.StructuredGrid(geom, collect(0.0:0.1:1.0), collect(0.0:0.1:1.0), trues(11, 11))
-    Test.@test_throws ArgumentError CGEF.Filtering.filter_field!(zeros(11, 11), rand(11, 11), badgrid, ker, ℓ; method = CGEF.Filtering.Spectral())
-
-    # Shape-correct (M = 2N-1) but NOT on the actual FSH quadrature nodes: must still be rejected,
-    # not silently accepted and given a meaningless transform.
-    wronggrid = FG.Grids.StructuredGrid(
-        geom, collect(range(0.0, 2π; length = M + 1)[1:M]), collect(range(π/2, -π/2; length = N)), trues(M, N),
-    )
-    Test.@test_throws ArgumentError CGEF.Filtering.filter_field!(zeros(M, N), rand(M, N), wronggrid, ker, ℓ; method = CGEF.Filtering.Spectral())
+    # `FSHTSpectralBackend` is refused on a grid it does not sample: the Clenshaw–Curtis nodes at another
+    # longitude count, a lat–lon grid of the same shape whose latitudes include the poles, and a Float32
+    # grid on its own nodes.
+    FSHT = CGEF.SpectralBackends.FSHTSpectralBackend()
+    wide = FG.Connectivity.structured_grid(CC, N; geometry = geom, nlon = 2N)
+    latlon = FG.Grids.StructuredGrid(geom, collect(range(0.0, 2π; length = M + 1)[1:M]),
+                                     collect(range(π/2, -π/2; length = N)), trues(M, N))
+    single = FG.Connectivity.structured_grid(Float32, CC, N; geometry = geom)
+    for g in (wide, latlon, single)
+        sz, Tg = size(FG.Grids.mask(g)), eltype(FG.Grids.measure(g))
+        Test.@test_throws ArgumentError CGEF.Filtering.filter_field!(
+            zeros(Tg, sz), rand(Tg, sz), g, ker, Tg(ℓ); method = CGEF.Filtering.Spectral(), spectral_backend = FSHT)
+    end
 end
 
 
@@ -416,16 +464,15 @@ Test.@testset "Spectral NUFSHT filtering" begin
         Test.@test applied ≈ ref rtol = 1e-7
     end
 
-    # `Deformable` divides the filtered `c·mask` by the filtered mask, so a constant comes back
-    # unchanged wherever the filtered mask clears NUFSHT's 0.01 floor.
+    # `Deformable` divides the filtered `c·mask` by the filtered mask, so a constant comes back unchanged
+    # at every active point and a masked point reads zero.
     mask = lat .< deg2rad(40)
     mg = FG.Grids.UnstructuredGrid(geom, lon, lat, ones(npts), mask)
     pd = CGEF.Filtering.plan_filter(mg, ker, 1e6; method = CGEF.Filtering.Spectral(),
                                     mask_strategy = CGEF.Filtering.Deformable())
     cd = CGEF.Filtering.filter_apply!(zeros(npts), fill(1.7, npts), pd)
-    keep = mask .& (pd.scratch.mask_filt .>= 0.01)
-    Test.@test count(keep) == count(mask)
-    Test.@test cd[keep] ≈ fill(1.7, count(keep)) rtol = 1e-10
+    Test.@test cd[mask] ≈ fill(1.7, count(mask)) rtol = 1e-10
+    Test.@test all(iszero, cd[.!mask])
 end
 
 

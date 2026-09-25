@@ -41,18 +41,6 @@ export check_setup, SetupReport
 export TopHatKernel, GaussianKernel, SharpSpectralKernel
 export plot_Π_map, plot_spectrum
 
-if isdefined(Base.Experimental, :register_error_hint)
-    function __init__()
-        Base.Experimental.register_error_hint(MethodError) do io, exc, argtypes, kwargs
-            if exc.f === Kernels.spectral_transfer && length(argtypes) >= 1 && argtypes[1] === Kernels.TopHatKernel
-                print(io, "\nSpectral filtering with TopHatKernel needs its exact planar transfer " *
-                    "function 2*J₁(kR)/(kR), provided by the SpecialFunctions weak dependency. Run " *
-                    "`using SpecialFunctions` to enable it.")
-            end
-        end
-    end
-end
-
 # Precompile workload to minimize Time To First Execution (TTFX)
 PrecompileTools.@setup_workload begin
     geom = FlowGeometries.Geometry.CartesianGeometry()

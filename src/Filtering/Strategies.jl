@@ -74,14 +74,13 @@ struct AutoMethod <: AbstractFilterMethod end
 
 A prebuilt filter (grid + kernel + scale + mask strategy + backend) that can be applied to many
 fields without redoing setup. Physical-space backends precompute a `FilterFootprint`; the spectral
-extensions (FFTW/FINUFFT/SHT) hold cached transform plans. Declared here rather than alongside
-`PhysicalFilterPlan` further down so that `filter_field!`'s `filter_plan::Union{Nothing,
-AbstractFilterPlan}` keyword annotation, just below, can name it.
+engines hold cached transform plans. Declared ahead of `filter_field!`, whose
+`filter_plan::Union{Nothing,AbstractFilterPlan}` keyword annotation, just below, names it.
 """
 abstract type AbstractFilterPlan end
 
-# A plan owns FFTW/FINUFFT/SHT plan objects, whose own `show` walks the library's internal plan tree —
-# 6 KB of output for a 16×16 transform, and a call into the C library from wherever the plan happens to
-# be printed, including a worker that does not own it. The type name is what a plan usefully prints.
+# A plan owns transform-library plan objects, whose own `show` can walk the library's internal plan
+# tree and call into a C library from wherever the plan happens to be printed, including a worker
+# that does not own it. The type name is what a plan usefully prints.
 Base.show(io::IO, p::AbstractFilterPlan) = print(io, nameof(typeof(p)), "(…)")
 Base.show(io::IO, ::MIME"text/plain", p::AbstractFilterPlan) = show(io, p)

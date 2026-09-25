@@ -355,16 +355,23 @@ end
     "on the dimension: call `kernel_weight(kernel, d, ℓ, Val(D))`.",
 ))
 
-@inline function kernel_weight(::SharpSpectralKernel, d::T, ℓ::T, ::Val{1}) where {T<:AbstractFloat}
-    x = T(π) * d / ℓ
-    return iszero(x) ? one(T) : sin(x) / x
-end
+@inline kernel_weight(::SharpSpectralKernel, d::T, ℓ::T, dim::Val) where {T<:AbstractFloat} =
+    _ball_transform(T(π) * d / ℓ, dim)
 
-# `3j₁(x)/x`. Below `x = 0.2` its Taylor series to `x⁸` is exact to round-off, where the closed form
-# loses `log₁₀(1/x²)` digits to the cancellation in `sin x − x cos x`.
-@inline function kernel_weight(::SharpSpectralKernel, d::T, ℓ::T, ::Val{3}) where {T<:AbstractFloat}
-    x = T(π) * d / ℓ
-    if x < T(0.2)
+"""
+    _ball_transform(x, Val(D))
+
+The Fourier transform of the unit ball's indicator in `D` dimensions at `|k| = x`, divided by the
+ball's volume: `sin x / x`, `2J₁(x)/x`, `3(sin x − x cos x)/x³`. It is the transfer function of a
+top-hat of radius `R` at `x = |k|R`, and the inverse transform of the brick wall `|k| ≤ k_c` at
+`x = k_c r`.
+"""
+@inline _ball_transform(x::T, ::Val{1}) where {T<:AbstractFloat} = iszero(x) ? one(T) : sin(x) / x
+
+# Below `x = 0.2` the Taylor series to `x⁸` is exact to round-off, where the closed form loses
+# `log₁₀(1/x²)` digits to the cancellation in `sin x − x cos x`.
+@inline function _ball_transform(x::T, ::Val{3}) where {T<:AbstractFloat}
+    if abs(x) < T(0.2)
         x2 = x * x
         return one(T) - x2 * (inv(T(10)) - x2 * (inv(T(280)) - x2 * (inv(T(15120)) - x2 / T(1330560))))
     end
@@ -373,12 +380,11 @@ end
 end
 
 # `D = 2` is `2J₁(x)/x`, defined by the SpecialFunctions extension as the more specific `Val{2}` method.
-@noinline function kernel_weight(::SharpSpectralKernel, ::T, ::T, ::Val{D}) where {T<:AbstractFloat, D}
+@noinline function _ball_transform(::T, ::Val{D}) where {T<:AbstractFloat, D}
     throw(ArgumentError(D == 2 ?
-        "SharpSpectralKernel's real-space weight in two dimensions is the jinc `2J₁(x)/x`, provided by " *
-        "the SpecialFunctions weak dependency. Run `using SpecialFunctions`, or filter with " *
-        "`method = Spectral()`." :
-        "SharpSpectralKernel's real-space weight is defined in 1, 2 and 3 dimensions; got $D."))
+        "the two-dimensional top-hat transfer and sharp-spectral weight are the jinc `2J₁(x)/x`, provided " *
+        "by the SpecialFunctions weak dependency. Run `using SpecialFunctions`." :
+        "the top-hat transfer and sharp-spectral weight are defined in 1, 2 and 3 dimensions; got $D."))
 end
 
 # ---------------------------------------------------------------------------
@@ -441,28 +447,30 @@ end
 
 """
     spectral_transfer(kernel, kmag::T, ℓ::T) where {T<:AbstractFloat}
+    spectral_transfer(kernel, kmag::T, ℓ::T, ::Val{D}) where {T<:AbstractFloat, D}
 
-Isotropic planar spectral transfer function `Ĝ(|k|, ℓ)`: the factor by which a Fourier mode of
-physical wavenumber magnitude `kmag` (rad m⁻¹) is multiplied when filtering at width `ℓ` on a 2D
-Cartesian grid. Normalized so `Ĝ(0, ℓ) = 1` (preserves the domain mean). Shared by the FFTW and
-FINUFFT backends (both 2D-Cartesian-only today). For the spherical-harmonic-degree analog used by
-the FastSphericalHarmonics/NUFSHT backends, see [`spectral_transfer_degree`](@ref).
+Isotropic transfer function `Ĝ(|k|, ℓ)` in `D` dimensions (two without the `Val`): the factor by
+which a Fourier mode of wavenumber magnitude `kmag` (rad m⁻¹) is multiplied when filtering at width
+`ℓ`, with `Ĝ(0, ℓ) = 1`. For the spherical-harmonic-degree analog see
+[`spectral_transfer_degree`](@ref).
 
-- `GaussianKernel(α)`: `Ĝ = exp(-k² ℓ² / (4α))` (the exact Fourier transform of `exp(-α(r/ℓ)²)`).
+- `GaussianKernel(α)`: `Ĝ = exp(-k² ℓ² / (4α))`, the transform of `exp(-α(r/ℓ)²)` in every dimension.
 - `SharpSpectralKernel`: `Ĝ = 1` for `k ≤ π/ℓ`, else `0`.
-- `TopHatKernel`: `Ĝ = 2 J₁(kR)/(kR)`, `R = ℓ/2` — the exact 2D (disk) Fourier transform of a top-hat
-  (the "jinc" function, the circular-aperture analog of `sinc`). This oscillates and goes negative in
-  `k`; that is the correct, exact behavior of a disk's Fourier transform, not an approximation error.
-  This method is provided entirely by the SpecialFunctions weak dependency
-  (`CoarseGrainingEnergyFluxesSpecialFunctionsExt`, for `besselj1`) — core has no method for
-  `TopHatKernel` here (Julia disallows two modules defining the identical method signature, so a
-  throwing core stub could never be replaced by the extension's real one); without `using
-  SpecialFunctions` loaded, calling this is a `MethodError` with a registered hint pointing at the fix.
+- `TopHatKernel`: the transform of the ball of radius `R = ℓ/2`, `sin(kR)/(kR)`, `2J₁(kR)/(kR)` and
+  `3(sin kR − kR cos kR)/(kR)³` in one, two and three dimensions. It oscillates and goes negative in
+  `k`. The two-dimensional form needs `using SpecialFunctions`.
 """
 @inline spectral_transfer(k::GaussianKernel, kmag::T, ℓ::T) where {T<:AbstractFloat} =
     exp(-kmag^2 * ℓ^2 / (T(4) * T(k.α)))
 @inline spectral_transfer(::SharpSpectralKernel, kmag::T, ℓ::T) where {T<:AbstractFloat} =
     kmag <= T(π) / ℓ ? one(T) : zero(T)
+@inline spectral_transfer(k::TopHatKernel, kmag::T, ℓ::T) where {T<:AbstractFloat} =
+    spectral_transfer(k, kmag, ℓ, Val(2))
+
+@inline spectral_transfer(k::AbstractFilterKernel, kmag::T, ℓ::T, ::Val) where {T<:AbstractFloat} =
+    spectral_transfer(k, kmag, ℓ)
+@inline spectral_transfer(::TopHatKernel, kmag::T, ℓ::T, dim::Val) where {T<:AbstractFloat} =
+    _ball_transform(kmag * ℓ / T(2), dim)
 
 # `½(1 - tanh)` and `exp(-r⁴)` have no elementary Fourier transform, so there is nothing to return
 # here. Refusing explicitly beats a `MethodError`: the message says what to do instead, and it makes

@@ -16,7 +16,6 @@ Test.@testset "Explicit imports (core)" begin
     # Per-extension checks (each loaded backend extension must also be import-clean).
     for extname in (
         :CoarseGrainingEnergyFluxesFFTWExt,
-        :CoarseGrainingEnergyFluxesFINUFFTExt,
         :CoarseGrainingEnergyFluxesFastSphericalHarmonicsExt,
         :CoarseGrainingEnergyFluxesNUFSHTExt,
         :CoarseGrainingEnergyFluxesOhMyThreadsExt,
@@ -50,7 +49,6 @@ Test.@testset "JET type stability (hot path)" begin
         jet_targets = (CGEF, CGEF.Kernels, CGEF.Filtering, CGEF.Derivatives, CGEF.Diagnostics, CGEF.Pipeline)
         for extname in (
             :CoarseGrainingEnergyFluxesFFTWExt,
-            :CoarseGrainingEnergyFluxesFINUFFTExt,
             :CoarseGrainingEnergyFluxesFastSphericalHarmonicsExt,
             :CoarseGrainingEnergyFluxesNUFSHTExt,
             :CoarseGrainingEnergyFluxesOhMyThreadsExt,
