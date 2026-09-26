@@ -1,6 +1,7 @@
 module CoarseGrainingEnergyFluxesFastSphericalHarmonicsExt
 
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
+using FFTW: FFTW
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries
 using FlowTransformBindings: FlowTransformBindings as FTB
@@ -38,8 +39,10 @@ through it depend on ℓ. Sharing the rest across a sweep matters more here than
 fresh `SphPlanCache` per scale means the transform rebuilds its internal plans the first time it sees
 each one, and the node validation below re-derives and re-compares the quadrature nodes every time.
 
-The cache is a memo table the transform populates on first use, so unlike the other spectral grid
-plans this one is written to during an apply, and a concurrent driver needs its own plan per worker.
+FastTransforms builds the cached plans on the libfftw3 FFTW.jl loads, whose planner is process-global,
+so the cache is filled when the grid plan is built, under FFTW.jl's planner lock at the plan's thread
+count, and a transform only reads it. Executing a cached plan writes its scratch, so a concurrent
+driver needs its own grid plan per worker.
 """
 struct SHTGridPlan{T<:AbstractFloat, MK} <: CGEF.Filtering.AbstractGridPlan
     cache::FSH.SphPlanCache{T}
@@ -114,12 +117,26 @@ function _sht_grid_plan(
         "`FlowGeometries.Connectivity.structured_grid(ClenshawCurtisSampling(), N)`, or filter it over its " *
         "cells with `spectral_backend = AutoSpectralBackend()` and `using NUFSHT`.",
     ))
+    nth = CGEF.Filtering._library_threads(backend)
     return SHTGridPlan(
-        FSH.SphPlanCache{Float64}(), N, M, N - 1, M ÷ 2,
+        _warmed_cache(N, M, nth), N, M, N - 1, M ÷ 2,
         Float64(FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid))),
         all(FlowGeometries.Grids.mask(grid)) ? nothing : FlowGeometries.Grids.mask(grid),
-        CGEF.Filtering._library_threads(backend), !CGEF.Filtering._host_memory(backend),
+        nth, !CGEF.Filtering._host_memory(backend),
     )
+end
+
+# Both transforms' plans, built by one transform and one evaluation of a zero field; see `SHTGridPlan`.
+function _warmed_cache(N::Int, M::Int, nthreads::Int)
+    cache = FSH.SphPlanCache{Float64}()
+    scratch = zeros(Float64, N, M)
+    FFTW.set_num_threads(nthreads) do
+        FTB.with_fasttransforms_threads(nthreads) do
+            FSH.sph_transform!(scratch; cache = cache)
+            FSH.sph_evaluate!(scratch; cache = cache)
+        end
+    end
+    return cache
 end
 
 @noinline _not_sht_grid(grid) = throw(ArgumentError(
