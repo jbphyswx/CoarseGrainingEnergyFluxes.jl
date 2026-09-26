@@ -256,8 +256,9 @@ other grid: the compact kernel applied exactly as written, through a gather over
 ball, which holds next to a boundary or a masked region. `method = CGEF.Filtering.Spectral()` is the
 `O(n log n)` spectral filter: it estimates the Fourier coefficients on a box with the quadrature rule of
 the grid's cell areas and multiplies by `Ĝ(k)`. The box is the grid's `period` in a direction declared
-periodic; elsewhere it pads the record (extent plus one spacing) as FFTW pads a bounded axis, the field
-being zero beyond the record. On a uniform lattice this is the FFTW result on the same grid.
+periodic; elsewhere it pads the length the nodes cover (`FG.Grids.domain_length`: the extent plus one
+spacing) as FFTW pads a bounded axis, the field being zero beyond it. On a uniform lattice this is the
+FFTW result on the same grid.
 
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF

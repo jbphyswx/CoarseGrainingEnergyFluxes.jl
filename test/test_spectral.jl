@@ -192,7 +192,7 @@ Test.@testset "Spectral NUFFT filtering: $(nameof(typeof(lib)))" for lib in NUFF
     CGEF.Filtering.filter_field!(outu_th, vec(u), ug, th, ℓ; nu...)
     Test.@test reshape(outu_th, Nx, Ny) ≈ outf_th atol = 1e-7
 
-    # `Deformable` divides by the filtered indicator of the record, which the padding leaves inactive.
+    # `Deformable` divides by the filtered indicator of the domain, which the padding leaves inactive.
     D = CGEF.Filtering.Deformable()
     outfd = CGEF.Filtering.filter_field!(zeros(Nx, Ny), u, sgb, g, ℓ; method = CGEF.Filtering.Spectral(), mask_strategy = D)
     outud = CGEF.Filtering.filter_field!(zeros(Nx*Ny), vec(u), ug, g, ℓ; nu..., mask_strategy = D)

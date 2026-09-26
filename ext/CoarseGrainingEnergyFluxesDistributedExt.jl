@@ -408,7 +408,7 @@ function CGEF.Filtering.distributed_nufft_filter_plan(
 ) where {T}
     transfer = Distributed.remotecall_fetch(_part_transfer, first(gp.workers), first(gp.parts), kernel, scale)
     invrenorm = if mask_strategy isa CGEF.Filtering.Deformable && (gp.masked || gp.bounded)
-        # `filter(mask)` through the same division of the points; the box beyond a bounded record is
+        # `filter(mask)` through the same division of the points; the padding beyond a bounded domain is
         # inactive.
         _each_part(_part_mass!, gp, gp.shared.partial)
         SharedArrays.sdata(_sum_partial!(gp.shared.spectrum, gp.shared.partial)) .*= transfer

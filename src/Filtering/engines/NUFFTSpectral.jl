@@ -11,9 +11,9 @@
 #
 # `Aⱼ` is the grid's measure of point j, so F_k is the quadrature rule for the box's Fourier coefficient
 # of c. A direction the grid declares periodic takes the grid's period. Any other is padded as FFTW pads
-# a bounded axis: the record, the points' extent plus one spacing, holds N modes, and the box holds
-# 2·nextprod((2,3,5), N) at the same spacing, so the wrap-around path between two points is at least
-# the record long.
+# a bounded axis: the length the nodes cover (`FlowGeometries.Grids.domain_length`) holds the N modes of
+# its N nodes (`FlowGeometries.Grids.node_counts`), and the box holds 2·nextprod((2,3,5), N) at the same
+# spacing, so the wrap-around path between two points is at least that length.
 #
 # An axis of even count N carries the frequencies |k| ≤ N/2 with weight ½ at ±N/2, so the series is
 # real for a real field and equals the FFT's on a lattice of N points. The values are real, and the
@@ -30,7 +30,7 @@ const _NUFFTRoute = Union{SpectralBackends.AbstractAutoSpectralBackend, Spectral
 
 The half of a nonuniform-FFT filter plan the filter scale does not reach: the transform over the
 node set (and one over a trailing batch of `nb` fields when planned for it), the box periods, the
-record's mode count per direction, the quadrature weights, the mask, the execution backend whose
+mode count per direction, the quadrature weights, the mask, the execution backend whose
 memory holds them, and the points this process transforms (`nothing` for all). A transform holds the
 working state of its own execution, so a concurrent driver needs its own grid plan per worker.
 """
@@ -84,16 +84,6 @@ plan_strategy(plan::NUFFTFilterPlan) = plan.strategy
 Base.show(io::IO, plan::NUFFTFilterPlan) =
     print(io, "NUFFTFilterPlan(", plan.grid_plan.plan, ")")
 
-# The record's mode count per direction: a lattice's own count per axis, or the count a uniform
-# density of the same points gives over the spans.
-function _record_counts(x::NTuple{D,AbstractVector}, spans::NTuple{D,Real}) where {D}
-    npts = length(first(x))
-    distinct = map(v -> length(unique(v)), x)
-    prod(distinct) == npts && return distinct
-    ρ = (npts / prod(spans))^(1 / D)
-    return map(s -> max(2, round(Int, s * ρ)), spans)
-end
-
 # An even count N runs over |k| ≤ N/2, one mode more than N.
 _mode_count(N::Int) = isodd(N) ? N : N + 1
 _edge_weight(::Type{T}, f::Int, N::Int) where {T} = (iseven(N) && abs(f) == N ÷ 2) ? T(1 // 2) : one(T)
@@ -117,11 +107,10 @@ function _nufft_grid_plan(
     all(>(0), spans) || throw(ArgumentError(
         "nonuniform-FFT spectral filtering needs a box of positive size; the points span $spans. A " *
         "point set with no extent in a direction needs `periodic` and `period` declared for it."))
-    record = _record_counts(x, spans)
-    # A bounded direction's record spacing is its extent over the count less one, so a lattice of N
-    # points spans exactly N spacings.
-    counts = ntuple(d -> periodic[d] ? record[d] : 2 * nextprod((2, 3, 5), record[d]), Val(D))
-    L = ntuple(d -> periodic[d] ? spans[d] : counts[d] * extent[d] / (record[d] - 1), Val(D))
+    nodes = FlowGeometries.Grids.node_counts(grid)
+    counts = ntuple(d -> periodic[d] ? nodes[d] : 2 * nextprod((2, 3, 5), nodes[d]), Val(D))
+    L = ntuple(d -> periodic[d] ? spans[d] : counts[d] * T(FlowGeometries.Grids.domain_length(grid, d)) / nodes[d],
+               Val(D))
     nmodes = map(_mode_count, counts)
     # This process's points, their weights and mask go where `backend` runs, and the library plans in
     # that memory. Type 1 is a sum over points, so the processes' partial spectra sum to the whole one.
@@ -290,7 +279,7 @@ function _nufft_filter_plan(
     sc = scratch === nothing ? _nufft_scratch(gp) : scratch
     transfer = _nufft_transfer(gp, kernel, scale)
     invrenorm = if mask_strategy isa Deformable && (gp.mask !== nothing || gp.bounded)
-        # `filter(mask)`, through the plan's own pipeline; the box beyond a bounded record is inactive.
+        # `filter(mask)`, through the plan's own pipeline; the padding beyond a bounded domain is inactive.
         if gp.mask === nothing
             sc.values .= gp.weights
         else
