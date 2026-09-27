@@ -1,6 +1,7 @@
 module CoarseGrainingEnergyFluxesNUFSHTExt
 
 using NUFSHT: NUFSHT
+using FlowTransformBindings: FlowTransformBindings as FTB
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries
 
@@ -63,7 +64,7 @@ struct NUFSHTScratch{T<:AbstractFloat, SV<:AbstractVector{T}, CA<:AbstractArray,
        CGEF.Filtering.AbstractFilterScratch
     masked_input::SV   # unused when mask === nothing
     coeffs::CA
-    ws::W              # NUFSHT.LSMRWorkspace
+    ws::W              # FTB.LSMRWorkspace, or nothing where NUFSHT's workers hold theirs
     local_out::LO      # this process's synthesized values, or nothing when it holds every node
     batched::BT        # (; masked_input, coeffs, ws, local_out) for the batched plan, or nothing
 end
@@ -116,6 +117,10 @@ _make_plan(T, θ, φ, lmax, backend::CGEF.ComputationalBackends.AbstractDistribu
 _make_plan(T, θ, φ, lmax, backend::CGEF.ComputationalBackends.AbstractExecutionBackend; kwargs...) =
     NUFSHT.make_plan(T, θ, φ, lmax; nthreads = CGEF.Filtering._library_threads(backend), kwargs...)
 
+# The fit's workspace for a plan `_make_plan` built; the workers of a divided plan hold their own.
+_workspace(plan, ::CGEF.ComputationalBackends.AbstractDistributedBackend) = nothing
+_workspace(plan, ::CGEF.ComputationalBackends.AbstractExecutionBackend) = FTB.LSMRWorkspace(plan)
+
 # `nufft` is the NUFFT library NUFSHT runs: a FlowTransformBindings tag, or `AutoSpectralBackend()` for
 # NUFSHT's own choice.
 function _nufsht_grid_plan(
@@ -138,7 +143,7 @@ function _nufsht_grid_plan(
     mask = all(m) ? nothing : CGEF.Filtering._on_backend(backend, part(m))
     C_mask = mask === nothing ? nothing :
              _fit!(NUFSHT.allocate_coefficients(nplan), CGEF.Filtering._on_backend(backend, T.(part(m))), nplan,
-                   NUFSHT.LSMRWorkspace(nplan), backend)
+                   _workspace(nplan, backend), backend)
     return NUFSHTGridPlan(
         nplan, T(FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid))), mask,
         C_mask, npts, bplan, backend, own === nothing ? nothing : CGEF.Filtering._on_backend(backend, own),
@@ -150,11 +155,11 @@ function _nufsht_scratch(gp::NUFSHTGridPlan{P,T}) where {P, T<:AbstractFloat}
     n = gp.own === nothing ? gp.npts : length(gp.own)
     zs(dims...) = CGEF.Filtering._allocate(gp.backend, T, dims)
     return NUFSHTScratch(
-        zs(n), NUFSHT.allocate_coefficients(gp.plan), NUFSHT.LSMRWorkspace(gp.plan),
+        zs(n), NUFSHT.allocate_coefficients(gp.plan), _workspace(gp.plan, gp.backend),
         gp.own === nothing ? nothing : zs(n),
         bp === nothing ? nothing :
             (masked_input = zs(n, bp.B), coeffs = NUFSHT.allocate_coefficients(bp),
-             ws = NUFSHT.LSMRWorkspace(bp), local_out = gp.own === nothing ? nothing : zs(n, bp.B)),
+             ws = _workspace(bp, gp.backend), local_out = gp.own === nothing ? nothing : zs(n, bp.B)),
     )
 end
 
