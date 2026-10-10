@@ -258,20 +258,66 @@ end
 @inline _query_topology(grid::FlowGeometries.Grids.AbstractGrid, ball) =
     FlowGeometries.Connectivity.default_sweep_topology(grid, ball, false)
 
-# Estimated cache byte size for the `AutoCache` budget check. The builder pushes only the candidates
-# inside the metric ball (`d <= rad`), so the estimate is the enclosing-box count divided by the
-# box-to-ball volume ratio: 4/π in 2-D, 6/π in 3-D. That ratio is exact in the limit of many cells and
-# slightly conservative at small windows, which is the safe direction for a budget check.
-const _BOX_TO_BALL_2D = 4 / π
-const _BOX_TO_BALL_3D = 6 / π
+# Bytes one cache entry holds: its neighbour index, one `Int` per axis, and its weight.
+@inline _cache_entry_bytes(::Val{N}, ::Type{T}) where {N,T} = N * sizeof(Int) + sizeof(T)
 
-@inline _scattered_cache_bytes(Nx::Integer, Ny::Integer, di_lim::Integer, dj_lim::Integer, ::Type{T}) where {T} =
-    round(Int, Nx * Ny * (2*di_lim + 1) * (2*dj_lim + 1) * (2*sizeof(Int) + sizeof(T)) / _BOX_TO_BALL_2D)
+"""
+    _cache_entries(count, strategy, budget, entry_bytes) -> Union{Int,Nothing}
 
-@inline function _should_cache(cache_strategy::AbstractCacheStrategy, est_bytes::Integer, cache_byte_budget::Integer)
-    cache_strategy isa AlwaysCache && return true
-    cache_strategy isa NeverCache && return false
-    return est_bytes <= cache_byte_budget   # AutoCache
+The number of entries a neighbour cache holds, or `nothing` when the plan streams. `count(limit)` counts
+the entries through the ball query the cache build runs and stops once the count passes `limit`;
+`AutoCache` sets that limit at the budget, so its decision is exact and its counting is bounded by it.
+"""
+function _cache_entries(
+    count::F, strategy::AbstractCacheStrategy, budget::Integer, entry_bytes::Integer,
+) where {F}
+    strategy isa NeverCache && return nothing
+    limit = strategy isa AlwaysCache ? typemax(Int) : Int(budget) ÷ entry_bytes
+    n = count(limit)
+    return n > limit ? nothing : n
+end
+
+# Entries of a 2-D cache, counted in target order, stopping once past `limit`.
+function _count_scattered(grid, rad, is_cartesian::Bool, mt, sc, limit::Int)
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
+    n = 0
+    for j in 1:Ny, i in 1:Nx
+        n = _ball_fold((m, _, _) -> m + 1, n, grid, i, j, rad, is_cartesian, mt, sc)
+        n > limit && break
+    end
+    return n
+end
+
+# The 2-D cache, `n` entries from `_count_scattered`, filled in target order `t = i + (j-1)·Nx`.
+function _fill_scattered(grid, kernel, scale::T, dim, rad, is_cartesian::Bool, mt, sc, n::Int) where {T}
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
+    ii = Vector{Int}(undef, n)
+    jj = Vector{Int}(undef, n)
+    w = Vector{T}(undef, n)
+    ptr = Vector{Int}(undef, Nx * Ny + 1)
+    ptr[1] = 1
+    k = 0
+    for j in 1:Ny, i in 1:Nx
+        k = _ball_fold(k, grid, i, j, rad, is_cartesian, mt, sc) do m, J, d
+            m += 1
+            ii[m] = J[1]
+            jj[m] = J[2]
+            w[m] = Kernels.kernel_weight(kernel, d, scale, dim) * FlowGeometries.Grids.area(grid, J[1], J[2])
+            m
+        end
+        ptr[i + (j - 1) * Nx + 1] = k + 1
+    end
+    return ScatteredCache(ii, jj, w, ptr)
+end
+
+# The cache a 2-D builder keeps under `strategy`, or `nothing`.
+function _scattered_cache(grid, kernel, scale::T, rad, is_cartesian::Bool, mt, strategy, budget) where {T}
+    sc = FlowGeometries.Connectivity.ball_scratch()
+    n = _cache_entries(strategy, budget, _cache_entry_bytes(Val(2), T)) do limit
+        _count_scattered(grid, rad, is_cartesian, mt, sc, limit)
+    end
+    n === nothing && return nothing
+    return _fill_scattered(grid, kernel, scale, _kernel_dim(grid), rad, is_cartesian, mt, sc, n)
 end
 
 """
@@ -368,40 +414,11 @@ function _build_footprint_scattered(
     cache_byte_budget::Integer = DEFAULT_CACHE_BYTE_BUDGET,
     kwargs...,   # accepts (and ignores) mask_strategy — only the separable-Gaussian path needs it
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    dim = _kernel_dim(grid)
-    rad = Kernels.kernel_radius(kernel, scale, dim)
+    rad = Kernels.kernel_radius(kernel, scale, _kernel_dim(grid))
     di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period, is_cartesian =
         _scattered_window_bounds(grid, rad)
     mt = _query_topology(grid, rad)
-
-    cache = if _should_cache(cache_strategy, _scattered_cache_bytes(Nx, Ny, di_lim, dj_lim, T), cache_byte_budget)
-        ii = Int[]
-        jj = Int[]
-        w = T[]
-        sizehint!(ii, Nx * Ny * (2*di_lim + 1) * (2*dj_lim + 1))
-        sizehint!(jj, Nx * Ny * (2*di_lim + 1) * (2*dj_lim + 1))
-        sizehint!(w, Nx * Ny * (2*di_lim + 1) * (2*dj_lim + 1))
-        ptr = Vector{Int}(undef, Nx * Ny + 1)
-        ptr[1] = 1
-        sc = FlowGeometries.Connectivity.ball_scratch()
-        for j in 1:Ny, i in 1:Nx # column-major target order: t = i + (j-1)*Nx, increasing monotonically
-            t = i + (j - 1) * Nx
-            target = FlowGeometries.Grids.coords(SA.SVector, grid, i, j)
-            _scattered_foldl(
-                nothing, grid, target, i, j, Nx, Ny, di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period, is_cartesian, rad, mt, sc,
-            ) do _, iin, jjn, d
-                push!(ii, iin)
-                push!(jj, jjn)
-                push!(w, Kernels.kernel_weight(kernel, d, scale, dim) * FlowGeometries.Grids.area(grid, iin, jjn))
-                nothing
-            end
-            ptr[t+1] = length(ii) + 1
-        end
-        ScatteredCache(ii, jj, w, ptr)
-    else
-        nothing
-    end
+    cache = _scattered_cache(grid, kernel, scale, rad, is_cartesian, mt, cache_strategy, cache_byte_budget)
     return ScatteredFilterPlan(
         kernel, scale, rad, di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period, is_cartesian,
         cache, mt, _exterior_mass(grid, kernel, scale),
@@ -412,12 +429,9 @@ end
     _build_footprint_curvilinear(grid, kernel, scale; cache_strategy=AutoCache(), cache_byte_budget=DEFAULT_CACHE_BYTE_BUDGET) -> ScatteredFilterPlan
 
 Compact plan (and, if `cache_strategy` calls for it, the full per-point cache) for a
-`FlowGeometries.Grids.CurvilinearGrid`. Enumeration goes through the grid's own ball query, as
-it does for a `StructuredGrid`; what differs is the SIZE ESTIMATE the cache budget is checked against.
-`Connectivity.metric_window` bounds a window from per-axis spacing, and a curvilinear mesh has no
-separable axes to bound with, so the estimate comes from the smallest adjacent-node spacing in each
-index direction instead. It feeds no computation — only the `AutoCache` decision — so being loose
-costs a cache that would have fit, never a wrong answer.
+`FlowGeometries.Grids.CurvilinearGrid`. Enumeration goes through the grid's own ball query, as it does
+for a `StructuredGrid`. The plan's `di_lim`/`dj_lim` are the index window the smallest adjacent-node
+spacing in each direction implies.
 """
 function _build_footprint_curvilinear(
     grid::FlowGeometries.Grids.CurvilinearGrid{T},
@@ -434,8 +448,7 @@ function _build_footprint_curvilinear(
     dim = _kernel_dim(grid)
     rad = Kernels.kernel_radius(kernel, scale, dim)
 
-    # Smallest adjacent-node spacing in each index direction (walk both directions of the 2D mesh) —
-    # an O(N) one-time pass to learn the mesh's spacing, not part of the O(N·M) storage question.
+    # Smallest adjacent-node spacing in each index direction.
     min_di = T(Inf)
     min_dj = T(Inf)
     for j in 1:Ny, i in 1:Nx
@@ -452,34 +465,7 @@ function _build_footprint_curvilinear(
     di_lim = isfinite(min_di) && min_di > 0 ? ceil(Int, rad / min_di) : 0
     dj_lim = isfinite(min_dj) && min_dj > 0 ? ceil(Int, rad / min_dj) : 0
     mt = _query_topology(grid, rad)
-
-    cache = if _should_cache(cache_strategy, _scattered_cache_bytes(Nx, Ny, di_lim, dj_lim, T), cache_byte_budget)
-        ii = Int[]
-        jj = Int[]
-        w = T[]
-        sizehint!(ii, Nx * Ny * (2*di_lim + 1) * (2*dj_lim + 1))
-        sizehint!(jj, Nx * Ny * (2*di_lim + 1) * (2*dj_lim + 1))
-        sizehint!(w, Nx * Ny * (2*di_lim + 1) * (2*dj_lim + 1))
-        ptr = Vector{Int}(undef, Nx * Ny + 1)
-        ptr[1] = 1
-        sc = FlowGeometries.Connectivity.ball_scratch()
-        for j in 1:Ny, i in 1:Nx # column-major target order: t = i + (j-1)*Nx
-            t = i + (j - 1) * Nx
-            target = FlowGeometries.Grids.coords(SA.SVector, grid, i, j)
-            _scattered_foldl(
-                nothing, grid, target, i, j, Nx, Ny, di_lim, dj_lim, false, false, zero(T), zero(T), false, rad, mt, sc,
-            ) do _, iin, jjn, d
-                push!(ii, iin)
-                push!(jj, jjn)
-                push!(w, Kernels.kernel_weight(kernel, d, scale, dim) * FlowGeometries.Grids.area(grid, iin, jjn))
-                nothing
-            end
-            ptr[t+1] = length(ii) + 1
-        end
-        ScatteredCache(ii, jj, w, ptr)
-    else
-        nothing
-    end
+    cache = _scattered_cache(grid, kernel, scale, rad, false, mt, cache_strategy, cache_byte_budget)
     # A curvilinear mesh carries no lattice past its cells, so its windows are normalized over the cells
     # it has.
     return ScatteredFilterPlan(kernel, scale, rad, di_lim, dj_lim, false, false, zero(T), zero(T), false, cache, mt, nothing)

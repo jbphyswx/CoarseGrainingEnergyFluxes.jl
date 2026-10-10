@@ -343,11 +343,37 @@ struct NDScatteredFilterPlan{
     exterior::EX
 end
 
-# Ball-gated, as in 2-D. The 1-D case needs no correction (a 1-D ball IS the interval).
-@inline _nd_box_to_ball(::Val{N}) where {N} = N == 3 ? _BOX_TO_BALL_3D : (N == 2 ? _BOX_TO_BALL_2D : 1.0)
-@inline _nd_scattered_cache_bytes(dims::NTuple{N,Int}, lim::NTuple{N,Int}, ::Type{T}) where {N,T} =
-    round(Int, prod(dims) * prod(2 .* lim .+ 1) * (sizeof(NTuple{N,Int}) + sizeof(T)) /
-               _nd_box_to_ball(Val(N)))
+# Entries of an N-D cache, counted in target order, stopping once past `limit`.
+function _count_nd_scattered(grid, rad, mt, limit::Int)
+    n = 0
+    for I in CartesianIndices(FlowGeometries.Grids.size_tuple(grid))
+        n = _nd_foldl((m, _, _) -> m + 1, n, grid, Tuple(I), rad, mt)
+        n > limit && break
+    end
+    return n
+end
+
+# The N-D cache, `n` entries from `_count_nd_scattered`, filled in linear target order.
+function _fill_nd_scattered(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel, scale::T, rad, mt, n::Int,
+) where {T, G, N}
+    dims = FlowGeometries.Grids.size_tuple(grid)
+    nbrs = Vector{NTuple{N,Int}}(undef, n)
+    w = Vector{T}(undef, n)
+    ptr = Vector{Int}(undef, prod(dims) + 1)
+    ptr[1] = 1
+    k = 0
+    for (t, I) in enumerate(CartesianIndices(dims))
+        k = _nd_foldl(k, grid, Tuple(I), rad, mt) do m, J, d
+            m += 1
+            nbrs[m] = J
+            w[m] = Kernels.kernel_weight(kernel, d, scale, Val(N)) * FlowGeometries.Grids.area(grid, J...)
+            m
+        end
+        ptr[t + 1] = k + 1
+    end
+    return NDScatteredCache(nbrs, w, ptr)
+end
 
 function _build_footprint_nd_scattered(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
@@ -357,33 +383,14 @@ function _build_footprint_nd_scattered(
     cache_byte_budget::Integer = DEFAULT_CACHE_BYTE_BUDGET,
     kwargs...,   # accepts (and ignores) mask_strategy — only the 2D separable-Gaussian path needs it
 ) where {N, T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    dims = FlowGeometries.Grids.size_tuple(grid)
     rad = Kernels.kernel_radius(kernel, scale, Val(N))
-    # Per-axis index bound at the worst cell, for the cache estimate only; the traversal is the grid's.
+    # Per-axis index bound at the worst cell; the traversal is the grid's.
     lim = FlowGeometries.Connectivity.metric_window(grid, rad)
     mt = _query_topology(grid, rad)
-
-    cache = if _should_cache(cache_strategy, _nd_scattered_cache_bytes(dims, lim, T), cache_byte_budget)
-        nbrs = NTuple{N,Int}[]
-        w = T[]
-        sizehint!(nbrs, prod(dims) * prod(2 .* lim .+ 1))
-        sizehint!(w, prod(dims) * prod(2 .* lim .+ 1))
-        lin = LinearIndices(dims)
-        ptr = Vector{Int}(undef, prod(dims) + 1)
-        ptr[1] = 1
-        for I in CartesianIndices(dims)
-            t = lin[I]
-            _nd_foldl(nothing, grid, Tuple(I), rad, mt) do _, J, d
-                push!(nbrs, J)
-                push!(w, Kernels.kernel_weight(kernel, d, scale, Val(N)) * FlowGeometries.Grids.area(grid, J...))
-                nothing
-            end
-            ptr[t+1] = length(nbrs) + 1
-        end
-        NDScatteredCache(nbrs, w, ptr)
-    else
-        nothing
+    n = _cache_entries(cache_strategy, cache_byte_budget, _cache_entry_bytes(Val(N), T)) do limit
+        _count_nd_scattered(grid, rad, mt, limit)
     end
+    cache = n === nothing ? nothing : _fill_nd_scattered(grid, kernel, scale, rad, mt, n)
     return NDScatteredFilterPlan(kernel, scale, rad, lim, cache, mt, _exterior_mass(grid, kernel, scale))
 end
 

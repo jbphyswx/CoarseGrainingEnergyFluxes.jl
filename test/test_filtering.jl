@@ -310,6 +310,22 @@ Test.@testset "cache-strategy control (AutoCache budget, AlwaysCache/NeverCache 
     # plan_filter itself must thread cache_strategy through (not just the internal builder).
     plan_never = CGEF.Filtering.plan_filter(grid, ker, scale; cache_strategy = CGEF.Filtering.NeverCache())
     Test.@test plan_never.footprint.cache === nothing
+
+    # `AutoCache` decides on the exact entry count: a budget of exactly the cache's bytes keeps it, one
+    # byte less streams it. A lon-lat grid reaching ±80° has its widest window at the polar rows.
+    sgrid = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(6.371e6), deg2rad.(collect(0.0:7.5:352.5)),
+                                    deg2rad.(collect(range(-80.0, 80.0; length = 33))))
+    for (g, k, ℓ, nd) in ((sgrid, CGEF.GaussianKernel(), 500e3, 2), (grid1, ker, scale, 1))
+        full = CGEF.Filtering.build_footprint(g, k, ℓ; cache_strategy = CGEF.Filtering.AlwaysCache())
+        n = length(full.cache.w)
+        Test.@test full.cache.ptr[end] == n + 1
+        bytes = n * (nd * sizeof(Int) + sizeof(Float64))
+        for (b, kept) in ((bytes, true), (bytes - 1, false))
+            fp = CGEF.Filtering.build_footprint(g, k, ℓ; cache_strategy = CGEF.Filtering.AutoCache(),
+                                                cache_byte_budget = b)
+            Test.@test (fp.cache !== nothing) == kept
+        end
+    end
 end
 
 

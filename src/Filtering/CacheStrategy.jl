@@ -19,9 +19,10 @@ abstract type AbstractCacheStrategy end
 """
     AutoCache <: AbstractCacheStrategy
 
-Build and store the full per-point neighbour-list cache only if its estimated size is under
-`cache_byte_budget` (default [`DEFAULT_CACHE_BYTE_BUDGET`](@ref)); otherwise fall back to recomputing
-neighbours on the fly at apply time. This is the only cache-strategy knob most callers ever need —
+Build and store the full per-point neighbour-list cache only if its size is within `cache_byte_budget`
+(default [`DEFAULT_CACHE_BYTE_BUDGET`](@ref)); otherwise recompute neighbours on the fly at apply time.
+The size is the exact entry count, taken through the ball query the build runs before anything is
+allocated, and the count stops once it passes the budget. This is the only cache-strategy knob most callers ever need —
 it caches whenever doing so is affordable, which is strictly better than not caching whenever a
 plan will be reused across more than one `filter_apply!` call.
 """
