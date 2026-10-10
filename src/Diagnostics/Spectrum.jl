@@ -315,31 +315,37 @@ end
 """
     spectral_density!(g, C, k) -> g
 
-In-place [`spectral_density`](@ref): writes the non-uniform finite-difference derivative of `C`
-w.r.t. `k` into the caller-supplied `g` (central in the interior, one-sided at the ends). Fills
-zeros for fewer than two points.
+In-place [`spectral_density`](@ref): writes `dC/dk` into the caller-supplied `g`.
 """
 function spectral_density!(g::AbstractVector{T}, C::AbstractVector{T}, k::AbstractVector) where {T<:AbstractFloat}
     n = length(C)
     length(g) == n || throw(DimensionMismatch("g has length $(length(g)), expected $n (= length(C))"))
-    n < 2 && (fill!(g, zero(T)); return g)
+    length(k) == n || throw(DimensionMismatch("k has length $(length(k)), expected $n (= length(C))"))
+    n < 2 && return fill!(g, T(NaN))
+    if n == 2
+        s = T((C[2] - C[1]) / (k[2] - k[1]))
+        return fill!(g, s)
+    end
     @inbounds for i in 1:n
-        if i == 1
-            g[i] = (C[2] - C[1]) / (k[2] - k[1])
-        elseif i == n
-            g[i] = (C[n] - C[n-1]) / (k[n] - k[n-1])
-        else
-            g[i] = (C[i+1] - C[i-1]) / (k[i+1] - k[i-1])
-        end
+        j = clamp(i - 1, 1, n - 2)   # the three points nearest `i`: centred inside, one-sided at an end
+        g[i] = _quadratic_slope(k[i], k[j], k[j+1], k[j+2], C[j], C[j+1], C[j+2])
     end
     return g
 end
 
+# Derivative at `x` of the quadratic through `(x0, y0)`, `(x1, y1)`, `(x2, y2)` (Lagrange form).
+@inline _quadratic_slope(x, x0, x1, x2, y0, y1, y2) =
+    y0 * ((x - x1) + (x - x2)) / ((x0 - x1) * (x0 - x2)) +
+    y1 * ((x - x0) + (x - x2)) / ((x1 - x0) * (x1 - x2)) +
+    y2 * ((x - x0) + (x - x1)) / ((x2 - x0) * (x2 - x1))
+
 """
     spectral_density(C, k) -> dC/dk
 
-Non-uniform finite-difference derivative of cumulative values `C` w.r.t. `k` (central in the
-interior, one-sided at the ends). Returns zeros for fewer than two points.
+Derivative of cumulative values `C` with respect to `k`, at each `k`: the slope of the quadratic through
+the three nearest points, centred in the interior and one-sided at the ends, so second order on any
+spacing and exact for a quadratic `C(k)`. Two points give their secant; with fewer there is no
+derivative, and the result is `NaN`.
 """
 function spectral_density(C::AbstractVector{T}, k::AbstractVector) where {T<:AbstractFloat}
     return spectral_density!(zeros(T, length(C)), C, k)

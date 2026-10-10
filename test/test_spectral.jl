@@ -608,10 +608,13 @@ Test.@testset "Filtering spectrum" begin
     Test.@test all(E -> isapprox(E, expected_energy; rtol = 1e-6),
                    CGEF.Diagnostics.cumulative_energy(u, v, nothing, grid, CGEF.GaussianKernel(), scales))
 
-    # spectral_density reproduces a known derivative: C(k)=k² ⇒ dC/dk = 2k (central differences
-    # are exact for a quadratic on a uniform grid).
-    kk = collect(1.0:1.0:5.0)
-    Test.@test CGEF.Diagnostics.spectral_density(kk .^ 2, kk)[3] ≈ 2 * kk[3]
+    # spectral_density is exact for a quadratic C(k) at every point, ends included, on the geometric
+    # spacing a sweep over scales gives (k = 1/ℓ, descending).
+    kk = 1.0 ./ exp10.(range(3.0, 5.0; length = 9))
+    C = @. 0.3 - 2.0e4 * kk + 7.0e8 * kk^2
+    Test.@test CGEF.Diagnostics.spectral_density(C, kk) ≈ (@. -2.0e4 + 1.4e9 * kk) rtol = 1e-10
+    Test.@test CGEF.Diagnostics.spectral_density(C[1:2], kk[1:2]) ≈ fill((C[2] - C[1]) / (kk[2] - kk[1]), 2)
+    Test.@test all(isnan, CGEF.Diagnostics.spectral_density(C[1:1], kk[1:1]))
 end
 
 # The padded-FFT engine computes the LINEAR convolution, so it is the real-space answer on a bounded,
