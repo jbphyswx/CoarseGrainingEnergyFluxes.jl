@@ -22,6 +22,28 @@ Test.@testset "Derivatives" begin
     Test.@test ∂f∂x[6, 3] ≈ 3.0 # backward difference at boundary
 end
 
+# A grid with no inactive cell takes FlowGeometries' direct `BlankMasked` apply, which matches the
+# `ReduceInRun` apply a masked grid takes to round-off; the plan-free form is the plan form.
+Test.@testset "Derivatives: unmasked grids take the direct apply" begin
+    geom = FG.Geometry.CartesianGeometry()
+    x = collect(range(0.0, 50.0; length = 26)) .+ [iseven(i) ? 0.2 : -0.1 for i in 1:26]
+    y = collect(range(0.0, 30.0; length = 16))
+    f = [sin(0.2xi) * cos(0.1yj) for xi in x, yj in y]
+    for g in (FG.Grids.StructuredGrid(geom, x, y), FG.Grids.StructuredGrid(geom, x, y, trues(26, 16)))
+        Test.@test CGEF.Derivatives._mask_policy(FG.Grids.mask(g)) === FG.Operators.BlankMasked()
+        p = CGEF.Derivatives.StencilPlan(g)
+        for (d, dd!) in ((1, CGEF.Derivatives.ddx!), (2, CGEF.Derivatives.ddy!))
+            got = dd!(zeros(26, 16), f, g, p)
+            ref = FG.Operators.derivative!(zeros(26, 16), f, g, p.tables[d]..., d; order = 1, masked = 0.0,
+                                           policy = FG.Operators.ReduceInRun(), scratch = p.scratch)
+            Test.@test isapprox(got, ref; rtol = 0, atol = 1e-13 * maximum(abs, ref))
+            Test.@test dd!(zeros(26, 16), f, g) == got
+        end
+    end
+    m = trues(26, 16); m[10:12, 5:7] .= false
+    Test.@test CGEF.Derivatives._mask_policy(m) === FG.Operators.ReduceInRun()
+end
+
 
 # Real convergence-RATE tests: refine resolution 3x (not just "error is small at one
 # resolution") and assert the observed order matches the claimed 2nd-order accuracy of the

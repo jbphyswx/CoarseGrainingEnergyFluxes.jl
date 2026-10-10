@@ -51,17 +51,19 @@ end
 # metric the division is the identity and costs nothing.
 # ---------------------------------------------------------------------------
 """
-    _dd!(∂f, f, grid, d) -> ∂f
+    _dd!(∂f, f, grid, d[, plan]) -> ∂f
 
-Derivative of `f` with respect to distance along direction `d`. `nodes = 3` for 2nd order on a
-stretched axis; `ReduceInRun` keeps the one-sided value at a mask edge, where the default writes zero.
+Derivative of `f` with respect to distance along direction `d`, from a [`StencilPlan`](@ref): 3 nodes
+for 2nd order on a stretched axis, as many as a shorter axis has.
 """
 _dd!(∂f::AbstractArray{T}, f::AbstractArray{T}, grid, d::Int) where {T<:AbstractFloat} =
-    FlowGeometries.Operators.derivative!(
-        ∂f, f, grid, d;
-        order = 1, nodes = 3, masked = zero(T),
-        policy = FlowGeometries.Operators.ReduceInRun(),
-    )
+    _dd!(∂f, f, grid, d, StencilPlan(grid))
+
+# `ReduceInRun` keeps the one-sided value at a mask edge, where the default writes zero. With no
+# inactive cell no window reads one, so the direct `BlankMasked` apply gives the same values.
+@inline _mask_policy(::FlowGeometries.Grids.AllActive) = FlowGeometries.Operators.BlankMasked()
+@inline _mask_policy(m::AbstractArray{Bool}) =
+    all(m) ? FlowGeometries.Operators.BlankMasked() : FlowGeometries.Operators.ReduceInRun()
 
 """
     ddx!(∂f∂x, f, grid[, plan]) -> ∂f∂x
@@ -166,7 +168,7 @@ end
     return FlowGeometries.Operators.derivative!(
         ∂f, f, grid, tab[1], tab[2], d;
         order = plan.order, masked = zero(T),
-        policy = FlowGeometries.Operators.ReduceInRun(),
+        policy = _mask_policy(FlowGeometries.Grids.mask(grid)),
         scratch = plan.scratch,
     )
 end
