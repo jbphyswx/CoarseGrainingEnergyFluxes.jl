@@ -290,14 +290,6 @@ function check_setup(
     end
     spectral_note === nothing || push!(notes, spectral_note)
 
-    if kernel isa Kernels.HighOrderKernel && !isempty(sp)
-        b = kernel.b_over_ℓ * ℓ
-        mx = maximum(sp_coarse)
-        b < mx && push!(notes,
-            "each limb is $(round(b / mx; digits = 2)) cells wide where the grid is coarsest; below 1 the " *
-            "vanishing moments do not survive discretization. This kernel needs ℓ ≥ " *
-            "$(round(mx / kernel.b_over_ℓ)).")
-    end
     # `AutoMethod` can evaluate the SAME real-space convolution by transform where the grid allows it —
     # a padded FFT of the sampled kernel on a uniform Cartesian lattice, or a transform along the
     # longitude ring on a global sphere. Both agree with the direct sum only to round-off, so neither is

@@ -203,7 +203,8 @@ function _build_separable_nd(
         # past a bounded edge, `Deformable` on a fully active grid only the in-domain ones.
         profiles = ntuple(Val(N)) do d
             _separable_profile(
-                FlowGeometries.Grids.coordinates(grid, d), lim[d], g[d], periodic[d], kernel, scale, zerofill,
+                FlowGeometries.Grids.coordinates(grid, d), lim[d], g[d], periodic[d], kernel, scale,
+                convert(AbstractVector{T}, mf[d]), zerofill,
             )
         end
         return SeparableFootprintND(

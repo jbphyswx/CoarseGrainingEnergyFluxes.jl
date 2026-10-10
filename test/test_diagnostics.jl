@@ -721,7 +721,7 @@ Test.@testset "filtering spectrum: only kernels with monotone |Ĝ|² are admitte
         Test.@test 7.5 < ks[izero] < 7.8                # measured 7.663
         Test.@test 10.1 < ks[ipeak] < 10.4              # measured 10.271
         Test.@test 0.017 < g2[ipeak] < 0.018            # measured 0.01750
-        # and it never exceeds the DC value, unlike HighOrderKernel's |Ĝ|², which reaches 1.0124
+        # and it never exceeds the DC value, unlike HighOrderKernel{5}'s |Ĝ|², which reaches 1.0125
         Test.@test maximum(g2) <= 1.0
     end
 

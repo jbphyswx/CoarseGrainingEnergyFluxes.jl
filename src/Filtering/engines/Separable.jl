@@ -187,27 +187,6 @@ function _separable_convolve!(dst::AbstractMatrix{T}, src::AbstractMatrix{T}, fp
     return dst
 end
 
-# Cell-averaged weights keep a discontinuous kernel's mass exact on any grid, and cannot recover the
-# vanishing moments where a limb is thinner than a cell. The filter is still a valid normalized
-# low-pass there, just not the high-order one asked for, so this warns.
-_warn_unresolved_limbs(::Kernels.AbstractFilterKernel, _, ::Int, _) = nothing
-
-function _warn_unresolved_limbs(
-    kernel::Kernels.HighOrderKernel, x::AbstractVector, d::Int, scale::Real,
-)
-    length(x) < 2 && return nothing
-    Δ = minimum(abs(x[i] - x[i - 1]) for i in (firstindex(x) + 1):lastindex(x))
-    b = kernel.b_over_ℓ * scale
-    (isfinite(Δ) && Δ > 0 && b < Δ) && @warn(
-        "$(nameof(typeof(kernel))) at ℓ = $scale has limb width b = $b, below axis $d's spacing " *
-        "$Δ — under one cell per limb, so the vanishing moments it is built for do not survive " *
-        "discretization and the result is effectively a box. At b_over_ℓ = $(kernel.b_over_ℓ) this " *
-        "needs ℓ ≥ $(Δ / kernel.b_over_ℓ).",
-        maxlog = 1,
-    )
-    return nothing
-end
-
 """
     _separable_axis_weights(x, lim, periodic, period, kernel, scale, wfac) -> AbstractVecOrMat
 
@@ -267,6 +246,140 @@ function _separable_axis_weights(
     return g
 end
 
+# ---------------------------------------------------------------------------
+# HighOrderKernel on a grid: weights that carry its vanishing moments.
+#
+# On a grid the filter is the sum `Σₖ wₖ f(x + sₖ)` over the stencil's cells, `sₖ` a cell's node
+# displacement, so its order is set by the moments `Σₖ wₖ sₖⁿ`. The kernel's cell integrals `w̃ₖ` zero
+# `∫ G(s) sⁿ ds`, which that sum matches only as `Δ → 0`. The weights are the least change to `w̃`, over
+# the cells the support touches, that gives `Σₖ wₖ sₖⁿ = δₙ₀ Σₖ w̃ₖ` for `n = 0…P`:
+#
+#     w = w̃ + Vᵀλ,   (VVᵀ) λ = t − V w̃,   Vₙₖ = (sₖ/ℓ)ⁿ,   t = (Σₖ w̃ₖ, 0, …, 0).
+#
+# The identity filter meets these conditions, so they always have a solution; where too few cells make
+# `VVᵀ` singular (`ℓ` within a few cells) the minimum-norm one is taken. The stencil is continued past a
+# bounded edge at the edge gap, as `ZeroFill` continues the lattice.
+# ---------------------------------------------------------------------------
+
+# Node displacements and widths of the stencil's cells about position `i`, into `ss` and `wcs`: wrapped
+# across a periodic seam, continued at the edge gap past a bounded edge.
+function _stencil_cells!(
+    ss::AbstractVector{T}, wcs::AbstractVector{T}, x::AbstractVector{T}, i::Int, lim::Int,
+    periodic::Bool, period::T, wfac::AbstractVector{T},
+) where {T<:AbstractFloat}
+    n = length(x)
+    sgn = (n > 1 && x[n] < x[1]) ? -one(T) : one(T)
+    for ddi in -lim:lim
+        k = ddi + lim + 1
+        ii = i + ddi
+        if 1 <= ii <= n
+            ss[k], wcs[k] = T(x[ii]) - T(x[i]), wfac[ii]
+        elseif periodic
+            jj = mod1(ii, n)
+            ss[k], wcs[k] = T(x[jj]) + sgn * T(fld(ii - 1, n)) * period - T(x[i]), wfac[jj]
+        else
+            gap = ii < 1 ? T(x[2] - x[1]) : T(x[n] - x[n - 1])
+            xe = ii < 1 ? T(x[1]) + (ii - 1) * gap : T(x[n]) + (ii - n) * gap
+            ss[k], wcs[k] = xe - T(x[i]), abs(gap)
+        end
+    end
+    return ss, wcs
+end
+
+# `(1, q, q², …, q^(M−1))`.
+@inline function _moment_powers(q::T, ::Val{M}) where {T, M}
+    return SA.SVector{M, T}(ntuple(Val(M)) do n
+        p = one(T)
+        for _ in 2:n
+            p *= q
+        end
+        p
+    end)
+end
+
+# The kernel's cell integrals `w` over the cells `(ss, wcs)`, corrected in place to the weights above.
+function _highorder_correct!(
+    w::AbstractVector{T}, k::Kernels.HighOrderKernel{P}, ss::AbstractVector{T}, wcs::AbstractVector{T},
+    ℓ::T,
+) where {P, T<:AbstractFloat}
+    M = Val(P + 1)
+    R = Kernels.kernel_radius(k, ℓ)
+    G = zero(SA.SMatrix{P + 1, P + 1, T})
+    r = zero(SA.SVector{P + 1, T})
+    m₀ = zero(T)
+    for t in eachindex(w)
+        m₀ += w[t]
+        abs(ss[t]) - wcs[t] / T(2) < R || continue
+        v = _moment_powers(ss[t] / ℓ, M)
+        G += v * v'
+        r -= w[t] * v
+    end
+    e₁ = _moment_powers(zero(T), M)
+    r += m₀ * e₁
+    λ = try
+        G \ r
+    catch err
+        err isa LinearAlgebra.SingularException || rethrow()
+        LinearAlgebra.pinv(G) * r
+    end
+    moments = -m₀ * e₁
+    for t in eachindex(w)
+        abs(ss[t]) - wcs[t] / T(2) < R || continue
+        v = _moment_powers(ss[t] / ℓ, M)
+        w[t] += LinearAlgebra.dot(λ, v)
+        moments += w[t] * v
+    end
+    maximum(abs, moments) <= sqrt(eps(T)) * sum(abs, w) || _no_highorder_weights(k, ℓ)
+    return w
+end
+
+@noinline _no_highorder_weights(::Kernels.HighOrderKernel{P}, ℓ) where {P} = throw(ArgumentError(
+    "HighOrderKernel{$P} at ℓ = $ℓ: the weights on this axis's cells did not reach $P vanishing moments",
+))
+
+# Position `i`'s weights over its stencil cells, those continued past a bounded edge included.
+function _highorder_cell_weights!(
+    w::AbstractVector{T}, ss::AbstractVector{T}, wcs::AbstractVector{T}, x::AbstractVector{T}, i::Int,
+    lim::Int, periodic::Bool, period::T, kernel::Kernels.HighOrderKernel, scale::T,
+    wfac::AbstractVector{T},
+) where {T<:AbstractFloat}
+    _stencil_cells!(ss, wcs, x, i, lim, periodic, period, wfac)
+    for t in eachindex(w)
+        w[t] = Kernels.profile_cell_average(kernel, ss[t], wcs[t], scale) * wcs[t]
+    end
+    return _highorder_correct!(w, kernel, ss, wcs, scale)
+end
+
+function _separable_axis_weights(
+    x::AbstractRange{T}, lim::Int, ::Bool, ::T, kernel::Kernels.HighOrderKernel, scale::T,
+    ::AbstractVector{T},
+) where {T<:AbstractFloat}
+    Δ = abs(T(step(x)))
+    ss = [T(d) * Δ for d in -lim:lim]
+    wcs = fill(Δ, 2lim + 1)
+    w = [Kernels.profile_cell_average(kernel, s, Δ, scale) for s in ss]
+    return _highorder_correct!(w, kernel, ss, wcs, scale)
+end
+
+function _separable_axis_weights(
+    x::AbstractVector{T}, lim::Int, periodic::Bool, period::T,
+    kernel::Kernels.HighOrderKernel, scale::T, wfac::AbstractVector{T},
+) where {T<:AbstractFloat}
+    n = length(x)
+    g = zeros(T, n, 2lim + 1)
+    w = Vector{T}(undef, 2lim + 1)
+    ss = Vector{T}(undef, 2lim + 1)
+    wcs = Vector{T}(undef, 2lim + 1)
+    for i in 1:n
+        _highorder_cell_weights!(w, ss, wcs, x, i, lim, periodic, period, kernel, scale, wfac)
+        for ddi in -lim:lim
+            (1 <= i + ddi <= n || periodic) || continue   # past a bounded edge: an exact zero, as for every kernel
+            g[i, ddi + lim + 1] = w[ddi + lim + 1]
+        end
+    end
+    return g
+end
+
 """
     _build_separable_footprint(grid, kernel::GaussianKernel, scale; mask_strategy=ZeroFill(), kwargs...) -> SeparableFootprint
 
@@ -283,8 +396,6 @@ function _build_separable_footprint(
     scratch::Union{Nothing,SeparableScratch} = nothing,
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    _warn_unresolved_limbs(kernel, FlowGeometries.Grids.coordinates(grid, 1), 1, scale)
-    _warn_unresolved_limbs(kernel, FlowGeometries.Grids.coordinates(grid, 2), 2, scale)
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     rad = Kernels.kernel_radius(kernel, scale)
     # The smallest gap on each axis, so the stencil never under-covers: a coarser region's slots then
@@ -327,8 +438,10 @@ function _build_separable_footprint(
     if zerofill || fully_active
         # Rank-1: `ZeroFill` counts the offsets past a bounded edge, `Deformable` on a fully active grid
         # only the in-domain ones.
-        Nx_profile = _separable_profile(FlowGeometries.Grids.coordinates(grid, 1), di_lim, gx, periodic_x, kernel, scale, zerofill)
-        Ny_profile = _separable_profile(FlowGeometries.Grids.coordinates(grid, 2), dj_lim, gy, periodic_y, kernel, scale, zerofill)
+        Nx_profile = _separable_profile(FlowGeometries.Grids.coordinates(grid, 1), di_lim, gx, periodic_x, kernel, scale,
+                                        convert(AbstractVector{T}, mf[1]), zerofill)
+        Ny_profile = _separable_profile(FlowGeometries.Grids.coordinates(grid, 2), dj_lim, gy, periodic_y, kernel, scale,
+                                        convert(AbstractVector{T}, mf[2]), zerofill)
         return SeparableFootprint(
             gx, gy, di_lim, dj_lim, periodic_x, periodic_y, Nx_profile, Ny_profile, nothing,
             mask_strategy, !fully_active, bound, masked_input, row_pass,
@@ -349,14 +462,15 @@ function _build_separable_footprint(
 end
 
 """
-    _separable_profile(x, lim, g, periodic, kernel, scale, exterior) -> profile
+    _separable_profile(x, lim, g, periodic, kernel, scale, wfac, exterior) -> profile
 
 The denominator profile along one axis: `Σ w` over the stencil's in-domain offsets at each index and,
 with `exterior`, over the offsets past a bounded edge too, on the lattice continued at its edge gap.
+`wfac` is the axis's cell widths, the measure factor `_separable_axis_weights` was given.
 """
 function _separable_profile(
     x::AbstractVector, lim::Int, g::AbstractVecOrMat{T}, periodic::Bool,
-    kernel::Kernels.AbstractFilterKernel, scale::T, exterior::Bool,
+    kernel::Kernels.AbstractFilterKernel, scale::T, ::AbstractVector{T}, exterior::Bool,
 ) where {T<:AbstractFloat}
     N = length(x)
     profile = zeros(T, N)
@@ -371,6 +485,29 @@ function _separable_profile(
             end
         end
         profile[i] = s
+    end
+    return profile
+end
+
+# On a stretched axis a position's weights, continued cells included, come from one correction, so a
+# position whose stencil leaves a bounded axis sums those directly; elsewhere its row of the table is
+# the whole stencil, with exact zeros past a bounded edge.
+function _separable_profile(
+    x::AbstractVector, lim::Int, g::AbstractMatrix{T}, periodic::Bool,
+    kernel::Kernels.HighOrderKernel, scale::T, wfac::AbstractVector{T}, exterior::Bool,
+) where {T<:AbstractFloat}
+    N = length(x)
+    profile = zeros(T, N)
+    w = Vector{T}(undef, 2lim + 1)
+    ss = Vector{T}(undef, 2lim + 1)
+    wcs = Vector{T}(undef, 2lim + 1)
+    @inbounds for i in 1:N
+        if exterior && !periodic && (i - lim < 1 || i + lim > N)
+            _highorder_cell_weights!(w, ss, wcs, x, i, lim, false, zero(T), kernel, scale, wfac)
+            profile[i] = sum(w)
+        else
+            profile[i] = sum(view(g, i, :))
+        end
     end
     return profile
 end

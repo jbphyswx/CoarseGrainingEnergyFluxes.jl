@@ -193,7 +193,30 @@ Test.@testset "HighOrderKernel: cell-averaged weights are what make it work off 
     end
 end
 
-Test.@testset "HighOrderKernel: routing, product structure, and the resolution warning" begin
+# `P` vanishing moments of the filter the grid runs: it reproduces every polynomial of degree ≤ `P` in
+# each coordinate exactly wherever its support stays on the grid, on a stretched axis as on a uniform one.
+Test.@testset "HighOrderKernel: the filter on the grid reproduces polynomials of degree ≤ P" begin
+    geom = FG.Geometry.CartesianGeometry()
+    N = 48
+    xs = 0.0:1.0:(N - 1)
+    xv = collect(xs) .+ [0.03 * sin(2.3i) for i in 1:N]   # ±3% jitter
+    for order in (3, 5), ℓ in (4.0, 8.0, 11.3), ax in (xs, xv)
+        k = CGEF.Kernels.HighOrderKernel(; order = order)
+        g = FG.Grids.StructuredGrid(geom, ax, ax, trues(N, N))
+        rad = CGEF.Kernels.kernel_radius(k, ℓ)
+        inside = [min(ax[i] - ax[1], ax[end] - ax[i], ax[j] - ax[1], ax[end] - ax[j]) > rad + 2
+                  for i in 1:N, j in 1:N]
+        Test.@test count(inside) > 100
+        plan = CGEF.Filtering.plan_filter(g, k, ℓ)
+        for (a, b) in vcat([(n, 0) for n in 0:order], [(0, n) for n in 1:order], [(order, order)])
+            f = [(ax[i] / N)^a * (ax[j] / N)^b for i in 1:N, j in 1:N]
+            out = CGEF.Filtering.filter_apply!(zeros(N, N), f, plan)
+            Test.@test maximum(abs, (out .- f)[inside]) < 1e-12
+        end
+    end
+end
+
+Test.@testset "HighOrderKernel: routing and product structure" begin
     geom = FG.Geometry.CartesianGeometry()
     N = 48; dx = 1000.0; ℓ = 8 * dx
     xs = 0.0:dx:(N - 1) * dx
@@ -209,21 +232,20 @@ Test.@testset "HighOrderKernel: routing, product structure, and the resolution w
         Test.@test CGEF.Filtering.plan_filter(g3, k, ℓ).footprint isa CGEF.Filtering.SeparableFootprintND
     end
 
-    # The 2-D response really is the PRODUCT of 1-D profiles — a square footprint, not a disk. Checked
-    # against the impulse response, so it tests the engine and not just the kernel definition.
+    # The 2-D impulse response is the product of its own centre row and centre column: a square
+    # footprint.
     for order in (3, 5)
         k = CGEF.Kernels.HighOrderKernel(; order = order)
         plan = CGEF.Filtering.plan_filter(grid, k, ℓ)
         δ = zeros(N, N); δ[24, 24] = 1.0
         r = zeros(N, N)
         CGEF.Filtering.filter_apply!(r, δ, plan)
-        p1(t) = CGEF.Kernels.profile_cell_average(k, t, dx, ℓ)
-        scale = r[24, 24] / p1(0.0)^2
+        c = r[24, 24]
         worst = 0.0
         for dj in -10:10, di in -10:10
-            worst = max(worst, abs(r[24 + di, 24 + dj] - scale * p1(di * dx) * p1(dj * dx)))
+            worst = max(worst, abs(r[24 + di, 24 + dj] - r[24 + di, 24] * r[24, 24 + dj] / c))
         end
-        Test.@test worst < 1e-15 * abs(r[24, 24])
+        Test.@test worst < 1e-14 * abs(c)
         # The corners of the square carry real weight — a radial kernel would have zero there.
         Test.@test abs(r[24 + 3, 24 + 3]) > 0.1 * abs(r[24, 24])
     end
@@ -236,14 +258,6 @@ Test.@testset "HighOrderKernel: routing, product structure, and the resolution w
         Test.@test_throws ArgumentError CGEF.Filtering.plan_filter(
             cg, CGEF.Kernels.HighOrderKernel(), ℓ; method = CGEF.Filtering.RealSpace())
     end
-
-    # Under-resolved limbs warn and name the ℓ that would fix it: cell-averaging keeps the MASS right
-    # but cannot invent the resolution the vanishing moments need.
-    Test.@test_logs (:warn, r"vanishing moments") match_mode = :any CGEF.Filtering.plan_filter(
-        grid, CGEF.Kernels.HighOrderKernel(), 4 * dx)
-    # At the documented threshold there is no warning.
-    Test.@test_logs min_level = Logging.Warn CGEF.Filtering.plan_filter(
-        grid, CGEF.Kernels.HighOrderKernel(), 8 * dx)
 
     # It cannot produce a filtering spectrum either, for the same reason as the other ringing kernels.
     u = [sin(i / 5) * cos(j / 7) for i in 1:N, j in 1:N]

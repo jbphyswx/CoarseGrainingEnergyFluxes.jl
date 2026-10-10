@@ -5,6 +5,7 @@ using ..Kernels: Kernels
 using ComputationalBackends: ComputationalBackends
 using SpectralBackends: SpectralBackends
 using FlowTransformBindings: FlowTransformBindings
+using LinearAlgebra: LinearAlgebra
 using StaticArrays: StaticArrays as SA
 
 export AbstractMaskStrategy, ZeroFill, Deformable

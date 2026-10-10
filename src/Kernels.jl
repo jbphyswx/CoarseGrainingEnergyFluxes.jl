@@ -140,12 +140,9 @@ refuses it there rather than silently applying a radial approximation.
 
 # Slope recovery, and the domain it needs
 
-Measured on a synthetic `k^-α` field, `N = 256`, fit over `ℓ = 8-32Δx`: `P = 3` recovers `k⁻⁴` (-4.00
-against a true -4) where `TopHatKernel`/`GaussianKernel` saturate at -2.83/-2.73. `P = 5` does not
-reach `k⁻⁷` in that box.
-
-That last one is a property of the domain, not of the kernel. With `𝓔(ℓ) = ∫E(k)|Ĝ(kℓ)|²dk` and
-`x = kℓ`,
+`P` vanishing moments let the filtering spectrum follow a `k^-α` spectrum for `α < P + 2` (Sadek &
+Aluie 2018, eq. 18), past the `k⁻³` ceiling of `TopHatKernel` and `GaussianKernel`. With
+`𝓔(ℓ) = ∫E(k)|Ĝ(kℓ)|²dk` and `x = kℓ`,
 
 ```
 Ẽ(k_ℓ) ∝ k_ℓ^{-α} · I ,     I = -∫₀^∞ x^{1-α} (|Ĝ|²)'(x) dx
@@ -158,16 +155,19 @@ INFRARED effect, set by scales larger than the filter: seeing it needs many deca
 `p = 1`, marginal for `p = 3`, not enough for `p = 5`. A finer grid does not help; it adds modes above
 `1/ℓ`, which `I` does not see.
 
-# Two cautions
+# On a grid
 
-- **It needs resolution.** Every limb must span at least one cell, `b ≥ Δx`, i.e. `ℓ ≥ 8Δx` at the
-  default `b_over_ℓ = 1/8`; `plan_filter` warns below that. Weights are the kernel's integral over each
-  cell, not its value at the node ([`profile_cell_average`](@ref)): the discrete `m₂` residual then
-  falls as `O(Δx²)` rather than point sampling's `O(Δx)`, 100× smaller at `ℓ = 128Δx`. Still nonzero at
-  finite resolution, so the effective order is always below the nominal one.
-- **Do not use it for `Π`.** The vanishing moments are bought with negative weights, so `τ` is not
-  realizable, and `|Ĝ|²` reaches 0.282 (`P = 3`) and **1.0125** (`P = 5`) past its first zero — the
-  latter amplifies. For a flux use `TopHatKernel` or `GaussianKernel`.
+The filter a grid runs is a sum over cells, so the moments that set its order are the discrete ones,
+`Σₖ wₖ sₖⁿ` over the cells' node displacements `sₖ`. Its weights are the kernel's integral over each
+cell ([`profile_cell_average`](@ref)), corrected by the least change that makes `P` of those moments
+vanish, so the order holds at every `ℓ`; as `ℓ` nears a few cells the weights tend to the identity
+filter.
+
+# Not for `Π`
+
+The vanishing moments need negative weights, so the filter is not a positive operator and `τ` is not
+guaranteed positive (realizable). `|Ĝ|²` also reaches 0.282 (`P = 3`) and 1.0125 (`P = 5`) past its
+first zero, so the latter amplifies those scales. For a flux use `TopHatKernel` or `GaussianKernel`.
 """
 struct HighOrderKernel{P, T<:Real} <: AbstractFilterKernel
     b_over_ℓ::T

@@ -600,13 +600,8 @@ Test.@testset "check_setup reports what will run, and every capability it claims
         Test.@test any(n -> occursin("no-op", n), bad.notes)
     end
 
-    # The high-order resolution guard is reported here too, so it is visible BEFORE planning warns.
     let ho = CGEF.check_setup(grid, CGEF.Kernels.HighOrderKernel(), 4 * dx)
-        Test.@test any(n -> occursin("limb", n), ho.notes)
         Test.@test occursin("separable", ho.engine)
-    end
-    let ok = CGEF.check_setup(grid, CGEF.Kernels.HighOrderKernel(), 8 * dx)
-        Test.@test !any(n -> occursin("limb", n), ok.notes)
     end
 
     # The resolved backend is the one that will run, and an impossible request is reported not thrown.
