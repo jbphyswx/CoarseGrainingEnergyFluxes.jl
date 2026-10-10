@@ -168,14 +168,17 @@ Spherical and true-3-D grids always carry the vertical set: the spherical branch
 Cartesian components, so it has three velocity components and six products whether or not the caller
 supplied a vertical velocity.
 """
+@inline ΠWorkspace(grid::FlowGeometries.Grids.AbstractGrid, batch_size::Tuple = (); has_w::Bool = false) =
+    ΠWorkspace(grid, batch_size, Val(has_w))
+
+# `Val(has_w)` puts the choice in the type, so a caller that knows `w`'s type gets a concrete workspace.
 function ΠWorkspace(
-    grid::FlowGeometries.Grids.AbstractGrid{G,T}, batch_size::Tuple = ();
-    has_w::Bool = false,
-) where {G, T<:AbstractFloat}
+    grid::FlowGeometries.Grids.AbstractGrid{G,T}, batch_size::Tuple, ::Val{W},
+) where {G, T<:AbstractFloat, W}
     sz = (FlowGeometries.Grids.size_tuple(grid)..., batch_size...)
     spherical = G <: FlowGeometries.Geometry.SphericalGeometry
     rank = length(FlowGeometries.Grids.size_tuple(grid))
-    vertical = has_w || spherical || rank == 3
+    vertical = W || spherical || rank == 3
 
     z() = zeros(T, sz...)
     zv() = vertical ? zeros(T, sz...) : nothing

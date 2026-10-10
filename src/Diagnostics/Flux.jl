@@ -303,7 +303,7 @@ function compute_Π!(
     # tensor algebra and the stencil derivatives all carry the trailing axes through.
     _validate_field_sizes(grid, Π, u, v, w)
     ws = workspace === nothing ?
-        ΠWorkspace(grid, _batch_dims(Π, grid); has_w = w !== nothing) : workspace
+        ΠWorkspace(grid, _batch_dims(Π, grid), Val(w !== nothing)) : workspace
     _check_workspace_w(ws, w)
     # One plan for this scale, shared by all ~9 filterings below. A caller repeating this at a fixed
     # scale can pass a prebuilt `filter_plan` to share it across calls as well.

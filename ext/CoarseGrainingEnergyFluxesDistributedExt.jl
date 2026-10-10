@@ -179,17 +179,25 @@ CGEF.Pipeline.batch_alloc_shared(::Type{T}, dims::Integer...) where {T} =
 # parallelism. The scope is set inside the loop body because a scoped value does not cross processes.
 _serial_ft(f) = Base.ScopedValues.with(f, FTB.FASTTRANSFORMS_THREADS => 1)
 
-# Batch-parallel PIPELINE sweeps across worker processes — one shared-memory node, not a multi-node
-# decomposition. Slices write disjoint views of the batched result, so no synchronization is needed and
-# the assembled result is identical to serial.
-#
-# The storage must be shared: a `@distributed` loop over plain arrays would write them in the workers'
-# own address spaces and the caller would see zeros. That is a hard error rather than a silent copy.
+# Batch-parallel pipeline sweeps across the worker processes of one shared-memory node. Each worker runs
+# a contiguous block of slices from one scratch set, built there once (or its copy of entry 1 of the
+# caller's pools). Slices write disjoint views of the shared batched result, so the assembled result is
+# identical to serial; plain result arrays are refused, since workers write their own copies of them.
+function _batch_block!(batch, u, v, w, grid, valR, ctx, block::UnitRange{Int})
+    _serial_ft() do
+        CGEF.Pipeline._run_slices!(batch, u, v, w, grid, valR, ctx, block,
+                                   CGEF.Pipeline._worker_scratch(ctx, grid, w, 1))
+    end
+    return nothing
+end
+
 function CGEF.Pipeline.distributed_coarse_grain_batch!(batch, u, v, w, grid, valR, ctx)
     _require_shared(batch.Π, "coarse_grain_batch!")
     n = length(batch.slices)
-    @sync Distributed.@distributed for t in 1:n
-        _serial_ft(() -> CGEF.Pipeline.coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, t, 1))
+    pids = Distributed.workers()
+    nw = min(n, length(pids))
+    @sync for k in 1:nw
+        @async Distributed.remotecall_wait(_batch_block!, pids[k], batch, u, v, w, grid, valR, ctx, _block(k, nw, n))
     end
     return batch
 end

@@ -441,10 +441,9 @@ function plan_filter(
     )
     isempty(kwargs) || _unused_keywords(kwargs, method)
     _check_backend_compatible(grid, backend)
-    return PhysicalFilterPlan(
-        build_footprint(grid, kernel, scale), grid, mask_strategy, kernel, scale,
-        _resolve_backend(backend, grid),
-    )
+    resolved = _resolve_backend(backend, grid)
+    fp = build_footprint(grid, kernel, scale)
+    return PhysicalFilterPlan(prepare_workspace(resolved, grid, fp), grid, mask_strategy, kernel, scale, resolved)
 end
 
 # Curvilinear grids have a genuine real-space direct-sum engine (the scattered per-point footprint),

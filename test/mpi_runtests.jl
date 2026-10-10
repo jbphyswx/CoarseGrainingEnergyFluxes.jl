@@ -64,6 +64,30 @@ Test.@testset "MPI backend (rank $rank of $nproc)" begin
     Test.@test mpi_s ≈ serial_s
 end
 
+# Each rank sweeps its stride of slices from one scratch set, and the Allreduce assembles the whole batch
+# on every rank. With one slice more than ranks, a rank runs two slices on the same scratch.
+Test.@testset "MPI coarse_grain_batch! (rank $rank of $nproc)" begin
+    P = CGEF.Pipeline
+    CB = CGEF.ComputationalBackends
+    xs = 0.0:1000.0:23e3
+    mask = trues(24, 24); mask[8:12, 6:9] .= false
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs, mask)
+    scales = [4e3, 8e3]
+    kern = CGEF.GaussianKernel()
+    Random.seed!(3)   # identical on every rank
+    Nt = nproc + 1
+    u = randn(24, 24, Nt); v = randn(24, 24, Nt)
+    b = P.CoarseGrainBatchResult(grid, length(scales), (Nt,))
+    P.coarse_grain_batch!(b, u, v, grid; scales, kernel = kern, backend = CB.MPIBackend())
+    for t in 1:Nt
+        r = CGEF.coarse_grain(view(u, :, :, t), view(v, :, :, t), grid; scales, kernel = kern,
+                              backend = CB.SerialBackend())
+        Test.@test b.slices[t].Π == r.Π
+        Test.@test b.slices[t].cumulative_energy == r.cumulative_energy
+        Test.@test b.slices[t].filtering_spectrum == r.filtering_spectrum
+    end
+end
+
 # A nonuniform spectral plan under MPI gives each rank a disjoint share of the points: the partial
 # analyses add to the whole spectrum and each rank evaluates its own points. Every rank builds the serial
 # plan over all the points and holds the same field, so both outputs are the whole filtered field. The

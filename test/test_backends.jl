@@ -1,4 +1,7 @@
 
+# Allocations of one apply, through a top-level function so the testset's captured locals are not counted.
+_alloc_filter_apply!(out, field, plan) = @allocated CGEF.Filtering.filter_apply!(out, field, plan)
+
 # Execution backend lattice (ComputationalBackends.jl)
 Test.@testset "Backends" begin
     # Backend resolution returns INSTANCES; AutoBackend picks a concrete local backend. Auto is
@@ -151,6 +154,18 @@ Test.@testset "Backends" begin
             CGEF.Filtering.filter_apply!(g_ser, uf, p_ser)
             CGEF.Filtering.filter_apply!(g_gpu, uf, p_gpu)
             Test.@test g_ser == g_gpu
+        end
+        # The plan holds its adjacency on the device, so an apply allocates the same however many
+        # neighbours each node has.
+        let gpu = CGEF.ComputationalBackends.GPUBackend(KA.CPU()), kern = CGEF.GaussianKernel(),
+            p1 = CGEF.Filtering.plan_filter(ug, kern, 2000.0; backend = gpu, method = CGEF.Filtering.RealSpace()),
+            p2 = CGEF.Filtering.plan_filter(ug, kern, 8000.0; backend = gpu, method = CGEF.Filtering.RealSpace()),
+            o = zeros(nn * nn)
+            Test.@test length(CGEF.Filtering.build_footprint(ug, kern, 8000.0).nbrs) >
+                       4 * length(CGEF.Filtering.build_footprint(ug, kern, 2000.0).nbrs)
+            CGEF.Filtering.filter_apply!(o, uf, p1)
+            CGEF.Filtering.filter_apply!(o, uf, p2)
+            Test.@test _alloc_filter_apply!(o, uf, p1) == _alloc_filter_apply!(o, uf, p2)
         end
     end
 
@@ -471,6 +486,33 @@ Test.@testset "Pipeline batch axis: shared-grid, ragged, and the vertical profil
             b, u, v, g; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = SER,
             workspaces = typeof(CGEF.Diagnostics.ΠWorkspace(g))[],
         )
+    end
+
+    # Scratch the caller leaves `nothing` is built once per worker: a batch twice as long allocates
+    # exactly as much.
+    let kw = (; scales = scales, backend = SER, spectrum = CGEF.Diagnostics.NoSpectrum()),
+        u2 = cat(u, u; dims = 3), v2 = cat(v, v; dims = 3),
+        b1 = P.CoarseGrainBatchResult(g, Ns, (Nt,)), b2 = P.CoarseGrainBatchResult(g, Ns, (2Nt,))
+        P.coarse_grain_batch!(b1, u, v, g; kw...)
+        P.coarse_grain_batch!(b2, u2, v2, g; kw...)
+        Test.@test _alloc_coarse_grain_batch!(b2, u2, v2, g, kw) == _alloc_coarse_grain_batch!(b1, u, v, g, kw)
+        for t in 1:Nt
+            Test.@test same(b2.slices[Nt + t], refs[t])
+        end
+    end
+
+    # The Distributed driver (on the caller, with no workers added) and the MPI driver (one rank).
+    let bd = P.CoarseGrainBatchResult(g, Ns, (Nt,); alloc = P.batch_alloc_shared),
+        bm = P.CoarseGrainBatchResult(g, Ns, (Nt,))
+        kw = (; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum())
+        P.coarse_grain_batch!(bd, u, v, g; kw..., backend = CB.DistributedBackend())
+        P.coarse_grain_batch!(bm, u, v, g; kw..., backend = CB.MPIBackend())
+        for t in 1:Nt
+            Test.@test same(bd.slices[t], refs[t])
+            Test.@test same(bm.slices[t], refs[t])
+        end
+        Test.@test_throws ArgumentError P.coarse_grain_batch!(
+            P.CoarseGrainBatchResult(g, Ns, (Nt,)), u, v, g; kw..., backend = CB.DistributedBackend())
     end
 
     # The grid fixes the spatial rank; everything past it is batch, and a mismatch is an error.

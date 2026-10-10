@@ -393,7 +393,7 @@ function compute_Π!(
     analyzed = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     _validate_field_sizes(grid, Π, u, v, w)
-    ws = workspace === nothing ? ΠWorkspace(grid; has_w = w !== nothing) : workspace
+    ws = workspace === nothing ? ΠWorkspace(grid, (), Val(w !== nothing)) : workspace
     _check_workspace_w(ws, w)
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend, method=method) : filter_plan
@@ -429,7 +429,7 @@ function compute_Π!(
     analyzed = nothing,
 ) where {T<:AbstractFloat}
     _validate_field_sizes(grid, Π, u, v, w)
-    ws = workspace === nothing ? ΠWorkspace(grid; has_w = w !== nothing) : workspace
+    ws = workspace === nothing ? ΠWorkspace(grid, (), Val(w !== nothing)) : workspace
     _check_workspace_w(ws, w)
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend) : filter_plan
@@ -470,7 +470,7 @@ function compute_Π!(
     deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _validate_field_sizes(grid, Π, u, v, w)
-    ws = workspace === nothing ? ΠWorkspace(grid; has_w = w !== nothing) : workspace
+    ws = workspace === nothing ? ΠWorkspace(grid, (), Val(w !== nothing)) : workspace
     _check_workspace_w(ws, w)
     dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
     plan = filter_plan === nothing ?
@@ -566,7 +566,7 @@ function compute_Π!(
     deriv_plan::Union{Nothing, Derivatives.StencilPlan} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     _validate_field_sizes(grid, Π, u, v, w)
-    ws = workspace === nothing ? ΠWorkspace(grid; has_w = w !== nothing) : workspace
+    ws = workspace === nothing ? ΠWorkspace(grid, (), Val(w !== nothing)) : workspace
     _check_workspace_w(ws, w)
     dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
     plan = filter_plan === nothing ?

@@ -862,17 +862,12 @@ end
 # The banded engine is the one whose device kernel carries a batch index, so it is the one that can take
 # the fused launch. Every other engine falls to the slice loop in `filter_apply_batched!` rather than a
 # kernel that would silently ignore the batch axis.
-# `plan.footprint` on a GPU plan is the DEVICE-resident footprint that `prepare_workspace` produced, not
-# the host `FilterFootprint` — testing for the host type here silently disables the fused path.
-# Structured grids pre-upload at `plan_filter` time so the plan already holds a device-resident
-# footprint; a node grid does not, so its plan still holds the host `NodeFilterPlan` and `_resident`
-# uploads at apply time. Both spellings therefore have to be accepted, or the fused path is silently
-# disabled for exactly the grid architecture that needs it most.
+# `plan.footprint` on a GPU plan is the device-resident footprint `prepare_workspace` produced at
+# `plan_filter` time, for every grid architecture.
 CGEF.Filtering._gpu_batched_supported(plan::CGEF.Filtering.PhysicalFilterPlan) =
     plan.footprint isa Union{GPUBandedFootprint, GPUSeparable, GPUNodeFootprint, GPUFootprintND, GPUSeparableND,
                              GPUScatteredCached, GPUScatteredNDCached, GPUStreaming,
-                             GPUPrefixSum, GPUPrefixSum3D,
-                             CGEF.Filtering.NodeFilterPlan}
+                             GPUPrefixSum, GPUPrefixSum3D}
 
 # Node grids: the spatial rank is 1, so a batch is a `(Nnodes, Nb)` matrix rather than a 3-D array.
 function CGEF.Filtering.gpu_filter_field_batched!(

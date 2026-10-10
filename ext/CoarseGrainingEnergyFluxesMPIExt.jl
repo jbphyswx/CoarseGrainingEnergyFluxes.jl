@@ -202,18 +202,18 @@ function CGEF.Filtering.mpi_filter_field!(
     return out
 end
 
-# Batch-parallel PIPELINE sweeps across ranks: each rank takes a round-robin stride of slices, and the
-# five batched arrays are assembled with an in-place Allreduce. Every slice's columns are written by
-# exactly one rank, so summing zero-initialized partials reproduces the full result — including
-# `scales` and `wavenumber`, which are per-slice views rather than shared vectors.
+# Batch-parallel pipeline sweeps across ranks: each rank takes a round-robin stride of slices, run from
+# one scratch set it builds once, and the five batched arrays are assembled with an in-place Allreduce.
+# Every slice's columns are written by exactly one rank, so summing zero-initialized partials reproduces
+# the full result, `scales` and `wavenumber` included (they are per-slice views).
 function CGEF.Pipeline.mpi_coarse_grain_batch!(batch, u, v, w, grid, valR, ctx)
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nproc = MPI.Comm_size(comm)
     _zero_batch!(batch)
-    for t in (rank + 1):nproc:length(batch.slices)
-        CGEF.Pipeline.coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, t, 1)
-    end
+    mine = (rank + 1):nproc:length(batch.slices)
+    isempty(mine) || CGEF.Pipeline._run_slices!(batch, u, v, w, grid, valR, ctx, mine,
+                                                CGEF.Pipeline._worker_scratch(ctx, grid, w, 1))
     MPI.Allreduce!(batch.Π, +, comm)
     MPI.Allreduce!(batch.scales, +, comm)
     MPI.Allreduce!(batch.cumulative_energy, +, comm)

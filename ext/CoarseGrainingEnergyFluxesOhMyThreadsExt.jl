@@ -349,17 +349,17 @@ end
 # step. Slices write disjoint views of the batched result, so this needs no synchronization, and the
 # inner sweep is forced serial so the two levels of threading never nest.
 #
-# Scratch is pooled per WORKER: chunk the flat slice list and let each chunk own pool entry `ci`, so
-# pool memory is bounded by thread count rather than by batch length. No longest-first ordering here —
-# one shared grid makes every slice the same cost, unlike `threaded_coarse_grain_slices!`.
+# Scratch is pooled per worker: each chunk of the flat slice list owns pool entry `ci`, built inside its
+# task when the caller supplied none, so pool memory is bounded by the thread count. Slices share one
+# grid and cost the same, so the chunks are equal and unordered.
 function CGEF.Pipeline.threaded_coarse_grain_batch!(batch, u, v, w, grid, valR, ctx)
     n = length(batch.slices)
+    n == 0 && return batch
     groups = OhMyThreads.chunks(1:n; n = CGEF.Pipeline.batch_concurrency(ctx, n))
     _farm() do
         OhMyThreads.tforeach(enumerate(groups); scheduler = _sched()) do (ci, group)
-            for t in group
-                CGEF.Pipeline.coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, t, ci)
-            end
+            CGEF.Pipeline._run_slices!(batch, u, v, w, grid, valR, ctx, group,
+                                       CGEF.Pipeline._worker_scratch(ctx, grid, w, ci))
         end
     end
     return batch

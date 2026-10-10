@@ -74,6 +74,29 @@ Test.@testset "Distributed nonuniform-FFT spectral filtering on $(Distributed.nw
     end
 end
 
+# Each worker sweeps a contiguous block of slices from one scratch set into the shared result, so every
+# slice equals the serial sweep of that slice.
+Test.@testset "Distributed coarse_grain_batch! on $(Distributed.nworkers()) workers" begin
+    P = CGEF.Pipeline
+    xs = 0.0:1000.0:23e3
+    mask = trues(24, 24); mask[8:12, 6:9] .= false
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs, mask)
+    scales = [4e3, 8e3]
+    kern = CGEF.GaussianKernel()
+    Random.seed!(3)
+    Nt = 5
+    u = randn(24, 24, Nt); v = randn(24, 24, Nt)
+    b = P.CoarseGrainBatchResult(grid, length(scales), (Nt,); alloc = P.batch_alloc_shared)
+    P.coarse_grain_batch!(b, u, v, grid; scales, kernel = kern, backend = CB.DistributedBackend())
+    for t in 1:Nt
+        r = CGEF.coarse_grain(view(u, :, :, t), view(v, :, :, t), grid; scales, kernel = kern,
+                              backend = CB.SerialBackend())
+        Test.@test b.slices[t].Π == r.Π
+        Test.@test b.slices[t].cumulative_energy == r.cumulative_energy
+        Test.@test b.slices[t].filtering_spectrum == r.filtering_spectrum
+    end
+end
+
 Test.@testset "Distributed NUSHT spectral filtering on $(Distributed.nworkers()) workers" begin
     M = 400
     θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]

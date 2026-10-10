@@ -445,7 +445,7 @@ function coarse_grain(
     spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.AutoSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
-    workspace = Diagnostics.ΠWorkspace(grid; has_w = w !== nothing)
+    workspace = Diagnostics.ΠWorkspace(grid, (), Val(w !== nothing))
     return coarse_grain!(
         result, u, v, w, grid;
         scales = scales, kernel = kernel, workspace = workspace,
@@ -542,7 +542,7 @@ function coarse_grain!(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     _check_result_shape(result, grid, scales)
     policy = _check_spectrum(kernel, spectrum)
-    ws = workspace === nothing ? Diagnostics.ΠWorkspace(grid; has_w = w !== nothing) : workspace
+    ws = workspace === nothing ? Diagnostics.ΠWorkspace(grid, (), Val(w !== nothing)) : workspace
     # The filtered fields are read, differenced and averaged on the grid the strategy defines them on.
     og = Diagnostics.output_grid(grid, mask_strategy)
     dplan = _deriv_plan(og, deriv_plan)
@@ -605,12 +605,10 @@ _batch_driver!(backend::ComputationalBackends.AbstractExecutionBackend, args...)
     "coarse_grain_batch! has no batch driver for $(typeof(backend))",
 ))
 
-# Host-serial slice loop.
+# Host-serial slice loop over one set of scratch.
 function _batch_driver!(::ComputationalBackends.SerialBackend, batch, u, v, w, grid, valR, ctx)
-    for t in eachindex(batch.slices)
-        coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, t, 1)
-    end
-    return batch
+    isempty(batch.slices) && return batch
+    return _run_slices!(batch, u, v, w, grid, valR, ctx, eachindex(batch.slices), _worker_scratch(ctx, grid, w, 1))
 end
 
 # GPU: batch-native, and deliberately NOT the slice loop the host backends use. A device launch covering
@@ -629,7 +627,7 @@ function _batch_driver!(
 ) where {R}
     T = eltype(batch.Π)
     ws = ctx.workspaces === nothing ?
-        Diagnostics.ΠWorkspace(grid, batch.batch_size; has_w = w !== nothing) : _pool_get(ctx.workspaces, 1)
+        Diagnostics.ΠWorkspace(grid, batch.batch_size, Val(w !== nothing)) : _pool_get(ctx.workspaces, 1)
     # This driver hands the WHOLE batch to `compute_Π!`, so the workspace must be sized for the batch. A
     # slice-sized one leaves the scratch at the grid's rank while the fields carry a batch axis, and the
     # mismatch surfaces deep inside as a backend hook that has no method for the wider array — an error
@@ -854,13 +852,13 @@ function _check_batch_shape(
 end
 
 """
-    coarse_grain_batch_slice!(batch, u, v, w, grid, Val(R), ctx, t, p) -> batch.slices[t]
+    coarse_grain_batch_slice!(batch, u, v, w, grid, Val(R), ctx, t, scratch) -> batch.slices[t]
 
-Slice `t`'s sweep, drawing scratch from pool entry `p` and forcing the inner backend serial. Shared by
-the serial loop and every parallel driver so all of them run identical code.
+Slice `t`'s sweep on one worker's `scratch` (see `_worker_scratch`), with the inner backend `ctx.inner`.
+Shared by the serial loop and every parallel driver so all of them run identical code.
 """
 function coarse_grain_batch_slice!(
-    batch::CoarseGrainBatchResult, u, v, w, grid, ::Val{R}, ctx, t::Integer, p::Integer,
+    batch::CoarseGrainBatchResult, u, v, w, grid, ::Val{R}, ctx, t::Integer, scratch::NamedTuple,
 ) where {R}
     J = CartesianIndices(batch.batch_size)[t]
     return coarse_grain!(
@@ -869,9 +867,9 @@ function coarse_grain_batch_slice!(
         grid;
         scales = ctx.scales,
         kernel = ctx.kernel,
-        workspace = _pool_get(ctx.workspaces, p),
-        filter_plans = _pool_get(ctx.filter_plans, p),
-        deriv_plan = _pool_get(ctx.deriv_plans, p),
+        workspace = scratch.workspace,
+        filter_plans = scratch.filter_plans,
+        deriv_plan = scratch.deriv_plan,
         backend = ctx.inner,
         mask_strategy = ctx.mask_strategy,
         method = ctx.method,
@@ -902,6 +900,36 @@ pools than `nthreads()` deliberately caps concurrency rather than aliasing scrat
 function batch_concurrency(ctx, nslices::Integer)
     np = _pool_length(ctx)
     return min(nslices, np === nothing ? Threads.nthreads() : np)
+end
+
+"""
+    _worker_scratch(ctx, grid, w, p) -> (; workspace, filter_plans, deriv_plan)
+
+One worker's scratch for a batch sweep: entry `p` of each pool the caller supplied, and a workspace,
+per-scale filter plans or derivative plan built here for each pool left `nothing`. A worker builds it
+once and runs every one of its slices on it.
+"""
+function _worker_scratch(ctx, grid, w, p::Integer)
+    workspace = ctx.workspaces !== nothing ? ctx.workspaces[p] :
+        Diagnostics.ΠWorkspace(grid, (), Val(w !== nothing))
+    filter_plans = ctx.filter_plans !== nothing ? ctx.filter_plans[p] :
+        _plan_filter_sweep(grid, ctx.kernel, ctx.scales, ctx.mask_strategy, ctx.inner, ctx.method)
+    deriv_plan = ctx.deriv_plans !== nothing ? ctx.deriv_plans[p] :
+        _deriv_plan(Diagnostics.output_grid(grid, ctx.mask_strategy), nothing)
+    return (; workspace, filter_plans, deriv_plan)
+end
+
+"""
+    _run_slices!(batch, u, v, w, grid, Val(R), ctx, slices, scratch) -> batch
+
+Sweep each slice in `slices` on one worker's `scratch`, behind a function barrier so the loop compiles
+against the scratch's concrete type.
+"""
+function _run_slices!(batch, u, v, w, grid, valR, ctx, slices, scratch)
+    for t in slices
+        coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, t, scratch)
+    end
+    return batch
 end
 
 # Pools are indexed by worker, so they must agree in length or a chunk index valid for one is out of
@@ -1263,7 +1291,7 @@ function coarse_grain(
     spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.AutoSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
-    workspace = Diagnostics.ΠWorkspace(grid; has_w = w !== nothing)
+    workspace = Diagnostics.ΠWorkspace(grid, (), Val(w !== nothing))
     deriv_plan = Derivatives.gradient_plan(Diagnostics.output_grid(grid, mask_strategy))
     return coarse_grain!(
         result, u, v, w, grid;
@@ -1327,7 +1355,7 @@ function coarse_grain(
     spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.AutoSpectrum(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales))
-    workspace = Diagnostics.ΠWorkspace(grid; has_w = w !== nothing)
+    workspace = Diagnostics.ΠWorkspace(grid, (), Val(w !== nothing))
     deriv_plan = Derivatives.gradient_plan(Diagnostics.output_grid(grid, mask_strategy))
     return coarse_grain!(
         result, u, v, w, grid;
