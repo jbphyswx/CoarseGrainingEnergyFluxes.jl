@@ -53,6 +53,10 @@ end
 @inline _batch_dims(A::AbstractArray, grid) =
     _batch_dims(A, Val(length(FlowGeometries.Grids.size_tuple(grid))))
 
+# The grid's own index within the index of a field whose trailing axes are a batch, and the grid's rank.
+@inline _grid_index(I::CartesianIndex, ::Val{R}) where {R} = ntuple(d -> I[d], Val(R))
+@inline _grid_rank(grid) = Val(length(FlowGeometries.Grids.size_tuple(grid)))
+
 # The fields a flux computation filters, in the order their spectra are stored. Every one of them is a
 # RAW input — the velocities and their products — so none depends on the filter scale, which is what lets
 # a sweep transform them once and only synthesize per scale.
@@ -99,9 +103,10 @@ function _fill_planetary!(
 ) where {G, T<:AbstractFloat}
     has_w = w !== nothing
     geo = FlowGeometries.Grids.grid_geometry(grid)
+    valR = _grid_rank(grid)
     px, py, pz = p
     for I in CartesianIndices(px)
-        let i = Tuple(I)
+        let i = _grid_index(I, valR)
             if FlowGeometries.Grids.isactive(grid, i...)
                 λ, φ = FlowGeometries.Grids.coords(grid, i...)
                 p_vel = FlowGeometries.Geometry.vector_to_cartesian(
@@ -131,9 +136,10 @@ function _planetary_to_local!(
     l::Tuple, p::NTuple{3,AbstractArray}, grid::FlowGeometries.Grids.AbstractGrid{G,T},
 ) where {G, T<:AbstractFloat}
     geo = FlowGeometries.Grids.grid_geometry(grid)
+    valR = _grid_rank(grid)
     px, py, pz = p
     for I in CartesianIndices(px)
-        i = Tuple(I)
+        i = _grid_index(I, valR)
         if FlowGeometries.Grids.isactive(grid, i...)
             λ, φ = FlowGeometries.Grids.coords(grid, i...)
             loc = FlowGeometries.Geometry.vector_from_cartesian(geo, px[I], py[I], pz[I], λ, φ)

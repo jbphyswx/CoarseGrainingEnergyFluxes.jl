@@ -135,7 +135,9 @@ function _fill_stress_strain!(
     analyzed = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     has_w = w !== nothing
+    # Every field index, batch axes included; `_grid_index` is the grid's own part of one.
     cells = CartesianIndices(ws.u_filt)
+    valR = _grid_rank(grid)
     ograd = output_grid(grid, plan)
 
     if G <: FlowGeometries.Geometry.CartesianGeometry{T}
@@ -234,7 +236,7 @@ function _fill_stress_strain!(
 
         # Transform filtered planetary velocities back to local coordinates (u_filt, v_filt, w_filt)
         for I in cells
-            let i = Tuple(I)
+            let i = _grid_index(I, valR)
                 if FlowGeometries.Grids.isactive(ograd, i...)
                     λ, φ = FlowGeometries.Grids.coords(grid, i...)
                     l_vel = FlowGeometries.Geometry.vector_from_cartesian(FlowGeometries.Grids.grid_geometry(grid), ws.ux_filt[I], ws.uy_filt[I], ws.uz_filt[I], λ, φ)
@@ -258,7 +260,7 @@ function _fill_stress_strain!(
         # cross terms feed the rotated τee/τen/τnn. Only τer/τnr/τrr are genuinely radial.
         geo = FlowGeometries.Grids.grid_geometry(grid)
         for I in cells
-            let i = Tuple(I)
+            let i = _grid_index(I, valR)
                 if FlowGeometries.Grids.isactive(ograd, i...)
                     λ, φ = FlowGeometries.Grids.coords(grid, i...)
                     txx = ws.uu_filt[I] - ws.ux_filt[I] * ws.ux_filt[I]
@@ -299,7 +301,7 @@ function _fill_stress_strain!(
 
         R = FlowGeometries.Geometry.radius(geo)
         for I in cells
-            let i = Tuple(I)
+            let i = _grid_index(I, valR)
                 if FlowGeometries.Grids.isactive(ograd, i...)
                     _, φ = FlowGeometries.Grids.coords(grid, i...)
                     sinφ, cosφ = sincos(φ)

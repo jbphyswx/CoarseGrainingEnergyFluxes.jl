@@ -750,6 +750,37 @@ Test.@testset "Batch-native flux path: compute_Π!, energy_from_filtered!, GPU d
         end
     end
 
+    # The same on a lon-lat sphere, where the flux rotates the velocity into planetary Cartesian
+    # components point by point; a slice of the batch reads its point's coordinates.
+    let R = 6.371e6, lon = deg2rad.(collect(0.0:15.0:345.0)), lat = deg2rad.(collect(-60.0:12.0:60.0))
+        sgeo = FG.Geometry.SphericalGeometry(R)
+        smsk = trues(length(lon), length(lat))
+        smsk[3:6, 4:6] .= false
+        Nx, Ny = length(lon), length(lat)
+        sc = deg2rad(30.0) * R
+        kern = CGEF.GaussianKernel()
+        for g in (FG.Grids.StructuredGrid(sgeo, lon, lat, trues(Nx, Ny)),
+                  FG.Grids.StructuredGrid(sgeo, lon, lat, smsk))
+            dp = CGEF.Derivatives.StencilPlan(g)
+            u = randn(Nx, Ny, Nb)
+            v = randn(Nx, Ny, Nb)
+            for be in (CB.SerialBackend(), CB.GPUBackend(KA.CPU()))
+                plan = F.plan_filter(g, kern, sc; backend = be, mask_strategy = F.Deformable())
+                kw = (; filter_plan = plan, backend = be, mask_strategy = F.Deformable(), deriv_plan = dp)
+                ref = zeros(Nx, Ny, Nb)
+                ws1 = D.ΠWorkspace(g)
+                for b in 1:Nb
+                    D.compute_Π!(view(ref, :, :, b), view(u, :, :, b), view(v, :, :, b), nothing,
+                                 g, kern, sc; workspace = ws1, kw...)
+                end
+                got = zeros(Nx, Ny, Nb)
+                D.compute_Π!(got, u, v, nothing, g, kern, sc; workspace = D.ΠWorkspace(g, (Nb,)), kw...)
+                Test.@test maximum(abs, ref) > 0
+                Test.@test got == ref
+            end
+        end
+    end
+
     # A batch is only well-posed if every field agrees on it: matching the leading axes alone would let a
     # 3-slice u pair with a 5-slice v and silently truncate against the shorter one.
     let g = FG.Grids.StructuredGrid(cart, xs, xs),
