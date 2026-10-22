@@ -1,56 +1,55 @@
 # ---------------------------------------------------------------------------
-# Cache strategy: how much of the nonuniform-axis/curvilinear/ND real-space footprint to precompute
-# and store, vs. recompute on the fly at apply time (singleton types — specializable, same idiom as
-# AbstractMaskStrategy).
+# Cache strategy for the neighbour lists of nonuniform real-space footprints
 # ---------------------------------------------------------------------------
 
 """
     AbstractCacheStrategy
 
-Whether a real-space footprint over a genuinely nonuniform axis (`StructuredGrid` with a `Vector`
-axis, `CurvilinearGrid`, or ND with a non-`Range` axis) stores its full per-point neighbour list, or
-recomputes it on the fly at apply time. The per-point neighbour/weight computation itself is always
-the same either way (there is no shared translation-invariant table to exploit on a nonuniform axis,
-unlike the `FilterFootprint` fast path) — this only controls whether that computation's RESULT is
-kept in memory for reuse across separate future `filter_apply!` calls, or re-derived each time.
+Whether a real-space footprint over a nonuniform axis (`StructuredGrid` with a `Vector` axis,
+`CurvilinearGrid`, or ND with a non-`Range` axis) stores its per-point neighbour list for reuse across
+`filter_apply!` calls, or recomputes it at every apply. Both give the same neighbours and weights.
 """
 abstract type AbstractCacheStrategy end
 
 """
     AutoCache <: AbstractCacheStrategy
 
-Build and store the full per-point neighbour-list cache only if its size is within `cache_byte_budget`
-(default [`DEFAULT_CACHE_BYTE_BUDGET`](@ref)); otherwise recompute neighbours on the fly at apply time.
-The size is the exact entry count, taken through the ball query the build runs before anything is
-allocated, and the count stops once it passes the budget. This is the only cache-strategy knob most callers ever need —
-it caches whenever doing so is affordable, which is strictly better than not caching whenever a
-plan will be reused across more than one `filter_apply!` call.
+Store the per-point neighbour-list cache when it fits in `cache_byte_budget` (default
+[`default_cache_byte_budget`](@ref)), and recompute neighbours at apply time otherwise. The size is the
+exact entry count, counted by the build's ball query before anything is allocated; counting stops once
+it passes the budget.
 """
 struct AutoCache <: AbstractCacheStrategy end
 
 """
     AlwaysCache <: AbstractCacheStrategy
 
-Force building the full per-point neighbour-list cache regardless of `cache_byte_budget` — for a
-caller who knows more memory is available than the conservative default budget assumes.
+Store the per-point neighbour-list cache whatever its size; `cache_byte_budget` is ignored.
 """
 struct AlwaysCache <: AbstractCacheStrategy end
 
 """
     NeverCache <: AbstractCacheStrategy
 
-Force recomputing neighbours on the fly at every `filter_apply!`/`filter_apply_batch!` call, never
-storing the cache — for a genuine, known memory ceiling `AutoCache`'s budget check doesn't already
-account for (e.g. a GPU's device memory budget, or deliberately running many large plans
-concurrently). Not a speed/memory preference: for any workflow that reuses a plan across more than
-one call, caching is strictly better whenever it fits in memory, so this should be reached for only
-when a specific external memory constraint is known, not by default.
+Recompute neighbours at every `filter_apply!`/`filter_apply_batch!` call and store no cache, for a
+memory ceiling `cache_byte_budget` does not cover, such as a GPU's device memory.
 """
 struct NeverCache <: AbstractCacheStrategy end
 
 """
-    DEFAULT_CACHE_BYTE_BUDGET
+    default_cache_byte_budget() -> Int
 
-Default byte budget for [`AutoCache`](@ref)'s size check on a real-space footprint cache (256 MiB).
+[`AutoCache`](@ref)'s default byte budget: a quarter of the memory available to the process
+(`Sys.total_memory()`, which honours a cgroup limit), shared by every scale of a sweep.
 """
-const DEFAULT_CACHE_BYTE_BUDGET = 256 * 1024^2
+default_cache_byte_budget() = Int(Sys.total_memory() ÷ 4)
+
+"""
+    _cache_keep(strategy, budget, entry_bytes) -> (n -> Bool)
+
+Whether a neighbour cache of `n` entries is kept under `strategy`: always, never, or while it fits the
+byte budget.
+"""
+_cache_keep(::AlwaysCache, _, _) = Returns(true)
+_cache_keep(::NeverCache, _, _) = Returns(false)
+_cache_keep(::AutoCache, budget::Integer, entry_bytes::Integer) = n -> n <= Int(budget) ÷ entry_bytes

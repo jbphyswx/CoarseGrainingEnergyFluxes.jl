@@ -18,24 +18,44 @@ function _exterior_mass(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::Kernels.AbstractFilterKernel, scale::T,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
     dim = _kernel_dim(grid)
-    rad = Kernels.kernel_radius(kernel, scale, dim)
+    rad = _query_radius(grid, kernel, scale)
     lattice = _exterior_lattice(grid, rad)
     lattice === nothing && return nothing
     ext, lo, extended = lattice
-    return _exterior_mass(ext, lo, extended, FlowGeometries.Grids.size_tuple(grid), kernel, scale, rad, dim)
+    # A uniform periodic axis 1 the continuation leaves alone maps the continued lattice onto itself
+    # under a shift along it, so every target of a row has the row's first target's mass.
+    ring = !first(extended) && FlowGeometries.Grids.isperiodic(grid, 1) &&
+           FlowGeometries.Grids.coordinates(grid, 1) isa AbstractRange
+    return _exterior_mass(ext, lo, extended, FlowGeometries.Grids.size_tuple(grid), kernel, scale, rad, dim, ring)
 end
 
-# Each direction continues as a `Range` or as a `Vector` depending on how far it reaches, so `ext`'s type
-# is known only here, past the call.
+# A `HighOrderKernel`'s weights past the edge are those of each cell's own correction.
+function _exterior_mass(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::Kernels.HighOrderKernel, scale::T,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
+    rad = _query_radius(grid, kernel, scale)
+    lattice = _ho_lattice(grid, rad)
+    lattice === nothing && return nothing
+    mt = _query_topology(grid, rad)
+    fold = (f, acc, I) -> FlowGeometries.Connectivity.fold_within(
+        f, acc, grid, I...;
+        ball = rad, self = true, active_only = false, topology = mt,
+        images = FlowGeometries.Connectivity.NearestImage(),
+    )
+    _, exterior, _ = _highorder_targets(grid, kernel, scale, rad, fold, lattice, Returns(false))
+    return exterior
+end
+
 function _exterior_mass(
     ext::FlowGeometries.Grids.StructuredGrid{T,G,N}, lo::NTuple{N,Int}, extended::NTuple{N,Bool},
-    dims::NTuple{N,Int}, kernel::Kernels.AbstractFilterKernel, scale::T, rad::T, dim::Val,
+    dims::NTuple{N,Int}, kernel::Kernels.AbstractFilterKernel, scale::T, rad::T, dim::Val, ring::Bool,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
     mt = _query_topology(ext, rad)
     images = _image_convention(ext)
     E = zeros(T, dims)
     reached = false
-    for I in CartesianIndices(dims)
+    targets = ring ? CartesianIndices((1:1, Base.tail(map(n -> 1:n, dims))...)) : CartesianIndices(dims)
+    for I in targets
         Ie = ntuple(d -> I[d] + lo[d], Val(N))
         w = FlowGeometries.Connectivity.metric_window(ext, Ie, rad, mt)
         _window_inside(Ie, w, lo, dims, extended) && continue
@@ -46,7 +66,13 @@ function _exterior_mass(
             _inside(J, lo, dims) ? acc :
                 acc + Kernels.kernel_weight(kernel, T(d), scale, dim) * FlowGeometries.Grids.area(ext, J...)
         end
-        @inbounds E[I] = m
+        if ring
+            @inbounds for i in 1:dims[1]
+                E[i, Base.tail(Tuple(I))...] = m
+            end
+        else
+            @inbounds E[I] = m
+        end
         reached |= !iszero(m)
     end
     return reached ? E : nothing
@@ -69,7 +95,7 @@ window can leave the grid, so a strategy check built on it never accepts a misma
 function _reaches_exterior(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::Kernels.AbstractFilterKernel, scale::T,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
-    rad = Kernels.kernel_radius(kernel, scale, _kernel_dim(grid))
+    rad = _query_radius(grid, kernel, scale)
     geo = FlowGeometries.Grids.grid_geometry(grid)
     return any(ntuple(d -> _axis_counts(geo, grid, d, rad, true) != (0, 0), Val(N)))
 end
@@ -82,8 +108,7 @@ of a cell of `grid`, as a grid of the same geometry and closure; `lo[d]` exterio
 grid's own along direction `d`, and `extended[d]` says whether direction `d` gained any.
 
 `cap = false` continues each direction by the rows centred on its lattice only, leaving out the cap row
-between an end face and the pole. That is the node set's completion: its harmonic fit weights every
-node alike, and a cap row can cover a sliver of the sphere with as many nodes as a lattice row.
+between an end face and the pole.
 """
 function _exterior_lattice(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, rad::T; cap::Bool = true,
@@ -92,28 +117,34 @@ function _exterior_lattice(
     parts = ntuple(d -> _axis_extension(geo, grid, d, rad, cap), Val(N))
     extended = map(p -> p[1] > 0 || p[2] > 0, parts)
     any(extended) || return nothing
-    closure = ntuple(d -> _ext_closure(geo, grid, d, extended[d]), Val(N))
+    closure = ntuple(d -> _ext_closure(geo, grid, d), Val(N))
     ext = FlowGeometries.Grids.StructuredGrid(
         geo, map(p -> p[3], parts)...; topology = map(first, closure), period = map(last, closure),
     )
-    return _exact_continued_measure(ext, geo, parts), map(p -> p[1], parts), extended
+    return _exact_continued_measure(ext, geo, grid, parts), map(p -> p[1], parts), extended
 end
 
-# The lattice's measure, with each continued cell's factor the exact integral between its own faces. The
-# lattice places faces midway between centres, which a cell cut at a pole or at the origin, centred on
-# the part that remains, does not satisfy.
-_exact_continued_measure(ext, ::FlowGeometries.Geometry.AbstractGeometry, parts) = ext
+# `ext` with each continued cell's measure factor the exact integral between its own faces; a cell cut at
+# a pole or the origin has faces off the midpoints between centres. The grid's own columns keep the
+# grid's longitude factors, so the columns beside a regional box's seam leave its gap uncovered.
+_exact_continued_measure(ext, ::FlowGeometries.Geometry.AbstractGeometry, _, _) = ext
 
 function _exact_continued_measure(
     ext::FlowGeometries.Grids.StructuredGrid{T,G,N}, geo::FlowGeometries.Geometry.AbstractSphericalGeometry{T},
-    parts,
+    grid::FlowGeometries.Grids.StructuredGrid, parts,
 ) where {T<:AbstractFloat, G, N}
     N >= 2 || return ext
     factors = FlowGeometries.Grids.measure_factors(ext)
+    own = FlowGeometries.Grids.measure_factors(grid)
     exact = ntuple(Val(N)) do d
         n_lo, n_hi, axis, faces = parts[d]
-        (d == 1 || d > 3 || faces === nothing) && return factors[d]
         f = collect(T, factors[d])
+        if d == 1
+            @inbounds for i in 1:(length(axis) - n_lo - n_hi)
+                f[n_lo + i] = T(own[1][i])
+            end
+        end
+        (d == 1 || d > 3) && return f
         lo_a, lo_b, hi_a, hi_b = faces
         nλ = length(FlowGeometries.Grids.coordinates(ext, 1))
         for k in 1:n_lo
@@ -142,10 +173,12 @@ end
     return N == 2 ? R * R * s : s
 end
 
-# `(topology, period)` of direction `d` of the continued lattice: the grid's own, except a regional
-# longitude continued around the ring, which closes with period 2π.
-function _ext_closure(geo::FlowGeometries.Geometry.AbstractGeometry{T}, grid, d::Int, extended::Bool) where {T}
-    if geo isa FlowGeometries.Geometry.AbstractSphericalGeometry && d == 1 && extended
+# `(topology, period)` of direction `d` of the continued lattice: the grid's own, except a longitude of
+# more than one column, which identifies, so the lattice closes it with period 2π whether or not the
+# grid's cells reach round.
+function _ext_closure(geo::FlowGeometries.Geometry.AbstractGeometry{T}, grid, d::Int) where {T}
+    if geo isa FlowGeometries.Geometry.AbstractSphericalGeometry && d == 1 &&
+       length(FlowGeometries.Grids.coordinates(grid, 1)) > 1
         return (FlowGeometries.Grids.Periodic(), T(2π))
     end
     periodic = FlowGeometries.Grids.isperiodic(grid, d)
@@ -170,17 +203,18 @@ _spans_sphere(::FlowGeometries.Geometry.AbstractSphericalGeometry, grid, d::Int)
 
 # `(n_lo, n_hi, axis, faces)`: direction `d` continued by `n_lo` cells below its first and `n_hi` above
 # its last, each at the spacing of the gap it continues. `faces = (lo_a, lo_b, hi_a, hi_b)` bounds each
-# continued cell, the `k`-th away from its end at index `k`.
+# continued cell, the `k`-th away from its end at index `k`. Every direction is a `Vector`, so the
+# lattice's type follows from the grid's.
 function _axis_extension(
     geo::FlowGeometries.Geometry.AbstractGeometry{T}, grid, d::Int, rad::T, cap::Bool,
 ) where {T<:AbstractFloat}
     x = FlowGeometries.Grids.coordinates(grid, d)
     n = length(x)
     n_lo, n_hi = _axis_counts(geo, grid, d, rad, cap)
-    (n_lo == 0 && n_hi == 0) && return (0, 0, x, nothing)
+    (n_lo == 0 && n_hi == 0) && return (0, 0, collect(T, x), (T[], T[], T[], T[]))
     lo_c, lo_a, lo_b = _continued_cells(geo, d, T(x[1]), -T(x[2] - x[1]), n_lo)
     hi_c, hi_a, hi_b = _continued_cells(geo, d, T(x[n]), T(x[n] - x[n - 1]), n_hi)
-    axis = vcat(reverse(lo_c), T.(collect(x)), hi_c)
+    axis = vcat(reverse(lo_c), collect(T, x), hi_c)
     return (n_lo, n_hi, axis, (lo_a, lo_b, hi_a, hi_b))
 end
 

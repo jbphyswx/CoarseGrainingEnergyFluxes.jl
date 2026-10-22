@@ -36,10 +36,10 @@ end
 # ── Spherical volumetric shell: (lon, lat, radius) ────────────────────────────
 # A small regional patch at mid-latitude with roughly ISOTROPIC grid spacing in all three
 # directions (~30 km horizontal and vertical) — the true-3D method assumes one filter scale ℓ
-# applies equally in all three directions, so (unlike a real planetary atmosphere/ocean, where
-# horizontal scales are orders of magnitude larger than the vertical extent) the demo needs
-# comparable spacing to be meaningful; a fully global, planetary-vertical-extent patch would put
-# every scale below inside a single horizontal grid cell and show no scale dependence at all.
+# applies equally in all three directions, so the demo needs comparable spacing. In a real atmosphere
+# or ocean the horizontal scales are orders of magnitude larger than the vertical extent: on a global
+# patch of its full depth every scale below lies inside a single horizontal grid cell and shows no
+# scale dependence.
 R = 6.371e6
 sgeom = FG.Geometry.SphericalGeometry(R)
 lon = deg2rad.(collect(0.0:0.3:3.3))                # ~28 km spacing at this latitude

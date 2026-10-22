@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Masking strategy (singleton types — specializable, unlike Symbol dispatch)
+# Mask strategies
 # ---------------------------------------------------------------------------
 
 """
@@ -34,15 +34,16 @@ neither commutes with derivatives nor conserves the domain integral.
 struct Deformable <: AbstractMaskStrategy end
 
 # ---------------------------------------------------------------------------
-# Filtering method: physical direct-sum (default) vs spectral (FFT/SHT/NUFFT via extensions)
+# Filtering methods
 # ---------------------------------------------------------------------------
 
 """
     AbstractFilterMethod
 
-How the convolution is evaluated: [`RealSpace`](@ref) (physical-space footprint, any grid/mask) or
-[`Spectral`](@ref) (transform-space multiply — FFT for uniform periodic Cartesian, spherical
-harmonics for the uniform sphere, NUFFT/NUFSHT for scattered points; provided by extensions).
+How the convolution is evaluated: [`RealSpace`](@ref) (physical-space footprint, any grid/mask),
+[`AutoMethod`](@ref) (the same sum by its fastest engine) or [`Spectral`](@ref) (transform-space
+multiply, provided by extensions: an FFT on a uniform Cartesian grid, zero-padded along a bounded axis;
+spherical harmonics on a Clenshaw–Curtis sphere; a NUFFT or NUFSHT on scattered points).
 """
 abstract type AbstractFilterMethod end
 
@@ -53,7 +54,8 @@ struct RealSpace <: AbstractFilterMethod end
     Spectral <: AbstractFilterMethod
 
 Transform-space filtering (kernel applied as a multiply on the transformed field). Requires a
-spectral extension and a compatible grid (e.g. `using FFTW` for a uniform, periodic Cartesian grid).
+spectral extension and a compatible grid (e.g. `using FFTW` for a uniform Cartesian grid, periodic or
+bounded).
 """
 struct Spectral <: AbstractFilterMethod end
 
@@ -72,15 +74,13 @@ struct AutoMethod <: AbstractFilterMethod end
 """
     AbstractFilterPlan
 
-A prebuilt filter (grid + kernel + scale + mask strategy + backend) that can be applied to many
-fields without redoing setup. Physical-space backends precompute a `FilterFootprint`; the spectral
-engines hold cached transform plans. Declared ahead of `filter_field!`, whose
-`filter_plan::Union{Nothing,AbstractFilterPlan}` keyword annotation, just below, names it.
+A prebuilt filter (grid + kernel + scale + mask strategy + execution backend), applied to many fields
+with no repeated setup. A physical-space plan holds a precomputed footprint; a spectral plan holds its
+transform plans.
 """
 abstract type AbstractFilterPlan end
 
-# A plan owns transform-library plan objects, whose own `show` can walk the library's internal plan
-# tree and call into a C library from wherever the plan happens to be printed, including a worker
-# that does not own it. The type name is what a plan usefully prints.
+# A plan prints its type name only: the `show` of a transform-library plan it owns can call into a C
+# library, on a worker that does not own the plan too.
 Base.show(io::IO, p::AbstractFilterPlan) = print(io, nameof(typeof(p)), "(…)")
 Base.show(io::IO, ::MIME"text/plain", p::AbstractFilterPlan) = show(io, p)

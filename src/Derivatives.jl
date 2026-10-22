@@ -1,231 +1,53 @@
 module Derivatives
 
 using FlowGeometries: FlowGeometries
-
-export ddx!, ddy!, ddz!
-export StencilPlan
-export gradient_plan
-
-# A grid with no separable axis to difference along — curvilinear, or a node set — takes the
-# least-squares tangent-plane gradient instead: `gradient_plan(grid)` once, then
-# `Operators.gradient!(g1, g2, field, plan)`, which returns both components from one traversal.
-# Nothing of that belongs here; it is geometry and connectivity.
+using ComputationalBackends: ComputationalBackends
 
 """
-    gradient_plan(grid) -> Operators.GradientPlan
+    derivative_plan(grid; execution = SerialBackend()) -> FG.Operators.StencilPlans | FG.Operators.GradientPlan
 
-The least-squares tangent-plane gradient plan for `grid`, refusing a grid that carries no adjacency
-for it to fit.
+The derivative weights the diagnostics difference filtered fields with on `grid`: on a
+`StructuredGrid`, `FlowGeometries.Operators.stencil_plans` with 3 nodes, where a window reaching an
+inactive cell shrinks to the cell's active run (`ReduceInRun`); on any other grid, the least-squares
+`FlowGeometries.Operators.gradient_plan`, which needs the grid's adjacency. The weights are built from
+the host `grid` and held where `execution`'s loops read them.
+
+The weights depend on the grid alone: build one per grid and pass it as `deriv_plan` to every diagnostic
+taken there. Tasks may share it.
 """
-gradient_plan(grid::FlowGeometries.Grids.AbstractGrid) =
-    _gradient_plan(FlowGeometries.Grids.adjacency_source(grid), grid)
+derivative_plan(
+    grid::FlowGeometries.Grids.AbstractGrid;
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.SerialBackend(),
+) = FlowGeometries.Execution.on_backend(execution, _host_derivative_plan(grid))
 
-# A formula layout derives its neighbours from the cell id, so it always has them.
-_gradient_plan(::FlowGeometries.Grids.AbstractAdjacency, grid) =
-    FlowGeometries.Operators.gradient_plan(grid)
-
-# A node set is handed its adjacency at construction, and can be built without one.
-function _gradient_plan(::FlowGeometries.Grids.StoredMeshNeighbors, grid)
-    _require_adjacency(FlowGeometries.Grids.neighbor_nbrs(grid), grid)
-    return FlowGeometries.Operators.gradient_plan(grid)
-end
-
-# A least-squares gradient is a fit over a cell's neighbours, so a grid carrying none of them fits
-# nothing and every derivative reads zero — and a flux contracted against a zero strain is zero, with
-# no other sign that the grid was built without an adjacency. A node set gets one from `k` (the
-# k-nearest count) or from an explicit neighbour list.
-function _require_adjacency(nbrs, grid)
-    isempty(nbrs) && throw(ArgumentError(
-        "$(nameof(typeof(grid))) carries no neighbour adjacency, so a least-squares gradient has " *
-        "nothing to fit and every derivative on it is zero. Build the grid with an adjacency — " *
-        "`k = <n>` for k-nearest neighbours on a node set — or supply one explicitly.",
-    ))
-    return nothing
-end
-
-# ---------------------------------------------------------------------------
-# Structured derivatives: `Operators.derivative!` per direction.
-#
-# One set of methods for every geometry — the metric division and the pole, where `h_λ = R cos φ → 0`
-# and the derivative does not exist, are the geometry's own and are handled there. On a Cartesian
-# metric the division is the identity and costs nothing.
-# ---------------------------------------------------------------------------
-"""
-    _dd!(∂f, f, grid, d[, plan]) -> ∂f
-
-Derivative of `f` with respect to distance along direction `d`, from a [`StencilPlan`](@ref): 3 nodes
-for 2nd order on a stretched axis, as many as a shorter axis has.
-"""
-_dd!(∂f::AbstractArray{T}, f::AbstractArray{T}, grid, d::Int) where {T<:AbstractFloat} =
-    _dd!(∂f, f, grid, d, StencilPlan(grid))
-
-# `ReduceInRun` keeps the one-sided value at a mask edge, where the default writes zero. With no
-# inactive cell no window reads one, so the direct `BlankMasked` apply gives the same values.
-@inline _mask_policy(::FlowGeometries.Grids.AllActive) = FlowGeometries.Operators.BlankMasked()
-@inline _mask_policy(m::AbstractArray{Bool}) =
-    all(m) ? FlowGeometries.Operators.BlankMasked() : FlowGeometries.Operators.ReduceInRun()
+_host_derivative_plan(grid::FlowGeometries.Grids.StructuredGrid) =
+    FlowGeometries.Operators.stencil_plans(grid; nodes = 3, policy = FlowGeometries.Operators.ReduceInRun())
+_host_derivative_plan(grid::FlowGeometries.Grids.AbstractGrid) = FlowGeometries.Operators.gradient_plan(grid)
 
 """
-    ddx!(∂f∂x, f, grid[, plan]) -> ∂f∂x
+    ddz!(∂f∂z, f, grid, dz[, plan]; execution = SerialBackend()) -> ∂f∂z
 
-Derivative of `f` with respect to distance along the Eastward/λ direction.
-
-Pass a [`StencilPlan`](@ref) to reuse the weights across calls; without one they are rebuilt each time.
-The dimensionality is pinned per direction, so asking a grid for a derivative it has no axis for is a
-`MethodError` at the call rather than a bounds error inside the kernel.
-"""
-ddx!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}) where {T<:AbstractFloat,N,G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
-    _dd!(∂f, f, grid, 1)
-
-"""
-    ddy!(∂f∂y, f, grid[, plan]) -> ∂f∂y
-
-Derivative of `f` with respect to distance along the Northward/φ direction — see [`ddx!`](@ref).
-"""
-ddy!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}) where {T<:AbstractFloat,N,G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
-    _dd!(∂f, f, grid, 2)
-
-"""
-    ddz!(∂f∂z, f, grid[, plan]) -> ∂f∂z
-
-Derivative of `f` with respect to distance along the third direction of a 3D grid, which supplies the
-axis — see [`ddx!`](@ref). For a 3D field over a *2D* grid, see the `dz` method below.
-"""
-ddz!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{T,G,3}) where {T<:AbstractFloat,G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
-    _dd!(∂f, f, grid, 3)
-
-"""
-    StencilPlan(grid; order = 1, nodes = 3)
-
-The finite-difference weights of every direction of `grid`, built once. `Discretization.axis_stencils`
-per axis; the derivative is then `Operators.derivative!` reading a table it does not have to
-rebuild.
-
-The weights depend only on the axis, its wrap period and the requested order — never on a field — so a
-caller taking many derivatives on one grid should build this once and pass it. Without it each call
-rebuilds an `order`-by-`nodes` table per axis sample, which is `O(n)` work and `O(n·nodes)` garbage
-against an `O(nᴺ)` apply: negligible on a large grid, several times the whole cost on a small one.
-
-It also carries the degrade path's scratch, so a masked grid allocates nothing per call either. That
-scratch is written per cell, so a plan is **one per task** — the same contract as
-`Connectivity.ball_scratch`. Sharing one across concurrent tasks races; build one per task instead. (A
-threaded `backend` passed to `apply_stencil!` allocates its own set per chunk and ignores this one.)
-
-`compute_Π!` builds one internally when its `deriv_plan` is `nothing`.
-"""
-struct StencilPlan{N, TT<:Tuple, S}
-    tables::TT      # per direction: (indices, weights), or `nothing` where the axis is too short
-    order::Int
-    scratch::S      # Fornberg buffers for a window rebuilt at a mask edge; written per cell
-end
-
-Base.show(io::IO, p::StencilPlan{N}) where {N} =
-    print(io, "StencilPlan{", N, "}(order ", p.order, ", ",
-          count(!isnothing, p.tables), " of ", N, " directions differentiable)")
-
-function StencilPlan(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}; order::Integer = 1, nodes::Integer = 3,
-) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    ord = Int(order)
-    tables = ntuple(Val(N)) do d
-        x = FlowGeometries.Grids.coordinates(grid, d)
-        # An axis with fewer than `order + 1` samples carries no derivative of that order at all, so
-        # there is no table to build — `ReduceInRun` writes `masked` across it, which is what the
-        # apply below does directly.
-        length(x) < ord + 1 && return nothing
-        return FlowGeometries.Discretization.axis_stencils(
-            x, ord, min(Int(nodes), length(x));
-            period = FlowGeometries.Grids.isperiodic(grid, d) ?
-                     FlowGeometries.Grids.period(grid, d) : nothing,
-        )
-    end
-    scratch = FlowGeometries.Discretization.stencil_scratch(T, ord, Int(nodes))
-    return StencilPlan{N, typeof(tables), typeof(scratch)}(tables, ord, scratch)
-end
-
-"""
-    StencilPlan(axis::AbstractVector; order = 1, nodes = 3, period = nothing)
-
-A one-direction plan over a bare axis, for the level-stack [`ddz!`](@ref) — there the vertical spacing
-is an argument rather than a grid axis, so there is no grid to take it from.
-"""
-function StencilPlan(
-    x::AbstractVector{T}; order::Integer = 1, nodes::Integer = 3, period = nothing,
-) where {T<:AbstractFloat}
-    ord = Int(order)
-    tables = (length(x) < ord + 1 ? nothing :
-              FlowGeometries.Discretization.axis_stencils(x, ord, min(Int(nodes), length(x));
-                                                          period = period),)
-    scratch = FlowGeometries.Discretization.stencil_scratch(T, ord, Int(nodes))
-    return StencilPlan{1, typeof(tables), typeof(scratch)}(tables, ord, scratch)
-end
-
-@inline function _dd!(
-    ∂f::AbstractArray{T}, f::AbstractArray{T}, grid, d::Int, plan::StencilPlan,
-) where {T<:AbstractFloat}
-    tab = plan.tables[d]
-    tab === nothing && return fill!(∂f, zero(T))
-    return FlowGeometries.Operators.derivative!(
-        ∂f, f, grid, tab[1], tab[2], d;
-        order = plan.order, masked = zero(T),
-        policy = _mask_policy(FlowGeometries.Grids.mask(grid)),
-        scratch = plan.scratch,
-    )
-end
-
-ddx!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid, plan::StencilPlan) = _dd!(∂f, f, grid, 1, plan)
-ddy!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid, plan::StencilPlan) = _dd!(∂f, f, grid, 2, plan)
-ddz!(∂f, f, grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, plan::StencilPlan) where {T<:AbstractFloat,G} =
-    _dd!(∂f, f, grid, 3, plan)
-
-# ---------------------------------------------------------------------------
-# Z-derivative (ddz!) - Supports 3D structures
-# ---------------------------------------------------------------------------
-
-"""
-    ddz!(∂f∂z, f, grid, dz[, plan]) -> ∂f∂z
-
-Calculate spatial derivative of `f` in the vertical coordinate z, writing to `∂f∂z`.
-
-This is the level-stack case: a 3D field over a **2D** grid (the same shape `filter_field!` accepts for
-a stack of levels). The grid describes only the horizontal, so it cannot supply the vertical spacing —
-`dz` is therefore an explicit argument rather than something read off the geometry. For a genuine 3D
-grid use the `StructuredGrid{…,3}` method, which takes its spacing from the grid's own third axis and
-handles nonuniform levels.
-
-Since the vertical axis is not on the grid, its weights cannot come from a grid-built
-[`StencilPlan`](@ref); build one over the axis instead — `StencilPlan(range(0; step = dz, length = Nz))`
-— and pass it, or the table is rebuilt on every call at `O(Nz)`.
+The vertical derivative of a stack of levels, a 3-D field over a 2-D `grid`, the shape `filter_field!`
+accepts. The grid describes the horizontal alone, so the vertical spacing `dz` is an argument. `plan` is
+`FlowGeometries.Discretization.stencil_plan(range(0; step = dz, length = Nz), 1, 3)`, built once for
+repeated calls. A masked horizontal cell is zero at every level. The fields live in the memory of
+`execution`, whose loops difference them.
 """
 function ddz!(
     ∂f∂z::AbstractArray{T,3},
     f::AbstractArray{T,3},
     grid::FlowGeometries.Grids.StructuredGrid{T,FlowGeometries.Geometry.CartesianGeometry{T},2},
     dz::T,
-    plan::Union{Nothing,StencilPlan} = nothing,
+    plan::FlowGeometries.Discretization.AbstractStencilPlan =
+        FlowGeometries.Discretization.stencil_plan(range(zero(T); step = dz, length = size(f, 3)), 1,
+                                                   min(3, size(f, 3)));
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.SerialBackend(),
 ) where {T<:AbstractFloat}
-    Nx, Ny, Nz = size(f)
-    tab = plan === nothing ? nothing : plan.tables[1]
-    if tab === nothing
-        FlowGeometries.Operators.apply_stencil!(
-            ∂f∂z, f, range(zero(T); step = dz, length = Nz), 3;
-            order = 1, nodes = 3, masked = zero(T),
-        )
-    else
-        FlowGeometries.Operators.apply_stencil!(
-            ∂f∂z, f, tab[1], tab[2], 3; masked = zero(T),
-        )
-    end
-    # The grid's mask is horizontal, so it blanks whole columns; the vertical itself is unmasked and
-    # is the one direction `apply_stencil!` cannot take the mask for, the shapes differing by a rank.
-    @inbounds for k in 1:Nz, j in 1:Ny, i in 1:Nx
-        FlowGeometries.Grids.isactive(grid, i, j) || (∂f∂z[i, j, k] = zero(T))
-    end
+    FlowGeometries.Operators.apply_stencil!(∂f∂z, f, plan, 3; masked = zero(T), execution = execution)
+    # The mask is horizontal, so it blanks whole columns.
+    mask = FlowGeometries.Execution.on_backend(execution, FlowGeometries.Grids.mask(grid))
+    @. ∂f∂z = ifelse(mask, ∂f∂z, zero(T))
     return ∂f∂z
 end
-
-# A true 3D spherical grid needs no methods of its own: the third axis is the radius, so `h_λ = r cos φ`
-# and `h_φ = r` vary per level rather than using a fixed reference radius, and `scale_factors` is
-# evaluated at each point's own coordinates — which is what the generic methods above already do.
 
 end # module

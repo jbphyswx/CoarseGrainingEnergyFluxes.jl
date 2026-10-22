@@ -15,7 +15,7 @@ tracks the work as it lands.
   Cartesian metric on every grid, so a spherical caller — the package's primary case — could not call
   them at all. Each gets a spherical method, with `SphericalPiDecomposedWorkspace` and
   `SphericalFavreWorkspace` alongside the Cartesian workspaces. Every quantity carrying a direction is
-  formed in planetary-Cartesian coordinates and rotated back to the local frame, and every spatial
+  formed in ambient Cartesian components and rotated back to the local frame, and every spatial
   operator carries the frame's `tanφ/R` curvature terms. The stress moments come from one shared
   routine with the spherical `tau_decomposition!`, and the strain from one shared routine with
   `compute_Π!`, so each decomposition's total equals `compute_Π!` by construction — asserted, since
@@ -23,7 +23,7 @@ tracks the work as it lands.
 - **The rotational/divergent split on a spherical shell.** `compute_Π_decomposed` covered a Cartesian
   volume in true 3-D and both metrics in the tangent plane; the volumetric shell — the configuration a
   global model runs — had no method. `SphericalPiDecomposed3DWorkspace` closes it: the three stresses
-  come from the shared moment routine in planetary-Cartesian coordinates and rotate back to local
+  come from the shared moment routine in ambient Cartesian components and rotate back to local
   `(east, north, radial)`, and each part's strain carries the shell's curvature terms. Naming the whole
   field rotational leaves the other two channels exactly zero and the total equal to `compute_Π!`.
 - **True-3-D forms of the Germano split and the Favre budget, on both metrics.**
@@ -115,8 +115,67 @@ tracks the work as it lands.
   `UnstructuredGrid` methods and the generic `coarse_grain!` did, so `Spectral()` was unreachable from
   the allocating API on structured, curvilinear, 1D and profile sweeps. `nothing` still defers to
   `plan_filter`'s per-grid default.
+- **The generalized convolution of vectors and tensors on a sphere (Aluie 2019).**
+  `Filtering.GeneralizedConvolution(; lmax)` multiplies every degree-`n` vector and tensor harmonic by
+  the kernel's `Ĝ(n)` through spin-weighted spherical-harmonic transforms: a tangent vector at spin 1, a
+  symmetric tangent tensor's trace at spin 0 and its traceless part at spin 2, a radial component as a
+  scalar. Filtering then commutes with the surface gradient, divergence and curl. FastSphericalHarmonics
+  transforms on its own grid, NUFSHT by quadrature over any spherical grid's cells, and
+  `Filtering.DirectSpinTransforms` with neither loaded: the same quadrature summed directly over the
+  cells, `O(M·lmax²)` for `M` cells, its Wigner `d` by a three-term recurrence in the grid's element
+  type that carries a value below the floating-point range with its own binary exponent, in the memory
+  of the workspace's backend and under its loops. A library `transform` names that no
+  loaded extension provides raises an `ArgumentError`. Every diagnostic
+  that filters a vector or a tensor on the surface of a sphere — `compute_Π!`, `cumulative_energy`,
+  `filtering_spectrum`, `band_energies`, `tau_decomposition`, `tracer_variance_flux`, `enstrophy_flux`,
+  `compressible_flux`, `compute_Π_decomposed`, `compute_Π_strain_convergence` and the `coarse_grain`
+  family — takes `vector_filter` and `transform` and applies it under `ZeroFill` by default;
+  `Filtering.CartesianComponents()` filters the ambient Cartesian components, the method of `Deformable`
+  and of a spheroid, and `Filtering.resolve_vector_filter` states which applies. Workspaces hold the
+  transforms, a sweep analyzes its fields once, and the vector filter reads no scalar filter plan, so
+  none is built for it. The tracer flux and the Favre budget filter `θ`, `ρ` and `P` at spin 0 by the
+  same transforms and `Ĝ(n)` as their vectors.
+- **`Kernels.spectral_transfer_degrees!` and `Kernels.LegendreQuadrature`**: a radial kernel's transfer
+  at every degree on a sphere, the Legendre transform of its real-space weight over the support the
+  real-space engines keep — Jekeli's closed form for a cap, Gauss–Legendre quadrature for any other
+  kernel — in the element type of the transfer.
 
 ### Changed
+- **On the surface of a sphere the vector filter is the generalized convolution** (breaking). A
+  `ΠWorkspace`, `EnergyWorkspace`, `Sym3TauWorkspace`, `SphericalPiDecomposedWorkspace`,
+  `SphericalTracerFluxWorkspace`, `SphericalFavreWorkspace` or `EnstrophyFluxWorkspace` on a sphere holds
+  its spin-weighted transforms — FastSphericalHarmonics' on its own grid, NUFSHT's where it is loaded, and
+  the in-core direct sum otherwise — and carries only the buffers that filter reaches;
+  `vector_filter = Filtering.CartesianComponents()` builds
+  the ambient-component workspace, which a `Deformable` plan needs.
+- **A spherical spectral filter is the Legendre transform of the kernel's real-space weight** for every
+  kernel, from `Kernels.spectral_transfer_degrees!`; `SmoothHatKernel` and `HyperGaussianKernel` filter
+  spectrally on a sphere, and `SharpSpectralKernel` there needs `using SpecialFunctions`.
+- **A diagnostic workspace lives in the memory of the plan it serves** (breaking). Every workspace
+  constructor takes `execution` (default `SerialBackend()`) and allocates its buffers, with copies of
+  the grid, in that backend's memory; the allocating diagnostics build theirs from
+  `Filtering.plan_execution(plan)`, which every plan type defines. An in-place call whose workspace and
+  plan sit in different memory throws `ArgumentError`. `Derivatives.derivative_plan(grid; execution)`,
+  `Derivatives.ddz!(…; execution)` and `Diagnostics.vorticity(…; execution)` place their outputs the
+  same way.
+- **`energy_from_filtered(ws, plan, has_w, area)` and `energy_from_filtered!(out, ws, plan, has_w,
+  area)` take the plan** (breaking) whose outputs `ws` holds; the plan's mask strategy fixes the cells
+  the energy is summed over.
+- **`CoarseGrainBatchResult(grid, Nscales, batch_size; execution)`** (breaking) allocates `Π` in
+  `execution`'s memory; under a `DistributedBackend` every array of the result is shared with the
+  worker processes.
+- `compute_Π!` takes `method` on a 2-D `StructuredGrid` and on every other tangent grid, as the rest of
+  the entry points do.
+- **The execution backend is the `execution` keyword and the spectral transform the `transform`
+  keyword** (breaking), the names every package of the stack uses. `execution` is taken by
+  `plan_filter`, `plan_filter_sweep`, `filter_field!`, `filter_fields!`, `filter_slices!`, `compute_Π!`,
+  every diagnostic, `coarse_grain`, `coarse_grain!`, `coarse_grain_profile`, `coarse_grain_profile!`,
+  `coarse_grain_batch!`, `coarse_grain_slices!` and `check_setup`; `transform` by `plan_filter`,
+  `plan_filter_sweep` and `filter_field!`. A caller passing `backend =` or `spectral_backend =` passes
+  `execution =` or `transform =`. A plan's execution backend is its `execution` field, and
+  `SetupReport` reports `execution_requested` and `execution_resolved`. A batch entry takes one
+  `execution`, for the batch axis: each slice runs serially inside a host-parallel batch and on the
+  device under a `GPUBackend`.
 - **`RealSpace()` is the default method on every grid architecture, node sets included.** Coarse
   graining is defined as a convolution against a compact kernel (Aluie 2019), and that compact support
   is what survives a regional domain and a coastline. A scattered `UnstructuredGrid` defaulted to
@@ -173,6 +232,24 @@ tracks the work as it lands.
   every grid/kernel combination.
 
 ### Fixed
+- **Under `GPUBackend` the diagnostics ran host loops over device memory.** Their workspaces were host
+  arrays, and the frame rotations, curvature terms, strain, contractions and energy sums walked the
+  grid cell by cell on the host. Every diagnostic, sweep and batch now runs through FlowGeometries'
+  backend operators, `run_indices` and `reduce_indices`, on device buffers. The suite gates each one on
+  a device array that refuses host scalar indexing (JLArrays) against the serial result: maps equal,
+  domain sums to the reduction's round-off.
+- **`DistributedBackend` ran the prefix-sum top-hat on the calling process**, in 2-D and 3-D. The
+  workers fill the scan's rows (planes) in shared memory, then sweep their own output rows (planes).
+- **`MPIBackend` ran the 3-D prefix-sum top-hat and the N-pass separable engine whole on every rank**,
+  and the 2-D separable row pass too. Each rank takes a stride of the planes or pass lines, and an
+  `Allreduce!` assembles each pass on every rank before the next reads it. Both multi-process suites
+  assert every real-space engine equal to the serial one and to the direct sum.
+- **A spheroid's `ΠWorkspace` lacked buffers its flux writes**: the pre-filter and vertical buffers
+  were sized for a sphere alone, while every non-Cartesian geometry takes the ambient Cartesian branch.
+- **`coarse_grain_batch!` under `GPUBackend` threw `MethodError` on a curvilinear grid or a node set**,
+  whose `compute_Π!` took no batch axis. The method for every tangent grid takes trailing batch axes.
+- **The Distributed batch and slice drivers checked only `Π` for shared memory**, while the workers
+  write the per-scale arrays too. Every array of the result is checked, and allocated shared.
 - **A node set carrying no adjacency returned a flux of exactly zero.** A least-squares gradient fits
   a cell's neighbours, so a grid built with none of them fits nothing: every derivative read zero, the
   strain was zero, and `compute_Π!` and every diagnostic built on it returned an all-zero field — the
@@ -244,6 +321,8 @@ tracks the work as it lands.
   a separate repository. Julia git history is preserved.
 
 ### Removed
+- `Pipeline.batch_alloc_shared` and `CoarseGrainBatchResult`'s `alloc` keyword: `execution` places
+  the result.
 - **IO extensions** (CSV, NCDatasets, Zarr) — the package operates on plain arrays + a grid;
   callers handle their own I/O (ecosystem convention).
 - **In-package Helmholtz/SOR solver** (`helmholtz_decompose!`, `solve_poisson!`) — rotational/
@@ -312,7 +391,7 @@ tracks the work as it lands.
   gradients — Vallis; Pedlosky): genuinely coupled 3D Cartesian `compute_Π!` (all nine strain/stress
   components) and, new, true 3D **spherical volumetric** support — a radius/depth axis, a spherical-
   shell volume element `dV = r²cosφ·dλ·dφ·dr` (`Geometry.volume_element`), 3D spherical `ddx!`/
-  `ddy!`/`ddz!` using the local radius at each level, and the full 3×3 planetary-Cartesian tensor
+  `ddy!`/`ddz!` using the local radius at each level, and the full 3×3 ambient Cartesian tensor
   rotation. `coarse_grain`/`cumulative_energy`/`filtering_spectrum`/`compute_Π_decomposed`/
   `tracer_variance_flux` are now dimension-generic and cover true 3D Cartesian.
 - **`compute_Π_profile!` / `coarse_grain_profile`**: the literature-standard "vertical structure"
@@ -331,7 +410,7 @@ tracks the work as it lands.
   streamfunction/potential pair that is exactly non-divergent/irrotational by construction, for any
   wavenumber) rather than a synthetic non-divergence-free split.
 - **`tau_decomposition` on spherical grids**: the Leonard/Cross/Reynolds (Germano 1992) decomposition
-  now rotates through planetary-Cartesian coordinates before taking moments, then rotates the result
+  now rotates through ambient Cartesian components before taking moments, then rotates the result
   back to local east/north — matching `compute_Π!`'s existing spherical approach — instead of
   silently building the decomposition from frame-inconsistent raw local components.
 - **Real MPI test execution**: `MPI` added to `test/Project.toml`; `test/mpi_runtests.jl` (run via
@@ -564,14 +643,14 @@ tracks the work as it lands.
   method = RealSpace())` builds a per-node neighbour list from the grid's own ball query, so scattered
   data is no longer spectral-only. `Spectral()` remains the default. Agrees with the structured engine
   on identical points to 3.3e-16.
-- **Device-resident GPU plans.** `plan_filter(…; backend = GPUBackend(dev))` uploads the footprint
+- **Device-resident GPU plans.** `plan_filter(…; execution = GPUBackend(dev))` uploads the footprint
   tables, the mask and the separable scratch planes once, through the new `prepare_workspace` backend
   hook, instead of re-transferring them on every `filter_apply!`. A rectilinear grid's cell measure is
   uploaded as its two axis factors rather than the materialized outer product (16 kB instead of 8 MB
   at 1000²).
 - **`tracer_variance_flux` on spherical grids**, 2-D and true-3-D. The subfilter tracer flux is a
-  vector, so it follows the same convention as `compute_Π!`: rotate the velocity to planetary
-  Cartesian, filter, rotate the flux back to local east/north(/radial), then contract with `∂_j θ̄`.
+  vector, so it follows the same convention as `compute_Π!`: rotate the velocity to ambient
+  Cartesian components, filter, rotate the flux back to local east/north(/radial), then contract with `∂_j θ̄`.
 
 ### Fixed
 - **A periodic axis whose search window was wider than the axis itself double-counted cells, making
@@ -683,7 +762,7 @@ tracks the work as it lands.
   keyword need to rename it to `filter_plan=`.
 
 ### Added
-- **`plan_filter(...; method = Spectral(), spectral_backend = ...)`** — the spectral transform
+- **`plan_filter(...; method = Spectral(), transform = ...)`** — the spectral transform
   algorithm is now selectable rather than implicit. Previously the choice was whatever extension
   happened to define a `spectral_filter_plan` method for the grid type, with no way to ask for a
   specific one; `spectral_filter_plan` now takes a `SpectralBackends.jl` tag as its first argument

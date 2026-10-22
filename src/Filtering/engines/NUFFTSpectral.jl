@@ -10,10 +10,11 @@
 #   type 2:    c̄ⱼ = Σ_k F_k exp(+i k⋅xⱼ)
 #
 # `Aⱼ` is the grid's measure of point j, so F_k is the quadrature rule for the box's Fourier coefficient
-# of c. A direction the grid declares periodic takes the grid's period. Any other is padded as FFTW pads
-# a bounded axis: the length the nodes cover (`FlowGeometries.Grids.domain_length`) holds the N modes of
-# its N nodes (`FlowGeometries.Grids.node_counts`), and the box holds 2·nextprod((2,3,5), N) at the same
-# spacing, so the wrap-around path between two points is at least that length.
+# of c. A direction the grid declares periodic takes the grid's period. Any other is padded as
+# `_fft_layout` pads a bounded axis: the length the nodes cover (`FlowGeometries.Grids.domain_length`)
+# holds the N modes of its N nodes (`FlowGeometries.Grids.node_counts`), and the box holds
+# 2·nextprod((2,3,5), N) at the same spacing, so the wrap-around path between two points is at least
+# that length.
 #
 # An axis of even count N carries the frequencies |k| ≤ N/2 with weight ½ at ±N/2, so the series is
 # real for a real field and equals the FFT's on a lattice of N points. The values are real, and the
@@ -45,7 +46,7 @@ struct NUFFTGridPlan{
     weights::VT          # Aⱼ / ∏ L_d over this process's points
     mask::MK             # the grid's mask over this process's points, or nothing when fully active
     bounded::Bool
-    backend::B
+    execution::B
     own::O               # this process's points, or nothing for all of them
     npts::Int            # the grid's point count
 end
@@ -80,6 +81,7 @@ struct NUFFTFilterPlan{
 end
 
 plan_strategy(plan::NUFFTFilterPlan) = plan.strategy
+plan_execution(plan::NUFFTFilterPlan) = plan.grid_plan.execution
 
 Base.show(io::IO, plan::NUFFTFilterPlan) =
     print(io, "NUFFTFilterPlan(", plan.grid_plan.plan, ")")
@@ -88,10 +90,10 @@ Base.show(io::IO, plan::NUFFTFilterPlan) =
 _mode_count(N::Int) = isodd(N) ? N : N + 1
 _edge_weight(::Type{T}, f::Int, N::Int) where {T} = (iseven(N) && abs(f) == N ÷ 2) ? T(1 // 2) : one(T)
 
-# `points` is the share of the points this plan transforms, `_owned(backend, npts)` unless given.
+# `points` is the share of the points this plan transforms, `_owned(execution, npts)` unless given.
 function _nufft_grid_plan(
     nufft, grid::FlowGeometries.Grids.UnstructuredGrid{T,G,D};
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     batch::Union{Nothing,Integer} = nothing,
     points::Union{Nothing,AbstractVector{Int}} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}, D}
@@ -112,19 +114,19 @@ function _nufft_grid_plan(
     L = ntuple(d -> periodic[d] ? spans[d] : counts[d] * T(FlowGeometries.Grids.domain_length(grid, d)) / nodes[d],
                Val(D))
     nmodes = map(_mode_count, counts)
-    # This process's points, their weights and mask go where `backend` runs, and the library plans in
+    # This process's points, their weights and mask go where `execution` runs, and the library plans in
     # that memory. Type 1 is a sum over points, so the processes' partial spectra sum to the whole one.
-    own = points === nothing ? _owned(backend, npts) : points
+    own = points === nothing ? _owned(execution, npts) : points
     part(v) = own === nothing ? v : v[own]
-    xb = map(v -> _on_backend(backend, T.(part(v))), x)
-    kw = (; period = L, origin = lo, nthreads = _library_threads(backend))
+    xb = map(v -> _on_backend(execution, T.(part(v))), x)
+    kw = (; period = L, origin = lo, nthreads = _library_threads(execution))
     plan = FlowTransformBindings.plan_nufft(nufft, T, xb, nmodes; kw...)
     nb = batch === nothing ? 0 : Int(batch)
     batched = nb == 0 ? nothing : FlowTransformBindings.plan_nufft(nufft, T, xb, nmodes; ntrans = nb, kw...)
-    weights = _on_backend(backend, T.(part(FlowGeometries.Grids.measure(grid)) ./ prod(L)))
+    weights = _on_backend(execution, T.(part(FlowGeometries.Grids.measure(grid)) ./ prod(L)))
     m = FlowGeometries.Grids.mask(grid)
-    return NUFFTGridPlan(plan, batched, nb, L, counts, weights, all(m) ? nothing : _on_backend(backend, part(m)),
-                         !all(periodic), backend, own === nothing ? nothing : _on_backend(backend, own), npts)
+    return NUFFTGridPlan(plan, batched, nb, L, counts, weights, all(m) ? nothing : _on_backend(execution, part(m)),
+                         !all(periodic), execution, own === nothing ? nothing : _on_backend(execution, own), npts)
 end
 
 # This process's points of a field every process holds.
@@ -136,7 +138,7 @@ end
 # Type 1 of this process's points, summed over the processes into the whole spectrum.
 function _analysis!(modes, p, values, gp::NUFFTGridPlan)
     FlowTransformBindings.nufft_type1!(modes, p, values)
-    return _sum_across!(gp.backend, modes)
+    return _sum_across!(gp.execution, modes)
 end
 
 function _nufft_scratch(gp::NUFFTGridPlan)
@@ -148,22 +150,17 @@ function _nufft_scratch(gp::NUFFTGridPlan)
     )
 end
 
-# `Ĝ(|k|, ℓ)` on the plan's modes, with the split-Nyquist weights.
+# `Ĝ(k, ℓ)` on the plan's modes, with the split-Nyquist weights.
 function _nufft_transfer(gp::NUFFTGridPlan{T,D}, kernel::Kernels.AbstractFilterKernel, scale::T) where {T,D}
     p = gp.plan
     freqs = ntuple(d -> FlowTransformBindings.mode_frequencies(p, d), Val(D))
     transfer = Array{T}(undef, FlowTransformBindings.mode_size(p))
     for I in CartesianIndices(transfer)
-        k2 = zero(T)
-        w = one(T)
-        for d in 1:D
-            f = freqs[d][I[d]]
-            k2 += (T(2π) * f / gp.period[d])^2
-            w *= _edge_weight(T, f, gp.counts[d])
-        end
-        transfer[I] = w * Kernels.spectral_transfer(kernel, sqrt(k2), scale, Val(D))
+        k = ntuple(d -> T(2π) * freqs[d][I[d]] / gp.period[d], Val(D))
+        w = prod(ntuple(d -> _edge_weight(T, freqs[d][I[d]], gp.counts[d]), Val(D)))
+        transfer[I] = w * Kernels.spectral_transfer(kernel, k, scale)
     end
-    return _on_backend(gp.backend, transfer)
+    return _on_backend(gp.execution, transfer)
 end
 
 # `w .* field`, or `mask .* (w .* field)`: a `Bool` is a strong zero, so a masked point adds nothing
@@ -178,7 +175,7 @@ function _load_weighted!(c::AbstractArray, field::AbstractArray, gp::NUFFTGridPl
 end
 
 # This process's filtered values into `out`, which each process then holds whole.
-_store_filtered!(out, c, invrenorm, gp::NUFFTGridPlan) = _store_filtered!(out, c, invrenorm, gp.own, gp.backend)
+_store_filtered!(out, c, invrenorm, gp::NUFFTGridPlan) = _store_filtered!(out, c, invrenorm, gp.own, gp.execution)
 _store_filtered!(out, c, ::Nothing, ::Nothing, _) = (out .= c; out)
 _store_filtered!(out, c, invrenorm::AbstractVector, ::Nothing, _) = (out .= c .* invrenorm; out)
 function _store_filtered!(out, c, invrenorm, own, backend)
@@ -211,7 +208,7 @@ _nufft_library(t::SpectralBackends.AbstractNUFFTSpectralBackend) = throw(Argumen
 spectral_scratch(gp::NUFFTGridPlan) = _nufft_scratch(gp)
 
 """
-    distributed_nufft_grid_plan(nufft, grid; backend::DistributedBackend, batch) -> AbstractGridPlan
+    distributed_nufft_grid_plan(nufft, grid; execution::DistributedBackend, batch) -> AbstractGridPlan
     distributed_nufft_filter_plan(grid_plan, kernel, scale, mask_strategy) -> AbstractFilterPlan
 
 A nonuniform-FFT spectral plan whose points are divided among the worker processes, each holding the
@@ -225,28 +222,30 @@ distributed_nufft_grid_plan(args...; kwargs...) = throw(ArgumentError(
 
 # The grid plan for `backend`: over this process's points, or divided among the worker processes.
 _nufft_grid_plan_for(nufft, grid, backend::ComputationalBackends.AbstractDistributedBackend, batch) =
-    distributed_nufft_grid_plan(nufft, grid; backend = backend, batch = batch)
+    distributed_nufft_grid_plan(nufft, grid; execution = backend, batch = batch)
 _nufft_grid_plan_for(nufft, grid, backend::ComputationalBackends.AbstractExecutionBackend, batch) =
-    _nufft_grid_plan(nufft, grid; backend = backend, batch = batch)
+    _nufft_grid_plan(nufft, grid; execution = backend, batch = batch)
 
 function spectral_grid_plan(
     spectral_backend::_NUFFTRoute, grid::FlowGeometries.Grids.UnstructuredGrid{T,G},
     ::Kernels.AbstractFilterKernel;
     mask_strategy::AbstractMaskStrategy = ZeroFill(),
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     batch::Union{Nothing,Integer} = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}}
     nufft = _nufft_library(spectral_backend)
     nufft === nothing && return nothing
-    return _nufft_grid_plan_for(nufft, grid, backend, batch)
+    return _nufft_grid_plan_for(nufft, grid, execution, batch)
 end
 
 """
     spectral_filter_plan(spectral_backend, grid::UnstructuredGrid{Cartesian}, kernel, scale;
-                         mask_strategy = ZeroFill(), backend = AutoBackend(), batch = nothing)
+                         mask_strategy = ZeroFill(), execution = AutoBackend(), batch = nothing,
+                         grid_plan = nothing, scratch = nothing) -> AbstractFilterPlan
 
-`batch = nb` adds a transform with `ntrans = nb`, which `filter_apply_batched!` runs over an
-`(npts, nb)` array in one execution per direction. The library runs on `_library_threads(backend)`
+The nonuniform-FFT filter plan over a Cartesian node set, built on `grid_plan` and `scratch` when
+given. `batch = nb` adds a transform with `ntrans = nb`, which `filter_apply_batched!` runs over an
+`(npts, nb)` array in one execution per direction. The library runs on `_library_threads(execution)`
 threads.
 """
 function spectral_filter_plan(
@@ -255,7 +254,7 @@ function spectral_filter_plan(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     mask_strategy::AbstractMaskStrategy = ZeroFill(),
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     batch::Union{Nothing,Integer} = nothing,
     grid_plan::Union{Nothing,AbstractGridPlan} = nothing,
     scratch::Union{Nothing,NUFFTScratch} = nothing,
@@ -263,7 +262,7 @@ function spectral_filter_plan(
     gp = if grid_plan === nothing
         nufft = _nufft_library(spectral_backend)
         nufft === nothing && _no_spectral_backend(spectral_backend, grid)
-        _nufft_grid_plan_for(nufft, grid, backend, batch)
+        _nufft_grid_plan_for(nufft, grid, execution, batch)
     else
         grid_plan
     end

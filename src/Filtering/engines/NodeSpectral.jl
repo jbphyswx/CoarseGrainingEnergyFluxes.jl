@@ -2,15 +2,13 @@
 # Spectral filtering over a grid's cells as a node set
 # ---------------------------------------------------------------------------
 #
-# Every grid is a set of cells, each with a centre, a measure and a mask flag. A grid that no transform
-# targets directly — a stretched or curvilinear Cartesian grid, a regional or pixelized sphere — is
-# filtered spectrally through that set: the nonuniform transform of its geometry (NUFFT on the plane,
-# NUFSHT on the sphere) runs over the cell centres, and fields are read and written in the grid's linear
-# cell order.
+# A grid no transform targets directly (a stretched or curvilinear Cartesian grid, a regional or
+# pixelized sphere) is filtered over its cells as a node set: the nonuniform transform of its geometry
+# (NUFFT on the plane, NUFSHT on the sphere) runs over the cell centres, and fields are read and written
+# in the grid's linear cell order.
 #
 # A regional spherical grid is completed to the whole sphere by its lattice continued past each bounded
-# edge, as inactive nodes. The harmonic fit then sees the field extended by zero, the sphere's
-# counterpart of padding a bounded axis before an FFT.
+# edge, as inactive nodes, so the harmonic fit sees the field extended by zero.
 
 # Which spectral backends may be served through the node set: the nonuniform transforms, and `Auto`.
 @inline _node_route(::SpectralBackends.AbstractAutoSpectralBackend) = true
@@ -35,7 +33,7 @@ struct NodeSetGridPlan{
     ncells::Int
     dims::NTuple{N,Int}
     batch::B
-    backend::BE
+    execution::BE
 end
 
 """
@@ -65,6 +63,7 @@ struct NodeSetPlan{P<:AbstractFilterPlan, GP<:NodeSetGridPlan, SC<:NodeSetScratc
 end
 
 plan_strategy(plan::NodeSetPlan) = plan_strategy(plan.inner)
+plan_execution(plan::NodeSetPlan) = plan.grid_plan.execution
 
 Base.show(io::IO, plan::NodeSetPlan) =
     print(io, "NodeSetPlan(", plan.grid_plan.ncells, " cells, ", length(plan.scratch.field), " nodes, ",
@@ -119,7 +118,8 @@ function _complete_from(ext, lo::NTuple{N,Int}, dims::NTuple{N,Int}, x, A, m) wh
 end
 
 """
-    _node_set_grid_plan(spectral_backend, grid, kernel; batch, kwargs...) -> NodeSetGridPlan or nothing
+    _node_set_grid_plan(spectral_backend, grid, kernel; execution = AutoBackend(), batch = nothing,
+                        kwargs...) -> NodeSetGridPlan or nothing
 
 The node set of `grid` and the nonuniform transform's grid plan over it, planned for a trailing batch of
 `batch` fields, or `nothing` where the backend does not take the node set or no loaded extension
@@ -128,23 +128,23 @@ transforms it.
 function _node_set_grid_plan(
     spectral_backend::SpectralBackends.AbstractSpectralBackend, grid::FlowGeometries.Grids.AbstractGrid,
     kernel::Kernels.AbstractFilterKernel;
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     batch::Union{Nothing,Integer} = nothing, kwargs...,
 )
     _node_route(spectral_backend) || return nothing
     nodes = _node_set(grid)
-    inner = spectral_grid_plan(spectral_backend, nodes, kernel; backend = backend, batch = batch, kwargs...)
+    inner = spectral_grid_plan(spectral_backend, nodes, kernel; execution = execution, batch = batch, kwargs...)
     inner === nothing && return nothing
     return NodeSetGridPlan(nodes, inner, length(FlowGeometries.Grids.mask(grid)),
                            FlowGeometries.Grids.size_tuple(grid), batch === nothing ? nothing : Int(batch),
-                           backend)
+                           execution)
 end
 
 function _node_set_scratch(gp::NodeSetGridPlan, inner_scratch)
     T = eltype(FlowGeometries.Grids.measure(gp.nodes))
     n = length(FlowGeometries.Grids.mask(gp.nodes))
     b = gp.batch
-    zs(dims...) = _allocate(gp.backend, T, dims)
+    zs(dims...) = _allocate(gp.execution, T, dims)
     return NodeSetScratch(zs(n), zs(n), b === nothing ? nothing : (field = zs(n, b), out = zs(n, b)),
                           inner_scratch)
 end
@@ -152,7 +152,8 @@ end
 spectral_scratch(gp::NodeSetGridPlan) = _node_set_scratch(gp, spectral_scratch(gp.inner))
 
 """
-    _node_set_filter_plan(spectral_backend, grid, kernel, scale; grid_plan, scratch, batch, kwargs...) -> NodeSetPlan
+    _node_set_filter_plan(spectral_backend, grid, kernel, scale; execution = AutoBackend(),
+                          grid_plan = nothing, scratch = nothing, batch = nothing, kwargs...) -> NodeSetPlan
 
 The spectral plan for `grid` over its node set. Raises where the backend does not take a node set or no
 loaded extension transforms it.
@@ -160,7 +161,7 @@ loaded extension transforms it.
 function _node_set_filter_plan(
     spectral_backend::SpectralBackends.AbstractSpectralBackend, grid::FlowGeometries.Grids.AbstractGrid,
     kernel::Kernels.AbstractFilterKernel, scale::AbstractFloat;
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     grid_plan::Union{Nothing,NodeSetGridPlan} = nothing,
     scratch::Union{Nothing,NodeSetScratch} = nothing,
     batch::Union{Nothing,Integer} = nothing,
@@ -171,12 +172,12 @@ function _node_set_filter_plan(
     nb = grid_plan === nothing ? (batch === nothing ? nothing : Int(batch)) : grid_plan.batch
     inner = spectral_filter_plan(
         spectral_backend, nodes, kernel, scale;
-        backend = backend, grid_plan = grid_plan === nothing ? nothing : grid_plan.inner,
+        execution = execution, grid_plan = grid_plan === nothing ? nothing : grid_plan.inner,
         scratch = scratch === nothing ? nothing : scratch.inner, batch = nb, kwargs...,
     )
     gp = grid_plan === nothing ?
         NodeSetGridPlan(nodes, inner.grid_plan, length(FlowGeometries.Grids.mask(grid)),
-                        FlowGeometries.Grids.size_tuple(grid), nb, backend) : grid_plan
+                        FlowGeometries.Grids.size_tuple(grid), nb, execution) : grid_plan
     sc = scratch === nothing ? _node_set_scratch(gp, inner.scratch) : scratch
     return NodeSetPlan(inner, gp, sc)
 end
@@ -206,14 +207,14 @@ spectral_grid_plan(
 @noinline _no_spectral_backend(::SpectralBackends.AbstractFFTSpectralBackend, grid) = throw(ArgumentError(
     "FFT spectral filtering samples each direction at equal steps, which a grid states in its axis " *
     "types (`FlowGeometries.Axes.spacing_trait`); this $(nameof(typeof(grid))) is not two uniform " *
-    "directions. Filter it over its cells with `spectral_backend = AutoSpectralBackend()` and a " *
+    "directions. Filter it over its cells with `transform = AutoSpectralBackend()` and a " *
     "nonuniform FFT: $(_NUFFT_LIBRARIES_HINT).",
 ))
 
 @noinline _no_spectral_backend(spectral_backend, grid) = throw(ArgumentError(
     "Spectral filtering with $(nameof(typeof(spectral_backend))) is unavailable for " *
     "$(nameof(typeof(grid))). A grid whose own layout has no transform is filtered over its cells by " *
-    "the nonuniform transform of its geometry: pass `spectral_backend = AutoSpectralBackend()` and load " *
+    "the nonuniform transform of its geometry: pass `transform = AutoSpectralBackend()` and load " *
     "a nonuniform FFT for a Cartesian grid ($(_NUFFT_LIBRARIES_HINT)) or `NUFSHT` for a spherical one.",
 ))
 

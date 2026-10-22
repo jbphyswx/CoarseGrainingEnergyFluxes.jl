@@ -23,7 +23,7 @@ This package implements the coarse-graining (spatial filtering) framework. The c
 | Variable-density (Favre) budget: Π, baropycnal work Λ, pressure dilatation | [`Diagnostics.compressible_flux`](@ref) |
 
 Six filter kernels are available — top-hat, Gaussian, sharp-spectral, smooth-hat, hyper-Gaussian and
-the high-order `M^I`/`M^II` pair — and they are **not** interchangeable: only some have a spectral
+the high-order `M^I`/`M^II` pair — and they differ in what they support: only some have a spectral
 transfer function, only some can carry a filtering spectrum, and only some are valid for Π.
 [`check_setup`](@ref) reports which, for your grid and scale, without running anything.
 
@@ -38,10 +38,10 @@ kernel on a uniform Cartesian lattice, and a transform along the longitude ring 
 where a great-circle kernel depends on the longitude difference alone. See
 [Architecture](architecture.md#Real-space-engines) for the full table.
 
-Sweeping scales, the parts of a plan that the scale does not change — transform objects, measure
-prefix scans, point sorts — are built once by
-[`Filtering.plan_filter_sweep`](@ref) rather than once per scale, and every diagnostic has an in-place
-form whose workspace holds only the buffers its configuration can reach.
+For a sweep over scales, [`Filtering.plan_filter_sweep`](@ref) builds the parts of a plan the scale
+does not change — transform objects, measure prefix scans, point sorts — once for the whole sweep, and
+every diagnostic has an in-place form whose workspace holds only the buffers its configuration
+reaches.
 
 Every diagnostic works across the full grid×dimensionality matrix — `StructuredGrid` (1D, 2D, and
 true 3D Cartesian or spherical-volumetric), `CurvilinearGrid` (model-native orthogonal curvilinear meshes), and
@@ -94,7 +94,7 @@ is the domain average of the filtered KE:
 E(ℓ) = ½ ⟨|ū_ℓ|²⟩
 ```
 
-This is a *cumulative* quantity, **not** a spectral density. The **filtering spectral density**
+This is a *cumulative* quantity. The **filtering spectral density**
 (`filtering_spectrum`; their Eq. 14 — comparable to a Fourier energy spectrum) is its derivative
 with respect to the filtering wavenumber `k_ℓ = L/ℓ`:
 
@@ -105,11 +105,12 @@ with respect to the filtering wavenumber `k_ℓ = L/ℓ`:
 `coarse_grain` returns both (`result.cumulative_energy`, `result.filtering_spectrum`,
 `result.wavenumber`).
 
-`Ẽ(k_ℓ) ≥ 0` is guaranteed only for a kernel whose `|Ĝ(k)|²` is monotone decreasing, which the
-default `TopHatKernel` is not. By default `coarse_grain` therefore throws rather than return a density
-it cannot vouch for — but the condition is sufficient, not necessary, so all three readings are
-reachable: `kernel = GaussianKernel()` for a guaranteed-non-negative spectrum,
-`spectrum = CGEF.Diagnostics.ForceSpectrum()` to compute the top-hat's anyway and check its sign
-yourself, or `spectrum = CGEF.Diagnostics.NoSpectrum()` for `Π` and the cumulative energy alone. Note
-also that a `p = 1` kernel — top-hat and Gaussian both — saturates the recovered slope at `k⁻³`; see
-[`Diagnostics.AbstractSpectrumPolicy`](@ref) and [`Diagnostics.filtering_spectrum`](@ref).
+`Ẽ(k_ℓ) ≥ 0` is guaranteed for a kernel whose `|Ĝ(k)|²` is monotone decreasing; the default
+`TopHatKernel`'s is not, so by default (`spectrum = AutoSpectrum()`) `coarse_grain` fills its
+`filtering_spectrum` with `NaN` for it, and `Diagnostics.filtering_spectrum` throws. The condition is
+sufficient but not necessary, and three choices are available: `kernel = GaussianKernel()` for a
+guaranteed-non-negative spectrum, `spectrum = CGEF.Diagnostics.ForceSpectrum()` to compute the
+top-hat's anyway and check its sign yourself, or `spectrum = CGEF.Diagnostics.NoSpectrum()` for `Π`
+and the cumulative energy alone. A `p = 1` kernel — top-hat and Gaussian both — saturates the
+recovered slope at `k⁻³`; see [`Diagnostics.AbstractSpectrumPolicy`](@ref) and
+[`Diagnostics.filtering_spectrum`](@ref).

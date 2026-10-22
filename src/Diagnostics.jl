@@ -5,6 +5,7 @@ using ..Kernels: Kernels
 using ..Filtering: Filtering
 using ..Derivatives: Derivatives
 using ComputationalBackends: ComputationalBackends
+using SpectralBackends: SpectralBackends
 
 export ΠWorkspace, EnergyWorkspace, compute_Π!, cumulative_energy, cumulative_energy!, filtering_spectrum, spectral_density, spectral_density!
 export tau_decomposition, tau_decomposition!, TauWorkspace, Sym3TauWorkspace
@@ -21,6 +22,7 @@ export FavreWorkspace, SphericalFavreWorkspace, Favre3DWorkspace
 export AbstractSpectrumPolicy, AutoSpectrum, StrictSpectrum, ForceSpectrum, NoSpectrum
 
 include("Diagnostics/SpectrumPolicy.jl")
+include("Diagnostics/SpinFilter.jl")
 include("Diagnostics/Flux.jl")
 include("Diagnostics/TensorDriver.jl")
 include("Diagnostics/Spectrum.jl")

@@ -5,22 +5,19 @@ using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries
 using FlowTransformBindings: FlowTransformBindings as FTB
 
-# Dynamic scheduling balances the uneven per-row cost that masking creates. Constructed as an object
-# rather than passed as the `:dynamic` symbol: the symbol form resolves the scheduler type at runtime,
-# which shows up as a dynamic dispatch on every parallel call in this file.
-# One scheduler object for the module rather than a fresh one at each of the call sites below: it is
-# immutable and carries no per-run state, so constructing it repeatedly is pure overhead.
+# A scheduler object of concrete type, so every `tforeach` call below resolves its scheduler statically.
 const _SCHED = OhMyThreads.DynamicScheduler()
 @inline _sched() = _SCHED
+# One task per slice, spawned in the order given: slices sorted by descending cost are taken largest
+# first as threads come free.
+const _SLICE_SCHED = OhMyThreads.DynamicScheduler(; chunking = false)
 
-# Pass driver for the separable ND engine and row driver for the FFTW extension's transform engines:
-# same shape as `CGEF.Filtering._sep_serial`, so each parallelizes without duplicating its kernel.
+# Driver for the separable ND engine and the transform engines, with the signature of
+# `CGEF.Filtering._sep_serial`.
 @inline _omt_driver(f::F, indices) where {F} =
     OhMyThreads.tforeach(f, indices; scheduler = _sched())
 
-# ThreadedBackend: build the footprint once, then fill output rows in parallel. Rows write disjoint
-# columns of the column-major output, so this is race-free and bit-identical to serial. Works for any
-# row-decomposable 2D grid, structured or curvilinear, via the shared per-row kernel.
+# Row `j` writes only `out[:, j]`, so the parallel row loop is race-free and bit-identical to serial.
 function CGEF.Filtering.threaded_filter_field!(
     out::AbstractMatrix{T},
     field::AbstractMatrix,
@@ -50,15 +47,11 @@ function CGEF.Filtering.threaded_filter_field!(
     return out
 end
 
-# Separable Gaussian. The column pass at row `j` reads `row_pass` across rows, so this cannot use the
-# single fused row-parallel loop: two `tforeach` sweeps instead, one per pass, relying on `tforeach`'s
-# implicit barrier to complete the whole `row_pass` before the column pass reads it. Calls the same
-# per-row/per-column bodies and epilogue as serial, so results are bit-identical.
+# Separable Gaussian. The column pass reads `row_pass` across rows; the first `tforeach` returns only
+# once every row of it is written.
 function _threaded_apply_separable!(
     out::AbstractMatrix{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid, fp::CGEF.Filtering.SeparableFootprint{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
 ) where {T<:AbstractFloat}
-    # Same contract as the serial path: the footprint's denominator is fixed at build time, so a
-    # strategy it was not built for cannot be honoured and must not be silently ignored.
     CGEF.Filtering._separable_check_strategy(fp, strategy)
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     mask = FlowGeometries.Grids.mask(grid)
@@ -78,9 +71,8 @@ function _threaded_apply_separable!(
     return out
 end
 
-# Prefix-sum top-hat. Every output row reads prefix sums of other rows in its band, so the table must
-# be complete before phase 2 starts; `tforeach`'s barrier provides that. Within each phase row `j`
-# writes only its own column of `prefix_num` / row of `out`, so both parallelize cleanly.
+# Prefix-sum top-hat. An output row reads the prefix sums of other rows in its band, so the first
+# `tforeach` completes the table before the second starts. Within a phase, row `j` writes only its own.
 function _threaded_apply_prefixsum_tophat!(
     out::AbstractMatrix{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid,
     fp::CGEF.Filtering.PrefixSumTopHatPlan{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
@@ -96,16 +88,13 @@ function _threaded_apply_prefixsum_tophat!(
     return out
 end
 
-# Batched form of the same two phases. Two parallel regions for the whole batch, not two per field:
-# every field's numerator scan is filled in phase 1, then phase 2 walks each support interval once and
-# feeds all of them. The numerator slots are grown before the region opens, since that mutates the
-# scratch's own slot list and must not race.
+# Batched form: phase 1 fills every field's numerator scan, phase 2 walks each support interval once for
+# all fields. The numerator slots are grown before the parallel region, since growing them mutates the
+# shared scratch.
 function _threaded_apply_prefixsum_tophat_batch!(
     outs, fields, grid::FlowGeometries.Grids.StructuredGrid,
     fp::CGEF.Filtering.PrefixSumTopHatPlan{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
 ) where {T<:AbstractFloat}
-    # Fuse only where there is a support walk to share; on a uniform axis the per-field form has the
-    # smaller working set and wins, exactly as it does serially.
     if !CGEF.Filtering._prefixsum_batch_fuses(fp)
         for k in eachindex(outs)
             _threaded_apply_prefixsum_tophat!(outs[k], fields[k], grid, fp, strategy)
@@ -124,18 +113,8 @@ function _threaded_apply_prefixsum_tophat_batch!(
     return outs
 end
 
-# Batched 2D apply: rows in parallel, and within a row the whole batch shares one enumeration of each
-# point's neighbours. A per-field loop over the single-field hook would thread just as well but pay
-# that enumeration `K` times, which for a streaming scattered footprint is the dominant cost.
-# `SeparableFootprint` has no such shared derivation — its weight tables are computed once at
-# plan-build time — so it takes a per-field threaded apply. That crosses `2K` barriers per scale; the
-# alternative, one region per pass over `(row, field)`, needs `K` live full-grid pass buffers. The
-# barrier cost against the batch is measured in `benchmark/` ("threaded batch barrier cost") and is a
-# fraction of a percent at 512² and 1024², so the per-field form keeps the smaller working set.
-#
-# `PrefixSumTopHatPlan` DOES have one on a nonuniform axis: the two-pointer support walk, which
-# dominates its apply and is identical for every field. There it takes the fused row kernel, which
-# also drops the batch from `2K` parallel regions (a numerator fill and a sweep per field) to 2.
+# Batched 2-D apply: rows in parallel; within a row, each point's neighbours are enumerated once for the
+# whole batch.
 function CGEF.Filtering.threaded_filter_fields!(
     outs,
     fields,
@@ -169,40 +148,26 @@ function CGEF.Filtering.threaded_filter_fields!(
     return outs
 end
 
-# 3-D prefix-sum top-hat. Two phases, as in 2-D: an output plane reads the axis-1 scan of other planes
-# in its band, so the whole scan must be complete before any of them is summed, and `tforeach`'s
-# implicit barrier provides that. Within each phase a `(j, k)` plane touches only its own column of the
-# scan / row of the output, so both parallelize cleanly.
+# 3-D prefix-sum top-hat, two phases as in 2-D: an output `(j, k)` plane reads the axis-1 scans of other
+# planes in its band, and within a phase each plane writes only its own.
 function _threaded_apply_prefixsum_tophat_3d!(
     out::AbstractArray{T,3}, field::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid,
     fp::CGEF.Filtering.PrefixSumTopHat3DPlan{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
 ) where {T<:AbstractFloat}
-    Nx, Ny, Nz = FlowGeometries.Grids.size_tuple(grid)
+    _, Ny, Nz = FlowGeometries.Grids.size_tuple(grid)
     P = fp.scratch.prefix
-    invden = fp.invden
     planes = CartesianIndices((Ny, Nz))
     OhMyThreads.tforeach(planes; scheduler = _sched()) do JK
         CGEF.Filtering._prefixsum3d_fill_plane!(P, field, grid, fp.masked, JK[1], JK[2])
     end
     OhMyThreads.tforeach(planes; scheduler = _sched()) do JK
-        j, k = JK[1], JK[2]
-        oc = view(out, :, j, k)
-        @inbounds @simd for i in 1:Nx
-            oc[i] = zero(T)
-        end
-        CGEF.Filtering._prefixsum3d_plane!(
-            oc, P, fp.wcell, fp.dj_lim, fp.dk_lim, fp.periodic, Nx, Ny, Nz, j, k,
-        )
-        @inbounds @simd for i in 1:Nx
-            oc[i] *= invden[i, j, k]
-        end
+        CGEF.Filtering._prefixsum3d_out_plane!(out, fp, JK[1], JK[2])
     end
     return out
 end
 
-# Batched 1D/true-3D apply: point-indexed, so the parallel unit is a block of the index space rather
-# than a row. Blocks are disjoint and each point writes only its own cell, so the result matches
-# serial exactly.
+# Batched 1-D / 3-D apply over disjoint blocks of the index space; each point writes only its own cell,
+# so the result matches serial.
 function CGEF.Filtering.threaded_filter_fields!(
     outs,
     fields,
@@ -214,10 +179,8 @@ function CGEF.Filtering.threaded_filter_fields!(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
     CGEF.Filtering._check_strategy(fp, mask_strategy)
-    # Neither of these is a per-point offset walk, so neither has a neighbour derivation for a batch to
-    # share: the separable-ND passes read precomputed tap tables, and the 3-D prefix-sum reads a window
-    # whose bounds are a table lookup. Both take the per-field threaded apply, which is also the only
-    # form their shared pass/scan buffers allow.
+    # These engines pass every field through the plan's one set of pass/scan buffers, so they apply per
+    # field.
     if fp isa Union{CGEF.Filtering.SeparableFootprintND, CGEF.Filtering.PrefixSumTopHat3DPlan}
         for k in eachindex(outs)
             CGEF.Filtering.threaded_filter_field!(outs[k], fields[k], grid, kernel, scale, mask_strategy, fp)
@@ -234,10 +197,8 @@ function CGEF.Filtering.threaded_filter_fields!(
     return outs
 end
 
-# 1D/true-3D grids have point-indexed footprints and no row structure, so this parallelizes over
-# `CartesianIndices(out)`. Each point writes only its own cell, and it reuses the serial per-point
-# kernels, so the result is identical. `N` is unconstrained here; the 2D method above is more specific
-# and wins for N=2.
+# 1-D / 3-D grids, in parallel over points; each point writes only its own cell. The 2-D method above is
+# more specific and takes `N == 2`.
 function CGEF.Filtering.threaded_filter_field!(
     out::AbstractArray{T,N},
     field::AbstractArray,
@@ -255,9 +216,8 @@ function CGEF.Filtering.threaded_filter_field!(
     dims = FlowGeometries.Grids.size_tuple(grid)
     fill!(out, zero(T))
     if fp isa CGEF.Filtering.SeparableFootprintND
-        # The passes are ordered in `d` — each reads across its predecessor's whole output — but every
-        # point WITHIN a pass is independent, so the sweep is threaded and `tforeach`'s implicit
-        # barrier separates the passes.
+        # Pass `d` reads the whole output of pass `d - 1`; the points of one pass are independent, and
+        # each `tforeach` returns before the next pass starts.
         return CGEF.Filtering.apply_separable_nd!(out, field, grid, fp, mask_strategy, _omt_driver)
     elseif fp isa CGEF.Filtering.PrefixSumTopHat3DPlan
         return _threaded_apply_prefixsum_tophat_3d!(out, field, grid, fp, mask_strategy)
@@ -283,12 +243,8 @@ function CGEF.Filtering.threaded_filter_field!(
 end
 
 
-# The node CSR engine, on any flat-cell grid. Cells are point-indexed with no row structure, so this
-# parallelizes over `eachindex(out)` on the same argument as the 1D/true-3D method above: cell `t`
-# writes only `out[t]`. It reuses the serial per-cell kernel, so the result is bit-identical to serial.
-#
-# The footprint slot carries the dispatch. A 1-D `StructuredGrid` also presents a vector output over a
-# grid, and its ND footprint sends it to the rank-generic method above.
+# The node CSR engine on any flat-cell grid, selected by the `NodeFilterPlan` slot; cell `t` writes only
+# `out[t]`. A 1-D `StructuredGrid` also has a vector output; its ND footprint takes the method above.
 function CGEF.Filtering.threaded_filter_field!(
     out::AbstractVector{T},
     field::AbstractVector,
@@ -304,8 +260,6 @@ function CGEF.Filtering.threaded_filter_field!(
     return out
 end
 
-# Batched form: one pass over the nodes applying the shared neighbourhood to every field, so the
-# adjacency walk is done once per node rather than once per node per field.
 function CGEF.Filtering.threaded_filter_fields!(
     outs,
     fields,
@@ -324,34 +278,23 @@ function CGEF.Filtering.threaded_filter_fields!(
 end
 
 
-# The farms below run a whole serial apply or sweep per task, which may be a spherical-harmonic
-# transform; its FastTransforms calls run on one OpenMP thread, the tasks carrying the parallelism.
+# Runs `f` with FastTransforms on one OpenMP thread, for tasks that each run a whole serial apply or
+# sweep.
 _farm(f) = Base.ScopedValues.with(f, FTB.FASTTRANSFORMS_THREADS => 1)
 
-# Slice-parallel apply. Slices are independent and each writes only its own output, so this needs no
-# synchronization; the inner apply is forced serial so the two levels of threading never nest.
-#
-# Slices are dispatched LONGEST-FIRST under a dynamic scheduler. Per-slice cost grows at least
-# linearly in the point count and the counts are ragged in practice, so equal-count chunking leaves
-# one worker holding the largest slice after the others have drained. Longest-processing-time-first
-# is the standard remedy and bounds the makespan at 4/3 of optimal.
+# Slice-parallel apply. Each slice runs serially and writes only its own output.
 function CGEF.Filtering.threaded_filter_slices!(outs, fields, plans)
     order = sortperm(CGEF.Filtering.slice_costs(plans); rev = true)
     _farm() do
-        OhMyThreads.tforeach(order; scheduler = OhMyThreads.DynamicScheduler()) do t
+        OhMyThreads.tforeach(order; scheduler = _SLICE_SCHED) do t
             CGEF.Filtering.apply_slice_serial!(outs[t], fields[t], plans[t])
         end
     end
     return outs
 end
 
-# Batch-parallel PIPELINE sweeps over one shared grid — the whole sweep per slice, not just the filter
-# step. Slices write disjoint views of the batched result, so this needs no synchronization, and the
-# inner sweep is forced serial so the two levels of threading never nest.
-#
-# Scratch is pooled per worker: each chunk of the flat slice list owns pool entry `ci`, built inside its
-# task when the caller supplied none, so pool memory is bounded by the thread count. Slices share one
-# grid and cost the same, so the chunks are equal and unordered.
+# Batch-parallel pipeline sweeps over one shared grid; slices write disjoint views of the batched result.
+# Chunk `ci` owns scratch pool entry `ci`, built in its task when the caller supplied none.
 function CGEF.Pipeline.threaded_coarse_grain_batch!(batch, u, v, w, grid, valR, ctx)
     n = length(batch.slices)
     n == 0 && return batch
@@ -365,16 +308,11 @@ function CGEF.Pipeline.threaded_coarse_grain_batch!(batch, u, v, w, grid, valR, 
     return batch
 end
 
-# Batch-parallel PIPELINE sweeps whose slices carry their own grids. Scratch is per slice here — a
-# workspace is grid-shaped and cannot be reused across differing shapes — so slices index it directly
-# and no chunk mapping is needed.
-#
-# Dispatched LONGEST-FIRST under a dynamic scheduler: ragged point counts mean equal chunking leaves
-# one worker holding the largest sweep after the others have drained.
+# Pipeline sweeps whose slices carry their own grids, each with its own scratch.
 function CGEF.Pipeline.threaded_coarse_grain_slices!(results, us, vs, ws, grids, ctx)
     order = sortperm(CGEF.Pipeline.slice_pipeline_costs(grids, length(ctx.scales)); rev = true)
     _farm() do
-        OhMyThreads.tforeach(order; scheduler = _sched()) do t
+        OhMyThreads.tforeach(order; scheduler = _SLICE_SCHED) do t
             CGEF.Pipeline.coarse_grain_slice_serial!(results, us, vs, ws, grids, ctx, t)
         end
     end

@@ -1,231 +1,275 @@
 
-# physical-space filtering algorithms
-Test.@testset "Filtering" begin
-    geom = FG.Geometry.CartesianGeometry()
-    x = collect(0.0:100.0:1000.0) # 11 points
-    y = collect(0.0:100.0:1000.0) # 11 points
-    mask = trues(11, 11)
-    grid = FG.Grids.StructuredGrid(geom, x, y, mask)
+# The real-space filter against its definition. Each engine, on grids that reach it, under both mask
+# strategies and on every execution backend, equals the direct sum over the lattice continued past the
+# grid's bounded edges (`_cgef_direct_filter`) or over the grid's own cells (`_cgef_cellset_filter`).
 
-    # Constant field filtering must return exactly the same constant
-    field = fill(42.0, 11, 11)
-    out = zeros(11, 11)
-    CGEF.Filtering.filter_field!(out, field, grid, CGEF.TopHatKernel(), 300.0)
+const _CGEF_SERIAL = CGEF.ComputationalBackends.SerialBackend()
+const _CGEF_PARALLEL = (CGEF.ComputationalBackends.ThreadedBackend(), CGEF.ComputationalBackends.GPUBackend(KA.CPU()),
+                        CGEF.ComputationalBackends.DistributedBackend(), CGEF.ComputationalBackends.MPIBackend())
 
-    # Active (unmasked) cells must have the exact filtered value (42.0)
-    Test.@test out[5, 5] ≈ 42.0
+# What `check_setup` reports for each engine.
+const _CGEF_ENGINE_REPORT = Dict(
+    :PrefixSumTopHatPlan => "prefix-sum top-hat, exact, O(N·w_y)",
+    :PrefixSumTopHat3DPlan => "prefix-sum top-hat, exact, O(N·w_y·w_z)",
+    :SeparableFootprint => "separable two-pass",
+    :SeparableFootprintND => "separable N-pass",
+    :FilterFootprint => "banded footprint",
+    :ScatteredFilterPlan => "scattered per-point",
+    :FilterFootprintND => "N-dimensional ball",
+    :NDScatteredFilterPlan => "scattered N-dimensional",
+    :NodeFilterPlan => "node CSR",
+    :PaddedFFTFootprint => "padded-FFT",
+    :ZonalFFTFootprint => "zonal-FFT",
+)
 
-    # Test division by zero protection with single-latitude grid
-    # This catches the InexactError: Int64(Inf) bug
-    geom_sph = FG.Geometry.SphericalGeometry(6371000.0)
-    lon_sph = collect(0.0:5.0:355.0)
-    lat_sph = [0.0]  # Single latitude
-    mask_sph = trues(length(lon_sph), 1)
-    grid_sph = FG.Grids.StructuredGrid(geom_sph, deg2rad.(lon_sph), deg2rad.(lat_sph), mask_sph)
+_cgef_alloc_apply(out, f, plan) = @allocated CGEF.Filtering.filter_apply!(out, f, plan)
+_cgef_alloc_batch(outs, fs, plan) = @allocated CGEF.Filtering.filter_apply_batch!(outs, fs, plan)
 
-    field_sph = rand(length(lon_sph), 1)
-    out_sph = zeros(length(lon_sph), 1)
+_cgef_field(sz) = [sin(1.3 * I[1] + 0.7 * get(Tuple(I), 2, 0) + 0.4 * get(Tuple(I), 3, 0)) + 0.2
+                   for I in CartesianIndices(sz)]
 
-    # This should not throw InexactError
-    Test.@test_nowarn CGEF.Filtering.filter_field!(out_sph, field_sph, grid_sph, CGEF.TopHatKernel(), 1e6)
-end
-
-
-# filter_field!/filter_fields! reimplemented as thin wrappers over plan_filter+filter_apply!
-# (`workspace=` renamed to `filter_plan=`, a real prebuilt-plan reuse point, not a dead parameter).
-Test.@testset "filter_field!/filter_fields!: filter_plan= reuse is correctness-preserving" begin
-    geom = FG.Geometry.CartesianGeometry()
-    N = 20
-    xsR = 0.0:1000.0:(N - 1) * 1000.0
-    mask = trues(N, N); mask[8:11, 8:11] .= false
-    grid = FG.Grids.StructuredGrid(geom, xsR, xsR, mask)
-    ker = CGEF.TopHatKernel(); scale = 4000.0
-    u = randn(N, N); v = randn(N, N)
-
-    out_noplan = zeros(N, N)
-    CGEF.Filtering.filter_field!(out_noplan, u, grid, ker, scale)
-
-    plan = CGEF.Filtering.plan_filter(grid, ker, scale)
-    out_plan = zeros(N, N)
-    CGEF.Filtering.filter_field!(out_plan, u, grid, ker, scale; filter_plan = plan)
-    Test.@test out_plan == out_noplan
-
-    outs_noplan = (zeros(N, N), zeros(N, N))
-    CGEF.Filtering.filter_fields!(outs_noplan, (u, v), grid, ker, scale)
-    outs_plan = (zeros(N, N), zeros(N, N))
-    CGEF.Filtering.filter_fields!(outs_plan, (u, v), grid, ker, scale; filter_plan = plan)
-    Test.@test outs_plan[1] == outs_noplan[1]
-    Test.@test outs_plan[2] == outs_noplan[2]
-
-    # 3D-layered filter_field! on a non-serial backend must build the plan once and reuse it across
-    # every layer — checked against per-layer manual calls sharing one explicit plan. A per-layer
-    # rebuild gives the same numbers, just wastefully, so this comparison alone does not prove
-    # reuse; the real proof is the allocation bound in test_allocs.jl. This checks correctness
-    # end-to-end for the 3D entry point on a non-serial backend at all, which had no coverage.
-    Nz = 3
-    u3 = randn(N, N, Nz)
-    out3_threaded = zeros(N, N, Nz)
-    CGEF.Filtering.filter_field!(out3_threaded, u3, grid, ker, scale; backend = CGEF.ComputationalBackends.ThreadedBackend())
-    out3_manual = zeros(N, N, Nz)
-    for k in 1:Nz
-        CGEF.Filtering.filter_apply!(view(out3_manual, :, :, k), view(u3, :, :, k), plan)
-    end
-    Test.@test out3_threaded == out3_manual
-end
-
-
-# Reusable filter plans + batched multi-field filtering
-Test.@testset "Filter plans & batching" begin
-    geom = FG.Geometry.CartesianGeometry()
-    x = collect(0.0:1000.0:30e3)
-    y = collect(0.0:1000.0:30e3)
-    grid = FG.Grids.StructuredGrid(geom, x, y, trues(length(x), length(y)))
-    u = rand(length(x), length(y))
-    v = rand(length(x), length(y))
-    kern = CGEF.TopHatKernel()
-    scale = 5000.0
-
-    # A prebuilt plan applied to a field matches a direct filter_field! call. Pin SerialBackend so
-    # the footprint-based PhysicalFilterPlan (whose reuse/allocation we assert below) is built
-    # regardless of how many threads the suite happens to run with.
-    plan = CGEF.Filtering.plan_filter(grid, kern, scale; backend = CGEF.ComputationalBackends.SerialBackend())
-    out_plan = zeros(size(u))
-    out_direct = zeros(size(u))
-    CGEF.Filtering.filter_apply!(out_plan, u, plan)
-    CGEF.Filtering.filter_field!(out_direct, u, grid, kern, scale)
-    Test.@test out_plan ≈ out_direct
-
-    # Batched filter_fields! matches per-field filtering.
-    ou = zeros(size(u)); ov = zeros(size(v))
-    CGEF.Filtering.filter_fields!((ou, ov), (u, v), grid, kern, scale)
-    ru = zeros(size(u)); rv = zeros(size(v))
-    CGEF.Filtering.filter_field!(ru, u, grid, kern, scale)
-    CGEF.Filtering.filter_field!(rv, v, grid, kern, scale)
-    Test.@test ou ≈ ru
-    Test.@test ov ≈ rv
-
-    # Reapplying a prebuilt plan must NOT rebuild the footprint (a rebuild would allocate the
-    # offset/weight vectors, ~kBs); a reused plan allocates essentially nothing.
-    CGEF.Filtering.filter_apply!(out_plan, u, plan)  # warm up
-    Test.@test (@allocated CGEF.Filtering.filter_apply!(out_plan, u, plan)) < 256
-end
-
-
-
-# -----------------------------------------------------------------------
-# Cache-strategy control, cached/streaming bit-identical equivalence, `filter_apply_batch!`
-# correctness, and the separable-Gaussian fast path. Allocation SIZE assertions for these same
-# features live in test_allocs.jl; everything here is value correctness.
-# -----------------------------------------------------------------------
-# -----------------------------------------------------------------------
-# Exact prefix-sum top-hat engine (`PrefixSumTopHatPlan`): reduces the real-space top-hat
-# convolution from O(N·di_lim·dj_lim) to O(N·dj_lim) with NO approximation, on any rectilinear 2D
-# StructuredGrid. Cross-checked against the general scattered engine (the pre-existing,
-# independently-tested implementation) to roundoff, then separately checked for the semantic
-# distinctions a fast-vs-reference comparison alone cannot catch — if BOTH paths ignored the mask,
-# or if ZeroFill and Deformable silently agreed, a pure agreement test would still pass.
-# -----------------------------------------------------------------------
-Test.@testset "Prefix-sum top-hat engine: exact agreement with the general scattered engine" begin
-    function reference_scattered(field, grid, scale, strategy)
-        fp = CGEF.Filtering._build_footprint_scattered(
-            grid, CGEF.TopHatKernel(), scale;
-            mask_strategy = strategy, cache_strategy = CGEF.Filtering.AlwaysCache(),
-        )
-        out = zeros(FG.Grids.size_tuple(grid))
-        return CGEF.Filtering.apply_footprint!(
-            out, field, grid, fp, strategy,
-            FG.Grids.isperiodic(grid, 1), FG.Grids.isperiodic(grid, 2),
-        )
-    end
-
-    function check_agreement(grid, scale, strategy)
-        Nx, Ny = FG.Grids.size_tuple(grid)
-        field = [sin(i / 6.3) * cos(j / 4.1) + 0.3 for i in 1:Nx, j in 1:Ny]
-        fp = CGEF.Filtering.build_footprint(grid, CGEF.TopHatKernel(), scale; mask_strategy = strategy)
-        Test.@test fp isa CGEF.Filtering.PrefixSumTopHatPlan
-        fast = zeros(Nx, Ny)
-        CGEF.Filtering._apply_serial!(fast, field, grid, fp, strategy)
-        ref = reference_scattered(field, grid, scale, strategy)
-        # Exact in exact arithmetic; differs only by floating-point reassociation (prefix sums vs.
-        # a direct per-point accumulation), hence a roundoff-level rtol rather than `==`.
-        Test.@test maximum(abs, fast .- ref) / max(maximum(abs, ref), eps()) < 1e-11
-    end
-
-    geom = FG.Geometry.CartesianGeometry()
-    N = 40
-    xR = 0.0:1000.0:(N - 1) * 1000.0
-    xV = collect(xR) .+ [0.3 * 1000.0 * sin(2.7i) for i in 1:N]
-    yV = collect(xR) .+ [0.25 * 1000.0 * cos(1.9i) for i in 1:N]
-    R = 6.371e6
-    sgeom = FG.Geometry.SphericalGeometry(R)
-    lonR = range(0.0; step = deg2rad(360 / 48), length = 48)
-    latR = range(deg2rad(-60.0); step = deg2rad(4.0), length = 31)
-    lonV = collect(lonR) .+ [0.2 * deg2rad(360 / 48) * sin(3.1i) for i in 1:48]
-    latV = collect(latR) .+ [0.2 * deg2rad(4.0) * cos(2.3j) for j in 1:31]
-
-    for strat in (CGEF.Filtering.Deformable(), CGEF.Filtering.ZeroFill())
-        # Cartesian: uniform Range, genuinely nonuniform Vector, masked, and both periodicities.
-        check_agreement(FG.Grids.StructuredGrid(geom, xR, xR, trues(N, N)), 8000.0, strat)
-        check_agreement(FG.Grids.StructuredGrid(geom, xV, yV, trues(N, N)), 8000.0, strat)
-        mask = trues(N, N); mask[12:18, 10:16] .= false; mask[1, :] .= false
-        check_agreement(FG.Grids.StructuredGrid(geom, xV, yV, mask), 8000.0, strat)
-        check_agreement(FG.Grids.StructuredGrid(geom, xR, xR, trues(N, N); periodic = (true, true)), 6000.0, strat)
-        # A nonuniform periodic axis has no seam gap derivable from its samples, so the wrap length is
-        # explicit. `xV` is a perturbed uniform axis, so the domain it wraps over is still N·Δ.
-        check_agreement(
-            FG.Grids.StructuredGrid(
-                geom, xV, yV, trues(N, N); periodic = (true, false), period = (N * 1000.0, 0.0),
-            ),
-            6000.0, strat,
-        )
-
-        # Spherical: global (periodic longitude), regional nonuniform, and masked global.
-        check_agreement(FG.Grids.StructuredGrid(sgeom, lonR, latR, trues(48, 31)), 700e3, strat)
-        check_agreement(FG.Grids.StructuredGrid(sgeom, lonV, latV, trues(48, 31); periodic = false), 700e3, strat)
-        smask = trues(48, 31); smask[10:20, 8:14] .= false
-        check_agreement(FG.Grids.StructuredGrid(sgeom, lonR, latR, smask), 700e3, strat)
+# `engine` is the footprint type the serial plan must build. A box-truncated separable engine differs
+# from the disk-truncated reference by the kernel's weight past its radius, below 1e-9 of its peak for
+# the Gaussian.
+function _cgef_engine_matches(grid, kernel, ℓ, engine; reference = _cgef_direct_filter, rtol = 1e-11,
+                              method = CGEF.Filtering.RealSpace(), kw...)
+    f = _cgef_field(size(FG.Grids.mask(grid)))
+    fs = (f, 2 .* f)
+    for strategy in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
+        ref = reference(grid, kernel, ℓ, f, strategy)
+        plan(b) = CGEF.Filtering.plan_filter(grid, kernel, ℓ; method, execution = b, mask_strategy = strategy, kw...)
+        p = plan(_CGEF_SERIAL)
+        built = nameof(typeof(p.footprint))
+        built === engine || error("$(nameof(typeof(grid))), $(nameof(typeof(kernel))), ℓ = $ℓ builds $built, not $engine")
+        Test.@test occursin(_CGEF_ENGINE_REPORT[engine],
+                            CGEF.check_setup(grid, kernel, ℓ; method, mask_strategy = strategy, execution = _CGEF_SERIAL).engine)
+        out = CGEF.Filtering.filter_apply!(zero(f), f, p)
+        Test.@test _cgef_relerr(out, ref) < rtol
+        Test.@test minimum(_ -> _cgef_alloc_apply(out, f, p), 1:2) == 0
+        outs = (zero(f), zero(f))
+        CGEF.Filtering.filter_apply_batch!(outs, fs, p)
+        Test.@test outs[1] == out && outs[2] == CGEF.Filtering.filter_apply!(zero(f), fs[2], p)
+        Test.@test minimum(_ -> _cgef_alloc_batch(outs, fs, p), 1:2) == 0
+        for b in _CGEF_PARALLEL
+            Test.@test _cgef_relerr(CGEF.Filtering.filter_apply!(zero(f), f, plan(b)), ref) < rtol
+        end
     end
 end
 
+const _CGEF_TH = CGEF.TopHatKernel()
+const _CGEF_GA = CGEF.GaussianKernel()
+const _CGEF_SH = CGEF.Kernels.SmoothHatKernel()
+const _CGEF_SS = CGEF.SharpSpectralKernel()
+const _CGEF_AUTO = CGEF.Filtering.AutoMethod()
+const _CGEF_CACHES = (CGEF.Filtering.AlwaysCache(), CGEF.Filtering.NeverCache())
+_cgef_hole(sz) = (m = trues(sz); m[5:8, 3:5] .= false; m)
 
-Test.@testset "Prefix-sum top-hat engine: masking/strategy semantics and exact physical limits" begin
-    geom = FG.Geometry.CartesianGeometry()
-    N = 40
-    x = collect(0.0:1000.0:(N - 1) * 1000.0) .+ [0.3 * 1000.0 * sin(2.7i) for i in 1:N]
-    y = collect(0.0:1000.0:(N - 1) * 1000.0) .+ [0.25 * 1000.0 * cos(1.9i) for i in 1:N]
-    field = [sin(i / 6.3) * cos(j / 4.1) + 0.3 for i in 1:N, j in 1:N]
-    scale = 8000.0
-    m = trues(N, N); m[12:18, 10:16] .= false; m[1, :] .= false
-    g_un = FG.Grids.StructuredGrid(geom, x, y, trues(N, N))
-    g_m = FG.Grids.StructuredGrid(geom, x, y, m)
+# Top-hat radii here sit off every distance between cells, so no cell lies on a support boundary.
+Test.@testset "Real-space engines on Cartesian grids" begin
+    cart = FG.Geometry.CartesianGeometry()
+    xs = cumsum([0.0, 1.1, 0.8, 1.3, 0.9, 1.2, 0.7, 1.0, 1.1, 0.95, 1.05, 1.15, 0.85])
 
-    function run_filter(grid, strat, f = field)
-        fp = CGEF.Filtering.build_footprint(grid, CGEF.TopHatKernel(), scale; mask_strategy = strat)
-        out = zeros(N, N)
-        CGEF.Filtering._apply_serial!(out, f, grid, fp, strat)
-        return out
+    # Periods 16 and 8.4; the supports reach one, two and five periods, and a periodic Cartesian direction
+    # counts a cell once per image.
+    gp = FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:7.7; periodic = (true, true))
+    for ℓ in (4.8, 19.2, 40.8)
+        _cgef_engine_matches(gp, _CGEF_TH, ℓ, :PrefixSumTopHatPlan)
+        _cgef_engine_matches(gp, _CGEF_SH, ℓ, :FilterFootprint)
+        _cgef_engine_matches(gp, _CGEF_SH, ℓ, :PaddedFFTFootprint; method = _CGEF_AUTO)
+    end
+    _cgef_engine_matches(gp, _CGEF_GA, 4.8, :SeparableFootprint; rtol = 1e-8)
+
+    # Bounded, with the support past more than half the rows, unmasked and masked.
+    gb = FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:2.8)
+    gbm = FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:4.9, _cgef_hole((16, 8)))
+    for g in (gb, gbm), ℓ in (4.8, 9.6)
+        _cgef_engine_matches(g, _CGEF_TH, ℓ, :PrefixSumTopHatPlan)
+        _cgef_engine_matches(g, _CGEF_SH, ℓ, :FilterFootprint)
+        _cgef_engine_matches(g, _CGEF_SH, ℓ, :PaddedFFTFootprint; method = _CGEF_AUTO)
+        _cgef_engine_matches(g, _CGEF_GA, ℓ, :SeparableFootprint; rtol = 1e-8)
     end
 
-    o_un = run_filter(g_un, CGEF.Filtering.Deformable())
-    o_m_def = run_filter(g_m, CGEF.Filtering.Deformable())
-    o_m_zf = run_filter(g_m, CGEF.Filtering.ZeroFill())
+    # Stretched axes, bounded and periodic, and the same cells stored in descending order.
+    gs = FG.Grids.StructuredGrid(cart, xs, collect(0.0:0.7:4.9), _cgef_hole((13, 8)))
+    gd = FG.Grids.StructuredGrid(cart, reverse(xs), collect(4.9:-0.7:0.0), reverse(_cgef_hole((13, 8))))
+    for g in (gs, gd), ℓ in (2.9, 6.13)
+        _cgef_engine_matches(g, _CGEF_TH, ℓ, :PrefixSumTopHatPlan)
+        _cgef_engine_matches(g, _CGEF_GA, ℓ, :SeparableFootprint; rtol = 1e-8)
+        for cs in _CGEF_CACHES
+            _cgef_engine_matches(g, _CGEF_SH, ℓ, :ScatteredFilterPlan; cache_strategy = cs)
+        end
+    end
+    gsp = FG.Grids.StructuredGrid(cart, xs, 0.0:0.7:7.7; periodic = (true, true), period = (13.0, 8.4))
+    for ℓ in (5.1462, 29.9226)
+        _cgef_engine_matches(gsp, _CGEF_TH, ℓ, :PrefixSumTopHatPlan)
+    end
 
-    # Masked-out points are exactly zero, and masking genuinely changes active points (so a
-    # mask-ignoring implementation could not pass the agreement test above by accident).
-    Test.@test all(o_m_def[.!m] .== 0.0)
-    Test.@test maximum(abs, (o_m_def .- o_un)[m]) > 1e-3
-    # The two strategies use genuinely different denominators near a mask boundary.
-    Test.@test maximum(abs, (o_m_zf .- o_m_def)[m]) > 1e-3
+    # A uniform axis 1 with a stretched axis 2: one band of offsets per row.
+    ys = cumsum([0.6 + 0.8 * abs(sin(0.3j)) for j in 1:12])
+    for g in (FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, ys),
+              FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, ys; periodic = (true, true), period = (16.0, ys[end] - ys[1] + 1.0)))
+        _cgef_engine_matches(g, _CGEF_SS, 2.0, :FilterFootprint)
+        _cgef_engine_matches(g, _CGEF_SH, 5.0, :FilterFootprint)
+    end
 
-    # A constant field must come back exactly (numerator and denominator share every weight).
-    oc = run_filter(g_m, CGEF.Filtering.Deformable(), fill(7.25, N, N))
-    Test.@test all(abs.(oc[m] .- 7.25) .< 1e-12)
+    # One dimension.
+    g1 = FG.Grids.StructuredGrid(cart, 0.0:1.0:23.0)
+    _cgef_engine_matches(g1, _CGEF_TH, 4.8, :FilterFootprintND)
+    _cgef_engine_matches(FG.Grids.StructuredGrid(cart, 0.0:1.0:23.0; periodic = true), _CGEF_TH, 30.5, :FilterFootprintND)
+    _cgef_engine_matches(g1, _CGEF_GA, 4.8, :SeparableFootprintND; rtol = 1e-8)
+    for cs in _CGEF_CACHES
+        _cgef_engine_matches(FG.Grids.StructuredGrid(cart, xs), _CGEF_SH, 2.9, :NDScatteredFilterPlan; cache_strategy = cs)
+    end
 
-    # A filter wider than the whole sphere returns the area-weighted mean over the grid under
-    # `Deformable`. Under `ZeroFill` the lattice continues to both poles and around the ring, its cells
-    # tile the rest of the sphere, and the result is the grid's integral over `4πR²`: with the latitude
-    # rows landing on the poles, with them missing the poles by half a step, and with a regional
-    # longitude whose remaining arc is not a whole number of steps.
+    # Three dimensions: whole turns of axis 1 and images along axes 2 and 3; stretched; bounded and masked.
+    g3 = FG.Grids.StructuredGrid(cart, 0.0:1.0:5.0, 0.0:0.7:2.8, 0.0:0.9:2.7; periodic = (true, true, true))
+    for ℓ in (4.8, 13.3)
+        _cgef_engine_matches(g3, _CGEF_TH, ℓ, :PrefixSumTopHat3DPlan)
+        _cgef_engine_matches(g3, _CGEF_SH, ℓ, :FilterFootprintND)
+    end
+    _cgef_engine_matches(g3, _CGEF_GA, 2.9, :SeparableFootprintND; rtol = 1e-8)
+    g3s = FG.Grids.StructuredGrid(cart, cumsum([0.0, 1.1, 0.8, 1.3, 0.9, 1.2]), 0.0:0.7:2.8, 0.0:0.9:2.7;
+                                  periodic = (true, true, true), period = (6.2, 3.5, 3.6))
+    for cs in _CGEF_CACHES
+        _cgef_engine_matches(g3s, _CGEF_SH, 4.8, :NDScatteredFilterPlan; cache_strategy = cs)
+    end
+    m3 = trues(6, 5, 4)
+    m3[2:3, 2:3, 2] .= false
+    g3b = FG.Grids.StructuredGrid(cart, 0.0:1.0:5.0, 0.0:0.7:2.8, 0.0:0.9:2.7, m3)
+    for ℓ in (2.9, 5.3)
+        _cgef_engine_matches(g3b, _CGEF_TH, ℓ, :PrefixSumTopHat3DPlan)
+        _cgef_engine_matches(g3b, _CGEF_SH, ℓ, :FilterFootprintND)
+    end
+end
+
+# A spherical longitude identifies, so each cell counts once however far the support reaches.
+Test.@testset "Real-space engines on spherical grids" begin
+    sph = FG.Geometry.SphericalGeometry(6.371e6)
+    # Global, the support reaching over a pole and round the ring.
+    ring = range(0.0; step = deg2rad(10.0), length = 36)
+    gw = FG.Grids.StructuredGrid(sph, ring, range(deg2rad(-80.0); step = deg2rad(10.0), length = 17); periodic = (true, false))
+    _cgef_engine_matches(gw, _CGEF_TH, 2 * 12_000e3, :PrefixSumTopHatPlan)
+    _cgef_engine_matches(gw, _CGEF_GA, 3.0e6, :FilterFootprint)
+    _cgef_engine_matches(gw, _CGEF_GA, 3.0e6, :ZonalFFTFootprint; method = _CGEF_AUTO)
+
+    # Stretched latitude, with a hole.
+    φs = [deg2rad(-75 + 150 * (s + 0.12 * sin(π * s))) for s in range(0, 1; length = 14)]
+    gls = FG.Grids.StructuredGrid(sph, ring, φs, (m = trues(36, 14); m[10:14, 5:8] .= false; m))
+    _cgef_engine_matches(gls, _CGEF_GA, 1.5e6, :FilterFootprint)
+
+    # A regional box whose longitude support is wider than half its columns, with and without a hole;
+    # range axes take the banded engine and vector axes the per-point one.
+    λr = range(0.0, deg2rad(38.0); length = 20)
+    φr = range(deg2rad(60.0), deg2rad(80.0); length = 11)
+    gr = FG.Grids.StructuredGrid(sph, λr, φr)
+    _cgef_engine_matches(gr, _CGEF_SH, 1000e3, :FilterFootprint)
+    _cgef_engine_matches(gr, _CGEF_TH, 1000e3, :PrefixSumTopHatPlan)
+    for cs in _CGEF_CACHES
+        _cgef_engine_matches(FG.Grids.StructuredGrid(sph, collect(λr), collect(φr)), _CGEF_SH, 1000e3,
+                             :ScatteredFilterPlan; cache_strategy = cs)
+    end
+    grm = FG.Grids.StructuredGrid(sph, λr, φr, (m = trues(20, 11); m[4:6, 3:4] .= false; m))
+    _cgef_engine_matches(grm, _CGEF_SH, 1500e3, :FilterFootprint)
+    _cgef_engine_matches(grm, _CGEF_TH, 600e3, :PrefixSumTopHatPlan)
+
+    # A box over 320° of longitude, whose 40° gap the support spans: the columns at its two ends are
+    # neighbours across the gap.
+    λw = range(0.0; step = deg2rad(10.0), length = 33)
+    φw = range(deg2rad(50.0), deg2rad(70.0); length = 5)
+    _cgef_engine_matches(FG.Grids.StructuredGrid(sph, λw, φw), _CGEF_TH, 5.0e6, :PrefixSumTopHatPlan)
+    _cgef_engine_matches(FG.Grids.StructuredGrid(sph, λw, φw), _CGEF_SH, 2.5e6, :FilterFootprint)
+    for cs in _CGEF_CACHES
+        _cgef_engine_matches(FG.Grids.StructuredGrid(sph, collect(λw), collect(φw)), _CGEF_SH, 2.5e6,
+                             :ScatteredFilterPlan; cache_strategy = cs)
+    end
+
+    # A meridian and a parallel: the measure is an arc length.
+    lat = deg2rad.(collect(-60.0:5.0:60.0))
+    _cgef_engine_matches(FG.Grids.StructuredGrid(sph, [0.0], lat), _CGEF_TH, 2.0e6, :PrefixSumTopHatPlan)
+    _cgef_engine_matches(FG.Grids.StructuredGrid(sph, deg2rad.(collect(0.0:5.0:355.0)), [0.3]), _CGEF_TH, 2.0e6,
+                         :PrefixSumTopHatPlan)
+
+    # Latitude stored north to south, as `π/2 − θ` gives it.
+    gn = FG.Grids.StructuredGrid(sph, range(0.0; step = deg2rad(15.0), length = 24), π / 2 .- range(0.3, π - 0.3; length = 12))
+    _cgef_engine_matches(gn, _CGEF_TH, 1.7e6, :PrefixSumTopHatPlan)
+    _cgef_engine_matches(gn, _CGEF_GA, 1.2e6, :FilterFootprint)
+end
+
+Test.@testset "Real-space engines on meshes, node sets and sphere pixelizations" begin
+    cart = FG.Geometry.CartesianGeometry()
+    θ = deg2rad(15.0)
+    cx = [i * cos(θ) - 0.3j * sin(θ) for i in 0:11, j in 0:9]
+    cy = [i * sin(θ) + j * (1 + 0.3cos(θ)) for i in 0:11, j in 0:9]
+    gc = FG.Grids.CurvilinearGrid(cart, cx, cy, _cgef_hole((12, 10)))
+    for (k, ℓ) in ((_CGEF_TH, 3.1), (_CGEF_GA, 2.0), (_CGEF_SS, 1.0)), cs in _CGEF_CACHES
+        _cgef_engine_matches(gc, k, ℓ, :ScatteredFilterPlan; reference = _cgef_cellset_filter, cache_strategy = cs)
+    end
+
+    mn = vec(_cgef_hole((12, 10)))
+    gu = FG.Grids.UnstructuredGrid(cart, vec(cx) .+ 0.1 .* sin.(1:120), vec(cy), fill(1.1, 120), mn)
+    _cgef_engine_matches(gu, _CGEF_GA, 2.0, :NodeFilterPlan; reference = _cgef_cellset_filter, method = CGEF.Filtering.RealSpace())
+
+    # Each pixelization with a hole of half the kernel radius about cell 1, at a width of about 1.3 cells.
+    sgeo = FG.Geometry.SphericalGeometry()
+    builders = (m -> FG.Grids.RingGrid(sgeo, FG.SphericalSampling.ReducedGaussianSampling([16, 24, 32, 32, 24, 16]); mask = m),
+                m -> FG.Grids.CubedSphereGrid(sgeo, 6; mask = m), m -> FG.Grids.HEALPixGrid(sgeo, 4; mask = m),
+                m -> FG.Grids.IcosahedralGrid(sgeo, 4; mask = m), m -> FG.Grids.YinYangGrid(sgeo, 20, 10; mask = m))
+    for build in builders
+        g0 = build(nothing)
+        n = length(FG.Grids.mask(g0))
+        ℓ = 1.3 * FG.Geometry.radius(sgeo) * sqrt(4π / n)
+        p1 = Tuple(FG.Grids.coords(g0, 1))
+        cut = CGEF.Kernels.kernel_radius(_CGEF_GA, ℓ) / 2
+        hole = [FG.Geometry.distance(sgeo, p1, Tuple(FG.Grids.coords(g0, i))) > cut for i in 1:n]
+        _cgef_engine_matches(build(hole), _CGEF_GA, ℓ, :NodeFilterPlan; reference = _cgef_cellset_filter)
+    end
+end
+
+# A window sum read off a running sum is a difference of two numbers `row length / window` times larger
+# than itself, and a periodic row is scanned over three copies of it. The rows are 10 apart and the
+# support radius 3.5, so each target averages its own row; the reference is that mean summed in Float64
+# from the same Float32 values.
+Test.@testset "Prefix sums in Float32 on long periodic rows" begin
+    Nx = 4096
+    x = range(0.0f0; step = 1.0f0, length = Nx)
+    window_mean(row, i) = sum(Float64(row[mod1(i + d, Nx)]) for d in -3:3) / 7
+    geo = FG.Geometry.CartesianGeometry(Float32)
+    y = range(0.0f0; step = 10.0f0, length = 2)
+    f2 = Float32[1000 + sin(0.37f0 * i) + 0.5f0 * cos(1.3f0 * i + j) for i in 1:Nx, j in 1:2]
+    f3 = Float32[1000 + sin(0.37f0 * i) + 0.5f0 * cos(1.3f0 * i + j - k) for i in 1:Nx, j in 1:2, k in 1:2]
+    for (g, f) in ((FG.Grids.StructuredGrid(geo, x, y; periodic = (true, false)), f2),
+                   (FG.Grids.StructuredGrid(geo, x, y, y; periodic = (true, false, false)), f3))
+        ref = [window_mean(view(f, :, Tuple(I)[2:end]...), I[1]) for I in CartesianIndices(f)]
+        for b in (_CGEF_SERIAL, CGEF.ComputationalBackends.GPUBackend(KA.CPU()))
+            out = CGEF.Filtering.filter_apply!(similar(f), f, CGEF.Filtering.plan_filter(g, _CGEF_TH, 7.0f0; execution = b))
+            Test.@test maximum(abs, out .- ref) <= 8 * eps(1000.0f0)
+        end
+    end
+end
+
+# On a sphere cut from a cell-centred lattice whose faces fall on the poles, the lattice continued past the
+# cut is the removed rows, so `ZeroFill` divides by the kernel's mass over the whole lattice.
+Test.@testset "ZeroFill on a sphere cut from a whole lattice" begin
+    geo = FG.Geometry.SphericalGeometry(6.371e6)
+    nlat, nlon = 18, 36
+    h = π / nlat
+    lat = range(-π / 2 + h / 2; step = h, length = nlat)
+    lon = range(0, 2π; length = nlon + 1)[1:nlon]
+    whole = FG.Grids.StructuredGrid(geo, lon, lat)
+    rows = 4:(nlat - 3)
+    f = [cos(2a) * sin(b) + 0.3 for a in lon, b in lat]
+    ℓ = 3.0e6
+    out = CGEF.Filtering.filter_field!(zeros(nlon, length(rows)), f[:, rows], FG.Grids.StructuredGrid(geo, lon, lat[rows]),
+                                       _CGEF_GA, ℓ; execution = _CGEF_SERIAL)
+    fz = [j in rows ? f[i, j] : 0.0 for i in 1:nlon, j in 1:nlat]
+    ref = _cgef_cellset_filter(whole, _CGEF_GA, ℓ, fz)
+    Test.@test _cgef_relerr(out, ref[:, rows]) < 1e-12
+end
+
+# A support wider than the sphere averages over all of it: the area-weighted mean of the grid under
+# `Deformable`, and under `ZeroFill`, where the lattice continues to both poles and round the ring and
+# tiles the rest of the sphere, the grid's integral over `4πR²`.
+Test.@testset "A filter wider than the sphere" begin
     R = 6.371e6
     sph = FG.Geometry.SphericalGeometry(R)
     for (lon, lat, periodic) in (
@@ -233,784 +277,183 @@ Test.@testset "Prefix-sum top-hat engine: masking/strategy semantics and exact p
         (range(0.0; step = deg2rad(10.0), length = 36), range(deg2rad(-88.5); step = deg2rad(2.0), length = 89), true),
         (range(0.0; step = deg2rad(7.0), length = 21), range(deg2rad(-60.0); step = deg2rad(5.0), length = 25), false),
     )
-        nl, nφ = length(lon), length(lat)
-        gs = FG.Grids.StructuredGrid(sph, lon, lat, trues(nl, nφ); periodic = (periodic, false))
-        sf = [sin(2 * lon[i]) * cos(lat[j]) + 2.0 for i in 1:nl, j in 1:nφ]
-        integral = sum(sf[i, j] * FG.Grids.area(gs, i, j) for i in 1:nl, j in 1:nφ)
-        wsum = sum(FG.Grids.area(gs, i, j) for i in 1:nl, j in 1:nφ)
-        for (strat, expected) in ((CGEF.Filtering.Deformable(), integral / wsum),
-                                  (CGEF.Filtering.ZeroFill(), integral / (4π * R^2)))
-            fps = CGEF.Filtering.build_footprint(gs, CGEF.TopHatKernel(), 4 * π * R; mask_strategy = strat)
-            os = zeros(nl, nφ)
-            CGEF.Filtering._apply_serial!(os, sf, gs, fps, strat)
-            Test.@test maximum(abs, os .- expected) < 1e-10 * expected
-        end
-    end
-
-    # A Deformable apply against a ZeroFill-built plan on a masked grid has no renormalization data
-    # and must THROW rather than silently computing ZeroFill (the silent-wrong-answer shape of a
-    # mask_strategy that isn't threaded through to build_footprint).
-    fp_zf = CGEF.Filtering.build_footprint(g_m, CGEF.TopHatKernel(), scale; mask_strategy = CGEF.Filtering.ZeroFill())
-    Test.@test_throws ArgumentError CGEF.Filtering._apply_serial!(
-        zeros(N, N), field, g_m, fp_zf, CGEF.Filtering.Deformable(),
-    )
-end
-
-
-Test.@testset "cache-strategy control (AutoCache budget, AlwaysCache/NeverCache force)" begin
-    # The cache is the scattered engine's per-point neighbour list, so this needs a kernel with no
-    # closed form: top-hat takes the exact prefix-sum path and a Gaussian is separable on any
-    # rectilinear grid, uniform or not — neither has a per-point list to cache. `SharpSpectralKernel`
-    # has neither shortcut, so it is what actually reaches the machinery under test.
-    #
-    # The scale is chosen to reproduce the search window the Gaussian at 20 km used, so every
-    # cache-size figure asserted below is unchanged. Both kernels' radii are linear in the scale.
-    ker = CGEF.SharpSpectralKernel()
-    geom = FG.Geometry.CartesianGeometry()
-    N = 60
-    x_nu = collect(0.0:1000.0:(N - 1) * 1000.0) .+ [iseven(i) ? 3.0 : -2.0 for i in 1:N]
-    grid = FG.Grids.StructuredGrid(geom, x_nu, x_nu, trues(N, N))
-    scale = 20_000.0 * CGEF.Kernels.kernel_radius(CGEF.GaussianKernel(), 20_000.0) /
-            CGEF.Kernels.kernel_radius(ker, 20_000.0, Val(2))
-
-    fp_always = CGEF.Filtering.build_footprint(grid, ker, scale; cache_strategy = CGEF.Filtering.AlwaysCache())
-    fp_never = CGEF.Filtering.build_footprint(grid, ker, scale; cache_strategy = CGEF.Filtering.NeverCache())
-    Test.@test fp_always isa CGEF.Filtering.ScatteredFilterPlan
-    Test.@test fp_always.cache !== nothing
-    Test.@test fp_never.cache === nothing
-
-    fp_auto_generous = CGEF.Filtering.build_footprint(
-        grid, ker, scale; cache_strategy = CGEF.Filtering.AutoCache(), cache_byte_budget = 10 * 1024^3,
-    )
-    Test.@test fp_auto_generous.cache !== nothing
-    fp_auto_tiny = CGEF.Filtering.build_footprint(
-        grid, ker, scale; cache_strategy = CGEF.Filtering.AutoCache(), cache_byte_budget = 1,
-    )
-    Test.@test fp_auto_tiny.cache === nothing
-
-    # 1D nonuniform (NDScatteredFilterPlan) — same cache-strategy contract.
-    grid1 = FG.Grids.StructuredGrid(geom, x_nu, trues(N))
-    fp1_always = CGEF.Filtering.build_footprint(grid1, ker, scale; cache_strategy = CGEF.Filtering.AlwaysCache())
-    fp1_never = CGEF.Filtering.build_footprint(grid1, ker, scale; cache_strategy = CGEF.Filtering.NeverCache())
-    Test.@test fp1_always isa CGEF.Filtering.NDScatteredFilterPlan
-    Test.@test fp1_always.cache !== nothing
-    Test.@test fp1_never.cache === nothing
-
-    # CurvilinearGrid — same cache-strategy contract (its only real-space engine).
-    Nc = 30
-    ic = collect(0.0:(Nc - 1)); jc = collect(0.0:(Nc - 1))
-    clon = [1000.0 * ii for ii in ic, jj in jc]
-    clat = [1000.0 * jj for ii in ic, jj in jc]
-    cgrid = FG.Grids.CurvilinearGrid(geom, clon, clat, trues(Nc, Nc))
-    cfp_always = CGEF.Filtering.build_footprint(cgrid, ker, scale; cache_strategy = CGEF.Filtering.AlwaysCache())
-    cfp_never = CGEF.Filtering.build_footprint(cgrid, ker, scale; cache_strategy = CGEF.Filtering.NeverCache())
-    Test.@test cfp_always.cache !== nothing
-    Test.@test cfp_never.cache === nothing
-
-    # plan_filter itself must thread cache_strategy through (not just the internal builder).
-    plan_never = CGEF.Filtering.plan_filter(grid, ker, scale; cache_strategy = CGEF.Filtering.NeverCache())
-    Test.@test plan_never.footprint.cache === nothing
-
-    # `AutoCache` decides on the exact entry count: a budget of exactly the cache's bytes keeps it, one
-    # byte less streams it. A lon-lat grid reaching ±80° has its widest window at the polar rows.
-    sgrid = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(6.371e6), deg2rad.(collect(0.0:7.5:352.5)),
-                                    deg2rad.(collect(range(-80.0, 80.0; length = 33))))
-    for (g, k, ℓ, nd) in ((sgrid, CGEF.GaussianKernel(), 500e3, 2), (grid1, ker, scale, 1))
-        full = CGEF.Filtering.build_footprint(g, k, ℓ; cache_strategy = CGEF.Filtering.AlwaysCache())
-        n = length(full.cache.w)
-        Test.@test full.cache.ptr[end] == n + 1
-        bytes = n * (nd * sizeof(Int) + sizeof(Float64))
-        for (b, kept) in ((bytes, true), (bytes - 1, false))
-            fp = CGEF.Filtering.build_footprint(g, k, ℓ; cache_strategy = CGEF.Filtering.AutoCache(),
-                                                cache_byte_budget = b)
-            Test.@test (fp.cache !== nothing) == kept
+        g = FG.Grids.StructuredGrid(sph, lon, lat; periodic = (periodic, false))
+        f = [sin(2a) * cos(b) + 2.0 for a in lon, b in lat]
+        A = FG.Grids.measure(g)
+        for (strategy, want) in ((CGEF.Filtering.Deformable(), sum(f .* A) / sum(A)),
+                                 (CGEF.Filtering.ZeroFill(), sum(f .* A) / (4π * R^2)))
+            out = CGEF.Filtering.filter_field!(zero(f), f, g, _CGEF_TH, 4π * R; mask_strategy = strategy)
+            Test.@test maximum(abs, out .- want) < 1e-10 * want
         end
     end
 end
 
-
-Test.@testset "cached vs streaming apply are bit-identical (same candidate-iteration order)" begin
-    # Cached and streaming are two branches of the SCATTERED engine, so this needs the one kernel
-    # that reaches it — see the cache-strategy testset above.
-    ker = CGEF.SharpSpectralKernel()
-    geom = FG.Geometry.CartesianGeometry()
-    N = 45
-    x_nu = collect(0.0:900.0:(N - 1) * 900.0) .+ [iseven(i) ? 3.0 : -2.0 for i in 1:N]
-    y_nu = collect(0.0:1100.0:(N - 1) * 1100.0) .+ [isodd(i) ? -4.0 : 1.5 for i in 1:N]
-    mask = trues(N, N); mask[10:13, 10:13] .= false
-    grid = FG.Grids.StructuredGrid(geom, x_nu, y_nu, mask)
-    # Same window the Gaussian at 12 km spanned, so the cache stays a sane size.
-    scale = 12_000.0 * CGEF.Kernels.kernel_radius(CGEF.GaussianKernel(), 12_000.0) /
-            CGEF.Kernels.kernel_radius(ker, 12_000.0, Val(2))
-    field = randn(N, N)
-
-    for strategy in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
-        plan_cached = CGEF.Filtering.plan_filter(grid, ker, scale; mask_strategy = strategy, cache_strategy = CGEF.Filtering.AlwaysCache())
-        plan_stream = CGEF.Filtering.plan_filter(grid, ker, scale; mask_strategy = strategy, cache_strategy = CGEF.Filtering.NeverCache())
-        Test.@test plan_cached.footprint.cache !== nothing
-        Test.@test plan_stream.footprint.cache === nothing
-
-        out_cached = zeros(N, N); out_stream = zeros(N, N)
-        CGEF.Filtering.filter_apply!(out_cached, field, plan_cached)
-        CGEF.Filtering.filter_apply!(out_stream, field, plan_stream)
-        Test.@test out_cached == out_stream
+# The flux budget commutes the filter with derivatives. `ZeroFill` keeps the whole kernel mass in its
+# denominator, so it is one convolution of the zero-extended field everywhere, land targets included: it
+# commutes with a difference taken over the whole lattice and conserves the domain integral. `Deformable`
+# divides by the mass over water, which changes within ℓ of a coast.
+Test.@testset "ZeroFill commutes with ∂/∂x and conserves the integral; Deformable does neither" begin
+    N = 48
+    xs = 0.0:1000.0:((N - 1) * 1000.0)
+    coast = 31
+    mask = trues(N, N)
+    mask[coast:end, :] .= false
+    cart = FG.Geometry.CartesianGeometry()
+    grid = FG.Grids.StructuredGrid(cart, xs, xs, mask)
+    lattice = FG.Grids.StructuredGrid(cart, xs, xs)
+    ddx(a) = _cgef_dd(a, lattice, 1)
+    # A C³ bump, zero from column 30 on, so it and its derivative vanish on land.
+    f = [((r2 = ((i - 24)^2 + (j - 24)^2) / 36) < 1 ? (1 - r2)^4 : 0.0) for i in 1:N, j in 1:N]
+    df = ddx(f)
+    Test.@test all(iszero, f[coast:end, :]) && all(iszero, df[coast:end, :])
+    gap = Dict{Any,Float64}()
+    drift = Dict{Any,Float64}()
+    for s in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
+        filt(a) = CGEF.Filtering.filter_field!(zeros(N, N), a, grid, _CGEF_TH, 6200.0; mask_strategy = s)
+        rhs = ddx(filt(f))
+        gap[s] = maximum(abs, filt(df) .- rhs) / maximum(abs, rhs)
+        drift[s] = abs(sum(filt(f)) - sum(f)) / sum(f)
     end
-
-    # 1D nonuniform (NDScatteredFilterPlan).
-    grid1 = FG.Grids.StructuredGrid(geom, x_nu, trues(N))
-    plan1_cached = CGEF.Filtering.plan_filter(grid1, ker, scale; cache_strategy = CGEF.Filtering.AlwaysCache())
-    plan1_stream = CGEF.Filtering.plan_filter(grid1, ker, scale; cache_strategy = CGEF.Filtering.NeverCache())
-    u1 = randn(N)
-    o1c = zeros(N); o1s = zeros(N)
-    CGEF.Filtering.filter_apply!(o1c, u1, plan1_cached)
-    CGEF.Filtering.filter_apply!(o1s, u1, plan1_stream)
-    Test.@test o1c == o1s
-
-    # True-3D nonuniform (NDScatteredFilterPlan).
-    geom3 = FG.Geometry.CartesianGeometry()
-    N3 = 14
-    x3_nu = collect(0.0:900.0:(N3 - 1) * 900.0) .+ [iseven(i) ? 2.0 : -1.5 for i in 1:N3]
-    grid3 = FG.Grids.StructuredGrid(geom3, x3_nu, x3_nu, x3_nu, trues(N3, N3, N3))
-    plan3_cached = CGEF.Filtering.plan_filter(grid3, ker, 2500.0; cache_strategy = CGEF.Filtering.AlwaysCache())
-    plan3_stream = CGEF.Filtering.plan_filter(grid3, ker, 2500.0; cache_strategy = CGEF.Filtering.NeverCache())
-    u3 = randn(N3, N3, N3)
-    o3c = zeros(N3, N3, N3); o3s = zeros(N3, N3, N3)
-    CGEF.Filtering.filter_apply!(o3c, u3, plan3_cached)
-    CGEF.Filtering.filter_apply!(o3s, u3, plan3_stream)
-    Test.@test o3c == o3s
-
-    # CurvilinearGrid (ScatteredFilterPlan, non-Cartesian `is_cartesian=false` branch).
-    Nc = 26
-    ic = collect(0.0:(Nc - 1)); jc = collect(0.0:(Nc - 1))
-    θ = deg2rad(20.0)
-    clon = [1000.0 * (ii * cos(θ) - jj * 0.2 * sin(θ)) for ii in ic, jj in jc]
-    clat = [1000.0 * (ii * sin(θ) + jj * (1 + 0.2 * cos(θ))) for ii in ic, jj in jc]
-    cmask = trues(Nc, Nc); cmask[5:7, 5:7] .= false
-    cgrid = FG.Grids.CurvilinearGrid(geom, clon, clat, cmask)
-    cplan_cached = CGEF.Filtering.plan_filter(cgrid, ker, 6000.0; cache_strategy = CGEF.Filtering.AlwaysCache())
-    cplan_stream = CGEF.Filtering.plan_filter(cgrid, ker, 6000.0; cache_strategy = CGEF.Filtering.NeverCache())
-    uc = randn(Nc, Nc)
-    occ = zeros(Nc, Nc); ocs = zeros(Nc, Nc)
-    CGEF.Filtering.filter_apply!(occ, uc, cplan_cached)
-    CGEF.Filtering.filter_apply!(ocs, uc, cplan_stream)
-    Test.@test occ == ocs
+    Test.@test gap[CGEF.Filtering.ZeroFill()] < 1e-13
+    Test.@test drift[CGEF.Filtering.ZeroFill()] < 1e-13
+    Test.@test gap[CGEF.Filtering.Deformable()] > 1e-3
+    Test.@test drift[CGEF.Filtering.Deformable()] > 1e-6
 end
 
-
-# Every footprint/plan type reaches the batch path through its own method, so a type with no batch
-# method is a MethodError the moment a caller filters more than one field on that grid. Each is
-# checked on every backend it has a hook for, since the backends route batching separately too.
-Test.@testset "filter_apply_batch! is bit-identical to per-field filter_apply! (all footprint/plan types)" begin
-    function _check_batch(grid, kernel, scale, dims::Integer...; K::Integer = 4, kwargs...)
-        fields = ntuple(_ -> randn(dims...), K)
-        for backend in (CGEF.ComputationalBackends.SerialBackend(), CGEF.ComputationalBackends.ThreadedBackend())
-            # Ask only for a backend this grid has a hook for; `plan_filter` rejects the rest by
-            # design, and that rejection is covered elsewhere.
-            CGEF.Filtering._backend_supported(grid, backend) || continue
-            plan = CGEF.Filtering.plan_filter(grid, kernel, scale; backend = backend, kwargs...)
-            outs_ref = ntuple(_ -> zeros(dims...), K)
-            for k in 1:K
-                CGEF.Filtering.filter_apply!(outs_ref[k], fields[k], plan)
-            end
-            outs_batch = ntuple(_ -> zeros(dims...), K)
-            CGEF.Filtering.filter_apply_batch!(outs_batch, fields, plan)
-            for k in 1:K
-                Test.@test outs_batch[k] == outs_ref[k]
-            end
-            # Vector (runtime-determined batch size) form must agree too.
-            fields_v = [fields...]
-            outs_v = [zeros(dims...) for _ in 1:K]
-            CGEF.Filtering.filter_apply_batch!(outs_v, fields_v, plan)
-            for k in 1:K
-                Test.@test outs_v[k] == outs_ref[k]
-            end
-        end
+# `AutoCache` keeps a scattered plan's neighbour cache exactly when its entries fit the budget, and one
+# budget bounds a whole sweep: each scale gets what the scales before it left.
+Test.@testset "The cache budget" begin
+    g = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(6.371e6), deg2rad.(collect(0.0:7.5:352.5)),
+                                deg2rad.(collect(range(-80.0, 80.0; length = 33))))
+    entries(ℓ) = length(CGEF.Filtering.build_footprint(g, _CGEF_GA, ℓ; cache_strategy = CGEF.Filtering.AlwaysCache()).cache.w)
+    bytes(ℓ) = entries(ℓ) * (2 * sizeof(Int) + sizeof(Float64))
+    cached(fp) = fp.cache !== nothing
+    full = bytes(500e3)
+    for b in (full, full - 1)
+        Test.@test cached(CGEF.Filtering.build_footprint(g, _CGEF_GA, 500e3; cache_strategy = CGEF.Filtering.AutoCache(),
+                                                         cache_byte_budget = b)) == (b == full)
     end
+    scales = [400e3, 500e3, 600e3]
+    budget = bytes(scales[1]) + bytes(scales[2])
+    Test.@test bytes(scales[3]) <= budget
+    plans = CGEF.Filtering.plan_filter_sweep(g, _CGEF_GA, scales; cache_byte_budget = budget, execution = _CGEF_SERIAL)
+    Test.@test [cached(p.footprint) for p in plans] == [true, true, false]
+end
 
-    geom = FG.Geometry.CartesianGeometry()
+# A `HighOrderKernel{P}`'s weights on a grid are corrected so their moments of degree 1…P vanish, so the
+# filter reproduces every polynomial of degree ≤ P wherever its support stays on the grid; off separable
+# axes the correction runs over the cells each point has, so there every point reproduces them.
+Test.@testset "HighOrderKernel on a grid reproduces polynomials of degree ≤ P" begin
+    cart = FG.Geometry.CartesianGeometry()
     N = 32
-    xsR = 0.0:1000.0:(N - 1) * 1000.0
-    x_nu = collect(xsR) .+ [iseven(i) ? 4.0 : -3.0 for i in 1:N]
-    mask = trues(N, N); mask[6:9, 6:9] .= false
+    xs = 0.0:1.0:(N - 1)
+    xv = collect(xs) .+ [0.03 * sin(2.3i) for i in 1:N]
+    for order in (3, 5), ℓ in (4.0, 11.3), ax in (xs, xv)
+        k = CGEF.Kernels.HighOrderKernel(; order)
+        g = FG.Grids.StructuredGrid(cart, ax, ax)
+        rad = CGEF.Kernels.kernel_radius(k, ℓ)
+        inside = [min(ax[i] - ax[1], ax[end] - ax[i], ax[j] - ax[1], ax[end] - ax[j]) > rad + 2 for i in 1:N, j in 1:N]
+        Test.@test count(inside) > 50
+        plan = CGEF.Filtering.plan_filter(g, k, ℓ; execution = _CGEF_SERIAL)
+        for (a, b) in vcat([(n, 0) for n in 0:order], [(0, n) for n in 1:order], [(order, order)])
+            f = [(ax[i] / N)^a * (ax[j] / N)^b for i in 1:N, j in 1:N]
+            Test.@test maximum(abs, (CGEF.Filtering.filter_apply!(zeros(N, N), f, plan) .- f)[inside]) < 1e-12
+        end
+    end
 
-    # Fast Range-axis TopHat (FilterFootprint).
-    grid_fast = FG.Grids.StructuredGrid(geom, xsR, xsR, mask)
-    _check_batch(grid_fast, CGEF.TopHatKernel(), 5000.0, N, N)
-
-    # Separable Gaussian fast path (SeparableFootprint).
-    _check_batch(grid_fast, CGEF.GaussianKernel(), 5000.0, N, N)
-
-    # Nonuniform-axis (ScatteredFilterPlan) — cached and streaming.
-    grid_nu = FG.Grids.StructuredGrid(geom, x_nu, x_nu, mask)
-    _check_batch(grid_nu, CGEF.TopHatKernel(), 5000.0, N, N; cache_strategy = CGEF.Filtering.AlwaysCache())
-    _check_batch(grid_nu, CGEF.TopHatKernel(), 5000.0, N, N; cache_strategy = CGEF.Filtering.NeverCache())
-
-    # Spherical per-latitude-band fast path (never separable/uniform-Cartesian).
-    R = 6.371e6
-    lonR = range(0.0; step = deg2rad(4.0), length = N)
-    latR = range(deg2rad(-40.0); step = deg2rad(4.0), length = N)
-    sgrid = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), lonR, latR, mask)
-    _check_batch(sgrid, CGEF.TopHatKernel(), 400e3, N, N)
-
-    # 1D nonuniform (NDScatteredFilterPlan) — cached and streaming.
-    grid1 = FG.Grids.StructuredGrid(geom, x_nu, trues(N))
-    _check_batch(grid1, CGEF.TopHatKernel(), 5000.0, N; cache_strategy = CGEF.Filtering.AlwaysCache())
-    _check_batch(grid1, CGEF.TopHatKernel(), 5000.0, N; cache_strategy = CGEF.Filtering.NeverCache())
-
-    # 1D uniform Gaussian (SeparableFootprintND).
-    _check_batch(FG.Grids.StructuredGrid(geom, xsR, trues(N)), CGEF.GaussianKernel(), 5000.0, N)
-
-    # True-3D nonuniform (NDScatteredFilterPlan) and true-3D uniform (FilterFootprintND,
-    # SeparableFootprintND).
-    N3 = 12
-    x3R = 0.0:1000.0:(N3 - 1) * 1000.0
-    x3_nu = collect(x3R) .+ [iseven(i) ? 3.0 : -2.0 for i in 1:N3]
-    grid3 = FG.Grids.StructuredGrid(geom, x3_nu, x3_nu, x3_nu, trues(N3, N3, N3))
-    _check_batch(grid3, CGEF.TopHatKernel(), 2500.0, N3, N3, N3)
-    grid3u = FG.Grids.StructuredGrid(geom, x3R, x3R, x3R, trues(N3, N3, N3))
-    _check_batch(grid3u, CGEF.TopHatKernel(), 2500.0, N3, N3, N3)
-    _check_batch(grid3u, CGEF.GaussianKernel(), 2500.0, N3, N3, N3)
-
-    # CurvilinearGrid.
-    Nc = 20
-    ic = collect(0.0:(Nc - 1)); jc = collect(0.0:(Nc - 1))
-    clon = [1000.0 * ii for ii in ic, jj in jc]
-    clat = [1000.0 * jj for ii in ic, jj in jc]
-    cgrid = FG.Grids.CurvilinearGrid(geom, clon, clat, trues(Nc, Nc))
-    _check_batch(cgrid, CGEF.TopHatKernel(), 3000.0, Nc, Nc)
-
-    # Node set, real-space engine (NodeFilterPlan).
-    npts = 150
-    nodes_lon = [Float64(mod(2.399963 * t, 2π)) for t in 1:npts]
-    nodes_lat = Float64(π) / 2 .- [Float64(π * (t - 0.5) / npts) for t in 1:npts]
-    node_grid = FG.Grids.UnstructuredGrid(
-        FG.Geometry.SphericalGeometry(R), nodes_lon, nodes_lat, fill(4π * R^2 / npts, npts), trues(npts),
-    )
-    _check_batch(node_grid, CGEF.TopHatKernel(), 4.0e5, npts; method = CGEF.Filtering.RealSpace())
-
-    # Spectral (FFTW) plan — the generic `AbstractFilterPlan` fallback (no shared per-point
-    # derivation to hoist out, but must still be correct).
-    gridp = FG.Grids.StructuredGrid(geom, xsR, xsR, trues(N, N); periodic = (true, true))
-    _check_batch(gridp, CGEF.GaussianKernel(), 5000.0, N, N; method = CGEF.Filtering.Spectral())
+    n = 24
+    xg = [i + 0.25j + 0.03i^1.2 for i in 1:n, j in 1:n]
+    yg = [j + 0.02i + 0.01j^1.3 for i in 1:n, j in 1:n]
+    cg = FG.Grids.CurvilinearGrid(cart, xg, yg, trues(n, n))
+    ug = FG.Grids.UnstructuredGrid(cart, vec(xg), vec(yg), ones(n * n), trues(n * n))
+    for order in (3, 5)
+        k = CGEF.Kernels.HighOrderKernel(; order)
+        pc = CGEF.Filtering.plan_filter(cg, k, 7.0; execution = _CGEF_SERIAL)
+        pu = CGEF.Filtering.plan_filter(ug, k, 7.0; execution = _CGEF_SERIAL)
+        for a in 0:order, b in 0:(order - a)
+            f = ((xg .- 12) ./ 12) .^ a .* ((yg .- 12) ./ 12) .^ b
+            Test.@test maximum(abs, CGEF.Filtering.filter_apply!(zeros(n, n), f, pc) .- f) < 1e-10
+            Test.@test maximum(abs, CGEF.Filtering.filter_apply!(zeros(n * n), vec(f), pu) .- vec(f)) < 1e-10
+        end
+    end
 end
 
-
-Test.@testset "separable fast path — dispatch and correctness against an independent brute-force square-truncated reference" begin
-    geom = FG.Geometry.CartesianGeometry()  # deliberately anisotropic dx/dy
-    N = 24
-    xsR = 0.0:1000.0:(N - 1) * 1000.0
-    ysR = 0.0:1500.0:(N - 1) * 1500.0
-    ker = CGEF.GaussianKernel()
-    scale = 4000.0
-
-    # Dispatch: Range axes -> SeparableFootprint.
-    grid_range = FG.Grids.StructuredGrid(geom, xsR, ysR, trues(N, N))
-    fp_range = CGEF.Filtering.build_footprint(grid_range, ker, scale)
-    Test.@test fp_range isa CGEF.Filtering.SeparableFootprint
-
-    # Dispatch: separability is a property of the KERNEL, so a `Vector` axis takes the same engine.
-    # What the axis type decides is the weight table's rank — a vector when the spacing is constant
-    # and known from the type, a row per position otherwise — not which algorithm runs.
-    grid_uniform_vec = FG.Grids.StructuredGrid(geom, collect(xsR), collect(ysR), trues(N, N))
-    fp_uniform_vec = CGEF.Filtering.build_footprint(grid_uniform_vec, ker, scale)
-    Test.@test fp_uniform_vec isa CGEF.Filtering.SeparableFootprint
-    Test.@test fp_uniform_vec.gx isa AbstractMatrix
-    Test.@test fp_range.gx isa AbstractVector
-
-    x_nu = collect(xsR) .+ [iseven(i) ? 5.0 : -5.0 for i in 1:N]
-    grid_nonuniform = FG.Grids.StructuredGrid(geom, x_nu, collect(ysR), trues(N, N))
-    fp_nonuniform = CGEF.Filtering.build_footprint(grid_nonuniform, ker, scale)
-    Test.@test fp_nonuniform isa CGEF.Filtering.SeparableFootprint
-    Test.@test size(fp_nonuniform.gx, 1) == N
-
-    # Dispatch: Spherical + Gaussian never takes the Cartesian-only separable path, even with
-    # Range axes (great-circle distance does not factor into Gx(Δx)·Gy(Δy)).
-    sgeom = FG.Geometry.SphericalGeometry(6.371e6)
-    slonR = range(0.0; step = deg2rad(4.0), length = N)
-    slatR = range(deg2rad(-40.0); step = deg2rad(4.0), length = N)
-    sgrid = FG.Grids.StructuredGrid(sgeom, slonR, slatR, trues(N, N))
-    fp_sph = CGEF.Filtering.build_footprint(sgrid, ker, deg2rad(6.0) * 6.371e6)
-    Test.@test !(fp_sph isa CGEF.Filtering.SeparableFootprint)
-
-    # Correctness: cross-check against an INDEPENDENT brute-force square-truncated reference
-    # (written fresh here, not reusing any of the package's own engines) — this validates the
-    # actual mathematical claim (row-pass-then-column-pass == the full 2D square-truncated sum),
-    # not just "close to the disk-truncated RealSpace engine" (a genuinely different truncation
-    # shape — see `SeparableFootprint`'s own docstring).
-    for strategy in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
-        mask = trues(N, N); mask[8:11, 8:11] .= false; mask[1, :] .= false
-        grid_m = FG.Grids.StructuredGrid(geom, xsR, ysR, mask)
-        fp_m = CGEF.Filtering.build_footprint(grid_m, ker, scale; mask_strategy = strategy)
-        Test.@test fp_m isa CGEF.Filtering.SeparableFootprint
-
-        field = [sin(i / 3.0) * cos(j / 4.0) for i in 1:N, j in 1:N]
-        out_fast = zeros(N, N)
-        CGEF.Filtering.apply_separable!(out_fast, field, grid_m, fp_m, strategy)
-
-        # `ZeroFill` counts every tap of the box, those past an edge included, and keeps a masked
-        # target; `Deformable` counts the active in-domain taps and zeroes a masked target.
-        di_lim, dj_lim = fp_m.di_lim, fp_m.dj_lim
-        gx, gy = fp_m.gx, fp_m.gy
-        zf = strategy isa CGEF.Filtering.ZeroFill
-        out_ref = zeros(N, N)
-        for j in 1:N, i in 1:N
-            (zf || mask[i, j]) || continue
-            wsum = 0.0; wnorm = 0.0
-            for ddj in -dj_lim:dj_lim, ddi in -di_lim:di_lim
-                ii, jj = i + ddi, j + ddj
-                active = 1 <= ii <= N && 1 <= jj <= N && mask[ii, jj]
-                w = gx[ddi + di_lim + 1] * gy[ddj + dj_lim + 1]
-                (zf || active) && (wnorm += w)
-                active && (wsum += w * field[ii, jj])
+# On a sphere one correction serves a latitude row where its targets share their cells, so the banded
+# engine and the per-point engine, cached, streamed or on the device, are one filter; and a smooth field's
+# error grows as `ℓ^(P+1)` against the Gaussian's `ℓ²`.
+Test.@testset "HighOrderKernel on a sphere: one filter whichever engine runs it, order P + 1" begin
+    sph = FG.Geometry.SphericalGeometry(6.371e6)
+    for (λ, φ, ℓ) in ((range(0, 2π; length = 73)[1:72], range(deg2rad(-70), deg2rad(70); length = 29), 2.0e6),
+                      (range(deg2rad(10), deg2rad(70); length = 31), range(deg2rad(-20), deg2rad(20); length = 21), 1.0e6))
+        gv = FG.Grids.StructuredGrid(sph, collect(λ), collect(φ))
+        f = [cos(p) * cos(2l) + 0.3sin(p)^2 for l in λ, p in φ]
+        for order in (3, 5)
+            k = CGEF.Kernels.HighOrderKernel(; order)
+            pb = CGEF.Filtering.plan_filter(FG.Grids.StructuredGrid(sph, λ, φ), k, ℓ; execution = _CGEF_SERIAL)
+            pb.footprint isa CGEF.Filtering.FilterFootprint || error("a uniform-longitude grid builds $(typeof(pb.footprint))")
+            ob = CGEF.Filtering.filter_apply!(similar(f), f, pb)
+            oc = CGEF.Filtering.filter_apply!(similar(f), f,
+                                              CGEF.Filtering.plan_filter(gv, k, ℓ; execution = _CGEF_SERIAL,
+                                                                         cache_strategy = CGEF.Filtering.AlwaysCache()))
+            Test.@test maximum(abs, ob .- oc) < 1e-13 * maximum(abs, f)
+            for b in (_CGEF_SERIAL, CGEF.ComputationalBackends.GPUBackend(KA.CPU()))
+                p = CGEF.Filtering.plan_filter(gv, k, ℓ; execution = b, cache_strategy = CGEF.Filtering.NeverCache())
+                Test.@test CGEF.Filtering.filter_apply!(similar(f), f, p) == oc
             end
-            out_ref[i, j] = wsum / wnorm
-        end
-        Test.@test out_fast ≈ out_ref rtol = 1e-10
-    end
-end
-
-
-# Separability is a property of the KERNEL, not of the spacing: `exp(-α(Δx²+Δy²)/ℓ²)` factorizes on
-# any rectilinear grid. A stretched axis only makes the per-axis weight depend on position as well
-# as offset, so it takes the same two-pass engine rather than falling to the scattered one.
-Test.@testset "Separable Gaussian on a stretched Cartesian grid" begin
-    geom = FG.Geometry.CartesianGeometry()
-    n = 41
-    xr = range(0.0, 40e3; length = n)
-    xs = [20e3 * (1 - cos(π * (i - 1) / (n - 1))) for i in 1:n]   # same endpoints, clustered ends
-    ℓ = 5000.0
-    K = CGEF.GaussianKernel()
-    f = [sin(x / 9000) * cos(y / 7000) for x in xr, y in xr]
-
-    gr = FG.Grids.StructuredGrid(geom, xr, xr, trues(n, n))
-    gs = FG.Grids.StructuredGrid(geom, xs, xs, trues(n, n))
-    pr = CGEF.Filtering.plan_filter(gr, K, ℓ)
-    ps = CGEF.Filtering.plan_filter(gs, K, ℓ)
-
-    # Both take the separable engine; only the weight table's shape differs.
-    Test.@test pr.footprint isa CGEF.Filtering.SeparableFootprint
-    Test.@test ps.footprint isa CGEF.Filtering.SeparableFootprint
-    Test.@test pr.footprint.gx isa AbstractVector          # shared across positions
-    Test.@test ps.footprint.gx isa AbstractMatrix          # one row per position
-    Test.@test size(ps.footprint.gx, 1) == n
-
-    # The scattered engine is the independent reference: it forms `kernel_weight(d)·area` per
-    # candidate with no separability assumption at all. Agreement to ~1e-10 is the square-vs-disk
-    # truncation difference — the Gaussian is 1e-10 at its own truncation radius — not an error.
-    # This is also what catches the cell measure being dropped from the separable weights, which is
-    # invisible on a uniform grid (constant area cancels in the normalization) and ~16% here.
-    # Both engines count the lattice continued past each edge at its edge gap under `ZeroFill`, and
-    # the in-domain cells alone under `Deformable`.
-    for (grid, ax) in ((gr, xr), (gs, xs)),
-        strat in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
-        sep = zeros(n, n)
-        CGEF.Filtering.filter_field!(sep, f, grid, K, ℓ; mask_strategy = strat)
-        sca = zeros(n, n)
-        CGEF.Filtering.filter_field!(
-            sca, f, grid, K, ℓ;
-            filter_plan = CGEF.Filtering.PhysicalFilterPlan(
-                CGEF.Filtering._build_footprint_scattered(grid, K, ℓ), grid,
-                strat, K, ℓ, CGEF.ComputationalBackends.SerialBackend(),
-            ),
-        )
-        Test.@test maximum(abs.(sep .- sca)) / maximum(abs, sca) < 1e-8
-    end
-
-    # A normalized filter reproduces a constant whatever the spacing does: `Deformable` everywhere, and
-    # `ZeroFill` wherever the kernel's tail past an edge has decayed to round-off (two radii in). A
-    # corner cell has about three quarters of its mass past the edges.
-    rad = CGEF.Kernels.kernel_radius(K, ℓ)
-    inside = [min(xs[i] - xs[1], xs[n] - xs[i], xs[j] - xs[1], xs[n] - xs[j]) > 2rad for i in 1:n, j in 1:n]
-    Test.@test any(inside)
-    od = zeros(n, n); oz = zeros(n, n)
-    CGEF.Filtering.filter_field!(od, fill(2.5, n, n), gs, K, ℓ; mask_strategy = CGEF.Filtering.Deformable())
-    CGEF.Filtering.filter_field!(oz, fill(2.5, n, n), gs, K, ℓ)
-    Test.@test all(x -> isapprox(x, 2.5; atol = 1e-12), od)
-    Test.@test all(x -> isapprox(x, 2.5; atol = 1e-12), oz[inside])
-    Test.@test oz[1, 1] < 2.5 / 2
-end
-
-
-# The Gaussian factorizes in any number of dimensions, and the saving grows with it: a full-box
-# footprint enumerates ∏(2wᵈ+1) offsets per point where N passes cost ∑(2wᵈ+1). The reference here
-# is that full-box engine, which assumes no separability at all.
-Test.@testset "Separable Gaussian in 1D and 3D" begin
-    geom = FG.Geometry.CartesianGeometry()
-    K = CGEF.GaussianKernel()
-    dx = 1000.0
-    ℓ = 4000.0
-    serial = CGEF.ComputationalBackends.SerialBackend()
-
-    Test.@testset "3D" begin
-        n = 20
-        x = range(0.0, dx * (n - 1); length = n)
-        g3 = FG.Grids.StructuredGrid(geom, x, x, x, trues(n, n, n))
-        f = [sin(a / 5000) * cos(b / 6000) * sin(c / 7000) for a in x, b in x, c in x]
-        p = CGEF.Filtering.plan_filter(g3, K, ℓ)
-        Test.@test p.footprint isa CGEF.Filtering.SeparableFootprintND
-        Test.@test length(p.footprint.lim) == 3
-
-        # The full-box reference counts the same continued lattice under `ZeroFill`, and the in-domain
-        # cells alone under `Deformable`; the two differ only by the box-versus-ball truncation.
-        for strat in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
-            sep = zeros(n, n, n)
-            CGEF.Filtering.filter_field!(sep, f, g3, K, ℓ; mask_strategy = strat)
-            ref = zeros(n, n, n)
-            CGEF.Filtering.filter_field!(
-                ref, f, g3, K, ℓ;
-                filter_plan = CGEF.Filtering.PhysicalFilterPlan(
-                    CGEF.Filtering._build_footprint_nd(g3, K, ℓ), g3,
-                    strat, K, ℓ, serial,
-                ),
-            )
-            Test.@test maximum(abs.(sep .- ref)) / maximum(abs, ref) < 1e-8
-        end
-
-        # `Deformable` reproduces a constant everywhere; `ZeroFill` wherever the box stays on the grid,
-        # and damps it where the box leaves it. At a corner each axis keeps the offsets `0:lim` of the
-        # `-lim:lim` its denominator counts.
-        lim = p.footprint.lim
-        inside(I) = all(d -> lim[d] < I[d] <= n - lim[d], 1:3)
-        c = zeros(n, n, n)
-        CGEF.Filtering.filter_field!(c, fill(2.5, n, n, n), g3, K, ℓ; mask_strategy = CGEF.Filtering.Deformable())
-        Test.@test all(v -> isapprox(v, 2.5; atol = 1e-12), c)
-        CGEF.Filtering.filter_field!(c, fill(2.5, n, n, n), g3, K, ℓ)
-        Test.@test any(inside, CartesianIndices(c))
-        Test.@test all(I -> !inside(I) || isapprox(c[I], 2.5; atol = 1e-12), CartesianIndices(c))
-        kept(L) = (g = [CGEF.Kernels.kernel_weight(K, k * dx, ℓ) for k in 0:L]; sum(g) / (2sum(g) - g[1]))
-        Test.@test c[1, 1, 1] ≈ 2.5 * prod(kept, lim) rtol = 1e-12
-
-        # A masked grid under Deformable takes the dense denominator; masked cells read zero and
-        # the rest are still a weighted mean, so a constant survives there too.
-        m = trues(n, n, n)
-        m[2:3, 2:3, 2:3] .= false
-        gm = FG.Grids.StructuredGrid(geom, x, x, x, m)
-        cm = zeros(n, n, n)
-        CGEF.Filtering.filter_field!(cm, fill(2.5, n, n, n), gm, K, ℓ;
-                                     mask_strategy = CGEF.Filtering.Deformable())
-        Test.@test all(I -> m[I] ? isapprox(cm[I], 2.5; atol = 1e-12) : cm[I] == 0.0,
-                       CartesianIndices(cm))
-
-        # The default, ZeroFill, filters the zero-extended constant: it is exact where the box holds
-        # only active in-domain cells and damped where it overlaps the hole or leaves the grid, masked
-        # cells included. The separable ND engine's footprint is a per-axis box of half-width `lim`, so
-        # the split is taken from the plan's own limits.
-        cz = zeros(n, n, n)
-        CGEF.Filtering.filter_field!(cz, fill(2.5, n, n, n), gm, K, ℓ)
-        holes = filter(J -> !m[J], collect(CartesianIndices(m)))
-        overlaps(I) = any(J -> all(d -> abs(I[d] - J[d]) <= lim[d], 1:3), holes)
-        Test.@test all(I -> !inside(I) || overlaps(I) || isapprox(cz[I], 2.5; atol = 1e-12),
-                       CartesianIndices(cz))
-        Test.@test any(I -> m[I] && inside(I) && !overlaps(I), CartesianIndices(cz))
-        Test.@test all(I -> m[I] || 0 < cz[I] < 2.5 - 1e-6, CartesianIndices(cz))
-    end
-
-    Test.@testset "1D" begin
-        n = 64
-        x = range(0.0, dx * (n - 1); length = n)
-        g1 = FG.Grids.StructuredGrid(geom, x, trues(n))
-        f = [sin(a / 5000) for a in x]
-        p = CGEF.Filtering.plan_filter(g1, K, ℓ)
-        Test.@test p.footprint isa CGEF.Filtering.SeparableFootprintND
-
-        for strat in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
-            sep = zeros(n)
-            CGEF.Filtering.filter_field!(sep, f, g1, K, ℓ; mask_strategy = strat)
-            ref = zeros(n)
-            CGEF.Filtering.filter_field!(
-                ref, f, g1, K, ℓ;
-                filter_plan = CGEF.Filtering.PhysicalFilterPlan(
-                    CGEF.Filtering._build_footprint_nd(g1, K, ℓ), g1,
-                    strat, K, ℓ, serial,
-                ),
-            )
-            Test.@test maximum(abs.(sep .- ref)) / maximum(abs, ref) < 1e-8
         end
     end
 
-    # A stretched direction only changes the weight table's shape, exactly as in 2D.
-    Test.@testset "stretched third direction" begin
-        n = 16
-        x = range(0.0, dx * (n - 1); length = n)
-        z = [dx * (n - 1) * (i - 1)^2 / (n - 1)^2 for i in 1:n]
-        gz = FG.Grids.StructuredGrid(geom, x, x, z, trues(n, n, n))
-        p = CGEF.Filtering.plan_filter(gz, K, ℓ)
-        Test.@test p.footprint.g[1] isa AbstractVector
-        Test.@test p.footprint.g[3] isa AbstractMatrix
-        c = zeros(n, n, n)
-        CGEF.Filtering.filter_field!(c, fill(1.25, n, n, n), gz, K, ℓ;
-                                     mask_strategy = CGEF.Filtering.Deformable())
-        Test.@test all(v -> isapprox(v, 1.25; atol = 1e-12), c)
-    end
-end
-
-
-# Mathematical correctness: Filtered field of constant = constant
-Test.@testset "Filter Normalization - Constant Field" begin
-    # Filtering a constant field must return exactly the same constant
-    # This tests that kernel weights are properly normalized
-
-    geom = FG.Geometry.CartesianGeometry()
-    x = collect(0.0:1000.0:50e3)
-    y = collect(0.0:1000.0:50e3)
-    mask = trues(length(x), length(y))
-    grid = FG.Grids.StructuredGrid(geom, x, y, mask)
-
-    C = 42.0  # Constant value
-    field = fill(C, length(x), length(y))
-
-    # `Deformable` renormalizes over the in-domain cells, so it returns `C` everywhere. `ZeroFill`
-    # filters the constant extended by zero past the edges: exactly `C` where the kernel's tail past an
-    # edge has decayed to round-off (two radii in), and below `C` nearer an edge.
-    for kernel in [CGEF.TopHatKernel(), CGEF.GaussianKernel()]
-        for scale in [5000.0, 10000.0, 20000.0]
-            out_zero = zeros(length(x), length(y))
-            out_renorm = zeros(length(x), length(y))
-
-            CGEF.Filtering.filter_field!(out_zero, field, grid, kernel, scale; mask_strategy=CGEF.Filtering.ZeroFill())
-            CGEF.Filtering.filter_field!(out_renorm, field, grid, kernel, scale; mask_strategy=CGEF.Filtering.Deformable())
-
-            rad = CGEF.Kernels.kernel_radius(kernel, scale)
-            inside(i, j) = min(x[i] - x[1], x[end] - x[i], y[j] - y[1], y[end] - y[j]) > 2rad
-            Test.@test all(v -> isapprox(v, C; rtol = 1e-10), out_renorm)
-            Test.@test all(I -> !inside(Tuple(I)...) || isapprox(out_zero[I], C; rtol = 1e-10),
-                           CartesianIndices(out_zero))
-            Test.@test all(<=(C * (1 + 1e-12)), out_zero)
-            Test.@test out_zero[1, 1] < C / 2
+    λ = range(0, 2π; length = 361)[1:360]
+    φ = range(deg2rad(-75), deg2rad(75); length = 151)
+    g = FG.Grids.StructuredGrid(sph, λ, φ)
+    f = [cos(p) * cos(l) + sin(p) for l in λ, p in φ]
+    interior = [abs(p) < deg2rad(40) for l in λ, p in φ]
+    ℓs = (8.0e5, 1.2e6, 1.8e6)
+    for (k, order) in ((_CGEF_GA, 2), (CGEF.Kernels.HighOrderKernel(; order = 3), 4), (CGEF.Kernels.HighOrderKernel(; order = 5), 6))
+        errs = map(ℓ -> maximum(abs, (CGEF.Filtering.filter_apply!(similar(f), f,
+                       CGEF.Filtering.plan_filter(g, k, ℓ; execution = _CGEF_SERIAL)) .- f)[interior]), ℓs)
+        for i in 1:2
+            Test.@test log(errs[i + 1] / errs[i]) / log(ℓs[i + 1] / ℓs[i]) ≈ order atol = 0.2
         end
     end
 end
 
-# The uniform-spherical banded footprint is a single translation-invariant offset list per latitude
-# band, so its longitude window has to hold for every row the ball reaches — not just the target's —
-# and has to stop after one turn around the ring. Both go wrong only where a ball reaches over a pole,
-# which is why this checks against brute force at high latitude specifically.
-Test.@testset "Uniform spherical footprint: window covers the pole and counts each column once" begin
+# On a periodic lattice with `k_c ≤ π/Δx` the real-space brick wall transforms to the transfer function of
+# its truncated footprint, whose ripple the dropped Bessel tail bounds: in two dimensions
+# `√(k_c/k)/π · (1/(|k_c − k|R) + 1/((k_c + k)R))`, 0.039 at `k_c/2` and 0.010 at `2k_c`; in one
+# `(1/π)(1/(|k_c − k|R) + 1/((k_c + k)R))`, 0.028 and 0.014.
+Test.@testset "SharpSpectralKernel in real space passes and stops Fourier modes" begin
+    N = 64
+    xs = 0.0:1.0:(N - 1)
+    geo = FG.Geometry.CartesianGeometry()
+    g1 = FG.Grids.StructuredGrid(geo, xs; periodic = true)
+    g2 = FG.Grids.StructuredGrid(geo, xs, xs; periodic = (true, true))
+    gain(o, f) = sum(o .* f) / sum(f .* f)
+    for (m, target, tol) in ((4, 1.0, 0.05), (16, 0.0, 0.02))
+        k = 2π * m / N
+        f1 = cos.(k .* xs)
+        f2 = [cos(k * a) for a in xs, _ in xs]
+        o1 = CGEF.Filtering.filter_field!(zeros(N), f1, g1, _CGEF_SS, 4.0)
+        o2 = CGEF.Filtering.filter_field!(zeros(N, N), f2, g2, _CGEF_SS, 4.0)
+        Test.@test abs(gain(o1, f1) - target) < tol
+        Test.@test abs(gain(o2, f2) - target) < tol
+        Test.@test o2 ≈ gain(o2, f2) .* f2 atol = 1e-12
+    end
+end
+
+# `check_setup` measures a sphere's spacing in metres: along longitude the chord-angle distance
+# `2R·asin(cos φ·sin(Δλ/2))`, finest at the most poleward row and coarsest at the equator, which decides
+# whether ℓ is resolvable.
+Test.@testset "check_setup on a sphere" begin
     R = 6.371e6
-    geo = FG.Geometry.SphericalGeometry(R)
-    nlat, nlon = 60, 120
-    lat = range(-π / 2 + 1e-6; step = (π - 2e-6) / (nlat - 1), length = nlat)
-    lon = range(0.0; step = 2π / nlon, length = nlon)
-    grid = FG.Grids.StructuredGrid(geo, lon, lat; periodic = (true, false))
-    fld = [cos(3a) * exp(-((abs(b) - 1.40) / 0.12)^2) for a in lon, b in lat]
-
-    ker = CGEF.GaussianKernel()
-    scale = 3.0e6
-    rad = CGEF.Kernels.kernel_radius(ker, scale)
-    # A ball this wide at |φ| ≳ 76° reaches across the pole, which is the configuration that exposes
-    # both a short window and a ring counted more than once.
-    Test.@test rad > R * (π / 2 - 1.33)
-
-    out = zeros(nlon, nlat)
-    CGEF.Filtering.filter_field!(out, fld, grid, ker, scale;
-        backend = CGEF.ComputationalBackends.SerialBackend())
-    Test.@test CGEF.Filtering.build_footprint(grid, ker, scale) isa CGEF.Filtering.FilterFootprint
-
-    for j in (2, 4, nlat - 6, nlat - 3, nlat - 1), i in (1, 37)
-        num = zero(Float64)
-        den = zero(Float64)
-        for jj in 1:nlat, ii in 1:nlon
-            d = FG.Geometry.distance(geo, SA.SVector(lon[i], lat[j]), SA.SVector(lon[ii], lat[jj]))
-            d <= rad || continue
-            wgt = CGEF.Kernels.kernel_weight(ker, d, scale) * FG.Grids.area(grid, ii, jj)
-            num += wgt * fld[ii, jj]
-            den += wgt
-        end
-        Test.@test out[i, j] ≈ (den > 0 ? num / den : 0.0) rtol = 1e-12
-    end
-end
-
-# The engine restructures below all have a same-answer reference available, so each is asserted
-# against it rather than against a recorded number.
-Test.@testset "Real-space engine fast paths" begin
-    geom = FG.Geometry.CartesianGeometry()
-    N = 96
-    dx = 1000.0
-    xr = 0.0:dx:dx*(N - 1)
-    xv = collect(xr)              # same coordinates, but a Vector axis takes the GENERAL path
-    u = randn(N, N)
-
-    # Top-hat: the uniform-axis window collapses the two-pointer walk. Same coordinates through both
-    # paths must agree EXACTLY — the fast path makes the same boundary decision, it does not
-    # approximate it.
-    for m in (nothing, (mm = trues(N, N); mm[20:40, 20:40] .= false; mm)),
-        strat in (CGEF.Filtering.Deformable(), CGEF.Filtering.ZeroFill()),
-        sc in (4000.0, 16000.0)
-
-        gR = m === nothing ? FG.Grids.StructuredGrid(geom, xr, xr) : FG.Grids.StructuredGrid(geom, xr, xr, m)
-        gV = m === nothing ? FG.Grids.StructuredGrid(geom, xv, xv) : FG.Grids.StructuredGrid(geom, xv, xv, m)
-        oR = zeros(N, N); oV = zeros(N, N)
-        CGEF.Filtering.filter_apply!(oR, u, CGEF.Filtering.plan_filter(gR, CGEF.TopHatKernel(), sc;
-            backend = CGEF.ComputationalBackends.SerialBackend(), mask_strategy = strat))
-        CGEF.Filtering.filter_apply!(oV, u, CGEF.Filtering.plan_filter(gV, CGEF.TopHatKernel(), sc;
-            backend = CGEF.ComputationalBackends.SerialBackend(), mask_strategy = strat))
-        Test.@test oR == oV
-    end
-
-    # Separable Gaussian: the position-major weight table is the matrix path, reached by a Vector axis;
-    # the vector-table path is reached by a Range. Same geometry, so they agree to round-off.
-    let gR = FG.Grids.StructuredGrid(geom, xr, xr),
-        gV = FG.Grids.StructuredGrid(geom, xv, xv),
-        oR = zeros(N, N), oV = zeros(N, N)
-        CGEF.Filtering.filter_apply!(oR, u, CGEF.Filtering.plan_filter(gR, CGEF.GaussianKernel(), 8000.0;
-            backend = CGEF.ComputationalBackends.SerialBackend()))
-        CGEF.Filtering.filter_apply!(oV, u, CGEF.Filtering.plan_filter(gV, CGEF.GaussianKernel(), 8000.0;
-            backend = CGEF.ComputationalBackends.SerialBackend()))
-        Test.@test oR ≈ oV rtol = 1e-12
-        # A low-pass renormalized over the in-domain cells returns a constant unchanged, on both tables.
-        cR = zeros(N, N); cV = zeros(N, N)
-        CGEF.Filtering.filter_apply!(cR, fill(2.75, N, N), CGEF.Filtering.plan_filter(gR, CGEF.GaussianKernel(), 8000.0;
-            backend = CGEF.ComputationalBackends.SerialBackend(), mask_strategy = CGEF.Filtering.Deformable()))
-        CGEF.Filtering.filter_apply!(cV, fill(2.75, N, N), CGEF.Filtering.plan_filter(gV, CGEF.GaussianKernel(), 8000.0;
-            backend = CGEF.ComputationalBackends.SerialBackend(), mask_strategy = CGEF.Filtering.Deformable()))
-        Test.@test all(≈(2.75; rtol = 1e-12), cR)
-        Test.@test all(≈(2.75; rtol = 1e-12), cV)
-    end
-
-    # Periodic wrap is split into two constant-offset runs rather than indexed through `mod1`; a
-    # nonuniform periodic axis still takes the general path, so it is the reference.
-    let xp = range(0.0, dx * N; length = N + 1)[1:N],
-        gP = FG.Grids.StructuredGrid(geom, xp, xp; periodic = (true, true)),
-        gN = FG.Grids.StructuredGrid(geom, collect(xp), collect(xp); periodic = (true, true), period = (dx * N, dx * N)),
-        oP = zeros(N, N), oN = zeros(N, N)
-        CGEF.Filtering.filter_apply!(oP, u, CGEF.Filtering.plan_filter(gP, CGEF.GaussianKernel(), 8000.0;
-            backend = CGEF.ComputationalBackends.SerialBackend()))
-        CGEF.Filtering.filter_apply!(oN, u, CGEF.Filtering.plan_filter(gN, CGEF.GaussianKernel(), 8000.0;
-            backend = CGEF.ComputationalBackends.SerialBackend()))
-        Test.@test oP ≈ oN rtol = 1e-12
-    end
-end
-
-# ---------------------------------------------------------------------------
-# Why `ZeroFill` is the default mask strategy.
-#
-# The cross-scale flux budget is derived by commuting the filter with the spatial derivative, so the
-# kernel must not depend on position. `ZeroFill` keeps the full kernel mass in the denominator and so
-# stays position-independent; `Deformable` divides by the locally-included mass, which varies within ℓ
-# of a mask boundary. These testsets pin that difference numerically instead of leaving it as prose.
-# ---------------------------------------------------------------------------
-
-# A compactly-supported C³ bump, EXACTLY zero outside `rad` — so `mask ⊙ f == f` and
-# `mask ⊙ ∂f == ∂f` hold to the bit, and the identity under test is not contaminated by a tail
-# leaking onto the mask.
-function _cgef_test_bump(N, ic, jc, rad)
-    f = zeros(N, N)
-    for j in 1:N, i in 1:N
-        r2 = ((i - ic)^2 + (j - jc)^2) / rad^2
-        r2 < 1 && (f[i, j] = (1 - r2)^4)
-    end
-    return f
-end
-
-Test.@testset "mask_strategy: ZeroFill commutes with ∂/∂x, Deformable does not" begin
-    geom = FG.Geometry.CartesianGeometry()
-    N = 96
-    dx = 1000.0
-    xs = 0.0:dx:(N - 1) * dx
-    icoast = 61                                   # first LAND column
-    mask = trues(N, N); mask[icoast:end, :] .= false
-    grid = FG.Grids.StructuredGrid(geom, xs, xs, mask)
-    ker = CGEF.TopHatKernel()
-    ℓ = 8000.0                                    # footprint radius ℓ/2 = 4 cells
-
-    f = _cgef_test_bump(N, 49, 48, 8)
-    df = zeros(N, N)
-    CGEF.Derivatives.ddx!(df, f, grid)
-
-    # Preconditions. Without these the comparison measures the mask cutting into the field rather
-    # than the filter operator, and neither strategy would commute.
-    Test.@test all(iszero, @view f[icoast:end, :])
-    Test.@test all(iszero, @view df[icoast:end, :])
-
-    lhs = zeros(N, N); rhs = zeros(N, N); ff = zeros(N, N)
-    rel = Dict{Any,Float64}(); edge = Dict{Any,Float64}(); drift = Dict{Any,Float64}()
-    for strat in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
-        CGEF.Filtering.filter_field!(lhs, df, grid, ker, ℓ; mask_strategy = strat)
-        CGEF.Filtering.filter_field!(ff, f, grid, ker, ℓ; mask_strategy = strat)
-        CGEF.Derivatives.ddx!(rhs, ff, grid)
-        # `ddx!` runs the `ReduceInRun` policy, which degrades to a one-sided stencil at the domain
-        # edge and at the land boundary. Those two columns test the DERIVATIVE's edge treatment, not
-        # the filter, so they are excluded here and asserted separately below.
-        ii = 2:(icoast - 2)
-        s = maximum(abs, @view rhs[ii, :])
-        rel[strat] = maximum(abs, @view(lhs[ii, :]) .- @view(rhs[ii, :])) / s
-        edge[strat] = maximum(abs, @view(lhs[icoast - 1, :]) .- @view(rhs[icoast - 1, :])) / s
-        drift[strat] = (sum(ff) - sum(f)) / sum(f)
-    end
-
-    # `ZeroFill`: the identity holds to round-off. `Deformable`: it fails by ~13 orders of magnitude
-    # more, and the failure is the whole point of the default — it is asserted, not tolerated.
-    Test.@test rel[CGEF.Filtering.ZeroFill()] < 1e-13
-    Test.@test rel[CGEF.Filtering.Deformable()] > 1e-3
-    Test.@test rel[CGEF.Filtering.Deformable()] > 1e9 * rel[CGEF.Filtering.ZeroFill()]
-
-    # The excluded column is excluded for a reason that is itself checked: there `ZeroFill` fails too,
-    # at the same order as `Deformable`, because the one-sided stencil is not the operator the identity
-    # is stated for.
-    Test.@test edge[CGEF.Filtering.ZeroFill()] > 1e-3
-
-    # A position-independent kernel with the full mass in the denominator conserves the domain
-    # integral; a renormalized one does not.
-    Test.@test abs(drift[CGEF.Filtering.ZeroFill()]) < 1e-13
-    Test.@test abs(drift[CGEF.Filtering.Deformable()]) > 1e-6
-
-    # Unmasked reference: with nothing excluded the two strategies coincide and both commute, for a
-    # compact footprint (top-hat) and a truncated-tail one (Gaussian) alike.
-    let gfull = FG.Grids.StructuredGrid(geom, xs, xs, trues(N, N)),
-        fu = _cgef_test_bump(N, 48, 48, 10), dfu = zeros(N, N)
-        CGEF.Derivatives.ddx!(dfu, fu, gfull)
-        for k in (CGEF.TopHatKernel(), CGEF.GaussianKernel())
-            CGEF.Filtering.filter_field!(lhs, dfu, gfull, k, ℓ)
-            CGEF.Filtering.filter_field!(ff, fu, gfull, k, ℓ)
-            CGEF.Derivatives.ddx!(rhs, ff, gfull)
-            ii = 2:(N - 1)
-            Test.@test maximum(abs, @view(lhs[ii, :]) .- @view(rhs[ii, :])) <
-                       1e-13 * maximum(abs, @view rhs[ii, :])
-        end
-    end
-end
-
-Test.@testset "mask_strategy: footprint shape and mass at a coast" begin
-    geom = FG.Geometry.CartesianGeometry()
-    N = 200
-    xs = 0.0:1.0:(N - 1)                          # unit cells, so ℓ is in cells
-    icoast = 101
-    mask = trues(N, N); mask[icoast:end, :] .= false
-    grid = FG.Grids.StructuredGrid(geom, xs, xs, mask)
-    ker = CGEF.GaussianKernel(); ℓ = 16.0
-    jm = N ÷ 2
-
-    # Footprint moments AT a point without building an impulse response: filtering is linear, so
-    # filter(x)/filter(1) is the footprint-weighted mean of x there, and filter(1) is its mass. Both
-    # ratios divide the strategy's normalization out, which is exactly why they come out equal below.
-    xc = [xs[i] - xs[icoast] for i in 1:N, _ in 1:N]
-    f1 = zeros(N, N); fx = zeros(N, N); fx2 = zeros(N, N)
-    ds = (1, 4, 8, 16)
-    mass = Dict{Any,Vector{Float64}}(); cent = Dict{Any,Vector{Float64}}(); wid = Dict{Any,Vector{Float64}}()
-    for strat in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
-        plan = CGEF.Filtering.plan_filter(grid, ker, ℓ; mask_strategy = strat)
-        CGEF.Filtering.filter_apply!(f1, ones(N, N), plan)
-        CGEF.Filtering.filter_apply!(fx, xc, plan)
-        CGEF.Filtering.filter_apply!(fx2, xc .^ 2, plan)
-        σint = sqrt(fx2[50, jm] / f1[50, jm] - (fx[50, jm] / f1[50, jm])^2)
-        mass[strat] = [f1[icoast - d, jm] for d in ds]
-        cent[strat] = [fx[icoast - d, jm] / f1[icoast - d, jm] - xc[icoast - d, jm] for d in ds]
-        wid[strat] = [sqrt(fx2[icoast - d, jm] / f1[icoast - d, jm] -
-                           (fx[icoast - d, jm] / f1[icoast - d, jm])^2) / σint for d in ds]
-    end
-
-    # The shape distortion is the truncated footprint's, so it is IDENTICAL under both strategies —
-    # it is not something `Deformable` buys its way out of.
-    Test.@test cent[CGEF.Filtering.ZeroFill()] ≈ cent[CGEF.Filtering.Deformable()] rtol = 1e-12
-    Test.@test wid[CGEF.Filtering.ZeroFill()] ≈ wid[CGEF.Filtering.Deformable()] rtol = 1e-12
-    Test.@test cent[CGEF.Filtering.ZeroFill()] ./ ℓ ≈ [-0.211, -0.111, -0.032, 0.0] atol = 5e-3
-    Test.@test wid[CGEF.Filtering.ZeroFill()] ≈ [0.621, 0.747, 0.897, 0.998] atol = 5e-3
-
-    # Only the mass differs, and it is exactly the value a uniform field filters to.
-    Test.@test mass[CGEF.Filtering.ZeroFill()] ≈ [0.543, 0.776, 0.948, 0.9996] atol = 5e-3
-    Test.@test all(≈(1.0; atol = 1e-12), mass[CGEF.Filtering.Deformable()])
-    let uni = zeros(N, N)
-        CGEF.Filtering.filter_field!(uni, ones(N, N), grid, ker, ℓ)   # default ⇒ ZeroFill
-        Test.@test [uni[icoast - d, jm] for d in ds] ≈ mass[CGEF.Filtering.ZeroFill()] rtol = 1e-12
-    end
+    d = deg2rad(1.0)
+    g = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), range(0.0; step = d, length = 360),
+                                range(deg2rad(-60.0), deg2rad(60.0); step = d / 4); periodic = (true, false))
+    r = CGEF.check_setup(g, _CGEF_GA, 500e3)
+    Test.@test r.coarsest_spacing[1] ≈ R * d rtol = 1e-12
+    Test.@test r.spacing[1] ≈ 2R * asin(cos(deg2rad(60.0)) * sin(d / 2)) rtol = 1e-12
+    Test.@test r.spacing[2] ≈ R * d / 4 rtol = 1e-12
+    Test.@test r.cells_per_scale[1] ≈ 500e3 / (R * d) rtol = 1e-12
+    Test.@test r.resolvable
+    Test.@test !CGEF.check_setup(g, _CGEF_GA, 150e3).resolvable
 end

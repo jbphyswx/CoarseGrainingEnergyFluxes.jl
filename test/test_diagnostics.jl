@@ -1,902 +1,980 @@
 
-# SFS Stresses and cross-scale energy transfer (Π) calculations
-Test.@testset "Diagnostics & Pipeline" begin
-    # 2D rigid-body rotation u = -Ωy, v = Ωx has zero kinetic energy transfer (Π = 0)
-    geom = FG.Geometry.CartesianGeometry()
-    x = collect(-20000.0:2000.0:20000.0) # 21 points
-    y = collect(-20000.0:2000.0:20000.0) # 21 points
-    mask = trues(21, 21)
-    grid = FG.Grids.StructuredGrid(geom, x, y, mask)
+# The flux diagnostics against identities that hold on any grid, closed forms, and their definitions
+# assembled from the filter and the derivatives.
 
-    Ω = 1e-4 # Coriolis frequency-like rotation rate
-    u = zeros(21, 21)
-    v = zeros(21, 21)
-    for j in 1:21, i in 1:21
-        u[i, j] = -Ω * grid.y[j]
-        v[i, j] = Ω * grid.x[i]
+const _CGEF_DF = CGEF.Filtering.Deformable()
+
+# Fields with a prescribed kinetic-energy spectrum, from a streamfunction, `u = −∂ψ/∂y`, `v = ∂ψ/∂x`.
+# `:exact` differentiates spectrally, so `E(k) ∝ k^(−α)` exactly; `:stencil` uses the three-point centred
+# derivative's symbol `sin(kΔx)/Δx`, so the field is divergence-free for the diagnostics' derivative to
+# round-off.
+# Phases from an irrational rotation.
+function _cgef_spectral_field(N, dx, α; symbol = :exact)
+    k = [2π / (N * dx) * (i - 1 <= N ÷ 2 ? i - 1 : i - 1 - N) for i in 1:N]
+    ψ̂ = zeros(ComplexF64, N, N)
+    for j in 1:N, i in 1:N
+        kmag = hypot(k[i], k[j])
+        iszero(kmag) || (ψ̂[i, j] = kmag^(-(α + 3) / 2) * cis(2π * mod(0.7548776662466927i + 0.5698402909980532j, 1.0)))
     end
-
-    Π = zeros(21, 21)
-    CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, grid, CGEF.TopHatKernel(), 10000.0)
-
-    # Kinetic energy transfer must be zero (rigid body rotation is pure laminar cascade-free flow)
-    Test.@test Π[11, 11] ≈ 0.0 atol=1e-12
-
-    # Test Pipeline integration with unicode Π
-    res = CGEF.coarse_grain(u, v, grid; scales=[10000.0], kernel=CGEF.TopHatKernel(), spectrum = CGEF.Diagnostics.NoSpectrum())
-    Test.@test res.Π[:, :, 1] ≈ Π
-
-    # Test Spherical projections and coarse graining with mixed types
-    sgeom = FG.Geometry.SphericalGeometry(6371000.0)
-    slon = collect(0.0:2.0:10.0)
-    slat = collect(0.0:2.0:10.0)
-    smask = trues(length(slon), length(slat))
-    sgrid = FG.Grids.StructuredGrid(sgeom, deg2rad.(slon), deg2rad.(slat), smask)
-
-    # Mixed-type support: the default return is a geometry-named NamedTuple, and asking for a
-    # storage type gives that type back with the promoted element type.
-    proj = FG.Geometry.vector_to_cartesian(sgeom, Float32(1.0), Float32(2.0), 0.1, 0.2, 0.3)
-    Test.@test proj isa NamedTuple{(:x, :y, :z)}
-    Test.@test FG.Geometry.vector_to_cartesian(
-        SA.SVector{3,Float64}, sgeom, Float32(1.0), Float32(2.0), 0.1, 0.2, 0.3,
-    ) isa SA.SVector{3, Float64}
-
-    inv_proj = FG.Geometry.vector_from_cartesian(sgeom, Float32(1.0), 2.0, 3.0, 0.1, 0.2)
-    Test.@test inv_proj isa NamedTuple{(:λ, :φ, :r)}
-    Test.@test FG.Geometry.vector_from_cartesian(
-        SA.SVector{3,Float64}, sgeom, Float32(1.0), 2.0, 3.0, 0.1, 0.2,
-    ) isa SA.SVector{3, Float64}
-
-    # Test coarse_grain on sphere with Float32 inputs (matching PythonCall runtime environment)
-    su = fill(Float32(1.0), length(slon), length(slat))
-    sv = fill(Float32(0.5), length(slon), length(slat))
-    sres = CGEF.coarse_grain(su, sv, sgrid; scales=[50000.0], kernel=CGEF.GaussianKernel())
-    Test.@test !any(isnan, @view sres.Π[:, :, 1])
-    Test.@test !any(isnan, sres.cumulative_energy)
-    Test.@test !any(isnan, sres.filtering_spectrum)
+    ψ̂ = FFTW.fft(real(FFTW.ifft(ψ̂)))
+    sym(κ) = symbol === :exact ? κ : sin(κ * dx) / dx
+    û = [-im * sym(k[j]) * ψ̂[i, j] for i in 1:N, j in 1:N]
+    v̂ = [im * sym(k[i]) * ψ̂[i, j] for i in 1:N, j in 1:N]
+    return real(FFTW.ifft(û)), real(FFTW.ifft(v̂))
 end
 
+_cgef_logfit(x, y) = (lx = log10.(x); ly = log10.(y); sum((lx .- sum(lx) / length(lx)) .* ly) / sum((lx .- sum(lx) / length(lx)) .^ 2))
 
-# Test Taylor-Green vortex for strain rate verification
-Test.@testset "Taylor-Green Vortex" begin
-    # Taylor-Green vortex has known analytical solutions
-    # u = sin(x)cos(y), v = -cos(x)sin(y)
-    # Strain rates and vorticity have exact analytical forms
-
-    geom = FG.Geometry.CartesianGeometry()  # 0.1 unit grid spacing
-    xs = collect(0.0:0.1:2π)
-    ys = collect(0.0:0.1:2π)
-    mask = trues(length(xs), length(ys))
-    grid = FG.Grids.StructuredGrid(geom, xs, ys, mask)
-
-    u = [sin(x) * cos(y) for x in xs, y in ys]
-    v = [-cos(x) * sin(y) for x in xs, y in ys]
-
-    # Compute derivatives
-    dudx = zeros(length(xs), length(ys))
-    dudy = zeros(length(xs), length(ys))
-    dvdx = zeros(length(xs), length(ys))
-    dvdy = zeros(length(xs), length(ys))
-
-    CGEF.Derivatives.ddx!(dudx, u, grid)
-    CGEF.Derivatives.ddy!(dudy, u, grid)
-    CGEF.Derivatives.ddx!(dvdx, v, grid)
-    CGEF.Derivatives.ddy!(dvdy, v, grid)
-
-    # Check a point away from boundaries
-    i, j = 10, 10
-    x, y = xs[i], ys[j]
-
-    # Analytical: ∂u/∂x = cos(x)cos(y)
-    Test.@test dudx[i, j] ≈ cos(x) * cos(y) rtol=0.01
-
-    # Analytical: ∂u/∂y = -sin(x)sin(y)
-    Test.@test dudy[i, j] ≈ -sin(x) * sin(y) rtol=0.01
-
-    # Analytical: ∂v/∂x = sin(x)sin(y)
-    Test.@test dvdx[i, j] ≈ sin(x) * sin(y) rtol=0.01
-
-    # Analytical: ∂v/∂y = -cos(x)cos(y)
-    Test.@test dvdy[i, j] ≈ -cos(x) * cos(y) rtol=0.01
+# τ the filter defines, on a Cartesian metric component by component; on a sphere from the moments of the
+# ambient Cartesian components, rotated back to the local frame (Aluie 2019).
+function _cgef_reference_tau(grid, u, v, plan, ::FG.Geometry.CartesianGeometry)
+    ub, vb, uu, uv, vv = ntuple(_ -> similar(u), 5)
+    CGEF.Filtering.filter_apply_batch!((ub, vb, uu, uv, vv), (u, v, u .* u, u .* v, v .* v), plan)
+    return (uu .- ub .* ub, uv .- ub .* vb, vv .- vb .* vb)
 end
 
+function _cgef_reference_tau(grid, u, v, plan, geo::FG.Geometry.AbstractSphericalGeometry)
+    sz = size(u)
+    sym = ((1, 1), (1, 2), (1, 3), (2, 2), (2, 3), (3, 3))
+    p = ntuple(_ -> zeros(sz), 3)
+    for I in CartesianIndices(sz)
+        λ, φ = FG.Grids.coords(grid, Tuple(I)...)
+        c = FG.Geometry.vector_to_cartesian(geo, u[I], v[I], λ, φ)
+        p[1][I], p[2][I], p[3][I] = c[1], c[2], c[3]
+    end
+    pb = ntuple(_ -> zeros(sz), 3)
+    mom = ntuple(_ -> zeros(sz), 6)
+    CGEF.Filtering.filter_apply_batch!((pb..., mom...), (p..., ntuple(k -> p[sym[k][1]] .* p[sym[k][2]], 6)...), plan)
+    τ = ntuple(_ -> zeros(sz), 3)
+    for I in CartesianIndices(sz)
+        λ, φ = FG.Grids.coords(grid, Tuple(I)...)
+        t = ntuple(k -> mom[k][I] - pb[sym[k][1]][I] * pb[sym[k][2]][I], 6)
+        l = FG.Geometry.tensor_to_local(geo, t[1], t[4], t[6], t[2], t[3], t[5], λ, φ)
+        τ[1][I], τ[2][I], τ[3][I] = l.λλ, l.λφ, l.φφ
+    end
+    return τ
+end
 
-# Mathematical correctness: Rigid body rotation must have exactly Π = 0
-Test.@testset "Rigid Body Rotation - Zero Energy Flux" begin
-    # Rigid body rotation has no deformation, so no energy cascade
-    # u = -Ωy, v = Ωx should give Π = 0 everywhere
+# On any grid: the Germano split rebuilds τ; the strain/convergence split's total is `−S̄:τ̄`; the
+# Helmholtz channels sum to Π for any split and are empty but for the rotational one when the whole field
+# is called rotational; and the Favre budget at constant density is `ρ·Π` with no baropycnal work. On a
+# sphere `vf` names the vector filter: τ is the reference's under `CartesianComponents`, and the flux's own
+# under the generalized convolution, which has no other.
+function _cgef_check_identities(grid, u, v, ℓ; vf = nothing)
+    k = CGEF.GaussianKernel()
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    D = CGEF.Diagnostics
+    sph = FG.Grids.grid_geometry(grid) isa FG.Geometry.AbstractSphericalGeometry
+    kv = sph ? (; vector_filter = vf) : (;)
+    d = D.tau_decomposition(u, v, grid, k, ℓ; kv...)
+    ws = sph ? D.ΠWorkspace(grid; kv...) : D.ΠWorkspace(grid)
+    Π = D.compute_Π!(zero(u), u, v, nothing, grid, k, ℓ; execution = SER, workspace = ws)
+    τ = vf isa CGEF.Filtering.GeneralizedConvolution ? (ws.τ_xx, ws.τ_xy, ws.τ_yy) :
+        _cgef_reference_tau(grid, u, v, CGEF.Filtering.plan_filter(grid, k, ℓ; execution = SER), FG.Grids.grid_geometry(grid))
+    for (c, ref) in zip((:xx, :xy, :yy), τ)
+        Test.@test _cgef_relerr(getproperty(d.L, c) .+ getproperty(d.C, c) .+ getproperty(d.R, c), ref) < 1e-10
+    end
+    Test.@test _cgef_relerr(D.compute_Π_strain_convergence(u, v, grid, k, ℓ; kv...).total, Π) < 1e-10
+    dec = D.compute_Π_decomposed(u, v, u, v, grid, k, ℓ; kv...)
+    Test.@test maximum(abs, dec.divergent) == 0 && maximum(abs, dec.cross) == 0
+    Test.@test _cgef_relerr(dec.total, Π) < 1e-10
+    dec2 = D.compute_Π_decomposed(u, v, 0.6 .* u, 0.6 .* v, grid, k, ℓ; kv...)
+    Test.@test _cgef_relerr(dec2.total, Π) < 1e-10
+    ΠD = CGEF.Diagnostics.compute_Π!(zero(u), u, v, nothing, grid, k, ℓ; execution = SER, mask_strategy = _CGEF_DF)
+    fav = CGEF.Diagnostics.compressible_flux(u, v, fill(2.5, size(u)), fill(1.0e5, size(u)), grid, k, ℓ; mask_strategy = _CGEF_DF)
+    Test.@test _cgef_relerr(fav.Π, 2.5 .* ΠD) < 1e-10
+    Test.@test maximum(abs, fav.Λ) < 1e-12 * maximum(abs, fav.Π)
+end
 
-    geom = FG.Geometry.CartesianGeometry()
-    xs = collect(-50e3:1000.0:50e3)  # 101 points
-    ys = collect(-50e3:1000.0:50e3)  # 101 points
-    mask = trues(length(xs), length(ys))
-    grid = FG.Grids.StructuredGrid(geom, xs, ys, mask)
+Test.@testset "Diagnostic identities on every grid architecture" begin
+    cart = FG.Geometry.CartesianGeometry()
+    n = 16
+    xr = range(0.0, 1000.0 * (n - 1); length = n)
+    X = [x for x in xr, y in xr]
+    Y = [y for x in xr, y in xr]
+    u = [sin(x / 5000) * cos(y / 6000) for x in xr, y in xr]
+    v = [cos(x / 4000) * sin(y / 7000) for x in xr, y in xr]
+    _cgef_check_identities(FG.Grids.StructuredGrid(cart, xr, xr), u, v, 3000.0)
+    _cgef_check_identities(FG.Grids.CurvilinearGrid(cart, X, Y, trues(n, n)), u, v, 3000.0)
+    _cgef_check_identities(FG.Grids.UnstructuredGrid(cart, vec(X), vec(Y), trues(n * n); k = 8), vec(u), vec(v), 3000.0)
 
-    Ω = 1e-4  # rotation rate
-    u = [-Ω * y for x in xs, y in ys]
-    v = [Ω * x for x in xs, y in ys]
-
-    # Test at multiple scales
-    for scale in [5000.0, 10000.0, 20000.0]
-        Π = zeros(length(xs), length(ys))
-        CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, grid, CGEF.TopHatKernel(), scale)
-
-        # Check interior points (away from boundaries)
-        for j in 40:60, i in 40:60
-            Test.@test abs(Π[i, j]) < 1e-10  # Should be exactly zero
+    sgeo = FG.Geometry.SphericalGeometry()
+    for grid in (FG.Grids.StructuredGrid(sgeo, range(0.0; step = 2π / 32, length = 32), range(deg2rad(-70.0), deg2rad(70.0); length = 20)),
+                 FG.Grids.HEALPixGrid(sgeo, 4), FG.Grids.CubedSphereGrid(sgeo, 6), FG.Grids.IcosahedralGrid(sgeo, 4),
+                 FG.Grids.RingGrid(sgeo, FG.SphericalSampling.ReducedGaussianSampling([16, 24, 32, 32, 24, 16])))
+        sz = size(FG.Grids.mask(grid))
+        c = [FG.Grids.coords(grid, Tuple(I)...) for I in CartesianIndices(sz)]
+        for vf in (CGEF.Filtering.CartesianComponents(), CGEF.Filtering.GeneralizedConvolution())
+            _cgef_check_identities(grid, [cos(p[2]) * sin(p[1]) for p in c], [cos(p[2]) * cos(p[1]) for p in c],
+                                   1.3 * FG.Geometry.radius(sgeo) * sqrt(4π / prod(sz)); vf)
         end
     end
 end
 
-
-# Mathematical correctness: Strain rate properties
-Test.@testset "Strain Rate Tensor Properties" begin
-    # Strain rate tensor S_ij must be symmetric: S_ij = S_ji
-    # For 2D incompressible flow: S_xx + S_yy = 0 (trace = divergence)
-
-    geom = FG.Geometry.CartesianGeometry()
-    xs = collect(0.0:1000.0:50e3)
-    ys = collect(0.0:1000.0:50e3)
-    mask = trues(length(xs), length(ys))
-    grid = FG.Grids.StructuredGrid(geom, xs, ys, mask)
-
-    # Create a divergent flow field
-    u = [0.01 * x for x in xs, y in ys]  # Linear in x
-    v = [0.01 * y for x in xs, y in ys]  # Linear in y
-
-    # Filter the field
-    u_filt = zeros(length(xs), length(ys))
-    v_filt = zeros(length(xs), length(ys))
-    CGEF.Filtering.filter_field!(u_filt, u, grid, CGEF.TopHatKernel(), 10000.0)
-    CGEF.Filtering.filter_field!(v_filt, v, grid, CGEF.TopHatKernel(), 10000.0)
-
-    # Compute strain rates
-    S_xx = zeros(length(xs), length(ys))
-    S_yy = zeros(length(xs), length(ys))
-    S_xy = zeros(length(xs), length(ys))
-    scratch = zeros(length(xs), length(ys))
-
-    CGEF.Derivatives.ddx!(S_xx, u_filt, grid)
-    CGEF.Derivatives.ddy!(S_yy, v_filt, grid)
-    CGEF.Derivatives.ddy!(S_xy, u_filt, grid)
-    CGEF.Derivatives.ddx!(scratch, v_filt, grid)
-    @. S_xy = 0.5 * (S_xy + scratch)
-
-    # Test symmetry: S_xy should equal S_yx (we only computed S_xy)
-    # Test trace = divergence for incompressible flow
-    #
-    # This should be essentially EXACT, not just "approximately 0.02": a TopHat filter is a
-    # symmetric (uniform-disk) average, which reproduces a linear field exactly at any interior
-    # point with a full, untruncated footprint (odd-order terms cancel by symmetry) — and the
-    # centered finite difference (`nonuniform_first_derivative`) has zero truncation error for a
-    # linear function too (its leading error term involves the third derivative, which is zero
-    # here). `i,j in 20:end-20` keeps a comfortable margin inside the domain relative to the
-    # 5000 m footprint radius (10000/2) on a 1000 m grid (5 cells), so every point checked has a
-    # full, untruncated footprint. A 50%-of-expected-value tolerance would hide any real bug in
-    # either the filter or the derivative; float64 roundoff alone is ~1e-12 relative here.
-    for j in 20:length(ys)-20, i in 20:length(xs)-20
-        divergence = S_xx[i,j] + S_yy[i,j]
-        Test.@test divergence ≈ 0.02 atol=1e-9
-    end
-end
-
-
-# Mathematical correctness: SFS stress properties
-Test.@testset "SFS Stress Tensor Properties" begin
-    # τ_ij = [u_i*u_j]̄ - ū_i*ū_j must be symmetric: τ_ij = τ_ji
-    # For isotropic turbulence, trace of τ should be positive (energy in SFS)
-
-    geom = FG.Geometry.CartesianGeometry()
-    x = collect(0.0:1000.0:30e3)
-    y = collect(0.0:1000.0:30e3)
-    mask = trues(length(x), length(y))
-    grid = FG.Grids.StructuredGrid(geom, x, y, mask)
-
-    # Create random velocity field
-    u = rand(length(x), length(y))
-    v = rand(length(x), length(y))
-
-    # Filter fields
-    u_filt = zeros(length(x), length(y))
-    v_filt = zeros(length(x), length(y))
-    CGEF.Filtering.filter_field!(u_filt, u, grid, CGEF.TopHatKernel(), 5000.0)
-    CGEF.Filtering.filter_field!(v_filt, v, grid, CGEF.TopHatKernel(), 5000.0)
-
-    # Filter products
-    uu = zeros(length(x), length(y))
-    uv = zeros(length(x), length(y))
-    vv = zeros(length(x), length(y))
-    scratch = zeros(length(x), length(y))
-
-    @. scratch = u * u
-    CGEF.Filtering.filter_field!(uu, scratch, grid, CGEF.TopHatKernel(), 5000.0)
-    @. scratch = u * v
-    CGEF.Filtering.filter_field!(uv, scratch, grid, CGEF.TopHatKernel(), 5000.0)
-    @. scratch = v * v
-    CGEF.Filtering.filter_field!(vv, scratch, grid, CGEF.TopHatKernel(), 5000.0)
-
-    # Compute SFS stress
-    τ_xx = zeros(length(x), length(y))
-    τ_xy = zeros(length(x), length(y))
-    τ_yy = zeros(length(x), length(y))
-
-    @. τ_xx = uu - u_filt * u_filt
-    @. τ_xy = uv - u_filt * v_filt
-    @. τ_yy = vv - v_filt * v_filt
-
-    # Test that trace of τ is positive (physical constraint for filtering)
-    # τ_xx + τ_yy = [u²+v²]̄ - (ū² + v̄²) ≥ 0 by Jensen's inequality
-    for j in 10:length(y)-10, i in 10:length(x)-10
-        trace_τ = τ_xx[i,j] + τ_yy[i,j]
-        Test.@test trace_τ >= -1e-10  # Should be non-negative
-    end
-
-    # Test symmetry: compute τ_yx and verify equals τ_xy
-    scratch2 = zeros(length(x), length(y))
-    @. scratch2 = v * u
-    CGEF.Filtering.filter_field!(scratch, scratch2, grid, CGEF.TopHatKernel(), 5000.0)
-    @. scratch2 = scratch - v_filt * u_filt  # τ_yx
-
-    for j in 10:length(y)-10, i in 10:length(x)-10
-        Test.@test τ_xy[i,j] ≈ scratch2[i,j] rtol=1e-10
-    end
-end
-
-
-# Mathematical correctness: Π sign consistency with SFS stress and strain
-Test.@testset "Energy Flux Sign Consistency" begin
-    # Π = -ρ₀ * S̄_ij * τ_ij should have consistent sign based on S and τ
-    # For a convergent strain with positive SFS stress, Π should be negative
-    # (energy goes from resolved to sub-grid = forward cascade)
-
-    geom = FG.Geometry.CartesianGeometry()
-    xs = collect(0.0:1000.0:50e3)
-    ys = collect(0.0:1000.0:50e3)
-    mask = trues(length(xs), length(ys))
-    grid = FG.Grids.StructuredGrid(geom, xs, ys, mask)
-
-    # Create a simple deformation field
-    # u = a*x, v = -a*y gives pure strain (convergence in x, divergence in y)
-    a = 0.001
-    u = [a * x for x in xs, y in ys]
-    v = [-a * y for x in xs, y in ys]
-
-    # The strain rate tensor for this field:
-    # S_xx = a, S_yy = -a, S_xy = 0
-
-    # At scale where filtering matters, we can verify:
-    # - SFS stress τ should be computed correctly
-    # - The sign of Π should match the sign of -S:τ
-
-    Π = zeros(length(xs), length(ys))
-    CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, grid, CGEF.TopHatKernel(), 10000.0)
-
-    # For this pure linear deformation, filtering doesn't change the field
-    # (linear fields are invariant under top-hat filtering)
-    # So τ should be ~0 and Π should be ~0
-    for j in 20:length(ys)-20, i in 20:length(xs)-20
-        Test.@test abs(Π[i,j]) < 1e-8
-    end
-end
-
-
-# Mathematical correctness: Energy budget closure
-Test.@testset "Energy Budget - Filtered vs Unfiltered" begin
-    # Test that: 0.5*ρ₀*|u|² = 0.5*ρ₀*|ū|² + 0.5*ρ₀*trace(τ) + (boundary terms)
-    # For periodic domains, the resolved + SFS energies should relate to total energy
-
-    geom = FG.Geometry.CartesianGeometry()
-    x = collect(0.0:1000.0:30e3)
-    y = collect(0.0:1000.0:30e3)
-    mask = trues(length(x), length(y))
-    grid = FG.Grids.StructuredGrid(geom, x, y, mask)
-
-    # Random velocity field
-    u = rand(length(x), length(y))
-    v = rand(length(x), length(y))
-
-    ρ₀ = 1025.0
-
-    # Compute total energy
-    total_energy = 0.5 * ρ₀ * (u.^2 + v.^2)
-
-    # Filter at some scale
-    scale = 5000.0
-    u_filt = zeros(length(x), length(y))
-    v_filt = zeros(length(x), length(y))
-    CGEF.Filtering.filter_field!(u_filt, u, grid, CGEF.TopHatKernel(), scale)
-    CGEF.Filtering.filter_field!(v_filt, v, grid, CGEF.TopHatKernel(), scale)
-
-    # Filter products for SFS stress trace
-    uu_filt = zeros(length(x), length(y))
-    vv_filt = zeros(length(x), length(y))
-    scratch = zeros(length(x), length(y))
-
-    @. scratch = u * u
-    CGEF.Filtering.filter_field!(uu_filt, scratch, grid, CGEF.TopHatKernel(), scale)
-    @. scratch = v * v
-    CGEF.Filtering.filter_field!(vv_filt, scratch, grid, CGEF.TopHatKernel(), scale)
-
-    # SFS energy = 0.5*ρ₀*trace(τ) = 0.5*ρ₀*([u²]̄ + [v²]̄ - ū² - v̄²)
-    sfs_energy = zeros(length(x), length(y))
-    @. sfs_energy = 0.5 * ρ₀ * (uu_filt + vv_filt - u_filt^2 - v_filt^2)
-
-    # Resolved energy
-    resolved_energy = zeros(length(x), length(y))
-    @. resolved_energy = 0.5 * ρ₀ * (u_filt^2 + v_filt^2)
-
-    # Verify: sfs_energy ≥ 0 (Jensen's inequality)
-    for j in 10:length(y)-10, i in 10:length(x)-10
-        Test.@test sfs_energy[i,j] >= -1e-12  # Should be non-negative
-    end
-
-    # Verify: sfs_energy + resolved_energy ≈ filtered total energy
-    # ([u²]̄ + [v²]̄)/2 = ([u²+v²]̄)/2
-    filtered_total = zeros(length(x), length(y))
-    @. scratch = u.^2 + v.^2
-    CGEF.Filtering.filter_field!(filtered_total, scratch, grid, CGEF.TopHatKernel(), scale)
-    @. filtered_total = 0.5 * ρ₀ * filtered_total
-
-    for j in 10:length(y)-10, i in 10:length(x)-10
-        energy_sum = sfs_energy[i,j] + resolved_energy[i,j]
-        Test.@test energy_sum ≈ filtered_total[i,j] rtol=1e-10
-    end
-end
-
-
-# Germano subfilter-stress decomposition: L + C + R == τ (exact closure)
-Test.@testset "Stress decomposition (Leonard/Cross/Reynolds)" begin
-    geom = FG.Geometry.CartesianGeometry()
-    x = collect(0.0:1000.0:30e3)
-    y = collect(0.0:1000.0:30e3)
-    grid = FG.Grids.StructuredGrid(geom, x, y, trues(length(x), length(y)))
-    u = rand(length(x), length(y))
-    v = rand(length(x), length(y))
-    kern = CGEF.TopHatKernel()
-    scale = 5000.0
-
-    d = CGEF.Diagnostics.tau_decomposition(u, v, grid, kern, scale)
-
-    # The workspace form is the same implementation the allocating one delegates to, so it must agree
-    # exactly; with the workspace AND the plan held it also stops allocating per call.
-    let ws = CGEF.Diagnostics.TauWorkspace(grid),
-        pl = CGEF.Filtering.plan_filter(grid, kern, scale;
-            backend = CGEF.ComputationalBackends.SerialBackend())
-        dw = CGEF.Diagnostics.tau_decomposition!(ws, u, v, grid, kern, scale; filter_plan = pl)
-        for blk in (:L, :C, :R), comp in (:xx, :xy, :yy)
-            Test.@test getproperty(getproperty(dw, blk), comp) ==
-                       getproperty(getproperty(d, blk), comp)
+Test.@testset "Diagnostic identities in true 3-D" begin
+    k = CGEF.GaussianKernel()
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    sym = ((1, 1), (1, 2), (1, 3), (2, 2), (2, 3), (3, 3))
+    names = (:xx, :xy, :xz, :yy, :yz, :zz)
+    n = 10
+    x = range(0.0, 1000.0 * (n - 1); length = n)
+    cube = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), x, x, x)
+    R = 6.371e6
+    lon = deg2rad.(collect(0.0:15.0:345.0))
+    lat = deg2rad.(collect(-60.0:15.0:60.0))
+    shell = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), lon, lat, collect(R:100e3:(R + 300e3)))
+    for (grid, ℓ) in ((cube, 3000.0), (shell, 8.0e5))
+        sz = FG.Grids.size_tuple(grid)
+        c = [FG.Grids.coords(grid, Tuple(I)...) for I in CartesianIndices(sz)]
+        u = [sin(p[1] / 4000 + p[2]) * cos(p[2] / 5000) for p in c]
+        v = [cos(p[1] / 3000) * sin(p[3] / 6000 + p[2]) for p in c]
+        w = [0.1 * sin(p[2] / 5000 + 2p[1]) * cos(p[3] / 4000) for p in c]
+        d = CGEF.Diagnostics.tau_decomposition(u, v, w, grid, k, ℓ)
+        ws = CGEF.Diagnostics.ΠWorkspace(grid; has_w = true)
+        Π = CGEF.Diagnostics.compute_Π!(zeros(sz), u, v, w, grid, k, ℓ; workspace = ws, execution = SER)
+        for (nm, ref) in zip(names, (ws.τ_xx, ws.τ_xy, ws.τ_xz, ws.τ_yy, ws.τ_yz, ws.τ_zz))
+            Test.@test _cgef_relerr(getproperty(d.L, nm) .+ getproperty(d.C, nm) .+ getproperty(d.R, nm), ref) < 1e-9
         end
-        # Reusing the workspace must give the same answer, not accumulate into stale buffers.
-        dw2 = CGEF.Diagnostics.tau_decomposition!(ws, u, v, grid, kern, scale; filter_plan = pl)
-        Test.@test dw2.C.xy == dw.C.xy
-        # Per-call cost is the returned NamedTuple only — no field-sized allocation.
-        Test.@test (@allocated CGEF.Diagnostics.tau_decomposition!(
-            ws, u, v, grid, kern, scale; filter_plan = pl)) < 4096
-    end
-
-    # Reference τ_ij = filter(u_i u_j) - ū_i ū_j with the same filter.
-    ub = zeros(size(u)); vb = zeros(size(v))
-    CGEF.Filtering.filter_field!(ub, u, grid, kern, scale)
-    CGEF.Filtering.filter_field!(vb, v, grid, kern, scale)
-    uu = zeros(size(u)); uv = zeros(size(u)); vv = zeros(size(u))
-    CGEF.Filtering.filter_field!(uu, u .* u, grid, kern, scale)
-    CGEF.Filtering.filter_field!(uv, u .* v, grid, kern, scale)
-    CGEF.Filtering.filter_field!(vv, v .* v, grid, kern, scale)
-    τxx = uu .- ub .^ 2
-    τxy = uv .- ub .* vb
-    τyy = vv .- vb .^ 2
-
-    Test.@test d.L.xx .+ d.C.xx .+ d.R.xx ≈ τxx
-    Test.@test d.L.xy .+ d.C.xy .+ d.R.xy ≈ τxy
-    Test.@test d.L.yy .+ d.C.yy .+ d.R.yy ≈ τyy
-    # Reynolds (subfilter–subfilter) stress trace is non-negative (Jensen).
-    Test.@test all(d.R.xx .+ d.R.yy .>= -1e-10)
-end
-
-
-# Rotational/divergent (Helmholtz) decomposition of the energy flux. Uses genuine
-# streamfunction/potential test fields (exactly non-divergent / exactly irrotational by
-# elementary vector calculus, for ANY kx, ky) rather than an arbitrary scalar split of one
-# field — that older test passed even under the (buggy) one-sided-strain implementation,
-# since it degenerated to S̄ᵈ ≡ 0 and never exercised the cross-strain terms.
-Test.@testset "Helmholtz flux decomposition" begin
-    geom = FG.Geometry.CartesianGeometry()
-    x = collect(0.0:1000.0:30e3); y = collect(0.0:1000.0:30e3)
-    grid = FG.Grids.StructuredGrid(geom, x, y, trues(length(x), length(y)))
-    kern = CGEF.TopHatKernel(); scale = 5000.0
-
-    Lx = x[end] - x[1]; Ly = y[end] - y[1]
-    kx = 2π / Lx; ky = 2π / Ly
-
-    # Taylor-Green vortex from streamfunction ψ = cos(kx x) cos(ky y): u = -∂ψ/∂y, v = ∂ψ/∂x
-    # is exactly non-divergent (∂u/∂x + ∂v/∂y ≡ 0) by construction.
-    u_rot = [ky * cos(kx * xi) * sin(ky * yj) for xi in x, yj in y]
-    v_rot = [-kx * sin(kx * xi) * cos(ky * yj) for xi in x, yj in y]
-
-    # Sine-sine potential χ = sin(kx x) sin(ky y): u = ∂χ/∂x, v = ∂χ/∂y is exactly
-    # irrotational (∂v/∂x - ∂u/∂y ≡ 0) by construction.
-    u_div = [kx * cos(kx * xi) * sin(ky * yj) for xi in x, yj in y]
-    v_div = [ky * sin(kx * xi) * cos(ky * yj) for xi in x, yj in y]
-
-    u = u_rot .+ u_div
-    v = v_rot .+ v_div
-
-    dec = CGEF.Diagnostics.compute_Π_decomposed(u, v, u_rot, v_rot, grid, kern, scale)
-    Πfull = zeros(size(u)); CGEF.Diagnostics.compute_Π!(Πfull, u, v, nothing, grid, kern, scale)
-
-    # The workspace form is the implementation the allocating one delegates to, so it agrees exactly;
-    # holding the workspace and both plans makes a repeated evaluation allocation-free.
-    let ws = CGEF.Diagnostics.PiDecomposedWorkspace(grid),
-        pl = CGEF.Filtering.plan_filter(grid, kern, scale;
-            backend = CGEF.ComputationalBackends.SerialBackend()),
-        dp = CGEF.Derivatives.StencilPlan(grid)
-        dw = CGEF.Diagnostics.compute_Π_decomposed!(ws, u, v, u_rot, v_rot, grid, kern, scale;
-            filter_plan = pl, deriv_plan = dp)
-        for k in (:total, :rotational, :cross, :divergent)
-            Test.@test getproperty(dw, k) == getproperty(dec, k)
+        if grid === cube
+            plan = CGEF.Filtering.plan_filter(grid, k, ℓ; execution = SER)
+            vel = (u, v, w)
+            b = ntuple(_ -> zeros(sz), 3)
+            m = ntuple(_ -> zeros(sz), 6)
+            CGEF.Filtering.filter_apply_batch!((b..., m...), (vel..., ntuple(q -> vel[sym[q][1]] .* vel[sym[q][2]], 6)...), plan)
+            Test.@test _cgef_relerr(ws.τ_xy, m[2] .- b[1] .* b[2]) < 1e-12
         end
-        # Reuse must recompute from scratch, not accumulate into the previous call's buffers.
-        dw2 = CGEF.Diagnostics.compute_Π_decomposed!(ws, u, v, u_rot, v_rot, grid, kern, scale;
-            filter_plan = pl, deriv_plan = dp)
-        Test.@test dw2.total == dw.total
-        Test.@test (@allocated CGEF.Diagnostics.compute_Π_decomposed!(
-            ws, u, v, u_rot, v_rot, grid, kern, scale;
-            filter_plan = pl, deriv_plan = dp)) < 4096
+        ΠD = CGEF.Diagnostics.compute_Π!(zeros(sz), u, v, w, grid, k, ℓ; execution = SER, mask_strategy = _CGEF_DF)
+        fav = CGEF.Diagnostics.compressible_flux(u, v, w, fill(2.5, sz), fill(1.0e5, sz), grid, k, ℓ; mask_strategy = _CGEF_DF)
+        Test.@test _cgef_relerr(fav.Π, 2.5 .* ΠD) < 1e-9
+        Test.@test maximum(abs, fav.Λ) < 1e-12 * maximum(abs, fav.Π)
+        dec = CGEF.Diagnostics.compute_Π_decomposed(u, v, w, u, v, w, grid, k, ℓ)
+        Test.@test maximum(abs, dec.divergent) == 0 && maximum(abs, dec.cross) == 0
+        Test.@test _cgef_relerr(dec.total, Π) < 1e-10
     end
-
-    # (1) channels sum EXACTLY to the total, matching the standard full-flux computation.
-    Test.@test dec.total ≈ dec.rotational .+ dec.cross .+ dec.divergent
-    Test.@test dec.total ≈ Πfull
-
-    # (2) purely-rotational field ⇒ divergent/cross channels vanish, rotational = full flux
-    # computed on that field alone.
-    Πr_full = zeros(size(u_rot)); CGEF.Diagnostics.compute_Π!(Πr_full, u_rot, v_rot, nothing, grid, kern, scale)
-    dec_r = CGEF.Diagnostics.compute_Π_decomposed(u_rot, v_rot, u_rot, v_rot, grid, kern, scale)
-    Test.@test maximum(abs, dec_r.divergent) < 1e-10
-    Test.@test maximum(abs, dec_r.cross) < 1e-10
-    Test.@test dec_r.rotational ≈ Πr_full
-
-    # (3) purely-divergent field ⇒ rotational/cross channels vanish, divergent = full flux
-    # computed on that field alone.
-    Πd_full = zeros(size(u_div)); CGEF.Diagnostics.compute_Π!(Πd_full, u_div, v_div, nothing, grid, kern, scale)
-    dec_d = CGEF.Diagnostics.compute_Π_decomposed(u_div, v_div, zeros(size(u_div)), zeros(size(v_div)), grid, kern, scale)
-    Test.@test maximum(abs, dec_d.rotational) < 1e-10
-    Test.@test maximum(abs, dec_d.cross) < 1e-10
-    Test.@test dec_d.divergent ≈ Πd_full
-
-    # (4) each channel must contract against its OWN strain component, not the full undecomposed S̄.
-    # Contracting against the full strain is correct only where S̄ᵈ ≡ 0; that formula is built here
-    # from primitives, and Π_RR must differ from it, since S̄ᵈ is nonzero for this mixed field.
-    ub = zeros(size(u)); vb = zeros(size(v))
-    CGEF.Filtering.filter_field!(ub, u, grid, kern, scale)
-    CGEF.Filtering.filter_field!(vb, v, grid, kern, scale)
-    Sxx_full = zeros(size(u)); CGEF.Derivatives.ddx!(Sxx_full, ub, grid)
-    Syy_full = zeros(size(u)); CGEF.Derivatives.ddy!(Syy_full, vb, grid)
-    p = zeros(size(u)); q = zeros(size(u))
-    CGEF.Derivatives.ddy!(p, ub, grid); CGEF.Derivatives.ddx!(q, vb, grid)
-    Sxy_full = 0.5 .* (p .+ q)
-
-    urb = zeros(size(u_rot)); vrb = zeros(size(v_rot))
-    CGEF.Filtering.filter_field!(urb, u_rot, grid, kern, scale)
-    CGEF.Filtering.filter_field!(vrb, v_rot, grid, kern, scale)
-    uu = zeros(size(u)); uv = zeros(size(u)); vv = zeros(size(u))
-    CGEF.Filtering.filter_field!(uu, u_rot .* u_rot, grid, kern, scale)
-    CGEF.Filtering.filter_field!(uv, u_rot .* v_rot, grid, kern, scale)
-    CGEF.Filtering.filter_field!(vv, v_rot .* v_rot, grid, kern, scale)
-    τRRxx = uu .- urb .^ 2; τRRxy = uv .- urb .* vrb; τRRyy = vv .- vrb .^ 2
-
-    old_Πrr = -(Sxx_full .* τRRxx .+ 2 .* Sxy_full .* τRRxy .+ Syy_full .* τRRyy)
-    Test.@test !isapprox(dec.rotational, old_Πrr)
 end
 
+# A normalized even kernel reproduces any linear field away from the edges, so solid-body rotation and
+# pure strain filter to themselves and Π = 0. For pure strain `u = (Ωy, Ωx)` the stress is not zero:
+# `τ₁₁ = τ₂₂ = Ω²σ²` with σ² the filter's own second moment, read off the filter by linearity, and
+# `Π = −2Ωτ₁₂` vanishes with the cross moment.
+Test.@testset "Linear fields: filtered to themselves, Π = 0, τ = Ω²σ²" begin
+    N = 48
+    dx = 1000.0
+    xs = collect(range(-(N ÷ 2) * dx, ((N ÷ 2) - 1) * dx; length = N))
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs)
+    Ω = 1e-4
+    ℓ = 6dx
+    Yf = [xs[j] for i in 1:N, j in 1:N]
+    for kern in (CGEF.TopHatKernel(), CGEF.GaussianKernel())
+        pad = ceil(Int, CGEF.Kernels.kernel_radius(kern, ℓ) / dx) + 1
+        ii = (pad + 1):(N - pad)
+        plan = CGEF.Filtering.plan_filter(grid, kern, ℓ)
+        flt(a) = CGEF.Filtering.filter_apply!(zeros(N, N), a, plan)
+        f1 = flt(ones(N, N))
+        σ² = (flt(Yf .^ 2) ./ f1 .- (flt(Yf) ./ f1) .^ 2)[N ÷ 2, N ÷ 2]
+        kern isa CGEF.GaussianKernel && Test.@test σ² ≈ ℓ^2 / 12 rtol = 1e-9
+        for (uf, vf) in (((x, y) -> -Ω * y, (x, y) -> Ω * x), ((x, y) -> Ω * y, (x, y) -> Ω * x))
+            u = [uf(xs[i], xs[j]) for i in 1:N, j in 1:N]
+            v = [vf(xs[i], xs[j]) for i in 1:N, j in 1:N]
+            Test.@test maximum(abs, (flt(u) .- u)[ii, ii]) < 1e-14 * maximum(abs, u)
+            Test.@test maximum(abs, (flt(v) .- v)[ii, ii]) < 1e-14 * maximum(abs, v)
+            Π = CGEF.Diagnostics.compute_Π!(zeros(N, N), u, v, nothing, grid, kern, ℓ)
+            Test.@test maximum(abs, Π[ii, ii]) < 1e-11 * Ω^3 * σ²
+        end
+        L, C, R = CGEF.Diagnostics.tau_decomposition([Ω * xs[j] for i in 1:N, j in 1:N], [Ω * xs[i] for i in 1:N, j in 1:N],
+                                                     grid, kern, ℓ)
+        Test.@test all(≈(Ω^2 * σ²; rtol = 1e-12), (L.xx .+ C.xx .+ R.xx)[ii, ii])
+        Test.@test all(≈(Ω^2 * σ²; rtol = 1e-12), (L.yy .+ C.yy .+ R.yy)[ii, ii])
+        Test.@test maximum(abs, (L.xy .+ C.xy .+ R.xy)[ii, ii]) < 1e-11 * Ω^2 * σ²
+    end
+end
 
-# Measured through a top-level, fully-qualified helper: inside a testset the arguments and the module
-# alias are captured locals, and `@allocated` then charges that capture to the call under test.
-_alloc_decomposed3d!(ws, u, v, w, ur, vr, wr, grid, kern, scale, pl, dp) =
-    @allocated CGEF.Diagnostics.compute_Π_decomposed!(
-        ws, u, v, w, ur, vr, wr, grid, kern, scale; filter_plan = pl, deriv_plan = dp,
-    )
+# Rigid rotation of a shell, `u_e = Ω r cos φ`, has radial shear `Ω cos φ` and no strain, so Π = 0; the
+# spherical vorticity of rotation about the polar axis is `2Ω sin φ`, half of it from the curvature term.
+Test.@testset "Rigid rotation on a sphere: Π = 0 in a shell, ω = 2Ω sin φ on the surface" begin
+    R = 6.371e6
+    geo = FG.Geometry.SphericalGeometry(R)
+    lon = deg2rad.(collect(0.0:10.0:350.0))
+    lat = deg2rad.(collect(-60.0:10.0:60.0))
+    r = collect(R:5000.0:(R + 20000.0))
+    Ω = 7.292e-5
+    u = [Ω * rk * cos(φ) for _ in lon, φ in lat, rk in r]
+    zs = zeros(size(u))
+    shell = FG.Grids.StructuredGrid(geo, lon, lat, r)
+    Π = CGEF.Diagnostics.compute_Π!(zeros(size(u)), u, zs, zs, shell, CGEF.TopHatKernel(), 500e3; mask_strategy = _CGEF_DF)
+    Test.@test maximum(abs, Π) < 1e-12 * Ω * maximum(abs, u)^2
 
-# True-3D rotational/divergent split: the same both-sides decomposition over all six independent
-# tensor components, checked against the definition assembled from primitives.
-Test.@testset "3D decomposed flux" begin
+    φr = range(deg2rad(-70.0), deg2rad(70.0); length = 20)
+    surface = FG.Grids.StructuredGrid(geo, range(0.0; step = 2π / 32, length = 32), φr)
+    φs = [FG.Grids.coords(surface, i, j)[2] for i in 1:32, j in 1:20]
+    ω = CGEF.Diagnostics.vorticity(Ω .* R .* cos.(φs), zeros(32, 20), surface)
+    # The centred latitude difference of `cos φ` leaves `Ω sin φ (1 − sin Δφ/Δφ) < Ω Δφ²/6`.
+    Test.@test maximum(abs, ω[2:31, 2:19] .- 2Ω .* sin.(φs[2:31, 2:19])) < Ω * step(φr)^2 / 6
+end
+
+# With `w = 0` and `(u, v)` independent of height, the volume's six-term contraction is the plane's on
+# every layer.
+Test.@testset "A height-independent volume is the plane on every layer" begin
+    x = collect(0.0:1.0:15.0)
+    z = collect(0.0:50.0:100.0)
+    cart = FG.Geometry.CartesianGeometry()
+    u2 = [sin(0.4i) * cos(0.3j) for i in 1:16, j in 1:16]
+    v2 = [cos(0.5i + 0.2j) for i in 1:16, j in 1:16]
+    Π2 = CGEF.Diagnostics.compute_Π!(zeros(16, 16), u2, v2, nothing, FG.Grids.StructuredGrid(cart, x, x), CGEF.TopHatKernel(), 5.0)
+    Π3 = CGEF.Diagnostics.compute_Π!(zeros(16, 16, 3), repeat(u2, 1, 1, 3), repeat(v2, 1, 1, 3), zeros(16, 16, 3),
+                                     FG.Grids.StructuredGrid(cart, x, x, z), CGEF.TopHatKernel(), 5.0)
+    Test.@test all(k -> Π3[:, :, k] ≈ Π2, 1:3)
+end
+
+# Srinivasan, Barkan & McWilliams (2023) eq. (10): `Π = Π_α + Π_δ` with `ᾱ ≥ 0` and `|Π_α| ≤ ᾱE′`,
+# `E′ = (τ_uu + τ_vv)/2`; for a non-divergent field the convergence term is zero.
+Test.@testset "Strain/convergence split" begin
+    N = 24
+    dx = 1000.0
+    xs = 0.0:dx:(N - 1) * dx
+    geo = FG.Geometry.CartesianGeometry()
+    u = [sin(2π * 3 * i / N) * cos(2π * 2 * j / N) + 0.4cos(2π * 5 * i / N) for i in 1:N, j in 1:N]
+    v = [cos(2π * 2 * i / N) * sin(2π * 4 * j / N) + 0.3sin(2π * 6 * j / N) for i in 1:N, j in 1:N]
+    m = trues(N, N)
+    m[6:9, 5:8] .= false
+    grid = FG.Grids.StructuredGrid(geo, xs, xs, m)
+    for kern in (CGEF.TopHatKernel(), CGEF.GaussianKernel()), s in (CGEF.Filtering.ZeroFill(), _CGEF_DF)
+        ℓ = 4dx
+        d = CGEF.Diagnostics.compute_Π_strain_convergence(u, v, grid, kern, ℓ; mask_strategy = s)
+        Π = CGEF.Diagnostics.compute_Π!(zeros(N, N), u, v, nothing, grid, kern, ℓ; mask_strategy = s)
+        Test.@test maximum(abs, d.total .- Π) < 1e-12 * maximum(abs, Π)
+        Test.@test maximum(abs, d.strain) > 0.05 * maximum(abs, Π) && maximum(abs, d.convergence) > 0.05 * maximum(abs, Π)
+        Test.@test all(>=(0), d.strain_magnitude)
+        L, C, R = CGEF.Diagnostics.tau_decomposition(u, v, grid, kern, ℓ; mask_strategy = s)
+        E′ = ((L.xx .+ C.xx .+ R.xx) .+ (L.yy .+ C.yy .+ R.yy)) ./ 2
+        Test.@test all(I -> abs(d.strain[I]) <= abs(d.strain_magnitude[I] * E′[I]) + 1e-12 * maximum(abs, Π), CartesianIndices(Π))
+        # `Deformable` zeroes an inactive target.
+        s isa CGEF.Filtering.Deformable &&
+            Test.@test all(f -> all(iszero, f[.!m]), (d.total, d.strain, d.convergence, d.divergence, d.strain_magnitude))
+    end
+    # Under `ZeroFill` land is fluid at rest, so the flux reaches over it by the kernel radius and one
+    # derivative stencil and is zero beyond; the top-hat's compact support leaves a lake that far inside.
+    lake = trues(N, N)
+    lake[5:14, 5:14] .= false
+    glake = FG.Grids.StructuredGrid(geo, xs, xs, lake)
+    th = CGEF.TopHatKernel()
+    dl = CGEF.Diagnostics.compute_Π_strain_convergence(u, v, glake, th, 4dx)
+    dead = _cgef_beyond_reach(glake, CGEF.Kernels.kernel_radius(th, 4dx) + dx)
+    Test.@test any(dead)
+    Test.@test all(f -> all(iszero, f[dead]), (dl.total, dl.strain, dl.convergence, dl.divergence, dl.strain_magnitude))
+    xp = range(0.0, dx * 64; length = 65)[1:64]
+    us, vs = _cgef_spectral_field(64, dx, 3.0; symbol = :stencil)
+    d = CGEF.Diagnostics.compute_Π_strain_convergence(us, vs, FG.Grids.StructuredGrid(geo, xp, xp; periodic = (true, true)),
+                                                      CGEF.GaussianKernel(), 8dx)
+    Test.@test maximum(abs, d.convergence) < 1e-11 * maximum(abs, d.strain)
+end
+
+# `Π_RR = −S̄ʳ:τʳʳ`, `Π_DD = −S̄ᵈ:τᵈᵈ`, `Π_X = −(S̄ʳ:τᵈᵈ + S̄ᵈ:τʳʳ + S̄ʳ:τ_X + S̄ᵈ:τ_X)`, assembled from the filter
+# and the derivatives.
+Test.@testset "Helmholtz channels against their definitions" begin
     n = 12
     ax = range(0.0, 1200.0; length = n + 1)[1:n]
-    g3 = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), ax, ax, ax;
-                                 periodic = (true, true, true))
-    kern = CGEF.TopHatKernel(); scale = 300.0
-    # Deterministic and mutually independent, with a different wavenumber triple and phase per
-    # component, so every one of the six tensor components carries a distinct signal.
-    L = 1200.0
-    field(a, b, c, φ) = [sinpi(a * ax[i] / L + φ) * cospi(b * ax[j] / L) * sinpi(c * ax[k] / L + φ / 2)
-                         for i in 1:n, j in 1:n, k in 1:n]
+    g3 = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), ax, ax, ax; periodic = (true, true, true))
+    kern = CGEF.TopHatKernel()
+    ℓ = 300.0
+    field(a, b, c, φ) = [sinpi(a * x / 1200 + φ) * cospi(b * y / 1200) * sinpi(c * z / 1200 + φ / 2) for x in ax, y in ax, z in ax]
     u, v, w = field(2, 1, 1, 0.0), field(1, 3, 2, 0.3), field(3, 2, 1, 0.7)
-    ur, vr, wr = field(1, 2, 3, 0.11), field(2, 3, 1, 0.53), field(3, 1, 2, 0.91)
-
-    dec = CGEF.Diagnostics.compute_Π_decomposed(u, v, w, ur, vr, wr, g3, kern, scale)
-
-    # (1) the three channels sum to the total to the last bit, by construction.
-    Test.@test dec.total == dec.rotational .+ dec.cross .+ dec.divergent
-
-    # (2) against the definition, assembled independently from `filter_apply!` and the derivatives:
-    #     Π_RR = −S̄ʳ:τʳʳ, Π_DD = −S̄ᵈ:τᵈᵈ, Π_X = −(S̄ʳ:τᵈᵈ + S̄ᵈ:τʳʳ + S̄ʳ:τ_X + S̄ᵈ:τ_X).
-    pl = CGEF.Filtering.plan_filter(g3, kern, scale;
-                                    backend = CGEF.ComputationalBackends.SerialBackend())
-    dp = CGEF.Derivatives.StencilPlan(g3)
-    flt(f) = (o = zeros(n, n, n); CGEF.Filtering.filter_apply!(o, f, pl); o)
-    rot = (ur, vr, wr)
-    dv = (u .- ur, v .- vr, w .- wr)
-    br = map(flt, rot)
-    bd = map(flt, dv)
+    rot = (field(1, 2, 3, 0.11), field(2, 3, 1, 0.53), field(3, 1, 2, 0.91))
+    dec = CGEF.Diagnostics.compute_Π_decomposed(u, v, w, rot..., g3, kern, ℓ)
+    pl = CGEF.Filtering.plan_filter(g3, kern, ℓ; execution = CGEF.ComputationalBackends.SerialBackend())
+    flt(f) = CGEF.Filtering.filter_apply!(zeros(n, n, n), f, pl)
+    dv = (u .- rot[1], v .- rot[2], w .- rot[3])
+    br, bd = map(flt, rot), map(flt, dv)
     SYM = ((1, 1), (1, 2), (1, 3), (2, 2), (2, 3), (3, 3))
-    τRR = ntuple(k -> ((i1, i2) = SYM[k]; flt(rot[i1] .* rot[i2]) .- br[i1] .* br[i2]), 6)
-    τDD = ntuple(k -> ((i1, i2) = SYM[k]; flt(dv[i1] .* dv[i2]) .- bd[i1] .* bd[i2]), 6)
-    τX = ntuple(6) do k
-        (i1, i2) = SYM[k]
-        (flt(rot[i1] .* dv[i2]) .- br[i1] .* bd[i2]) .+ (flt(dv[i1] .* rot[i2]) .- bd[i1] .* br[i2])
-    end
-    dd(f, d) = begin
-        o = zeros(n, n, n)
-        d == 1 ? CGEF.Derivatives.ddx!(o, f, g3, dp) :
-        d == 2 ? CGEF.Derivatives.ddy!(o, f, g3, dp) : CGEF.Derivatives.ddz!(o, f, g3, dp)
-        o
-    end
-    strain(b) = ntuple(6) do k
-        (i1, i2) = SYM[k]
-        i1 == i2 ? dd(b[i1], i1) : 0.5 .* (dd(b[i1], i2) .+ dd(b[i2], i1))
-    end
-    SR = strain(br); SD = strain(bd)
-    con(S, t) = -(S[1] .* t[1] .+ S[4] .* t[4] .+ S[6] .* t[6] .+
-                  2 .* (S[2] .* t[2] .+ S[3] .* t[3] .+ S[5] .* t[5]))
+    τ(a, b, ba, bb) = ntuple(q -> flt(a[SYM[q][1]] .* b[SYM[q][2]]) .- ba[SYM[q][1]] .* bb[SYM[q][2]], 6)
+    τRR, τDD = τ(rot, rot, br, br), τ(dv, dv, bd, bd)
+    τX = τ(rot, dv, br, bd) .+ τ(dv, rot, bd, br)
+    dd(f, d) = _cgef_dd(f, g3, d)
+    strain(b) = ntuple(q -> ((i, j) = SYM[q]; i == j ? dd(b[i], i) : 0.5 .* (dd(b[i], j) .+ dd(b[j], i))), 6)
+    con(S, t) = -(S[1] .* t[1] .+ S[4] .* t[4] .+ S[6] .* t[6] .+ 2 .* (S[2] .* t[2] .+ S[3] .* t[3] .+ S[5] .* t[5]))
+    SR, SD = strain(br), strain(bd)
     Test.@test dec.rotational ≈ con(SR, τRR)
     Test.@test dec.divergent ≈ con(SD, τDD)
     Test.@test dec.cross ≈ con(SR, τDD) .+ con(SD, τRR) .+ con(SR, τX) .+ con(SD, τX)
-
-    # (3) a purely rotational field leaves the other two channels at zero.
-    dec_r = CGEF.Diagnostics.compute_Π_decomposed(ur, vr, wr, ur, vr, wr, g3, kern, scale)
-    Test.@test maximum(abs, dec_r.divergent) == 0.0
-    Test.@test maximum(abs, dec_r.cross) == 0.0
-
-    # (4) the workspace form is what the allocating one delegates to, and holding it plus both plans
-    # makes a repeated evaluation allocation-free.
-    ws = CGEF.Diagnostics.PiDecomposed3DWorkspace(g3)
-    dw = CGEF.Diagnostics.compute_Π_decomposed!(ws, u, v, w, ur, vr, wr, g3, kern, scale;
-                                                filter_plan = pl, deriv_plan = dp)
-    for k in (:total, :rotational, :cross, :divergent)
-        Test.@test getproperty(dw, k) == getproperty(dec, k)
-    end
-    dw2 = CGEF.Diagnostics.compute_Π_decomposed!(ws, u, v, w, ur, vr, wr, g3, kern, scale;
-                                                 filter_plan = pl, deriv_plan = dp)
-    Test.@test dw2.total == dw.total
-    _alloc_decomposed3d!(ws, u, v, w, ur, vr, wr, g3, kern, scale, pl, dp)
-    Test.@test _alloc_decomposed3d!(ws, u, v, w, ur, vr, wr, g3, kern, scale, pl, dp) == 0
 end
 
-
-# Cross-scale tracer-variance flux (scalar analog of Π).
-Test.@testset "Tracer variance flux" begin
-    geom = FG.Geometry.CartesianGeometry()
-    x = collect(0.0:1000.0:30e3); y = collect(0.0:1000.0:30e3)
-    grid = FG.Grids.StructuredGrid(geom, x, y, trues(length(x), length(y)))
-    u = rand(length(x), length(y)) .- 0.5
-    v = rand(length(x), length(y)) .- 0.5
-    θ = rand(length(x), length(y))
-    kern = CGEF.TopHatKernel(); scale = 5000.0
-
-    # (1) constant tracer ⇒ zero gradient ⇒ zero flux: everywhere under `Deformable`, and under
-    # `ZeroFill` wherever the kernel and the derivative stencil stay on the grid — past the edge the
-    # zero-extended tracer is not constant.
-    Πd = CGEF.Diagnostics.tracer_variance_flux(u, v, fill(2.5, size(θ)), grid, kern, scale;
-                                               mask_strategy = CGEF.Filtering.Deformable())
-    Test.@test maximum(abs, Πd) < 1e-9
-    Πc = CGEF.Diagnostics.tracer_variance_flux(u, v, fill(2.5, size(θ)), grid, kern, scale)
-    pad = ceil(Int, CGEF.Kernels.kernel_radius(kern, scale) / 1000.0) + 1
-    Test.@test maximum(abs, Πc[(pad + 1):(end - pad), (pad + 1):(end - pad)]) < 1e-9
-    Test.@test maximum(abs, Πc) > 1e-6
-
-    # (2) matches the explicit definition Πθ = -(τx ∂x θ̄ + τy ∂y θ̄) built from primitives.
-    Πθ = CGEF.Diagnostics.tracer_variance_flux(u, v, θ, grid, kern, scale)
-
-    # The workspace form is the implementation the allocating one delegates to, so it agrees exactly;
-    # with the workspace and both plans held it stops allocating per call.
-    let ws = CGEF.Diagnostics.TracerFluxWorkspace(grid),
-        pl = CGEF.Filtering.plan_filter(grid, kern, scale;
-            backend = CGEF.ComputationalBackends.SerialBackend()),
-        dp = CGEF.Derivatives.StencilPlan(grid),
-        got = zeros(size(Πθ))
-        CGEF.Diagnostics.tracer_variance_flux!(got, ws, u, v, θ, grid, kern, scale;
-            filter_plan = pl, deriv_plan = dp)
-        Test.@test got == Πθ
-        # Reusing the workspace must recompute, not accumulate into stale buffers.
-        CGEF.Diagnostics.tracer_variance_flux!(got, ws, u, v, θ, grid, kern, scale;
-            filter_plan = pl, deriv_plan = dp)
-        Test.@test got == Πθ
-        Test.@test (@allocated CGEF.Diagnostics.tracer_variance_flux!(
-            got, ws, u, v, θ, grid, kern, scale; filter_plan = pl, deriv_plan = dp)) < 4096
-    end
-    ub = zeros(size(u)); vb = zeros(size(v)); θb = zeros(size(θ))
-    CGEF.Filtering.filter_field!(ub, u, grid, kern, scale)
-    CGEF.Filtering.filter_field!(vb, v, grid, kern, scale)
-    CGEF.Filtering.filter_field!(θb, θ, grid, kern, scale)
-    uθ = zeros(size(u)); vθ = zeros(size(u))
-    CGEF.Filtering.filter_field!(uθ, u .* θ, grid, kern, scale)
-    CGEF.Filtering.filter_field!(vθ, v .* θ, grid, kern, scale)
-    τx = uθ .- ub .* θb; τy = vθ .- vb .* θb
-    gx = zeros(size(θ)); gy = zeros(size(θ))
-    CGEF.Derivatives.ddx!(gx, θb, grid); CGEF.Derivatives.ddy!(gy, θb, grid)
-    ref = .-(τx .* gx .+ τy .* gy)
-    Test.@test Πθ ≈ ref
-end
-
-
-# Spherical tracer-variance flux: the flux τ_j = ⟨u_j θ⟩ - ū_j θ̄ is a VECTOR, so it follows the same
-# rotate-to-planetary-Cartesian / filter / rotate-back convention as compute_Π! rather than filtering
-# the local east/north components in place.
-Test.@testset "Tracer variance flux: spherical" begin
+# The tracer flux `τ_j = ⟨u_j θ⟩ − ū_j θ̄` is a vector: under `CartesianComponents` filtered as ambient
+# Cartesian components and rotated back, the radial component carried in a shell.
+Test.@testset "Tracer-variance flux on a sphere and in a shell against its definition" begin
     R = 6.371e6
-    sgeom = FG.Geometry.SphericalGeometry(R)
-    lon = deg2rad.(collect(0.0:5.0:355.0))
-    lat = deg2rad.(collect(-40.0:5.0:40.0))
-    grid = FG.Grids.StructuredGrid(sgeom, lon, lat, trues(length(lon), length(lat)))
-    nx, ny = length(lon), length(lat)
-    u = rand(nx, ny) .- 0.5
-    v = rand(nx, ny) .- 0.5
-    θ = rand(nx, ny)
-    kern = CGEF.TopHatKernel(); scale = deg2rad(15.0) * R
-
-    # A constant tracer has no gradient, so the flux vanishes whatever the velocity does: everywhere
-    # under `Deformable`, and under `ZeroFill` on the rows whose kernel and stencil stay inside ±40°.
-    Πd = CGEF.Diagnostics.tracer_variance_flux(u, v, fill(2.5, nx, ny), grid, kern, scale;
-                                               mask_strategy = CGEF.Filtering.Deformable())
-    Test.@test maximum(abs, Πd) < 1e-9
-    Πc = CGEF.Diagnostics.tracer_variance_flux(u, v, fill(2.5, nx, ny), grid, kern, scale)
-    rows = findall(φ -> abs(φ) < deg2rad(40.0 - 7.5 - 5.0) - 1e-9, lat)
-    Test.@test !isempty(rows)
-    Test.@test maximum(abs, Πc[:, rows]) < 1e-9
-
-    # Against the definition, built from primitives with the rotation done explicitly.
-    Πθ = CGEF.Diagnostics.tracer_variance_flux(u, v, θ, grid, kern, scale)
-    ux = zeros(nx, ny); uy = zeros(nx, ny); uz = zeros(nx, ny)
-    for j in 1:ny, i in 1:nx
-        λ, φ = FG.Grids.coords(grid, i, j)
-        p = FG.Geometry.vector_to_cartesian(sgeom, u[i, j], v[i, j], λ, φ)
-        ux[i, j] = p[1]; uy[i, j] = p[2]; uz[i, j] = p[3]
-    end
-    flt(f) = (o = zeros(nx, ny); CGEF.Filtering.filter_field!(o, f, grid, kern, scale); o)
-    θb = flt(θ)
-    τX = flt(ux .* θ) .- flt(ux) .* θb
-    τY = flt(uy .* θ) .- flt(uy) .* θb
-    τZ = flt(uz .* θ) .- flt(uz) .* θb
-    τe = zeros(nx, ny); τn = zeros(nx, ny)
-    for j in 1:ny, i in 1:nx
-        λ, φ = FG.Grids.coords(grid, i, j)
-        l = FG.Geometry.vector_from_cartesian(sgeom, τX[i, j], τY[i, j], τZ[i, j], λ, φ)
-        τe[i, j] = l[1]; τn[i, j] = l[2]
-    end
-    gx = zeros(nx, ny); gy = zeros(nx, ny)
-    CGEF.Derivatives.ddx!(gx, θb, grid); CGEF.Derivatives.ddy!(gy, θb, grid)
-    Test.@test Πθ ≈ .-(τe .* gx .+ τn .* gy)
-
-    # The rotation is not cosmetic: filtering the local components in place gives a different answer,
-    # so a component-wise implementation would be silently wrong rather than merely less elegant.
-    τx_local = flt(u .* θ) .- flt(u) .* θb
-    τy_local = flt(v .* θ) .- flt(v) .* θb
-    Test.@test !isapprox(Πθ, .-(τx_local .* gx .+ τy_local .* gy); rtol = 1e-6)
-end
-
-# ---------------------------------------------------------------------------
-# The filtering spectral DENSITY is only guaranteed non-negative for a kernel whose |Ĝ(k)|² is
-# monotone decreasing (Sadek & Aluie 2018 eq. 21). A kernel that fails it is refused rather than
-# quietly handed back a spectrum that may go negative.
-# ---------------------------------------------------------------------------
-Test.@testset "filtering spectrum: only kernels with monotone |Ĝ|² are admitted" begin
-    K = CGEF.Kernels
-    Test.@test K.transfer_monotone(CGEF.GaussianKernel())
-    Test.@test K.transfer_monotone(CGEF.GaussianKernel(; α = 4))
-    Test.@test K.transfer_monotone(CGEF.SharpSpectralKernel())
-    Test.@test !K.transfer_monotone(CGEF.TopHatKernel())
-    # No fallback method: a new kernel must state which way it goes rather than inherit a guess.
-    Test.@test_throws MethodError K.transfer_monotone(nothing)
-
-    # The top-hat's |Ĝ|² really is non-monotone — the trait is measured, not asserted.
-    # (`spectral_transfer` for the top-hat lives in the SpecialFunctions extension, which the suite
-    # loads.)
-    let ℓ = 1.0, ks = range(0.1, 12.0; length = 4000)
-        g2(kern) = [K.spectral_transfer(kern, k, ℓ)^2 for k in ks]
-        rises(v) = maximum(diff(v))
-        Test.@test rises(g2(CGEF.TopHatKernel())) > 1e-6      # genuinely increases somewhere
-        Test.@test rises(g2(CGEF.GaussianKernel())) <= 0      # never increases
-        Test.@test rises(g2(CGEF.SharpSpectralKernel())) <= 0
-    end
-
-    # HOW non-monotone, in sampling-independent terms — this is what justifies offering `ForceSpectrum`
-    # at all, so it is gated rather than asserted in prose. A per-step `diff` scales with the sampling
-    # and cannot stand in for it: the climb from the first zero of Ĝ = 2J₁(kR)/(kR) up to the first
-    # Airy sidelobe is the physical quantity, and it is under 2% of the DC value.
-    let ℓ = 1.0, ks = range(0.1, 12.0; length = 40_000)
-        g2 = [K.spectral_transfer(CGEF.TopHatKernel(), k, ℓ)^2 for k in ks]
-        izero = argmin(g2)                              # first zero of Ĝ
-        ipeak = izero - 1 + argmax(@view g2[izero:end]) # first sidelobe past it
-        Test.@test 7.5 < ks[izero] < 7.8                # measured 7.663
-        Test.@test 10.1 < ks[ipeak] < 10.4              # measured 10.271
-        Test.@test 0.017 < g2[ipeak] < 0.018            # measured 0.01750
-        # and it never exceeds the DC value, unlike HighOrderKernel{5}'s |Ĝ|², which reaches 1.0125
-        Test.@test maximum(g2) <= 1.0
-    end
-
-    geom = FG.Geometry.CartesianGeometry()
-    N = 40
-    xs = 0.0:1000.0:(N - 1) * 1000.0
-    grid = FG.Grids.StructuredGrid(geom, xs, xs)
-    # A field with real structure across the sweep, so the density is not trivially flat.
-    u = [sin(2π * 3 * i / N) * cos(2π * 2 * j / N) + 0.4sin(2π * 7 * i / N) for i in 1:N, j in 1:N]
-    v = [cos(2π * 2 * i / N) * sin(2π * 5 * j / N) + 0.3cos(2π * 6 * j / N) for i in 1:N, j in 1:N]
-    scales = collect(4e3:2e3:16e3)
-
-    # Refused, with a message that names the condition and the way out.
-    err = try
-        CGEF.Diagnostics.filtering_spectrum(u, v, nothing, grid, CGEF.TopHatKernel(), scales)
-        nothing
-    catch e
-        e
-    end
-    Test.@test err isa ArgumentError
-    Test.@test occursin("TopHatKernel", err.msg)
-    Test.@test occursin("monotone", err.msg)
-    Test.@test occursin("GaussianKernel", err.msg)
-
-    # Admitted, and the density it returns is non-negative — the property the gate exists to protect.
-    for kern in (CGEF.GaussianKernel(), CGEF.GaussianKernel(; α = 4))
-        kℓ, Ẽ = CGEF.Diagnostics.filtering_spectrum(u, v, nothing, grid, kern, scales)
-        Test.@test kℓ ≈ 1.0 ./ scales
-        Test.@test all(isfinite, Ẽ)
-        Test.@test all(>=(0), Ẽ)
-    end
-
-    # The convention is a plain rescaling: k_ℓ = L/ℓ scales the abscissa by L and the density by 1/L,
-    # so a comparison against a Fourier spectrum is only meaningful once the two agree on it.
-    let kern = CGEF.GaussianKernel(), Lbox = N * 1000.0
-        k1, E1 = CGEF.Diagnostics.filtering_spectrum(u, v, nothing, grid, kern, scales)
-        kL, EL = CGEF.Diagnostics.filtering_spectrum(u, v, nothing, grid, kern, scales; L = Lbox)
-        Test.@test kL ≈ Lbox .* k1
-        Test.@test EL ≈ E1 ./ Lbox
-    end
-
-    # The pipeline's default policy computes the density for a monotone kernel and fills NaN for any
-    # other, so the default call — top-hat kernel included — returns Π and the cumulative energy.
-    SP = CGEF.Diagnostics
-    r0 = CGEF.coarse_grain(u, v, grid; scales = scales)
-    Test.@test all(isfinite, r0.Π)
-    Test.@test all(isfinite, r0.cumulative_energy)
-    Test.@test all(isnan, r0.filtering_spectrum)
-    rn = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = SP.NoSpectrum())
-    Test.@test r0.Π == rn.Π && r0.cumulative_energy == rn.cumulative_energy
-    rg = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel())
-    Test.@test rg.filtering_spectrum ==
-               CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel(),
-                                 spectrum = SP.StrictSpectrum()).filtering_spectrum
-    Test.@test all(isfinite, rg.filtering_spectrum)
-
-    # `StrictSpectrum()` refuses a non-monotone kernel on every pipeline entry point.
-    Test.@test_throws ArgumentError CGEF.coarse_grain(u, v, grid; scales = scales,
-                                                      spectrum = SP.StrictSpectrum())
-    let b = CGEF.Pipeline.CoarseGrainBatchResult(grid, length(scales), (2,))
-        Test.@test_throws ArgumentError CGEF.Pipeline.coarse_grain_batch!(
-            b, randn(N, N, 2), randn(N, N, 2), grid; scales = scales, spectrum = SP.StrictSpectrum(),
-        )
-        Test.@test_throws ArgumentError CGEF.Pipeline.coarse_grain_slices!(
-            [CGEF.Pipeline._allocate_result(grid, length(scales))], [u], [v], [grid]; scales = scales,
-            spectrum = SP.StrictSpectrum(),
-        )
-    end
-    # And the default resolves the same way through the batch drivers.
-    let b = CGEF.Pipeline.CoarseGrainBatchResult(grid, length(scales), (2,))
-        CGEF.Pipeline.coarse_grain_batch!(b, cat(u, u; dims = 3), cat(v, v; dims = 3), grid;
-                                          scales = scales)
-        Test.@test all(isnan, b.filtering_spectrum)
-        Test.@test b.slices[1].Π ≈ r0.Π rtol = 1e-12
+    geo = FG.Geometry.SphericalGeometry(R)
+    lon = deg2rad.(collect(0.0:10.0:350.0))
+    lat = deg2rad.(collect(-60.0:10.0:60.0))
+    kern = CGEF.TopHatKernel()
+    for (grid, ℓ, w) in ((FG.Grids.StructuredGrid(geo, lon, lat), deg2rad(25.0) * R, nothing),
+                         (FG.Grids.StructuredGrid(geo, lon, lat, collect(R:750e3:(R + 3000e3))), 3.0e6, 0.05))
+        sz = FG.Grids.size_tuple(grid)
+        c = [FG.Grids.coords(grid, Tuple(I)...) for I in CartesianIndices(sz)]
+        θ = [sin(2p[1]) * cos(p[2]) + (length(p) == 3 ? 2 * (p[3] - R) / 3000e3 : 0.0) for p in c]
+        u = [0.4 * cos(p[2]) * sin(p[1]) for p in c]
+        v = [0.3 * sin(2p[2]) for p in c]
+        wf = w === nothing ? nothing : [w * cos(p[1]) for p in c]
+        Πθ = wf === nothing ?
+            CGEF.Diagnostics.tracer_variance_flux(u, v, θ, grid, kern, ℓ; vector_filter = CGEF.Filtering.CartesianComponents()) :
+            CGEF.Diagnostics.tracer_variance_flux(u, v, wf, θ, grid, kern, ℓ)
+        P = [wf === nothing ? FG.Geometry.vector_to_cartesian(geo, u[I], v[I], c[I][1], c[I][2]) :
+                              FG.Geometry.vector_to_cartesian(geo, u[I], v[I], wf[I], c[I][1], c[I][2]) for I in CartesianIndices(sz)]
+        flt(f) = CGEF.Filtering.filter_field!(zeros(sz), f, grid, kern, ℓ)
+        θb = flt(θ)
+        τP = ntuple(q -> flt(getindex.(P, q) .* θ) .- flt(getindex.(P, q)) .* θb, 3)
+        τL = [FG.Geometry.vector_from_cartesian(geo, τP[1][I], τP[2][I], τP[3][I], c[I][1], c[I][2]) for I in CartesianIndices(sz)]
+        ref = .-(getindex.(τL, 1) .* _cgef_dd(θb, grid, 1) .+ getindex.(τL, 2) .* _cgef_dd(θb, grid, 2))
+        wf === nothing || (ref .-= getindex.(τL, 3) .* _cgef_dd(θb, grid, 3))
+        Test.@test maximum(abs, getindex.(τL, 1)) > 1e-4 * maximum(abs, u) * maximum(abs, θ)
+        Test.@test Πθ ≈ ref
     end
 end
 
-# ---------------------------------------------------------------------------
-# The monotonicity condition is SUFFICIENT, not necessary, so the strict reading is the default rather
-# than the only one. `ForceSpectrum` must produce exactly the density the gate was withholding — not a
-# different or regularized one — and must warn without changing any other field.
-# ---------------------------------------------------------------------------
-Test.@testset "spectrum policy: strict / force / off" begin
-    D = CGEF.Diagnostics
-    geom = FG.Geometry.CartesianGeometry()
-    N = 40
-    xs = 0.0:1000.0:(N - 1) * 1000.0
-    grid = FG.Grids.StructuredGrid(geom, xs, xs)
-    u = [sin(2π * 3 * i / N) * cos(2π * 2 * j / N) + 0.4sin(2π * 7 * i / N) for i in 1:N, j in 1:N]
-    v = [cos(2π * 2 * i / N) * sin(2π * 5 * j / N) + 0.3cos(2π * 6 * j / N) for i in 1:N, j in 1:N]
-    scales = collect(4e3:2e3:16e3)
-    th = CGEF.TopHatKernel()
-    ga = CGEF.GaussianKernel()
+# The enstrophy flux is Π's analogue in the same deformation gauge, `Z = −∂_jω̄ (⟨u_jω⟩ − ū_jω̄)`, with
+# `ω = ∂v/∂x − ∂u/∂y`.
+Test.@testset "Enstrophy flux: the deformation gauge" begin
+    N = 32
+    dx = 1000.0
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), 0.0:dx:(N - 1) * dx, 0.0:dx:(N - 1) * dx)
+    u = [sin(2π * 3 * i / N) * cos(2π * 2 * j / N) + 0.4cos(2π * 5 * i / N) for i in 1:N, j in 1:N]
+    v = [cos(2π * 2 * i / N) * sin(2π * 4 * j / N) + 0.3sin(2π * 6 * j / N) for i in 1:N, j in 1:N]
+    ℓ = 6dx
+    ω = CGEF.Diagnostics.vorticity(u, v, grid)
+    Test.@test ω == _cgef_dd(v, grid, 1) .- _cgef_dd(u, grid, 2)
+    Z = CGEF.Diagnostics.enstrophy_flux(u, v, grid, CGEF.GaussianKernel(), ℓ)
+    plan = CGEF.Filtering.plan_filter(grid, CGEF.GaussianKernel(), ℓ)
+    f(a) = CGEF.Filtering.filter_apply!(zeros(N, N), a, plan)
+    ω̄ = f(ω)
+    gx = _cgef_dd(ω̄, grid, 1)
+    gy = _cgef_dd(ω̄, grid, 2)
+    Test.@test maximum(abs, Z .+ (f(u .* ω) .- f(u) .* ω̄) .* gx .+ (f(v .* ω) .- f(v) .* ω̄) .* gy) < 1e-12 * maximum(abs, Z)
+end
 
-    # The policy is a singleton-type lattice, the same idiom as AbstractMaskStrategy — not a Symbol and
-    # not a Bool, so a typo is a MethodError at the call rather than a silently wrong mode.
-    Test.@test D.StrictSpectrum() isa D.AbstractSpectrumPolicy
-    Test.@test D.ForceSpectrum() isa D.AbstractSpectrumPolicy
-    Test.@test D.NoSpectrum() isa D.AbstractSpectrumPolicy
-    Test.@test_throws TypeError CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = false)
-    Test.@test_throws TypeError CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = :force)
-
-    # `gate_spectrum` is the whole decision: throw / warn-and-compute / skip.
-    Test.@test D.gate_spectrum(ga, D.StrictSpectrum())
-    Test.@test_throws ArgumentError D.gate_spectrum(th, D.StrictSpectrum())
-    Test.@test !D.gate_spectrum(th, D.NoSpectrum())
-    Test.@test !D.gate_spectrum(ga, D.NoSpectrum())
-    Test.@test D.gate_spectrum(th, D.ForceSpectrum())
-
-    # The strict error has to name every way forward, or it is the veto the policy exists to remove.
-    err = try
-        D.filtering_spectrum(u, v, nothing, grid, th, scales)
-        nothing
-    catch e
-        e
+# On a masked grid the diagnostics' derivative window shrinks to the cell's active run: a linear field is
+# differenced exactly wherever the run holds two cells, and a lone cell has no derivative.
+Test.@testset "Derivatives on a masked grid" begin
+    nx, ny = 24, 20
+    m = trues(nx, ny)
+    m[5:9, 6:11] .= false
+    m[15, :] .= false
+    m[[1, 3, 20, 21, 22, 23, 24], 3] .= false
+    xs = collect(0.0:1000.0:23e3) .+ [300 * sin(1.3i) for i in 1:nx]
+    ys = 0.0:800.0:(ny - 1) * 800.0
+    g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, ys, m)
+    lin = [2.5xs[i] - 0.7ys[j] for i in 1:nx, j in 1:ny]
+    # Active cells past `I` in steps of `s`, on the bounded plane.
+    reach(I, s) = (k = 0; J = I + s; while checkbounds(Bool, m, J) && m[J]; k += 1; J += s; end; k)
+    for (d, slope) in ((1, 2.5), (2, -0.7))
+        e = CartesianIndex(ntuple(k -> k == d ? 1 : 0, 2))
+        ref = [m[I] && reach(I, e) + reach(I, -e) ≥ 1 ? slope : 0.0 for I in CartesianIndices(m)]
+        Test.@test maximum(abs, _cgef_dd(lin, g, d) .- ref) < 1e-13
     end
-    Test.@test err isa ArgumentError
-    for recourse in ("ForceSpectrum", "NoSpectrum", "GaussianKernel", "cumulative_energy")
-        Test.@test occursin(recourse, err.msg)
+end
+
+# The Favre budget's terms, assembled from the filter and the derivatives: Π from the density-weighted
+# stress and the product-rule strain `ρ̄∂_jũ_i = ∂_j(ρu_i)‾ − ũ_i∂_jρ̄`, the baropycnal work
+# `Λ = ∇P̄·(ũ − ū)`, and the pressure dilatation `P̄∇·ū`, which is `P̄∇·ũ + Λ − ∇·(P̄(ũ − ū))`.
+Test.@testset "Favre budget against its definition" begin
+    N = 32
+    dx = 1000.0
+    xp = range(0.0, dx * N; length = N + 1)[1:N]
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xp, xp; periodic = (true, true))
+    ker = CGEF.GaussianKernel()
+    ℓ = 4dx
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    u = [sin(2π * 3 * i / N) * cos(2π * 2 * j / N) + 0.4cos(2π * 5 * i / N) for i in 1:N, j in 1:N]
+    v = [cos(2π * 2 * i / N) * sin(2π * 4 * j / N) + 0.3sin(2π * 6 * j / N) for i in 1:N, j in 1:N]
+    ρ = [1.0 + 0.3sin(2π * 2 * i / N) * cos(2π * 3 * j / N) for i in 1:N, j in 1:N]
+    P = [10.0 + 2.0cos(2π * 3 * i / N) * sin(2π * 2 * j / N) for i in 1:N, j in 1:N]
+    r = CGEF.Diagnostics.compressible_flux(u, v, ρ, P, grid, ker, ℓ; execution = SER)
+    pl = CGEF.Filtering.plan_filter(grid, ker, ℓ; execution = SER)
+    f(a) = CGEF.Filtering.filter_apply!(zeros(N, N), a, pl)
+    d(a, j) = _cgef_dd(a, grid, j)
+    ρ̄, P̄, ū, v̄ = f(ρ), f(P), f(u), f(v)
+    ũ, ṽ = f(ρ .* u) ./ ρ̄, f(ρ .* v) ./ ρ̄
+    Test.@test r.ρ̄ == ρ̄ && r.P̄ == P̄ && r.ũ == ũ && r.ṽ == ṽ
+    A(m, ũi, j) = d(m, j) .- ũi .* d(ρ̄, j)
+    τxx, τxy, τyy = f(ρ .* u .* u) ./ ρ̄ .- ũ .^ 2, f(ρ .* u .* v) ./ ρ̄ .- ũ .* ṽ, f(ρ .* v .* v) ./ ρ̄ .- ṽ .^ 2
+    Test.@test r.Π == -(A(f(ρ .* u), ũ, 1) .* τxx .+ (A(f(ρ .* u), ũ, 2) .+ A(f(ρ .* v), ṽ, 1)) .* τxy .+ A(f(ρ .* v), ṽ, 2) .* τyy)
+    Test.@test r.Λ == (d(P̄, 1) .* (f(ρ .* u) .- ρ̄ .* ū) .+ d(P̄, 2) .* (f(ρ .* v) .- ρ̄ .* v̄)) ./ ρ̄
+    Test.@test r.pressure_dilatation == P̄ .* (d(ū, 1) .+ d(v̄, 2))
+    Test.@test maximum(abs, P̄ .* (d(ũ, 1) .+ d(ṽ, 2)) .- r.pressure_dilatation) > 0.01 * maximum(abs, r.pressure_dilatation)
+end
+
+# Under `ZeroFill` land holds no fluid: ρ̄ is the fluid mass under the kernel, the Favre fields are
+# density-weighted means over the fluid, zero where none lies under the kernel, and land values are never
+# read. At constant density the Favre flux is ρ times the incompressible one where the kernel and the
+# derivative stencil hold only fluid.
+Test.@testset "Favre budget on a masked grid" begin
+    N = 32
+    dx = 1000.0
+    xs = 0.0:dx:(N - 1) * dx
+    geo = FG.Geometry.CartesianGeometry()
+    m = trues(N, N)
+    m[12:20, 10:18] .= false
+    ker = CGEF.TopHatKernel()
+    ℓ = 6dx
+    rad = CGEF.Kernels.kernel_radius(ker, ℓ)
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    u = [sin(2π * 3 * i / N) * cos(2π * 2 * j / N) + 0.4cos(2π * 5 * i / N) for i in 1:N, j in 1:N]
+    v = [cos(2π * 2 * i / N) * sin(2π * 4 * j / N) + 0.3sin(2π * 6 * j / N) for i in 1:N, j in 1:N]
+    ρ = [1.0 + 0.3sin(2π * 2 * i / N) * cos(2π * 3 * j / N) for i in 1:N, j in 1:N]
+    P = [10.0 + 2.0cos(2π * 3 * i / N) * sin(2π * 2 * j / N) for i in 1:N, j in 1:N]
+    for A in (u, v, ρ, P)
+        A[.!m] .= NaN
     end
-
-    # THE substantive assertion: forcing yields exactly the density the strict gate was withholding.
-    # `spectral_density` is ungated, so the reference is computable independently of the policy — if
-    # `ForceSpectrum` ever became a different computation, this catches it.
-    cum = D.cumulative_energy(u, v, nothing, grid, th, scales)
-    kℓ = 1.0 ./ scales
-    ref = D.spectral_density(cum, kℓ)
-    kf, Ẽf = Test.@test_logs (:warn, r"not monotone decreasing") match_mode = :any D.filtering_spectrum(
-        u, v, nothing, grid, th, scales; policy = D.ForceSpectrum())
-    Test.@test kf == kℓ
-    Test.@test Ẽf == ref
-    Test.@test all(isfinite, Ẽf)
-
-    # For this field and scale range the forced density is in fact positive throughout — the concrete
-    # case the strict default would have refused outright.
-    Test.@test all(>(0), Ẽf)
-
-    # A monotone kernel takes the identical path under `ForceSpectrum` and must NOT warn: the warning
-    # is about the kernel, not about having asked to force.
-    kg, Ẽg = Test.@test_logs min_level = Logging.Warn D.filtering_spectrum(
-        u, v, nothing, grid, ga, scales; policy = D.ForceSpectrum())
-    kd, Ẽd = D.filtering_spectrum(u, v, nothing, grid, ga, scales)
-    Test.@test kg == kd && Ẽg == Ẽd
-
-    # `NoSpectrum` returns the right shape rather than a short vector, so a caller indexing per scale
-    # still works and simply sees NaN.
-    kn, Ẽn = D.filtering_spectrum(u, v, nothing, grid, th, scales; policy = D.NoSpectrum())
-    Test.@test kn == kℓ
-    Test.@test length(Ẽn) == length(scales) && all(isnan, Ẽn)
-
-    # The pipeline agrees with the diagnostic under every policy, and only `filtering_spectrum` moves:
-    # Π and the cumulative energy are bit-identical across all three.
-    rF = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = th, spectrum = D.ForceSpectrum())
-    rN = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = th, spectrum = D.NoSpectrum())
-    Test.@test rF.filtering_spectrum == ref
-    Test.@test rF.Π == rN.Π
-    Test.@test rF.cumulative_energy == rN.cumulative_energy
-    Test.@test all(isnan, rN.filtering_spectrum)
-
-    # Every batch entry point honours the policy too — the strict gate is not a property of the
-    # single-slice driver, and neither is the escape from it.
-    let Nt = 2, ub = repeat(u, 1, 1, Nt), vb = repeat(v, 1, 1, Nt)
-        b = CGEF.Pipeline.CoarseGrainBatchResult(grid, length(scales), (Nt,))
-        CGEF.Pipeline.coarse_grain_batch!(b, ub, vb, grid; scales = scales, kernel = th,
-                                          spectrum = D.ForceSpectrum())
-        for t in 1:Nt
-            Test.@test b.slices[t].filtering_spectrum == ref
+    grids = (FG.Grids.StructuredGrid(geo, xs, xs, m),
+             FG.Grids.CurvilinearGrid(geo, [xs[i] for i in 1:N, j in 1:N], [xs[j] for i in 1:N, j in 1:N], m))
+    for g in grids
+        far = _cgef_beyond_reach(g, rad)
+        Test.@test any(far)
+        for s in (CGEF.Filtering.ZeroFill(), _CGEF_DF)
+            r = CGEF.Diagnostics.compressible_flux(u, v, ρ, P, g, ker, ℓ; mask_strategy = s, execution = SER)
+            Test.@test all(f -> all(isfinite, f), (r.Π, r.Λ, r.pressure_dilatation, r.ρ̄, r.P̄, r.ũ, r.ṽ))
+            dead = s isa CGEF.Filtering.ZeroFill ? far : .!m
+            Test.@test all(f -> all(iszero, f[dead]), (r.Π, r.Λ, r.pressure_dilatation, r.ũ, r.ṽ))
         end
-        CGEF.Pipeline.coarse_grain_batch!(b, ub, vb, grid; scales = scales, kernel = th,
-                                          spectrum = D.NoSpectrum())
-        Test.@test all(isnan, b.filtering_spectrum)
-
-        rs = [CGEF.Pipeline._allocate_result(grid, length(scales)) for _ in 1:Nt]
-        CGEF.Pipeline.coarse_grain_slices!(rs, [u, u], [v, v], [grid, grid]; scales = scales,
-                                           kernel = th, spectrum = D.ForceSpectrum())
-        Test.@test all(r -> r.filtering_spectrum == ref, rs)
     end
+    g = grids[1]
+    ρc = [m[I] ? 1.3 : NaN for I in CartesianIndices(m)]
+    land = [FG.Grids.coords(g, Tuple(J)...) for J in CartesianIndices(m) if !m[J]]
+    inner = [m[I] && all(x -> FG.Geometry.distance(geo, FG.Grids.coords(g, Tuple(I)...), x) > rad + dx, land) &&
+             all(d -> min(I[d] - 1, N - I[d]) * dx > rad + dx, 1:2) for I in CartesianIndices(m)]
+    Test.@test count(inner) > 100
+    rc = CGEF.Diagnostics.compressible_flux(u, v, ρc, P, g, ker, ℓ; execution = SER)
+    Πi = CGEF.Diagnostics.compute_Π!(zeros(N, N), u, v, nothing, g, ker, ℓ; execution = SER)
+    Test.@test maximum(abs, rc.Π[inner] ./ 1.3 .- Πi[inner]) < 1e-12 * maximum(abs, Πi[inner])
+end
+
+# The scale-band decomposition telescopes: bands plus the resolved energy are the total, exactly where
+# each filter conserves the domain integral, as `ZeroFill` does on a periodic grid, masked or not.
+# Past a bounded edge the residual is the integral the filters lose there.
+Test.@testset "Band energies sum to the total" begin
+    N = 32
+    dx = 1000.0
+    u = [sin(2π * 3 * i / N) * cos(2π * 2 * j / N) + 0.4cos(2π * 7 * i / N) for i in 1:N, j in 1:N]
+    v = [cos(2π * 2 * i / N) * sin(2π * 5 * j / N) + 0.3sin(2π * 6 * j / N) for i in 1:N, j in 1:N]
+    scales = [3dx, 6dx, 12dx]
+    geo = FG.Geometry.CartesianGeometry()
+    xp = range(0.0, dx * N; length = N + 1)[1:N]
+    grid = FG.Grids.StructuredGrid(geo, xp, xp; periodic = (true, true))
+    Etot = 0.5 * sum(u .^ 2 .+ v .^ 2) / N^2
+    for kern in (CGEF.TopHatKernel(), CGEF.GaussianKernel(), CGEF.Kernels.SmoothHatKernel())
+        r = CGEF.Diagnostics.band_energies(u, v, grid, kern, scales; maps = true)
+        Test.@test r.total ≈ Etot rtol = 1e-12
+        # A non-negative kernel makes every band a variance, pointwise.
+        Test.@test all(km -> all(>=(-1e-14 * Etot), km), r.band_maps)
+    end
+    rh = CGEF.Diagnostics.band_energies(u, v, grid, CGEF.Kernels.HighOrderKernel(; order = 3), [8dx, 16dx]; maps = true)
+    Test.@test rh.total ≈ Etot rtol = 1e-12
+    Test.@test any(km -> any(<(0), km), rh.band_maps)
+
+    gb = FG.Grids.StructuredGrid(geo, 0.0:dx:(N - 1) * dx, 0.0:dx:(N - 1) * dx)
+    k = CGEF.GaussianKernel()
+    rb = CGEF.Diagnostics.band_energies(u, v, gb, k, scales)
+    fu, fv = copy(u), copy(v)
+    loss = 0.0
+    for s in scales
+        p = CGEF.Filtering.plan_filter(gb, k, s)
+        sq = fu .^ 2 .+ fv .^ 2
+        loss += (sum(CGEF.Filtering.filter_apply!(zeros(N, N), sq, p)) - sum(sq)) / (2N^2)
+        fu = CGEF.Filtering.filter_apply!(zeros(N, N), fu, p)
+        fv = CGEF.Filtering.filter_apply!(zeros(N, N), fv, p)
+    end
+    Test.@test abs(loss) > 1e-3 * Etot
+    Test.@test rb.total - Etot ≈ loss rtol = 1e-10
+
+    m = trues(N, N)
+    m[8:13, 7:12] .= false
+    gm = FG.Grids.StructuredGrid(geo, xp, xp, m; periodic = (true, true))
+    Em = 0.5 * sum((u .^ 2 .+ v .^ 2)[m]) / count(m)
+    for kern in (CGEF.TopHatKernel(), CGEF.GaussianKernel())
+        rz = CGEF.Diagnostics.band_energies(u, v, gm, kern, scales)
+        Test.@test rz.total ≈ Em rtol = 1e-12
+        Test.@test abs(CGEF.Diagnostics.band_energies(u, v, gm, kern, scales; mask_strategy = _CGEF_DF).total - Em) > 1e-5 * Em
+    end
+end
+
+# On a uniform periodic grid the kernel does not depend on position, so filtering commutes with the
+# divergence and a divergence-free field stays divergence-free.
+Test.@testset "filter ∘ div == div ∘ filter" begin
+    N = 48
+    dx = 1000.0
+    xs = range(0.0, dx * N; length = N + 1)[1:N]
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs; periodic = (true, true))
+    u, v = _cgef_spectral_field(N, dx, 3.0; symbol = :stencil)
+    div(a, b) = _cgef_dd(a, grid, 1) .+ _cgef_dd(b, grid, 2)
+    Test.@test maximum(abs, div(u, v)) < 1e-12 * maximum(abs, _cgef_dd(u, grid, 1))
+    w = u .+ 0.3 .* [sin(2π * 2 * i / N) for i in 1:N, j in 1:N]
+    for kern in (CGEF.GaussianKernel(), CGEF.TopHatKernel()), ℓ in (8dx, 16dx)
+        p = CGEF.Filtering.plan_filter(grid, kern, ℓ)
+        flt(a) = CGEF.Filtering.filter_apply!(zeros(N, N), a, p)
+        s = maximum(abs, _cgef_dd(flt(u), grid, 1))
+        Test.@test maximum(abs, div(flt(u), flt(v))) < 1e-11 * s
+        Test.@test maximum(abs, flt(div(w, v)) .- div(flt(w), flt(v))) < 1e-11 * s
+    end
+end
+
+# Sadek & Aluie (2018) eq. 18: a kernel with `p` vanishing moments recovers a `k^(−α)` spectrum while
+# `α < p + 2` and saturates at `k^(−(p+2))` above. The Gaussian has `p = 1`; `HighOrderKernel{3}` has
+# `p = 3`, so it recovers `α = 4`, which the Gaussian cannot.
+Test.@testset "Filtering spectrum slope: min(α, p + 2)" begin
+    N = 256
+    dx = 1000.0
+    xs = range(0.0, dx * N; length = N + 1)[1:N]
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs; periodic = (true, true))
+    function slope(kern, α, lo, hi)
+        scales = collect(exp10.(range(log10(lo / 1.6), log10(hi * 1.6); length = 17)))
+        kℓ = 1.0 ./ scales
+        u, v = _cgef_spectral_field(N, dx, α)
+        Ẽ = CGEF.Diagnostics.spectral_density(CGEF.Diagnostics.cumulative_energy(u, v, nothing, grid, kern, scales), kℓ)
+        w = [i for i in eachindex(scales) if lo <= scales[i] <= hi && Ẽ[i] > 0]
+        Test.@test length(w) >= 6
+        return _cgef_logfit(kℓ[w], Ẽ[w])
+    end
+    g = CGEF.GaussianKernel()
+    Test.@test slope(g, 5 / 3, 8dx, 40dx) ≈ -5 / 3 atol = 0.2
+    Test.@test -3.15 < slope(g, 7.0, 8dx, 40dx) < -2.75
+    ho = CGEF.Kernels.HighOrderKernel(; order = 3)
+    s4 = slope(ho, 4.0, 12dx, 48dx)
+    Test.@test s4 ≈ -4.0 atol = 0.25
+    Test.@test s4 < slope(g, 4.0, 12dx, 48dx) - 0.5
+end
+
+# On a sphere every energy diagnostic filters the velocity as the flux does, by the vector filter it names.
+# Solid-body rotation about the polar axis is the degree-1 toroidal field `e_r × ∇*sin φ`, and degree 1 in
+# its ambient Cartesian components, which a radial kernel maps to multiples of themselves (Funk–Hecke).
+# Under `CartesianComponents` its resolved energy over `½cos²φ` is one constant across latitude away from
+# a regional grid's edges; under the generalized convolution on the whole sphere it is `Ĝ(1)²`.
+Test.@testset "Energies on a sphere filter the velocity as the flux does" begin
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    CC = CGEF.Filtering.CartesianComponents()
+    R = 6.371e6
+    lon = range(0.0; step = 2π / 144, length = 144)
+    lat = range(deg2rad(-75.0); stop = deg2rad(75.0), length = 61)
+    g = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), lon, lat; periodic = (true, false))
+    k = CGEF.GaussianKernel()
+    scales = [600e3, 1200e3]
+    u = [cos(φ) + 0.3sin(2λ) * cos(φ)^2 for λ in lon, φ in lat]
+    v = [0.2cos(3λ) * cos(φ) for λ in lon, φ in lat]
+    for vf in (nothing, CC)
+        r = CGEF.coarse_grain(u, v, g; scales, kernel = k, execution = SER, vector_filter = vf)
+        Test.@test CGEF.Diagnostics.cumulative_energy(u, v, nothing, g, k, scales; execution = SER, vector_filter = vf) ≈
+                   r.cumulative_energy rtol = 1e-13
+    end
+    ub = [cos(φ) for λ in lon, φ in lat]
+    rows = findall(φ -> abs(φ) <= deg2rad(50.0) + 1e-9, lat)
+    ratio = CGEF.Diagnostics.band_energies(ub, zero(ub), g, k, [1200e3]; execution = SER, vector_filter = CC).resolved_map ./
+            [0.5cos(φ)^2 for λ in lon, φ in lat]
+    Test.@test maximum(ratio[:, rows]) - minimum(ratio[:, rows]) < 1e-8 * ratio[1, rows[1]]
+
+    cc = FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), 24; geometry = FG.Geometry.SphericalGeometry(R))
+    φc = [FG.Grids.coords(cc, Tuple(I)...)[2] for I in CartesianIndices(FG.Grids.size_tuple(cc))]
+    for kern in (k, CGEF.TopHatKernel())
+        rmap = CGEF.Diagnostics.band_energies(cos.(φc), zero(φc), cc, kern, [1200e3]; execution = SER).resolved_map
+        Test.@test rmap ≈ _cgef_legendre_transfer(kern, 1, 1200e3, R)^2 .* 0.5 .* cos.(φc) .^ 2 rtol = 1e-11
+    end
+end
+
+# ---- The generalized convolution of vectors and tensors on a sphere (Aluie 2019) ----------------------
+
+# Degree-`n` real harmonics on the unit sphere as `(n, f, fλ, fφ)`, functions of `(λ, φ)`: `f ∝ P_n^m(sin φ)
+# cos mλ`, `fλ = (1/cos φ)∂f/∂λ` and `fφ = ∂f/∂φ`. `∇*f = (fλ, fφ)` and `e_r × ∇*f = (−fφ, fλ)` in
+# (east, north) components.
+const _CGEF_HARMONICS = (
+    (1, (λ, φ) -> sin(φ), (λ, φ) -> 0.0, (λ, φ) -> cos(φ)),
+    (2, (λ, φ) -> sin(φ) * cos(φ) * cos(λ), (λ, φ) -> -sin(φ) * sin(λ), (λ, φ) -> cos(2φ) * cos(λ)),
+    (3, (λ, φ) -> sin(φ) * cos(φ)^2 * cos(2λ), (λ, φ) -> -2sin(φ) * cos(φ) * sin(2λ),
+        (λ, φ) -> cos(φ) * (cos(φ)^2 - 2sin(φ)^2) * cos(2λ)),
+    (4, (λ, φ) -> sin(φ) * cos(φ)^3 * cos(3λ), (λ, φ) -> -3sin(φ) * cos(φ)^2 * sin(3λ),
+        (λ, φ) -> cos(φ)^2 * (cos(φ)^2 - 3sin(φ)^2) * cos(3λ)),
+    (5, (λ, φ) -> (63sin(φ)^5 - 70sin(φ)^3 + 15sin(φ)) / 8, (λ, φ) -> 0.0,
+        (λ, φ) -> cos(φ) * (315sin(φ)^4 - 210sin(φ)^2 + 15) / 8),
+)
+
+# The larger component error of `(x, y)` against `c·(u, v)`, over the field's largest component.
+_cgef_vec_err(x, y, u, v, c) =
+    max(maximum(abs, x .- c .* u), maximum(abs, y .- c .* v)) / max(maximum(abs, u), maximum(abs, v))
+
+_cgef_points(g) = [FG.Grids.coords(g, Tuple(I)...) for I in CartesianIndices(FG.Grids.size_tuple(g))]
+
+# FastSphericalHarmonics' own grid, and a Gauss–Legendre one on which NUFSHT transforms, whose measure is a
+# quadrature exact to twice its band limit; each with the error its transforms reach.
+_cgef_harmonic_grids(geo) = (
+    (FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), 24; geometry = geo), 1e-11),
+    (FG.Connectivity.structured_grid(FG.SphericalSampling.GaussLegendreSampling(), 24; geometry = geo), 1e-8),
+)
+
+# Lemma 1: every degree-`n` vector harmonic, the gradient `∇*f` and the rotational `e_r × ∇*f`, is filtered
+# to `Ĝ(n)` times itself, `Ĝ` the kernel's Legendre transform.
+Test.@testset "Generalized convolution: Ĝ(n) times each degree-n vector harmonic" begin
+    D = CGEF.Diagnostics
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    R = 6.371e6
+    for (g, tol) in _cgef_harmonic_grids(FG.Geometry.SphericalGeometry(R))
+        sz = FG.Grids.size_tuple(g)
+        pts = _cgef_points(g)
+        ws = D.ΠWorkspace(g)
+        for kern in (CGEF.GaussianKernel(), CGEF.TopHatKernel()), ℓ in (1.5e6, 3e6), (n, _, fλ, fφ) in _CGEF_HARMONICS
+            Ĝ = _cgef_legendre_transfer(kern, n, ℓ, R)
+            a = [fλ(p...) for p in pts]
+            b = [fφ(p...) for p in pts]
+            for (u, v) in ((a, b), (-b, a))
+                D.compute_Π!(zeros(sz), u, v, nothing, g, kern, ℓ; workspace = ws, execution = SER)
+                Test.@test _cgef_vec_err(ws.u_filt, ws.v_filt, u, v, Ĝ) < tol
+            end
+        end
+    end
+end
+
+# The ambient Cartesian components of `e_r × ∇*f` are degree-`n` harmonics and those of `∇*f` carry
+# degrees `n ± 1`: the scalar transform of each component equals the generalized convolution on the first,
+# and differs from it on the second.
+Test.@testset "CartesianComponents: equal on rotational harmonics, different on gradients" begin
+    D = CGEF.Diagnostics
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    R = 6.371e6
+    cc, tol = first(_cgef_harmonic_grids(FG.Geometry.SphericalGeometry(R)))
+    sz = FG.Grids.size_tuple(cc)
+    pts = _cgef_points(cc)
+    wc = D.ΠWorkspace(cc; vector_filter = CGEF.Filtering.CartesianComponents())
+    for kern in (CGEF.GaussianKernel(), CGEF.TopHatKernel()), (n, _, fλ, fφ) in _CGEF_HARMONICS
+        ℓ = 3e6
+        fp = CGEF.Filtering.plan_filter(cc, kern, ℓ; method = CGEF.Filtering.Spectral(), execution = SER)
+        Ĝ = _cgef_legendre_transfer(kern, n, ℓ, R)
+        a = [fλ(p...) for p in pts]
+        b = [fφ(p...) for p in pts]
+        D.compute_Π!(zeros(sz), -b, a, nothing, cc, kern, ℓ; workspace = wc, filter_plan = fp, execution = SER)
+        Test.@test _cgef_vec_err(wc.u_filt, wc.v_filt, -b, a, Ĝ) < tol
+        D.compute_Π!(zeros(sz), a, b, nothing, cc, kern, ℓ; workspace = wc, filter_plan = fp, execution = SER)
+        Test.@test _cgef_vec_err(wc.u_filt, wc.v_filt, a, b, Ĝ) > 1e-3
+    end
+end
+
+# Proposition 3: a symmetric tangent tensor's trace is filtered as a scalar and its traceless part, the
+# spin-2 field `T_ee − T_nn + 2iT_en`, by `Ĝ(n)` per degree. A degree-1 velocity's `u⊗u` has a traceless
+# part of degree 2 alone and a trace `|u|²` of degrees 0, 1 and 2; the E-mode `∇*∇*f − ½∇²f I` of a
+# degree-3 `f`, its 45° rotation (the B-mode) and `f I` are degree 3.
+Test.@testset "Generalized convolution of tensors: Ĝ(n) per degree" begin
+    D = CGEF.Diagnostics
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    R = 6.371e6
+    for (g, tol) in _cgef_harmonic_grids(FG.Geometry.SphericalGeometry(R)), kern in (CGEF.GaussianKernel(), CGEF.TopHatKernel())
+        ℓ = 2.5e6
+        sz = FG.Grids.size_tuple(g)
+        λs = [p[1] for p in _cgef_points(g)]
+        φs = [p[2] for p in _cgef_points(g)]
+        Ĝ1, Ĝ2, Ĝ3 = (_cgef_legendre_transfer(kern, n, ℓ, R) for n in 1:3)
+
+        # `u = ∇*x + 0.7 e_r × ∇*z`, with `|u|² = 1 − x² + 1.4y + 0.49(1 − z²)`.
+        x, y, z = cos.(φs) .* cos.(λs), cos.(φs) .* sin.(λs), sin.(φs)
+        u = -sin.(λs) .- 0.7 .* cos.(φs)
+        v = -sin.(φs) .* cos.(λs)
+        ws = D.ΠWorkspace(g)
+        D.compute_Π!(zeros(sz), u, v, nothing, g, kern, ℓ; workspace = ws, execution = SER)
+        tr = 1.49 * 2 / 3 .+ Ĝ1 .* 1.4 .* y .- Ĝ2 .* ((x .^ 2 .- 1 / 3) .+ 0.49 .* (z .^ 2 .- 1 / 3))
+        d = Ĝ2 .* (u .^ 2 .- v .^ 2)
+        scale = maximum(u .^ 2 .+ v .^ 2)
+        Test.@test maximum(abs, ws.uu_filt .- (tr .+ d) ./ 2) < tol * scale
+        Test.@test maximum(abs, ws.vv_filt .- (tr .- d) ./ 2) < tol * scale
+        Test.@test maximum(abs, ws.uv_filt .- Ĝ2 .* u .* v) < tol * scale
+
+        sf = ws.spin
+        D._spin_transfer!(sf, kern, ℓ)
+        s = sin.(φs)
+        A = (6 .* s .* cos.(φs) .^ 2 .- 4 .* s) .* cos.(2 .* λs)     # E_ee − E_nn
+        B = -2 .* cos.(2 .* φs) .* sin.(2 .* λs)                      # E_en
+        f3 = s .* cos.(φs) .^ 2 .* cos.(2 .* λs)
+        T = (zeros(sz), zeros(sz), zeros(sz))
+        for (Q, trace, want) in (((k -> complex(A[k], 2B[k])), (k -> 0.0), (A ./ 2, B, -A ./ 2)),
+                                 ((k -> complex(-2B[k], A[k])), (k -> 0.0), (-B, A ./ 2, B)),
+                                 ((k -> 0.0im), (k -> f3[k]), (f3 ./ 2, zero(f3), f3 ./ 2)))
+            D._spin_tensor!(T..., sf, false, Q, trace, 0)
+            Test.@test maximum(maximum.(abs, T .- Ĝ3 .* want)) < tol * maximum(abs, A)
+        end
+    end
+end
+
+# `div u + i curl u` on the unit sphere through NUFSHT's spin transforms: `u = ∇*f + e_r × ∇*g` has
+# `u_θ + iu_φ = Σ λ_ℓ(f_ℓm + ig_ℓm) ₁Y_ℓm`, `λ_ℓ = √(ℓ(ℓ+1))`, so `div u + i curl u = ∇²(f + ig)` is the
+# spin-0 field of the spin-1 coefficients times `−λ_ℓ`. `w` are the cells' measures on the unit sphere.
+function _cgef_div_curl(u, v, θ, φ, w, lmax)
+    p1 = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 1)
+    p0 = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0)
+    C = NUFSHT.allocate_coefficients(p1)
+    NUFSHT.nusht_analyze!(C, complex.(-vec(v), vec(u)), p1; weights = w)
+    for l in 0:lmax
+        C[l + 1, :, :] .*= -sqrt(l * (l + 1))
+    end
+    d = zeros(ComplexF64, length(θ))
+    NUFSHT.nusht_type2_spin!(d, C, p0)
+    return reshape(real.(d), size(u)), reshape(imag.(d), size(u))
+end
+
+# Proposition 1: filtering commutes with the surface divergence and curl, `div ū = (div u)‾` and
+# `curl ū = (curl u)‾`, the right sides filtered as scalars.
+Test.@testset "Generalized convolution commutes with div and curl" begin
+    D = CGEF.Diagnostics
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    R = 6.371e6
+    g = last(first.(_cgef_harmonic_grids(FG.Geometry.SphericalGeometry(R))))
+    sz = FG.Grids.size_tuple(g)
+    pts = _cgef_points(g)
+    θ = [π / 2 - p[2] for p in vec(pts)]
+    φ = [p[1] for p in vec(pts)]
+    w = collect(vec(FG.Grids.measure(g))) ./ R^2
+    lmax = FG.SphericalSampling.bandlimit(FG.Grids.sampling(g), sz[2])
+    a = (1.0, 0.5, -0.8, 0.3, 0.6)
+    b = (0.4, -0.7, 0.2, 0.9, -0.5)
+    u = sum(a[n] .* [h[3](p...) for p in pts] .- b[n] .* [h[4](p...) for p in pts] for (n, h) in enumerate(_CGEF_HARMONICS))
+    v = sum(a[n] .* [h[4](p...) for p in pts] .+ b[n] .* [h[3](p...) for p in pts] for (n, h) in enumerate(_CGEF_HARMONICS))
+    dv = sum(-h[1] * (h[1] + 1) * a[n] .* [h[2](p...) for p in pts] for (n, h) in enumerate(_CGEF_HARMONICS))
+    cu = sum(-h[1] * (h[1] + 1) * b[n] .* [h[2](p...) for p in pts] for (n, h) in enumerate(_CGEF_HARMONICS))
+    d0, c0 = _cgef_div_curl(u, v, θ, φ, w, lmax)
+    Test.@test _cgef_relerr(d0, dv) < 1e-8 && _cgef_relerr(c0, cu) < 1e-8
+    ws = D.ΠWorkspace(g)
+    for kern in (CGEF.GaussianKernel(), CGEF.TopHatKernel()), ℓ in (1.5e6, 3e6)
+        D.compute_Π!(zeros(sz), u, v, nothing, g, kern, ℓ; workspace = ws, execution = SER)
+        d1, c1 = _cgef_div_curl(ws.u_filt, ws.v_filt, θ, φ, w, lmax)
+        flt(f) = CGEF.Filtering.filter_field!(zeros(sz), f, g, kern, ℓ; method = CGEF.Filtering.Spectral(), execution = SER)
+        Test.@test _cgef_relerr(d1, flt(dv)) < 1e-6
+        Test.@test _cgef_relerr(c1, flt(cu)) < 1e-6
+    end
+end
+
+# Under `ZeroFill` a regional field is the field extended by zero over the sphere: masked cells, and a
+# regional grid's cells taken alone, filter as the whole sphere holding zero there.
+Test.@testset "Generalized convolution of a regional field: the zero-extended sphere's" begin
+    D = CGEF.Diagnostics
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    R = 6.371e6
+    geo = FG.Geometry.SphericalGeometry(R)
+    vf = CGEF.Filtering.GeneralizedConvolution(; lmax = 16)
+    nus = CGEF.SpectralBackends.NUFSHTSpectralBackend()
+    full = FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), 24; geometry = geo)
+    pts = _cgef_points(full)
+    box = [abs(p[2]) <= deg2rad(40.0) && p[1] <= deg2rad(120.0) for p in pts]
+    masked = FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), 24; geometry = geo, mask = box)
+    u = [cos(p[2]) * sin(2p[1]) + 0.3sin(p[2]) for p in pts]
+    v = [cos(3p[1]) * cos(p[2])^2 for p in pts]
+    uz, vz = ifelse.(box, u, 0.0), ifelse.(box, v, 0.0)
+    un, vn = ifelse.(box, u, NaN), ifelse.(box, v, NaN)
+    region = FG.Grids.UnstructuredGrid(geo, [p[1] for p in pts[box]], [p[2] for p in pts[box]],
+                                       collect(vec(FG.Grids.measure(full)))[vec(box)], trues(count(box)))
+    k = CGEF.GaussianKernel()
+    filtered(g, a, b; kw...) = (ws = D.EnergyWorkspace(g; vector_filter = vf, kw...);
+                                D.cumulative_energy!(zeros(1), a, b, nothing, g, k, [2e6]; workspace = ws, execution = SER);
+                                (ws.u_filt, ws.v_filt))
+    fz = filtered(full, uz, vz; transform = nus)
+    fm = filtered(masked, un, vn; transform = nus)
+    fr = filtered(region, u[box], v[box])
+    # The same points give the same transforms; the regional grid's own, over fewer points, agree to
+    # the NUFFT's tolerance.
+    Test.@test fm[1] == fz[1] && fm[2] == fz[2]
+    Test.@test fr[1] ≈ fz[1][box] rtol = 1e-8
+    Test.@test fr[2] ≈ fz[2][box] rtol = 1e-8
+    Test.@test maximum(abs, fz[1][.!box]) > 1e-3 * maximum(abs, u)
+end
+
+# Solid-body rotation is the degree-1 rotational harmonic, filtered to `Ĝ(1)` times itself, which has no
+# strain: Π = 0 to round-off over the whole sphere.
+Test.@testset "Solid-body rotation under the generalized convolution: Π = 0" begin
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    R = 6.371e6
+    cc = first(first(_cgef_harmonic_grids(FG.Geometry.SphericalGeometry(R))))
+    Ω = 7.292e-5
+    u = [Ω * R * cos(p[2]) for p in _cgef_points(cc)]
+    for kern in (CGEF.GaussianKernel(), CGEF.TopHatKernel())
+        Π = CGEF.Diagnostics.compute_Π!(zero(u), u, zero(u), nothing, cc, kern, 2e6; execution = SER)
+        Test.@test maximum(abs, Π) < 1e-11 * Ω * maximum(abs, u)^2
+    end
+end
+
+# The in-core direct sum against NUFSHT's spin plans on the same cells and weights, both ways and at every
+# spin `|s| ≤ 2`; and against closed forms on a Gauss–Legendre grid, whose quadrature is exact to twice its
+# band limit: the spin-1 fields of `∇*f` and `e_r × ∇*f` and the spin-2 E-mode of a degree-`n` `f` have
+# coefficients of degree `n` alone, analysis inverts synthesis, and a flux through it scales a vector
+# harmonic by `Ĝ(n)`.
+Test.@testset "Direct-sum spin transforms against NUFSHT and closed forms" begin
+    F = CGEF.Filtering
+    D = CGEF.Diagnostics
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    R = 6.371e6
+    g = FG.Connectivity.structured_grid(FG.SphericalSampling.GaussLegendreSampling(), 10;
+                                        geometry = FG.Geometry.SphericalGeometry(R))
+    L = 9
+    tr = F.DirectSpinTransforms(g; lmax = L)
+    Test.@test F.spin_transforms(CGEF.SpectralBackends.DirectSumSpectralBackend(), g; lmax = L) isa F.DirectSpinTransforms
+    θ, φ, w = F._spin_nodes(g)
+    M = length(θ)
+    G1 = ones(L + 1)
+    synth(C, s) = F.spin_synthesize!(F.spin_field(tr), C, F.spin_coefficients(tr), G1, tr, s)
+    analyze(f, s) = F.spin_analyze!(F.spin_coefficients(tr), f, tr, s)
+    for s in -2:2
+        plan = NUFSHT.make_spin_plan(ComplexF64, θ, φ, L, s)
+        f = [complex(sin(3k), cos(5k)) for k in 1:M]
+        Cn = NUFSHT.allocate_coefficients(plan)
+        NUFSHT.nusht_analyze!(Cn, f, plan; weights = w)
+        Test.@test _cgef_relerr(vec(analyze(f, s)), vec(Cn)) < 1e-8
+        C = [l >= max(abs(m), abs(s)) ? complex(cos(l + 2m), sin(3l - m)) : 0.0im for l in 0:L, m in -L:L]
+        fn = zeros(ComplexF64, M)
+        NUFSHT.nusht_type2_spin!(fn, reshape(C, L + 1, 2L + 1, 1), plan)
+        fd = synth(C, s)
+        Test.@test _cgef_relerr(fd, fn) < 1e-8
+        Test.@test _cgef_relerr(analyze(fd, s), C) < 1e-11
+    end
+
+    pts = vec(_cgef_points(g))
+    only_degree(C, n) = maximum(abs, C[[l != n for l in 0:L], :]) < 1e-11 * maximum(abs, C)
+    for (n, _, fλ, fφ) in _CGEF_HARMONICS
+        a = [fλ(p...) for p in pts]
+        b = [fφ(p...) for p in pts]
+        for U in (complex.(a, b), complex.(-b, a))
+            C = analyze(U, 1)
+            Test.@test only_degree(C, n)
+            Test.@test _cgef_relerr(synth(C, 1), U) < 1e-11
+        end
+    end
+    λs, φs = [p[1] for p in pts], [p[2] for p in pts]
+    Q = complex.((6 .* sin.(φs) .* cos.(φs) .^ 2 .- 4 .* sin.(φs)) .* cos.(2 .* λs), -4 .* cos.(2 .* φs) .* sin.(2 .* λs))
+    C2 = analyze(Q, 2)
+    Test.@test only_degree(C2, 3)
+    Test.@test _cgef_relerr(synth(C2, 2), Q) < 1e-11
+
+    ws = D.ΠWorkspace(g; transform = CGEF.SpectralBackends.DirectSumSpectralBackend())
+    Test.@test ws.spin.transforms isa F.DirectSpinTransforms
+    sz = FG.Grids.size_tuple(g)
+    pg = _cgef_points(g)
+    for (n, _, fλ, fφ) in _CGEF_HARMONICS, kern in (CGEF.GaussianKernel(), CGEF.TopHatKernel())
+        u = [fλ(p...) for p in pg]
+        v = [fφ(p...) for p in pg]
+        D.compute_Π!(zeros(sz), u, v, nothing, g, kern, 3e6; workspace = ws, execution = SER)
+        Test.@test _cgef_vec_err(ws.u_filt, ws.v_filt, u, v, _cgef_legendre_transfer(kern, n, 3e6, R)) < 1e-11
+    end
+end
+
+# `d^ℓ_{mn}(θ)` by its explicit alternating sum in 2048-bit `BigFloat`, rounded to `Float64`.
+function _cgef_wigner_big(ℓ, m, n, θ)
+    return setprecision(BigFloat, 2048) do
+        c, s = cos(big(θ) / 2), sin(big(θ) / 2)
+        f(k) = BigFloat(factorial(big(k)))
+        pre = sqrt(f(ℓ + m) * f(ℓ - m) * f(ℓ + n) * f(ℓ - n))
+        Float64(sum(ifelse(isodd(k + m - n), -1, 1) * pre / (f(ℓ + n - k) * f(k) * f(ℓ - m - k) * f(k + m - n)) *
+                    c^(2ℓ + n - m - 2k) * s^(2k + m - n) for k in max(0, n - m):min(ℓ + n, ℓ - m)))
+    end
+end
+
+# An order `m` whose seed `d^m_{m,n} ≈ sin^m θ` lies below `Float32`'s range, at degrees past the turning
+# point `ℓ sin θ = m`, where `d` is of order `ℓ^(−1/2)`: the direct synthesis of one coefficient against
+# `N_ℓ d^ℓ_{m,−s}(θ) e^{imφ}` from the explicit sum, in either element type.
+Test.@testset "Direct-sum spin harmonics past the floating-point range of their seeds" begin
+    F = CGEF.Filtering
+    colat = (0.38, 0.45, 0.52, π - 0.45)
+    lon = (0.3, 1.1, 2.0, 4.0)
+    L, m = 400, 120
+    for T in (Float32, Float64)
+        g = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(T(6.371e6)), T[λ for λ in lon],
+                                      T[π / 2 - θ for θ in colat], fill(T(1e10), 4), trues(4))
+        tr = F.DirectSpinTransforms(g; lmax = L)
+        θ, φ, _ = F._spin_nodes(g)
+        for s in (-1, 2), ℓ in (L - 40, L)
+            C = F.spin_coefficients(tr)
+            C[ℓ + 1, m + L + 1] = 1
+            f = F.spin_synthesize!(F.spin_field(tr), C, C, ones(T, L + 1), tr, s)
+            ref = [sqrt((2ℓ + 1) / 4π) * _cgef_wigner_big(ℓ, m, -s, θ[k]) * cis(m * Float64(φ[k])) for k in 1:4]
+            Test.@test maximum(abs, f .- ref) < (T === Float32 ? 1e-3 : 1e-10) * maximum(abs, ref)
+        end
+    end
+end
+
+# Under the generalized convolution the Favre budget and the tracer flux filter their scalars at spin 0 by
+# the transforms and the `Ĝ(n)` of their vectors: at constant density the budget is `ρ·Π` with no
+# baropycnal work, and a uniform tracer carries no flux, both to round-off over the whole sphere.
+Test.@testset "Generalized convolution: scalars and vectors through one operator" begin
+    D = CGEF.Diagnostics
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    R = 6.371e6
+    cc = first(first(_cgef_harmonic_grids(FG.Geometry.SphericalGeometry(R))))
+    sz = FG.Grids.size_tuple(cc)
+    pts = _cgef_points(cc)
+    u = [cos(p[2]) * sin(2p[1]) + 0.3sin(p[2]) for p in pts]
+    v = [cos(3p[1]) * cos(p[2])^2 - 0.2sin(p[1]) for p in pts]
+    θ = [sin(2p[2]) + cos(p[1]) * cos(p[2]) for p in pts]
+    for kern in (CGEF.GaussianKernel(), CGEF.TopHatKernel()), ℓ in (1.5e6, 3e6)
+        Π = D.compute_Π!(zero(u), u, v, nothing, cc, kern, ℓ; execution = SER)
+        fav = D.compressible_flux(u, v, fill(2.5, sz), fill(1.0e5, sz), cc, kern, ℓ; execution = SER)
+        Test.@test _cgef_relerr(fav.Π, 2.5 .* Π) < 1e-10
+        Test.@test maximum(abs, fav.Λ) < 1e-10 * maximum(abs, fav.Π)
+        Πθ = D.tracer_variance_flux(u, v, θ, cc, kern, ℓ; execution = SER)
+        Πθ0 = D.tracer_variance_flux(u, v, fill(3.0, sz), cc, kern, ℓ; execution = SER)
+        Test.@test maximum(abs, Πθ0) < 1e-12 * maximum(abs, Πθ)
+    end
+end
+
+# The generalized convolution is defined on a sphere under `ZeroFill`: asked for under `Deformable`, or
+# on a spheroid, it raises; a workspace holding it refuses a `Deformable` plan.
+Test.@testset "Generalized convolution: where it is defined" begin
+    D = CGEF.Diagnostics
+    R = 6.371e6
+    cc = first(first(_cgef_harmonic_grids(FG.Geometry.SphericalGeometry(R))))
+    u = [cos(p[2]) for p in _cgef_points(cc)]
+    k = CGEF.GaussianKernel()
+    GC = CGEF.Filtering.GeneralizedConvolution()
+    Test.@test_throws ArgumentError D.compute_Π!(zero(u), u, u, nothing, cc, k, 2e6; mask_strategy = _CGEF_DF, vector_filter = GC)
+    pd = CGEF.Filtering.plan_filter(cc, k, 2e6; mask_strategy = _CGEF_DF)
+    Test.@test_throws ArgumentError D.compute_Π!(zero(u), u, u, nothing, cc, k, 2e6; workspace = D.ΠWorkspace(cc), filter_plan = pd)
+    Test.@test CGEF.Filtering.resolve_vector_filter(cc, _CGEF_DF, nothing) isa CGEF.Filtering.CartesianComponents
+    sph = FG.Grids.StructuredGrid(FG.Geometry.SpheroidGeometry(), range(0.0; step = 2π / 16, length = 16), range(-1.0, 1.0; length = 8))
+    Test.@test_throws ArgumentError CGEF.Filtering.resolve_vector_filter(sph, CGEF.Filtering.ZeroFill(), GC)
+    Test.@test CGEF.Filtering.resolve_vector_filter(sph, CGEF.Filtering.ZeroFill(), nothing) isa CGEF.Filtering.CartesianComponents
+end
+
+# A `ZeroFill` sweep's energy sums `|ū|²` over every cell, land included, over the water area (Storer et
+# al. 2022), and its Π over land is the flux of the zero-extended field, zero beyond the kernel's reach
+# (Aluie et al. 2018). Land values are never read.
+Test.@testset "coarse_grain on a masked grid" begin
+    N = 24
+    xs = 0.0:1.0:(N - 1)
+    m = trues(N, N)
+    m[8:14, 6:12] .= false
+    g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs, m; periodic = (true, true))
+    u = [m[i, j] ? sin(2π * 2 * i / N) * cos(2π * 3 * j / N) + 0.3 : NaN for i in 1:N, j in 1:N]
+    v = [m[i, j] ? cos(2π * 3 * i / N) * sin(2π * 1 * j / N) - 0.2 : NaN for i in 1:N, j in 1:N]
+    k = CGEF.TopHatKernel()
+    scales = [2.9, 6.13]
+    SER = CGEF.ComputationalBackends.SerialBackend()
+    r = CGEF.coarse_grain(u, v, g; scales, kernel = k, execution = SER, spectrum = CGEF.Diagnostics.NoSpectrum())
+    for (s, ℓ) in enumerate(scales)
+        Test.@test r.cumulative_energy[s] ≈ 0.5 * sum(_cgef_direct_filter(g, k, ℓ, u) .^ 2 .+ _cgef_direct_filter(g, k, ℓ, v) .^ 2) / count(m) rtol = 1e-12
+        Test.@test r.Π[:, :, s] == CGEF.Diagnostics.compute_Π!(zeros(N, N), u, v, nothing, g, k, ℓ; execution = SER)
+    end
+    far = _cgef_beyond_reach(g, CGEF.Kernels.kernel_radius(k, scales[1]) + 1.0)
+    Test.@test any(far) && all(iszero, r.Π[:, :, 1][far])
+    Test.@test any(!iszero, r.Π[:, :, 1][.!m .& .!far])
+end
+
+# A density is guaranteed non-negative only for a kernel whose `|Ĝ|²` is monotone; the default policy
+# fills NaN for any other, and `ForceSpectrum` returns the density the cumulative energy implies. Π and
+# the cumulative energy do not depend on the policy; a uniform field's cumulative energy is its energy.
+Test.@testset "Spectrum policies" begin
+    D = CGEF.Diagnostics
+    N = 40
+    xs = 0.0:1000.0:(N - 1) * 1000.0
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs; periodic = (true, true))
+    u = [sin(2π * 3 * i / N) * cos(2π * 2 * j / N) + 0.4sin(2π * 7 * i / N) for i in 1:N, j in 1:N]
+    v = [cos(2π * 2 * i / N) * sin(2π * 5 * j / N) + 0.3cos(2π * 6 * j / N) for i in 1:N, j in 1:N]
+    scales = collect(4e3:2e3:16e3)
+    th, ga = CGEF.TopHatKernel(), CGEF.GaussianKernel()
+    ref = D.spectral_density(D.cumulative_energy(u, v, nothing, grid, th, scales), 1.0 ./ scales)
+    rF = Logging.with_logger(Logging.NullLogger()) do
+        CGEF.coarse_grain(u, v, grid; scales, kernel = th, spectrum = D.ForceSpectrum())
+    end
+    rN = CGEF.coarse_grain(u, v, grid; scales, kernel = th)
+    Test.@test rF.filtering_spectrum == ref
+    Test.@test all(isnan, rN.filtering_spectrum)
+    Test.@test rF.Π == rN.Π && rF.cumulative_energy == rN.cumulative_energy
+    rg = CGEF.coarse_grain(u, v, grid; scales, kernel = ga)
+    Test.@test rg.filtering_spectrum == D.filtering_spectrum(u, v, nothing, grid, ga, scales)[2]
+    Test.@test all(>=(0), rg.filtering_spectrum)
+    Test.@test all(E -> E ≈ 0.5 * (0.5^2 + 0.3^2), D.cumulative_energy(fill(0.5, N, N), fill(0.3, N, N), nothing, grid, th, scales))
 end

@@ -7,13 +7,10 @@ using SharedArrays: SharedArrays
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries
 
-# FFT spectral filtering on a uniform Cartesian grid, across worker processes. The two-direction
-# real-to-complex transform is a transform along each direction in turn: each worker transforms a block
-# of the columns along the first direction, then a block of the rows of the half spectrum along the
-# second, multiplies them by the transfer function, and inverts in the reverse order. The transform-grid
-# field, its half spectrum and the output are shared arrays; a worker copies its block into buffers in its
-# inner backend's memory, where its own transforms run. The four unnormalized transforms scale the field
-# by `Px·Py`, which the workers' transfer function divides out.
+# FFT spectral filtering on a uniform Cartesian grid, across worker processes. Each worker transforms a
+# block of columns along direction 1, then a block of rows of the half spectrum along direction 2,
+# multiplies them by the transfer function, and inverts in reverse order. The four unnormalized
+# transforms scale the field by `Px·Py`, which the workers' transfer function divides out.
 
 # The block of `1:n` the `k`-th of `nw` workers transforms.
 _block(k::Int, nw::Int, n::Int) = (div((k - 1) * n, nw) + 1):div(k * n, nw)
@@ -120,7 +117,7 @@ struct DistributedFFTGridPlan{T, L, M, B<:CGEF.ComputationalBackends.AbstractLoc
     rows::Vector{UnitRange{Int}}
     layout::L        # `_fft_layout(grid)`
     mask::M          # the grid's mask, or nothing when fully active
-    backend::B       # the workers' inner backend
+    execution::B     # the workers' inner execution backend
     single::S        # (; A, B, C) shared arrays for one field
     batched::BT      # the same with a trailing batch axis, or nothing
     nb::Int
@@ -141,6 +138,8 @@ struct DistributedFFTFilterPlan{GP<:DistributedFFTGridPlan, R, MS<:CGEF.Filterin
 end
 
 CGEF.Filtering.plan_strategy(plan::DistributedFFTFilterPlan) = plan.strategy
+CGEF.Filtering.plan_execution(plan::DistributedFFTFilterPlan) =
+    CGEF.ComputationalBackends.DistributedBackend(plan.grid_plan.execution)
 CGEF.Filtering.spectral_scratch(::DistributedFFTGridPlan) = nothing
 
 Base.show(io::IO, gp::DistributedFFTGridPlan) =
@@ -152,7 +151,7 @@ _shared(::Type{T}, dims, pids) where {T} =
 
 function CGEF.Filtering.distributed_fft_grid_plan(
     grid::FlowGeometries.Grids.StructuredGrid{T};
-    backend::CGEF.ComputationalBackends.AbstractDistributedBackend,
+    execution::CGEF.ComputationalBackends.AbstractDistributedBackend,
     batch::Union{Nothing,Integer} = nothing,
 ) where {T<:AbstractFloat}
     layout = CGEF.Filtering._fft_layout(grid)
@@ -161,7 +160,7 @@ function CGEF.Filtering.distributed_fft_grid_plan(
     # Every worker takes at least one column and one row.
     ws = Distributed.workers()[1:min(Distributed.nworkers(), Py, nk)]
     nw = length(ws)
-    inner = CGEF.ComputationalBackends.local_backend(backend)
+    inner = CGEF.ComputationalBackends.local_backend(execution)
     nb = batch === nothing ? 0 : Int(batch)
     rows = [_block(k, nw, nk) for k in 1:nw]
     parts = [Distributed.remotecall(_parts, w, inner, T, layout.P, _block(k, nw, Py), rows[k], nb)
@@ -217,9 +216,9 @@ function CGEF.Filtering.distributed_fft_filter_plan(
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
 ) where {T}
     (; kx, ky, P) = gp.layout
-    scaled = T[CGEF.Kernels.spectral_transfer(kernel, sqrt(kx[i]^2 + ky[j]^2), scale) / (P[1] * P[2])
+    scaled = T[CGEF.Kernels.spectral_transfer(kernel, (kx[i], ky[j]), scale) / (P[1] * P[2])
                for i in eachindex(kx), j in eachindex(ky)]
-    transfer = [Distributed.remotecall(_hold, w, gp.backend, scaled[gp.rows[k], :]) for (k, w) in enumerate(gp.workers)]
+    transfer = [Distributed.remotecall(_hold, w, gp.execution, scaled[gp.rows[k], :]) for (k, w) in enumerate(gp.workers)]
     invrenorm = if mask_strategy isa CGEF.Filtering.Deformable && (gp.mask !== nothing || gp.layout.padded)
         # `filter(mask)` through the same transforms; the padding beyond a bounded axis is inactive.
         dims = gp.layout.dims

@@ -1,7 +1,5 @@
 # ---------------------------------------------------------------------------
-# Batched apply: derive each target point's neighbours and weights once and apply them to every field
-# in the batch. `compute_Π!` makes 6-9 `filter_apply!` calls per scale against one plan, so this is
-# where the redundancy is. Orthogonal to caching, which changes only how the weights are derived.
+# Batched apply: each target point's neighbours and weights serve every field of the batch
 # ---------------------------------------------------------------------------
 
 # A footprint whose denominator is fixed at build time accepts only the strategy it was built for where
@@ -14,12 +12,8 @@ _check_strategy(fp::PrefixSumTopHatPlan, s::AbstractMaskStrategy) = _prefixsum_c
 _check_strategy(fp::PrefixSumTopHat3DPlan, s::AbstractMaskStrategy) = _prefixsum3d_check_strategy(fp, s)
 _check_strategy(_, ::AbstractMaskStrategy) = nothing
 
-# Homogeneous-`NTuple` batches (compile-time-known K): `MVector` accumulators are stack-allocated,
-# not heap — genuinely zero-allocation. `Vector` batches (runtime-known K, e.g. a variable number of
-# quadratic-product terms): a small `Vector{T}` accumulator, allocated ONCE per row/point-loop (not
-# per candidate or per target point), so its cost is O(Ny) or O(N) total, not part of the O(N·M) hot
-# path. Both share `eachindex`/`fill!`/indexing, so the rest of the per-row/per-point logic below is
-# written once, generic over which container `outs`/`fields` actually is.
+# Per-field accumulators: a stack `MVector` for an `NTuple` batch, a `Vector` for an `AbstractVector`
+# batch. Called once per row or index block, outside the per-point loop.
 @inline _batch_zeros(::NTuple{K,<:Any}, ::Type{T}) where {K,T<:AbstractFloat} = SA.MVector{K,T}(ntuple(_ -> zero(T), K))
 @inline _batch_zeros(v::AbstractVector, ::Type{T}) where {T<:AbstractFloat} = zeros(T, length(v))
 
@@ -34,15 +28,8 @@ _apply_serial_batch!(outs, fields, grid, fp::NDScatteredFilterPlan, strategy) =
 _apply_serial_batch!(outs, fields, grid, fp::PrefixSumTopHatPlan, strategy) =
     apply_prefixsum_tophat_batch!(outs, fields, grid, fp, strategy)
 
-# Every other footprint applies field by field. None carries a per-point neighbour derivation for a
-# batch to share: the separable Gaussians hold precomputed 1-D weight tables, `NodeFilterPlan` stores
-# its adjacency outright, and the FFTW extension's padded- and zonal-FFT engines filter a whole field
-# per transform.
-#
-# `PrefixSumTopHatPlan` is not among them. Its support intervals are O(1) amortized per point per band,
-# but the sweep TOTAL is O(N·dj_lim) — the engine's dominant cost — while its genuinely per-field part,
-# the numerator scan, is a small fraction of that. Whether sharing the sweep pays depends on the axis;
-# see `_prefixsum_batch_fuses`.
+# Every other footprint applies field by field: none derives a per-point neighbourhood for a batch to
+# share.
 function _apply_serial_batch!(outs, fields, grid, fp, strategy)
     for k in eachindex(outs)
         _apply_serial!(outs[k], fields[k], grid, fp, strategy)
@@ -71,13 +58,9 @@ end
 """
     apply_footprint_row_batch!(outs, fields, grid, fp, strategy, periodic_x, periodic_y, j) -> outs
 
-Batched banded row apply: one contiguous axpy per field per tap, every field sharing the plan's
-`invden`.
-
-The split is exactly along what depends on the field. The numerator does, so it is computed once per
-field. The window mass does not — it is a function of the geometry, the mask and the strategy — so it
-is precomputed per scale and read here, which is also what keeps each field's inner loop a vectorizable
-axpy rather than a per-point reduction.
+Row `j` of the batched banded apply: each field's numerator by one contiguous axpy per tap, scaled by
+the plan's precomputed inverse window mass `invden`, which depends on the geometry, the mask and the
+strategy alone.
 """
 function apply_footprint_row_batch!(
     outs, fields, grid::FlowGeometries.Grids.StructuredGrid, fp::FilterFootprint{T}, strategy::AbstractMaskStrategy,
@@ -85,8 +68,6 @@ function apply_footprint_row_batch!(
 ) where {T<:AbstractFloat}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     b = _banded_band(fp.nbands, j)
-    lo = fp.ptr[b]
-    hi = fp.ptr[b + 1] - 1
     invden = fp.invden
     for m in eachindex(outs)
         oc = view(@inbounds(outs[m]), :, j)
@@ -94,7 +75,7 @@ function apply_footprint_row_batch!(
             oc[i] = zero(T)
         end
         _banded_row_accumulate!(
-            oc, _banded_source(fp, @inbounds(fields[m]), m), fp.di, fp.dj, fp.w, lo, hi,
+            oc, _banded_source(fp, @inbounds(fields[m]), m), fp.taps, b,
             fp.periodic_x, fp.periodic_y, Nx, Ny, j,
         )
         @inbounds @simd for i in 1:Nx
@@ -123,11 +104,11 @@ function apply_footprint_row_batch!(
     periodic_x::Bool, periodic_y::Bool, j::Integer,
 ) where {T<:AbstractFloat}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    acc_ws = _batch_zeros(outs, T)
-    acc_wn = _batch_zeros(outs, T)
     cache = fp.cache
     zerofill = strategy isa ZeroFill
     if cache !== nothing
+        acc_ws = _batch_zeros(outs, T)
+        acc_wn = _batch_zeros(outs, T)
         for i in 1:Nx
             _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
             t = i + (j - 1) * Nx
@@ -162,47 +143,66 @@ function apply_footprint_row_batch!(
             end
         end
     else
-        kernel = fp.kernel
-        scale = fp.scale
-        dim = _kernel_dim(grid)
-        di_lim, dj_lim = fp.di_lim, fp.dj_lim
-        fp_periodic_x, fp_periodic_y = fp.periodic_x, fp.periodic_y
-        x_period, y_period = fp.x_period, fp.y_period
-        is_cartesian = fp.is_cartesian
-        rad = fp.rad
-        sc = FlowGeometries.Connectivity.ball_scratch()   # per row; see the single-field row apply
-        for i in 1:Nx
-            _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
-            target = FlowGeometries.Grids.coords(SA.SVector, grid, i, j)
-            fill!(acc_ws, zero(T))
-            fill!(acc_wn, zero(T))
-            _scattered_foldl(
-                nothing, grid, target, i, j, Nx, Ny, di_lim, dj_lim,
-                fp_periodic_x, fp_periodic_y, x_period, y_period, is_cartesian, rad, fp.topology, sc,
-            ) do _, iin, jjn, d
-                active = FlowGeometries.Grids.isactive(grid, iin, jjn)
-                w = Kernels.kernel_weight(kernel, d, scale, dim) * FlowGeometries.Grids.area(grid, iin, jjn)
-                if zerofill
-                    for m in eachindex(fields)
-                        acc_wn[m] += w
-                    end
-                    if active
-                        for m in eachindex(fields)
-                            acc_ws[m] += w * fields[m][iin, jjn]
-                        end
-                    end
-                elseif active
-                    for m in eachindex(fields)
-                        acc_wn[m] += w
-                        acc_ws[m] += w * fields[m][iin, jjn]
-                    end
+        _scattered_stream_row_batch!(outs, fields, grid, fp, strategy, Int(j))
+    end
+    return outs
+end
+
+# One row of the streamed batch; the fields share one window mass. An `NTuple` batch folds its sums
+# through the query as values and allocates nothing; a batch of unknown width sums into one buffer per row.
+function _scattered_stream_row_batch!(
+    outs::NTuple{K,<:AbstractArray}, fields::NTuple{K,<:AbstractArray}, grid, fp::ScatteredFilterPlan{T},
+    strategy::AbstractMaskStrategy, j::Int,
+) where {K, T<:AbstractFloat}
+    Nx = FlowGeometries.Grids.size_tuple(grid)[1]
+    rule = fp.weights
+    zerofill = strategy isa ZeroFill
+    sc = FlowGeometries.Connectivity.ball_scratch(fp.topology)
+    for i in 1:Nx
+        _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
+        t = i + (j - 1) * Nx
+        ws, wn = _ball_fold((zero(SA.SVector{K,T}), zero(T)), grid, i, j, fp.rad, fp.is_cartesian, fp.topology, sc) do acc, J, d
+            aws, awn = acc
+            active = FlowGeometries.Grids.isactive(grid, J[1], J[2])
+            (zerofill || active) || return acc
+            w = last(_cell_weight(rule, grid, t, (i, j), J, d))
+            active && (aws = aws .+ w .* SA.SVector{K,T}(ntuple(m -> @inbounds(fields[m][J[1], J[2]]), Val(K))))
+            return (aws, awn + w)
+        end
+        zerofill && (wn = _add_exterior(wn, fp.exterior, i, j))
+        @inbounds for m in 1:K
+            outs[m][i, j] = _normalized(ws[m], wn)
+        end
+    end
+    return outs
+end
+
+function _scattered_stream_row_batch!(
+    outs, fields, grid, fp::ScatteredFilterPlan{T}, strategy::AbstractMaskStrategy, j::Int,
+) where {T<:AbstractFloat}
+    Nx = FlowGeometries.Grids.size_tuple(grid)[1]
+    rule = fp.weights
+    zerofill = strategy isa ZeroFill
+    sc = FlowGeometries.Connectivity.ball_scratch(fp.topology)
+    acc_ws = zeros(T, length(fields))
+    for i in 1:Nx
+        _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
+        t = i + (j - 1) * Nx
+        fill!(acc_ws, zero(T))
+        wn = _ball_fold(zero(T), grid, i, j, fp.rad, fp.is_cartesian, fp.topology, sc) do awn, J, d
+            active = FlowGeometries.Grids.isactive(grid, J[1], J[2])
+            (zerofill || active) || return awn
+            w = last(_cell_weight(rule, grid, t, (i, j), J, d))
+            if active
+                for m in eachindex(fields)
+                    @inbounds acc_ws[m] += w * fields[m][J[1], J[2]]
                 end
-                nothing
             end
-            for m in eachindex(outs)
-                wn = zerofill ? _add_exterior(acc_wn[m], fp.exterior, i, j) : acc_wn[m]
-                outs[m][i, j] = _normalized(acc_ws[m], wn)
-            end
+            return awn + w
+        end
+        zerofill && (wn = _add_exterior(wn, fp.exterior, i, j))
+        @inbounds for m in eachindex(outs)
+            outs[m][i, j] = _normalized(acc_ws[m], wn)
         end
     end
     return outs
@@ -211,8 +211,8 @@ end
 """
     apply_footprint_nd_batch!(outs, fields, grid, fp, strategy) -> outs
 
-Batched point-indexed apply over the whole grid. The batch shares each point's neighbour enumeration
-across all `K` fields, so the enumeration is paid once rather than `K` times.
+Batched point-indexed apply over the whole grid: each point's neighbours are enumerated once for all
+fields.
 """
 function apply_footprint_nd_batch!(
     outs, fields, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, fp::Union{FilterFootprintND{N,T}, NDScatteredFilterPlan{N,T}}, strategy::AbstractMaskStrategy,
@@ -228,9 +228,8 @@ end
 """
     apply_footprint_nd_batch_over!(outs, fields, grid, fp, strategy, indices) -> outs
 
-The batched apply restricted to `indices`. Each output point depends only on its own neighbourhood,
-so a parallel backend can hand disjoint index blocks to different tasks and get the serial answer.
-`outs` must already be zeroed — the caller owns that, since a block only writes its own points.
+The batched apply restricted to `indices`. Each point writes only its own output, so disjoint index
+blocks may run concurrently. The caller zeroes `outs`.
 """
 function apply_footprint_nd_batch_over!(
     outs, fields, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, fp::FilterFootprintND{N,T}, strategy::AbstractMaskStrategy,
@@ -276,20 +275,21 @@ function apply_footprint_nd_batch_over!(
     return outs
 end
 
-# One streamed point of the ND batch. An `NTuple` batch has its width in the type, so it folds
-# immutable accumulators through `_nd_foldl`'s `acc` and allocates nothing; unknown width keeps the
-# mutable buffers. Both enumerate through `_nd_foldl`, so both match the cache builder.
+# One streamed point of the ND batch. An `NTuple` batch folds immutable accumulators and allocates
+# nothing; a batch of unknown width uses the mutable buffers. Both enumerate through `_nd_foldl`, as the
+# cache builder does.
 @inline function _nd_stream_point!(
     outs::NTuple{K,<:AbstractArray}, fields::NTuple{K,<:AbstractArray},
     grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, fp::NDScatteredFilterPlan{N,T},
-    strategy::AbstractMaskStrategy, mask, I::CartesianIndex{N}, kernel, scale,
-    _acc_ws, _acc_wn,
+    strategy::AbstractMaskStrategy, mask, I::CartesianIndex{N}, t::Int, _acc_ws, _acc_wn,
 ) where {K, N, T<:AbstractFloat, G}
     z = zero(SA.SVector{K,T})
-    ws, wn = _nd_foldl((z, z), grid, Tuple(I), fp.rad, fp.topology) do a, J, d
+    rule = fp.weights
+    Ti = Tuple(I)
+    ws, wn = _nd_foldl((z, z), grid, Ti, fp.rad, fp.topology) do a, J, d
         aws, awn = a
         active = mask[J...]
-        wk = Kernels.kernel_weight(kernel, d, scale, Val(N)) * FlowGeometries.Grids.area(grid, J...)
+        wk = last(_cell_weight(rule, grid, t, Ti, J, d))
         if strategy isa ZeroFill
             awn = awn .+ wk
             active && (aws = aws .+ wk .* SA.SVector{K,T}(ntuple(m -> fields[m][J...], Val(K))))
@@ -309,14 +309,15 @@ end
 
 @inline function _nd_stream_point!(
     outs, fields, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, fp::NDScatteredFilterPlan{N,T},
-    strategy::AbstractMaskStrategy, mask, I::CartesianIndex{N}, kernel, scale,
-    acc_ws, acc_wn,
+    strategy::AbstractMaskStrategy, mask, I::CartesianIndex{N}, t::Int, acc_ws, acc_wn,
 ) where {N, T<:AbstractFloat, G}
     fill!(acc_ws, zero(T))
     fill!(acc_wn, zero(T))
-    _nd_foldl(nothing, grid, Tuple(I), fp.rad, fp.topology) do _, J, d
+    rule = fp.weights
+    Ti = Tuple(I)
+    _nd_foldl(nothing, grid, Ti, fp.rad, fp.topology) do _, J, d
         active = mask[J...]
-        wk = Kernels.kernel_weight(kernel, d, scale, Val(N)) * FlowGeometries.Grids.area(grid, J...)
+        wk = last(_cell_weight(rule, grid, t, Ti, J, d))
         if strategy isa ZeroFill
             for m in eachindex(fields)
                 acc_wn[m] += wk
@@ -387,10 +388,10 @@ function apply_footprint_nd_batch_over!(
             end
         end
     else
-        kernel, scale = fp.kernel, fp.scale
+        lin = LinearIndices(dims)
         @inbounds for I in indices
             _filters_target(strategy, mask[I]) || continue
-            _nd_stream_point!(outs, fields, grid, fp, strategy, mask, I, kernel, scale, acc_ws, acc_wn)
+            _nd_stream_point!(outs, fields, grid, fp, strategy, mask, I, lin[I], acc_ws, acc_wn)
         end
     end
     return outs

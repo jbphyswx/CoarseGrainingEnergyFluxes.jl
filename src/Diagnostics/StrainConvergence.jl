@@ -3,24 +3,30 @@
 # ---------------------------------------------------------------------------
 
 """
-    PiStrainWorkspace(grid)
+    PiStrainWorkspace(grid; execution = SerialBackend())
 
-Scratch for [`compute_Π_strain_convergence!`](@ref): the two filtered velocities, the three stress
-components, the four velocity-gradient components, the two rotation invariants and the three flux
-fields, plus the two shared product buffers.
+Scratch for [`compute_Π_strain_convergence!`](@ref), in the memory of `execution` (see
+[`Placement`](@ref)): the two filtered velocities, the three stress components, the four
+velocity-gradient components, the two rotation invariants and the three flux fields, plus the two shared
+product buffers.
 """
-struct PiStrainWorkspace{T<:AbstractFloat, A<:AbstractArray{T}}
+struct PiStrainWorkspace{T<:AbstractFloat, A<:AbstractArray{T}, P<:Placement}
     ū::A; v̄::A
     prod::A; fbuf::A
     τuu::A; τuv::A; τvv::A
     ux::A; uy::A; vx::A; vy::A
     δ::A; α::A
     Πα::A; Πδ::A; total::A
+    at::P
 end
 
-function PiStrainWorkspace(grid::FlowGeometries.Grids.AbstractGrid{G,T}) where {T<:AbstractFloat, G}
+function PiStrainWorkspace(
+    grid::FlowGeometries.Grids.AbstractGrid{G,T};
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.SerialBackend(),
+) where {T<:AbstractFloat, G}
+    at = Placement(grid; execution = execution)
     gsz = FlowGeometries.Grids.size_tuple(grid)
-    return PiStrainWorkspace(ntuple(_ -> zeros(T, gsz), 16)...)
+    return PiStrainWorkspace(ntuple(_ -> _zeros(at, T, gsz), 16)..., at)
 end
 
 """
@@ -39,28 +45,27 @@ function compute_Π_strain_convergence!(
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
     deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _require_tangent_pair(grid, "compute_Π_strain_convergence!")
     plan = filter_plan === nothing ?
-        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
+        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution) :
         filter_plan
-    og = output_grid(grid, plan)
-    dplan = _resolve_deriv_plan(deriv_plan, og)
+    _check_placement(ws.at, plan)
+    b = ws.at.execution
+    og = _output(ws.at, plan)
+    dplan = _placed(ws.at, _resolve_deriv_plan(deriv_plan, output_grid(grid, plan)))
 
     Filtering.filter_apply_batch!((ws.ū, ws.v̄), (u, v), plan)
     _second_moment!(ws.τuu, u, u, ws.ū, ws.ū, ws.prod, ws.fbuf, plan)
     _second_moment!(ws.τuv, u, v, ws.ū, ws.v̄, ws.prod, ws.fbuf, plan)
     _second_moment!(ws.τvv, v, v, ws.v̄, ws.v̄, ws.prod, ws.fbuf, plan)
 
-    _grad2!(ws.ux, ws.uy, ws.ū, og, dplan)
-    _grad2!(ws.vx, ws.vy, ws.v̄, og, dplan)
+    _grad2!(ws.ux, ws.uy, ws.ū, og, dplan, b)
+    _grad2!(ws.vx, ws.vy, ws.v̄, og, dplan, b)
 
     mask = FlowGeometries.Grids.mask(og)
-    # δ̄ = ū_x + v̄_y and ᾱ² = σ̄_n² + σ̄_s² are the two rotation invariants of the filtered gradient;
-    # σ̄_n = ū_x − v̄_y (normal strain) and σ̄_s = ū_y + v̄_x (shear strain) are not, so they are
-    # consumed inline rather than returned.
     @. ws.δ = ifelse(mask, ws.ux + ws.vy, zero(T))
     @. ws.α = ifelse(mask, sqrt((ws.ux - ws.vy)^2 + (ws.uy + ws.vx)^2), zero(T))
     @. ws.Πα = ifelse(mask,
@@ -72,7 +77,7 @@ function compute_Π_strain_convergence!(
 end
 
 """
-    compute_Π_strain_convergence(u, v, grid, kernel, scale; backend=AutoBackend(), mask_strategy=ZeroFill())
+    compute_Π_strain_convergence(u, v, grid, kernel, scale; execution=AutoBackend(), mask_strategy=ZeroFill())
         -> (; total, strain, convergence, divergence, strain_magnitude)
 
 Split the 2D cross-scale flux into the two production terms of Srinivasan, Barkan & McWilliams (2023),
@@ -91,20 +96,16 @@ the flux separates into
 Π = Π_α − Π_δ ,   Π_α = (τ_vv − τ_uu) σ̄_n/2 − τ_uv σ̄_s ,   Π_δ = (τ_vv + τ_uu) δ̄/2 ,
 ```
 
-with `Π_α` the **deformation/shear production** — energy transferred by straining, present even in
-non-divergent flow — and `Π_δ` the **convergence production**, which vanishes identically for a
-non-divergent field and is the term that paper adds. Setting `δ̄ = 0` recovers Polzin (2010); the
+with `Π_α` the deformation (shear) production, energy transferred by straining, and `Π_δ` the
+convergence production, zero for a non-divergent field. Setting `δ̄ = 0` recovers Polzin (2010); the
 equivalent `Π = E′(γᵖ ᾱ − δ̄)` form with `E′ = (τ_vv + τ_uu)/2` recovers Jing et al. (2017), and
 `|γᵖ| ≤ 1` gives the bound `|Π_α| ≤ ᾱ E′`.
 
-`Π_α − Π_δ` is **algebraically identical** to the direct `Π = −S̄:τ̄` that [`compute_Π!`](@ref)
-computes — expanding eq. (10) collapses to `−τ_uu ū_x − τ_uv(ū_y + v̄_x) − τ_vv v̄_y`. The two are
-therefore a genuine cross-check rather than a tautology: they contract different combinations of the
-same four derivatives, so a sign or an ordering error in either shows up as a disagreement. The suite
-asserts they match to round-off on masked and unmasked grids.
+`total = Π_α − Π_δ` equals the `Π = −S̄:τ̄` of [`compute_Π!`](@ref): both expand to
+`−τ_uu ū_x − τ_uv(ū_y + v̄_x) − τ_vv v̄_y`.
 
-Returns specific flux maps in m² s⁻³, as [`compute_Π!`](@ref) does, plus the two rotation invariants, which are the natural axes to bin the
-flux against (`divergence` = δ̄, `strain_magnitude` = ᾱ).
+Returns specific flux maps (m² s⁻³) and the two rotation invariants, `divergence` = δ̄ and
+`strain_magnitude` = ᾱ.
 
 # References
 - Srinivasan, K., Barkan, R., & McWilliams, J. C. (2023). A forward energy flux at submesoscales
@@ -116,16 +117,16 @@ function compute_Π_strain_convergence(
     grid::FlowGeometries.Grids.AbstractGrid{G,T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
     size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
-    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution)
     return compute_Π_strain_convergence!(
-        PiStrainWorkspace(grid), u, v, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = _default_deriv_plan(output_grid(grid, plan)),
+        PiStrainWorkspace(grid; execution = Filtering.plan_execution(plan)), u, v, grid, kernel, scale;
+        filter_plan = plan, deriv_plan = Derivatives.derivative_plan(output_grid(grid, plan)),
     )
 end
 
@@ -133,23 +134,17 @@ end
     compute_Π_strain_convergence(u, v, grid::AbstractGrid{<:SphericalGeometry}, kernel, scale; ...)
         -> (; total, strain, convergence, divergence, strain_magnitude)
 
-Spherical form of the strain/convergence split, on any grid resolving two tangent directions.
-
-The split is a statement about the filtered strain tensor, so it carries over from the plane
-unchanged once that tensor is the spherical one:
+Spherical form of the strain/convergence split, on any grid resolving two tangent directions, with the
+invariants of the local-frame filtered strain:
 
 ```
 δ̄ = S̄_ee + S̄_nn        σ̄_n = S̄_ee − S̄_nn        σ̄_s = 2·S̄_en
 ```
 
-Substituting `S̄_xx = (δ̄+σ̄_n)/2`, `S̄_yy = (δ̄−σ̄_n)/2`, `S̄_xy = σ̄_s/2` into `−S̄:τ̄` collapses to
-`Π_α − Π_δ` term by term, on any metric. What the sphere changes is the two tensors fed in: `S̄` picks
-up the `tanφ/R` curvature terms of the local frame, and `τ̄` is formed in planetary-Cartesian
-coordinates and rotated back (Aluie 2019), exactly as [`compute_Π!`](@ref) does — this shares that
-code, so the two agree by construction and the suite asserts `total == compute_Π!`.
-
-Takes a [`ΠWorkspace`](@ref): the spherical path needs the three planetary components and their six
-moments, which that workspace already carries.
+`Π_α − Π_δ = −S̄:τ̄` holds on any metric. `S̄` carries the local frame's `tan φ/R` terms and `τ̄` is
+filtered by `vector_filter` ([`Filtering.resolve_vector_filter`](@ref)), the generalized convolution by
+default; both are those of [`compute_Π!`](@ref), so `total` is its flux. `workspace` is a
+[`ΠWorkspace`](@ref); `vector_filter` and `transform` build it when it is not given.
 """
 function compute_Π_strain_convergence(
     u::AbstractVecOrMat,
@@ -158,16 +153,23 @@ function compute_Π_strain_convergence(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     workspace::Union{Nothing, ΠWorkspace} = nothing,
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+    vector_filter::Union{Nothing, Filtering.AbstractVectorFilter} = nothing,
+    transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
     gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
     size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
-    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
+    ws, plan = _flux_setup(
+        grid, u, nothing, workspace, nothing,
+        () -> Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution);
+        execution, mask_strategy, vector_filter, transform,
+    )
     return compute_Π_strain_convergence!(
-        workspace === nothing ? ΠWorkspace(grid) : workspace, u, v, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = _default_deriv_plan(output_grid(grid, plan)),
+        ws, u, v, grid, kernel, scale;
+        filter_plan = plan isa Filtering.AbstractFilterPlan ? plan : nothing, mask_strategy = mask_strategy,
+        deriv_plan = Derivatives.derivative_plan(output_grid(grid, plan)),
     )
 end
 
@@ -176,7 +178,8 @@ end
         -> (; total, strain, convergence, divergence, strain_magnitude)
 
 In-place spherical [`compute_Π_strain_convergence`](@ref), over the same workspace
-[`compute_Π!`](@ref) uses. Returns views of `ws`'s buffers, valid until the next call on it.
+[`compute_Π!`](@ref) uses, whose vector filter applies. Returns views of `ws`'s buffers, valid until the
+next call on it.
 """
 function compute_Π_strain_convergence!(
     ws::ΠWorkspace,
@@ -187,22 +190,21 @@ function compute_Π_strain_convergence!(
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
     deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
     _require_tangent_pair(grid, "compute_Π_strain_convergence!")
-    plan = filter_plan === nothing ?
-        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
-        filter_plan
-    og = output_grid(grid, plan)
-    dplan = _resolve_deriv_plan(deriv_plan, og)
+    plan = _plan_for(ws.spin, filter_plan, mask_strategy,
+                     () -> Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution))
+    _check_placement(ws.at, plan)
+    dplan = _placed(ws.at, _resolve_deriv_plan(deriv_plan, output_grid(grid, plan)))
 
-    _fill_stress_strain!(u, v, nothing, grid, ws, plan, dplan, nothing)
+    _fill_stress_strain!(u, v, nothing, grid, ws, plan, dplan, kernel, scale, nothing)
 
-    # `scratch`/`scratch2`/`scratch3` are spent once the stress is built, so they carry the two
-    # invariants and the deformation channel; `u_filt`/`v_filt` carry the rest.
-    mask = FlowGeometries.Grids.mask(og)
-    δ, α, Πα = ws.scratch, ws.scratch2, ws.scratch3
+    # The filtered velocity and products are spent once the stress and strain are built, and hold the
+    # outputs.
+    mask = FlowGeometries.Grids.mask(_output(ws.at, plan))
+    δ, α, Πα = ws.uu_filt, ws.uv_filt, ws.vv_filt
     Πδ, total = ws.u_filt, ws.v_filt
     @. δ = ifelse(mask, ws.S_xx + ws.S_yy, zero(T))
     @. α = ifelse(mask, sqrt((ws.S_xx - ws.S_yy)^2 + (T(2) * ws.S_xy)^2), zero(T))
@@ -215,13 +217,11 @@ function compute_Π_strain_convergence!(
 end
 
 """
-    compute_Π_decomposed(u, v, w, u_rot, v_rot, w_rot, grid::StructuredGrid{T,Cartesian,3}, kernel, scale; backend=AutoBackend(), mask_strategy=ZeroFill())
+    compute_Π_decomposed(u, v, w, u_rot, v_rot, w_rot, grid::StructuredGrid{T,Cartesian,3}, kernel, scale; execution=AutoBackend(), mask_strategy=ZeroFill())
         -> (; total, rotational, cross, divergent)
 
-True three-dimensional analog of the 2D [`compute_Π_decomposed`](@ref) above: the same both-sides
-(strain AND stress) rotational/divergent split — see that method's docstring for the derivation —
-generalized to all six independent strain/stress tensor components, contracted the same way the
-true-3D [`compute_Π!`](@ref) method does (nine-term symmetric contraction).
+The rotational/divergent split of the 2-D [`compute_Π_decomposed`](@ref) in a Cartesian volume, over
+all six components of each strain and stress tensor.
 """
 function compute_Π_decomposed(
     u::AbstractArray{<:Any,3},
@@ -233,11 +233,9 @@ function compute_Π_decomposed(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    # One stencil table for every derivative below; they differ only in direction and field.
-    dplan = Derivatives.StencilPlan(grid)
     gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
     size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
@@ -245,109 +243,73 @@ function compute_Π_decomposed(
     size(u_rot) == gsz || throw(DimensionMismatch("u_rot has size $(size(u_rot)), grid expects $gsz"))
     size(v_rot) == gsz || throw(DimensionMismatch("v_rot has size $(size(v_rot)), grid expects $gsz"))
     size(w_rot) == gsz || throw(DimensionMismatch("w_rot has size $(size(w_rot)), grid expects $gsz"))
-    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, backend=backend)
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, execution=execution)
     return compute_Π_decomposed!(
-        PiDecomposed3DWorkspace(grid), u, v, w, u_rot, v_rot, w_rot, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = dplan,
+        PiDecomposed3DWorkspace(grid; execution = Filtering.plan_execution(plan)), u, v, w, u_rot, v_rot,
+        w_rot, grid, kernel, scale;
+        filter_plan = plan, deriv_plan = Derivatives.derivative_plan(output_grid(grid, plan)),
     )
 end
 
 """
-    PiDecomposed3DWorkspace(grid)
+    PiDecomposed3DWorkspace(grid; execution = SerialBackend())
 
-Scratch for the true-3D [`compute_Π_decomposed!`](@ref): the three divergent components, the two
-filtered velocity triples, six product buffers, the six independent components of each of the three
-stress tensors and the two strain tensors, the four flux fields, and one derivative temporary.
-
-Tensor components are stored in the `(xx, xy, xz, yy, yz, zz)` order shared with the spherical
-[`tau_decomposition!`](@ref), so one loop over that order builds a whole tensor and feeds a single
-batched apply.
+Scratch for the true-3D [`compute_Π_decomposed!`](@ref), in the memory of `execution` (see
+[`Placement`](@ref)): the three divergent components, the two filtered velocity triples, six product
+buffers, the six independent components of each of the three stress tensors and the two strain tensors,
+and the four flux fields. Tensor components are stored in the order `(xx, xy, xz, yy, yz, zz)`.
 """
-struct PiDecomposed3DWorkspace{T<:AbstractFloat, A<:AbstractArray{T,3}}
+struct PiDecomposed3DWorkspace{T<:AbstractFloat, A<:AbstractArray{T,3}, P<:Placement}
     div::NTuple{3,A}     # (u,v,w) − (u_rot,v_rot,w_rot)
     br::NTuple{3,A}      # filtered rotational triple
     bd::NTuple{3,A}      # filtered divergent triple
-    prod::NTuple{6,A}    # the six symmetric products feeding one batched apply
+    prod::NTuple{6,A}    # the six symmetric products, then the strains' scratch
     τRR::NTuple{6,A}
     τDD::NTuple{6,A}
     τX::NTuple{6,A}
     SR::NTuple{6,A}
     SD::NTuple{6,A}
     Πrr::A; Πdd::A; Πx::A; total::A
-    tmp::A
+    at::P
 end
 
 function PiDecomposed3DWorkspace(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,3};
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.SerialBackend(),
 ) where {T<:AbstractFloat, G}
+    at = Placement(grid; execution = execution)
     gsz = FlowGeometries.Grids.size_tuple(grid)
-    z() = zeros(T, gsz)
+    z() = _zeros(at, T, gsz)
     t(n) = ntuple(_ -> z(), n)
     return PiDecomposed3DWorkspace(
-        t(3), t(3), t(3), t(6), t(6), t(6), t(6), t(6), t(6), z(), z(), z(), z(), z(),
+        t(3), t(3), t(3), t(6), t(6), t(6), t(6), t(6), t(6), z(), z(), z(), z(), at,
     )
 end
 
-# Derivative along axis `d` ∈ {1,2,3}, selected at run time so the three off-diagonal strain components
-# share one loop body.
-@inline function _dd!(dst, f, d::Int, grid, dplan)
-    d == 1 ? Derivatives.ddx!(dst, f, grid, dplan) :
-    d == 2 ? Derivatives.ddy!(dst, f, grid, dplan) :
-             Derivatives.ddz!(dst, f, grid, dplan)
-    return nothing
-end
-
-# The six independent components of S̄ from an already-filtered velocity triple `b`, in `_SYM3` order.
-# `tmp` carries the second derivative of each off-diagonal.
-@inline function _strain3_into!(S, b, tmp, grid, dplan, ::Type{T}) where {T}
-    Derivatives.ddx!(S[1], b[1], grid, dplan)
-    Derivatives.ddy!(S[4], b[2], grid, dplan)
-    Derivatives.ddz!(S[6], b[3], grid, dplan)
-    for (k, i1, i2) in ((2, 1, 2), (3, 1, 3), (5, 2, 3))
-        _dd!(S[k], b[i1], i2, grid, dplan)
-        _dd!(tmp, b[i2], i1, grid, dplan)
-        @. S[k] = T(0.5) * (S[k] + tmp)
-    end
-    _add_strain3_curvature!(S, b, grid, T)
-    return nothing
-end
-
-# A Cartesian volume's strain is the symmetrized velocity gradient and nothing more.
-@inline _add_strain3_curvature!(
-    _S, _b, ::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.CartesianGeometry}, ::Type,
-) = nothing
-
-# A spherical shell, in the scale factors `h_λ = r cosφ`, `h_φ = r`, `h_r = 1`:
-#
-#     S_ee += w̄_r/r − v̄_n tanφ/r      S_nn += w̄_r/r      S_en += ½ ū_e tanφ/r
-#     S_er −= ½ ū_e/r                  S_nr −= ½ v̄_n/r
-#
-# with `S_rr = ∂w̄_r/∂r` carrying no correction. The distance derivatives are already metric-scaled at
-# each point's own radius, so this adds only the terms the frame's rotation contributes.
-function _add_strain3_curvature!(
-    S, b, grid::FlowGeometries.Grids.StructuredGrid{T2,G,3}, ::Type{T},
-) where {T, T2, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T2}}
-    @inbounds for I in CartesianIndices(S[1])
-        i = Tuple(I)
-        FlowGeometries.Grids.isactive(grid, i...) || continue
-        _, φ, rk = FlowGeometries.Grids.coords(grid, i...)
-        sinφ, cosφ = sincos(φ)
-        tf = abs(cosφ) > T(1e-12) ? sinφ / (rk * cosφ) : zero(T)
-        inv_r = one(T) / rk
-        u_e = b[1][I]; v_n = b[2][I]; w_r = b[3][I]
-        S[1][I] += w_r * inv_r - v_n * tf
-        S[4][I] += w_r * inv_r
-        S[2][I] += T(0.5) * u_e * tf
-        S[3][I] -= T(0.5) * u_e * inv_r
-        S[5][I] -= T(0.5) * v_n * inv_r
-    end
-    return nothing
-end
+# The six components of S̄ of a filtered velocity triple `b3` into `S`, in `_SYM3` order, the frame's
+# turning included; `g` is three scratch arrays, and `grid` is held where the backend `be` runs.
+@inline _strain_sym3!(S::NTuple{6}, b3::NTuple{3}, grid, dplan, g::NTuple{3}, be) =
+    _strain!((S[1], S[4], S[6], S[2], S[3], S[5]), b3, grid, dplan, g, be)
 
 # Nine-term symmetric contraction S_ij τ_ij at one point, over the `_SYM3` component order.
-Base.@propagate_inbounds _contract_sym3(S, τ, I) =
-    S[1][I] * τ[1][I] + S[4][I] * τ[4][I] + S[6][I] * τ[6][I] +
-    2 * (S[2][I] * τ[2][I] + S[3][I] * τ[3][I] + S[5][I] * τ[5][I])
+@inline _sym3_dot(S1, S2, S3, S4, S5, S6, t1, t2, t3, t4, t5, t6) =
+    S1 * t1 + S4 * t4 + S6 * t6 + 2 * (S2 * t2 + S3 * t3 + S5 * t5)
+
+# The three channels and their sum from the stored strains and stresses, zero where `mask` is false. The
+# cross channel accumulates its four terms in this order, and `total` sums the stored channels, so
+# `total == rotational + cross + divergent` holds to the last bit.
+function _decomposed_channels!(ws, mask, ::Type{T}) where {T}
+    SR, SD, τRR, τDD, τX = ws.SR, ws.SD, ws.τRR, ws.τDD, ws.τX
+    @. ws.Πrr = ifelse(mask, -_sym3_dot(SR..., τRR...), zero(T))
+    @. ws.Πdd = ifelse(mask, -_sym3_dot(SD..., τDD...), zero(T))
+    @. ws.Πx = _sym3_dot(SR..., τDD...)
+    @. ws.Πx += _sym3_dot(SD..., τRR...)
+    @. ws.Πx += _sym3_dot(SR..., τX...)
+    @. ws.Πx += _sym3_dot(SD..., τX...)
+    @. ws.Πx = ifelse(mask, -ws.Πx, zero(T))
+    @. ws.total = (ws.Πrr + ws.Πx) + ws.Πdd
+    return (; total = ws.total, rotational = ws.Πrr, cross = ws.Πx, divergent = ws.Πdd)
+end
 
 """
     compute_Π_decomposed!(ws::PiDecomposed3DWorkspace, u, v, w, u_rot, v_rot, w_rot, grid, kernel, scale;
@@ -356,15 +318,6 @@ Base.@propagate_inbounds _contract_sym3(S, τ, I) =
 
 In-place true-3D [`compute_Π_decomposed`](@ref). Returns views of `ws`'s buffers, valid until the next
 call on the same workspace. With `ws` and both plans supplied, a repeated evaluation allocates nothing.
-
-Each stress tensor comes from one batched apply of its six symmetric products. The cross stress sums
-the two orderings before filtering, which the linearity of the filter permits:
-
-    τX_ij = M(uʳ_i, uᵈ_j) + M(uᵈ_i, uʳ_j) = (uʳ_i uᵈ_j + uᵈ_i uʳ_j)‾ − (ūʳ_i ūᵈ_j + ūᵈ_i ūʳ_j)
-
-so it costs one product per component, and the diagonal `i = j` picks up its factor of two from the
-same expression. The two strains read the filtered triples the stresses already needed, so a whole
-evaluation is four batched applies over 24 fields.
 """
 function compute_Π_decomposed!(
     ws::PiDecomposed3DWorkspace{T},
@@ -378,65 +331,47 @@ function compute_Π_decomposed!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,Derivatives.StencilPlan} = nothing,
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    deriv_plan::Union{Nothing,FlowGeometries.Operators.StencilPlans} = nothing,
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     plan = filter_plan === nothing ?
-        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
+        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution) :
         filter_plan
-    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
+    _check_placement(ws.at, plan)
+    b = ws.at.execution
+    og = _output(ws.at, plan)
+    dplan = _placed(ws.at, deriv_plan === nothing ? Derivatives.derivative_plan(output_grid(grid, plan)) : deriv_plan)
 
     rot = (u_rot, v_rot, w_rot)
     dv, br, bd, pr = ws.div, ws.br, ws.bd, ws.prod
 
-    # Divergent (irrotational) part is the complement of the supplied rotational part.
     for (d, f, r) in zip(dv, (u, v, w), rot)
         @. d = f - r
     end
 
-    # Both filtered triples feed the self stresses, the cross stress AND a strain: one batch of six.
     Filtering.filter_apply_batch!((br..., bd...), (rot..., dv...), plan)
 
-    # `τʳʳ`, `τ_X` and `τᵈᵈ` are the three generalized second moments of the rotational/divergent pair.
-    # The Germano split takes the same three of the filtered velocity and its residual.
     _pair_moments!(ws.τRR, ws.τX, ws.τDD, rot, dv, br, bd, pr, plan)
 
-    og = output_grid(grid, plan)
-    _strain3_into!(ws.SR, br, ws.tmp, og, dplan, T)
-    _strain3_into!(ws.SD, bd, ws.tmp, og, dplan, T)
+    g = (pr[1], pr[2], pr[3])
+    _strain_sym3!(ws.SR, br, og, dplan, g, b)
+    _strain_sym3!(ws.SD, bd, og, dplan, g, b)
 
-    # One pass builds all four flux channels, so each tensor component is read once.
-    mask = FlowGeometries.Grids.mask(og)
-    @inbounds for I in CartesianIndices(ws.total)
-        if mask[I]
-            rr = _contract_sym3(ws.SR, ws.τRR, I)
-            dd = _contract_sym3(ws.SD, ws.τDD, I)
-            x = _contract_sym3(ws.SR, ws.τDD, I) + _contract_sym3(ws.SD, ws.τRR, I) +
-                _contract_sym3(ws.SR, ws.τX, I) + _contract_sym3(ws.SD, ws.τX, I)
-            # `total` is summed from the three stored channels, in their returned order, so
-            # `total == rotational + cross + divergent` holds to the last bit.
-            ws.Πrr[I] = -rr
-            ws.Πx[I] = -x
-            ws.Πdd[I] = -dd
-            ws.total[I] = (ws.Πrr[I] + ws.Πx[I]) + ws.Πdd[I]
-        else
-            ws.Πrr[I] = zero(T); ws.Πdd[I] = zero(T); ws.Πx[I] = zero(T); ws.total[I] = zero(T)
-        end
-    end
-    return (; total = ws.total, rotational = ws.Πrr, cross = ws.Πx, divergent = ws.Πdd)
+    return _decomposed_channels!(ws, FlowGeometries.Grids.mask(og), T)
 end
 
 """
-    SphericalPiDecomposed3DWorkspace(grid)
+    SphericalPiDecomposed3DWorkspace(grid; execution = SerialBackend())
 
-Scratch for the spherical volumetric [`compute_Π_decomposed!`](@ref): the two planetary-Cartesian
-velocity triples and their filtered forms, six product buffers, the six components of each of the
-three stresses and the two strains, one local triple, and the four flux fields.
+Scratch for the spherical volumetric [`compute_Π_decomposed!`](@ref), in the memory of `execution` (see
+[`Placement`](@ref)): the two ambient Cartesian velocity triples and their filtered forms, six product
+buffers, the six components of each of the three stresses and the two strains, one local triple, and the
+four flux fields.
 """
-struct SphericalPiDecomposed3DWorkspace{T<:AbstractFloat, A<:AbstractArray{T,3}}
-    pr::NTuple{3,A}     # planetary rotational
-    pd::NTuple{3,A}     # planetary divergent
+struct SphericalPiDecomposed3DWorkspace{T<:AbstractFloat, A<:AbstractArray{T,3}, P<:Placement}
+    pr::NTuple{3,A}     # ambient rotational
+    pd::NTuple{3,A}     # ambient divergent
     br::NTuple{3,A}
     bd::NTuple{3,A}
     prod::NTuple{6,A}
@@ -446,18 +381,20 @@ struct SphericalPiDecomposed3DWorkspace{T<:AbstractFloat, A<:AbstractArray{T,3}}
     SR::NTuple{6,A}
     SD::NTuple{6,A}
     loc::NTuple{3,A}    # one part's filtered velocity in the local frame, reused for the other
-    tmp::A
     Πrr::A; Πdd::A; Πx::A; total::A
+    at::P
 end
 
 function SphericalPiDecomposed3DWorkspace(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,3};
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.SerialBackend(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
+    at = Placement(grid; execution = execution)
     gsz = FlowGeometries.Grids.size_tuple(grid)
-    z() = zeros(T, gsz)
+    z() = _zeros(at, T, gsz)
     t(n) = ntuple(_ -> z(), n)
     return SphericalPiDecomposed3DWorkspace(
-        t(3), t(3), t(3), t(3), t(6), t(6), t(6), t(6), t(6), t(6), t(3), z(), z(), z(), z(), z(),
+        t(3), t(3), t(3), t(3), t(6), t(6), t(6), t(6), t(6), t(6), t(3), z(), z(), z(), z(), at,
     )
 end
 
@@ -465,11 +402,10 @@ end
     compute_Π_decomposed(u, v, w, u_rot, v_rot, w_rot, grid::StructuredGrid{T,<:SphericalGeometry,3}, kernel, scale; ...)
         -> (; total, rotational, cross, divergent)
 
-Spherical volumetric form of the rotational/divergent split: the same both-sides decomposition the
-Cartesian volume takes, with the shell's two conventions applied. The three stresses are formed as
-generalized second moments in planetary-Cartesian coordinates and rotated back to local
-`(east, north, radial)`, and each part's strain carries the shell's curvature terms — so the channels
-still sum to the flux the volumetric [`compute_Π!`](@ref) computes.
+The rotational/divergent split in a spherical shell. The three stresses are generalized second moments
+in ambient Cartesian components rotated to the local (east, north, up) frame, and each part's strain
+carries the shell's curvature terms, so the channels sum to the flux of the volumetric
+[`compute_Π!`](@ref).
 """
 function compute_Π_decomposed(
     u::AbstractArray{<:Any,3},
@@ -481,7 +417,7 @@ function compute_Π_decomposed(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
     gsz = FlowGeometries.Grids.size_tuple(grid)
@@ -489,18 +425,19 @@ function compute_Π_decomposed(
                     ("u_rot", u_rot), ("v_rot", v_rot), ("w_rot", w_rot))
         size(a) == gsz || throw(DimensionMismatch("$nm has size $(size(a)), grid expects $gsz"))
     end
-    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend)
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution)
     return compute_Π_decomposed!(
-        SphericalPiDecomposed3DWorkspace(grid), u, v, w, u_rot, v_rot, w_rot, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = Derivatives.StencilPlan(grid),
+        SphericalPiDecomposed3DWorkspace(grid; execution = Filtering.plan_execution(plan)),
+        u, v, w, u_rot, v_rot, w_rot, grid, kernel, scale;
+        filter_plan = plan, deriv_plan = Derivatives.derivative_plan(output_grid(grid, plan)),
     )
 end
 
 """
     compute_Π_decomposed!(ws::SphericalPiDecomposed3DWorkspace, u, v, w, u_rot, v_rot, w_rot, grid, kernel, scale; ...)
 
-In-place spherical volumetric [`compute_Π_decomposed`](@ref). Four batched applies carry the whole
-split: six planetary components of the two parts, then six products per stress.
+In-place spherical volumetric [`compute_Π_decomposed`](@ref). Returns views of `ws`'s buffers, valid
+until the next call on the same workspace.
 """
 function compute_Π_decomposed!(
     ws::SphericalPiDecomposed3DWorkspace{T},
@@ -514,48 +451,35 @@ function compute_Π_decomposed!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,Derivatives.StencilPlan} = nothing,
-    backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    deriv_plan::Union{Nothing,FlowGeometries.Operators.StencilPlans} = nothing,
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
     plan = filter_plan === nothing ?
-        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, backend = backend) :
+        Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution) :
         filter_plan
-    dplan = deriv_plan === nothing ? Derivatives.StencilPlan(grid) : deriv_plan
+    _check_placement(ws.at, plan)
+    b = ws.at.execution
+    og = _output(ws.at, plan)
+    dplan = _placed(ws.at, deriv_plan === nothing ? Derivatives.derivative_plan(output_grid(grid, plan)) : deriv_plan)
     pr, pd, br, bd = ws.pr, ws.pd, ws.br, ws.bd
 
-    # Both parts to planetary Cartesian, the divergent one as the complement of the rotational.
-    _fill_tau3_velocity!(pr, u_rot, v_rot, w_rot, grid, T)
-    _fill_tau3_velocity!(pd, u, v, w, grid, T)
+    _fill_tau3_velocity!(pr, u_rot, v_rot, w_rot, ws.at.grid, b)
+    _fill_tau3_velocity!(pd, u, v, w, ws.at.grid, b)
     for c in 1:3
         @. pd[c] = pd[c] - pr[c]
     end
 
     Filtering.filter_apply_batch!((br..., bd...), (pr..., pd...), plan)
     _pair_moments!(ws.τRR, ws.τX, ws.τDD, pr, pd, br, bd, ws.prod, plan)
-    og = output_grid(grid, plan)
-    _rotate_tau3_to_local!((ws.τRR, ws.τX, ws.τDD), og)
+    _rotate_tau3_to_local!((ws.τRR, ws.τX, ws.τDD), og, b)
 
-    # The strain is linear, so each part carries its own; both are taken in the local frame.
-    _localize_triple!(ws.loc, br, og, T)
-    _strain3_into!(ws.SR, ws.loc, ws.tmp, og, dplan, T)
-    _localize_triple!(ws.loc, bd, og, T)
-    _strain3_into!(ws.SD, ws.loc, ws.tmp, og, dplan, T)
+    # The product buffers are free once the stresses are formed.
+    g = (ws.prod[1], ws.prod[2], ws.prod[3])
+    _localize_triple!(ws.loc, br, og, b)
+    _strain_sym3!(ws.SR, ws.loc, og, dplan, g, b)
+    _localize_triple!(ws.loc, bd, og, b)
+    _strain_sym3!(ws.SD, ws.loc, og, dplan, g, b)
 
-    mask = FlowGeometries.Grids.mask(og)
-    @inbounds for I in CartesianIndices(ws.total)
-        if mask[I]
-            rr = _contract_sym3(ws.SR, ws.τRR, I)
-            dd = _contract_sym3(ws.SD, ws.τDD, I)
-            x = _contract_sym3(ws.SR, ws.τDD, I) + _contract_sym3(ws.SD, ws.τRR, I) +
-                _contract_sym3(ws.SR, ws.τX, I) + _contract_sym3(ws.SD, ws.τX, I)
-            ws.Πrr[I] = -rr
-            ws.Πx[I] = -x
-            ws.Πdd[I] = -dd
-            ws.total[I] = (ws.Πrr[I] + ws.Πx[I]) + ws.Πdd[I]
-        else
-            ws.Πrr[I] = zero(T); ws.Πdd[I] = zero(T); ws.Πx[I] = zero(T); ws.total[I] = zero(T)
-        end
-    end
-    return (; total = ws.total, rotational = ws.Πrr, cross = ws.Πx, divergent = ws.Πdd)
+    return _decomposed_channels!(ws, FlowGeometries.Grids.mask(og), T)
 end

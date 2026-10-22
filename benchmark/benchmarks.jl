@@ -19,19 +19,18 @@ let
     Π = zeros(N, N)
     scale = 10_000.0
 
-    # Cold: nothing prebuilt, so each call also pays for a footprint and (for `compute_Π!`) a whole
-    # workspace. This is what a one-shot caller sees.
+    # Cold: nothing prebuilt, so each call also builds a footprint and, for `compute_Π!`, a whole
+    # workspace, as a one-shot call does.
     SUITE["filter_field!/tophat/128x128"] =
         BenchmarkTools.@benchmarkable CGEF.Filtering.filter_field!($out, $u, $grid, CGEF.TopHatKernel(), $scale)
     SUITE["compute_Pi!/tophat/128x128"] =
         BenchmarkTools.@benchmarkable CGEF.Diagnostics.compute_Π!($Π, $u, $v, nothing, $grid, CGEF.TopHatKernel(), $scale)
 
-    # Held: the workspace, filter plan and stencil table prebuilt — the documented repeated-sweep path,
-    # and the one that is allocation-free. Without these entries the suite only ever tracked the cold
-    # cost, where a fresh `ΠWorkspace` dominates both the time and the memory.
+    # Held: the workspace, filter plan and stencil table prebuilt, the repeated-sweep path, which
+    # allocates nothing. A fresh `ΠWorkspace` dominates the cold entries' time and memory.
     ker = CGEF.TopHatKernel()
     ws = CGEF.Diagnostics.ΠWorkspace(grid)
-    dplan = CGEF.Derivatives.StencilPlan(grid)
+    dplan = CGEF.Derivatives.derivative_plan(grid)
     fplan = CGEF.Filtering.plan_filter(grid, ker, scale)
     SUITE["compute_Pi!/tophat/128x128/plans-held"] =
         BenchmarkTools.@benchmarkable CGEF.Diagnostics.compute_Π!(
@@ -49,10 +48,9 @@ let
         )
 end
 
-# The three diagnostics that have workspace forms, each measured BOTH ways. The allocating form is
-# what a one-shot caller gets; the held form is the repeated-sweep path and is the one whose
-# allocation must stay flat — these entries exist so a regression to per-call allocation is visible
-# in the baseline rather than discovered later.
+# The three diagnostics that have workspace forms, each in both forms. The allocating form is a one-shot
+# call; the held form is the repeated-sweep path, whose allocation stays flat, so a per-call allocation
+# shows in the baseline.
 let
     N = 192
     dx = 1_000.0
@@ -64,7 +62,7 @@ let
     ker = CGEF.TopHatKernel()
     scale = 12_000.0
     plan = CGEF.Filtering.plan_filter(grid, ker, scale)
-    dplan = CGEF.Derivatives.StencilPlan(grid)
+    dplan = CGEF.Derivatives.derivative_plan(grid)
 
     SUITE["tau_decomposition/192x192/allocating"] =
         BenchmarkTools.@benchmarkable CGEF.Diagnostics.tau_decomposition($u, $v, $grid, $ker, $scale)
@@ -95,8 +93,8 @@ let
     end
 end
 
-# Slice axis: many independent problems, one plan each. Ragged point counts, since that is the shape
-# the longest-first schedule exists for and an equal-count baseline would hide the imbalance.
+# Slice axis: many independent problems, one plan each, with ragged point counts, the imbalance the
+# longest-first schedule balances.
 let
     nslices = 64
     dx = 1_000.0
@@ -114,9 +112,8 @@ let
 end
 
 # Realistic-scale real-space filtering: a 100 km filter on 1 km data (top-hat radius = 50 grid cells).
-# This is the regime where cost is dominated by the filter WIDTH rather than the point count, and where
-# an O(N·di_lim·dj_lim) windowed sum stops being usable. Run on a genuinely NONUNIFORM axis — both the
-# harder case and the one real swath/observational products actually have.
+# Here the filter width sets the cost, and an O(N·di_lim·dj_lim) windowed sum is too slow to use. The
+# axis is nonuniform, as swath and observational products are.
 let
     N = 1_024
     dx = 1_000.0
@@ -131,9 +128,8 @@ let
     SUITE["filter_apply!/tophat/1024x1024/100km-on-1km"] =
         BenchmarkTools.@benchmarkable CGEF.Filtering.filter_apply!($out, $u, $plan)
 
-    # The general scattered engine on the same grid/scale, as the reference the prefix-sum path is
-    # measured against. Streaming (`NeverCache`), because a materialized neighbour list for a window
-    # this wide does not fit any sane memory budget.
+    # The general scattered engine on the same grid and scale, the reference for the prefix-sum path. It
+    # streams (`NeverCache`): a neighbour list for a window this wide exceeds any memory budget.
     fp_scattered = CGEF.Filtering._build_footprint_scattered(
         grid, CGEF.TopHatKernel(), scale;
         mask_strategy = CGEF.Filtering.Deformable(),
@@ -165,7 +161,7 @@ let
         for scale in (20_000.0, 40_000.0)
             w = round(Int, scale / (2 * dx))
             plan = CGEF.Filtering.plan_filter(
-                grid, ker, scale; backend = CGEF.ComputationalBackends.SerialBackend(),
+                grid, ker, scale; execution = CGEF.ComputationalBackends.SerialBackend(),
             )
             SUITE["filter_apply!/tophat/$(N)x$(N)/$axname/w$w"] =
                 BenchmarkTools.@benchmarkable CGEF.Filtering.filter_apply!($(outs[1]), $(fields[1]), $plan)
@@ -176,9 +172,9 @@ let
     end
 end
 
-# Sweep planning: one family against independent per-scale plans. What this measures is the
-# grid-determined work (measure prefix scans, extended axis, mask scan) being paid once instead of
-# once per scale, and the per-apply scratch being held once instead of `S` times.
+# Sweep planning: one family against independent per-scale plans. A family does the grid-determined work
+# (measure prefix scans, extended axis, mask scan) once for all its scales and holds one per-apply
+# scratch for all `S` of them.
 let
     N = 512
     dx = 1_000.0
@@ -190,10 +186,10 @@ let
     SER = CGEF.ComputationalBackends.SerialBackend()
 
     SUITE["plan_filter_sweep/tophat/$(N)x$(N)/8-scales"] =
-        BenchmarkTools.@benchmarkable CGEF.Filtering.plan_filter_sweep($grid, $ker, $scales; backend = $SER)
+        BenchmarkTools.@benchmarkable CGEF.Filtering.plan_filter_sweep($grid, $ker, $scales; execution = $SER)
     SUITE["plan_filter/tophat/$(N)x$(N)/8-independent-plans"] =
         BenchmarkTools.@benchmarkable [
-            CGEF.Filtering.plan_filter($grid, $ker, s; backend = $SER) for s in $scales
+            CGEF.Filtering.plan_filter($grid, $ker, s; execution = $SER) for s in $scales
         ]
 end
 
@@ -212,21 +208,19 @@ let
     SER = CGEF.ComputationalBackends.SerialBackend()
 
     for (name, scale) in (("200km", 200e3), ("800km", 800e3))
-        plan = CGEF.Filtering.plan_filter(grid, CGEF.GaussianKernel(), scale; backend = SER)
+        plan = CGEF.Filtering.plan_filter(grid, CGEF.GaussianKernel(), scale; execution = SER)
         SUITE["filter_apply!/gaussian-spherical/$(Nlon)x$(Nlat)/$name"] =
             BenchmarkTools.@benchmarkable CGEF.Filtering.filter_apply!($out, $u, $plan)
     end
 
     # Top-hat on the same grid takes the prefix-sum engine instead, so the two are directly comparable
     # and show what a fast engine is worth at the same scale.
-    plan_th = CGEF.Filtering.plan_filter(grid, CGEF.TopHatKernel(), 800e3; backend = SER)
+    plan_th = CGEF.Filtering.plan_filter(grid, CGEF.TopHatKernel(), 800e3; execution = SER)
     SUITE["filter_apply!/tophat-spherical/$(Nlon)x$(Nlat)/800km"] =
         BenchmarkTools.@benchmarkable CGEF.Filtering.filter_apply!($out, $u, $plan_th)
 end
 
-# True 3-D. A 3-D top-hat currently walks the inscribed ball at O(w³) because the prefix-sum engine is
-# 2-D only; the separable Gaussian is O(N·Σw). Both recorded, since the gap between them is the size
-# of the opportunity.
+# True 3-D: the top-hat by its 3-D prefix sums and the separable Gaussian at O(N·Σw).
 let
     N = 64
     dx = 1_000.0
@@ -238,31 +232,29 @@ let
     SER = CGEF.ComputationalBackends.SerialBackend()
 
     for (kname, ker) in (("tophat", CGEF.TopHatKernel()), ("gaussian", CGEF.GaussianKernel()))
-        plan = CGEF.Filtering.plan_filter(grid, ker, 12_000.0; backend = SER)
+        plan = CGEF.Filtering.plan_filter(grid, ker, 12_000.0; execution = SER)
         SUITE["filter_apply!/$kname-3d/$(N)cubed/w6"] =
             BenchmarkTools.@benchmarkable CGEF.Filtering.filter_apply!($out, $u, $plan)
     end
-    # The engine the 3-D top-hat prefix sums replace, at the same kernel and scale — the honest
-    # before/after pair for that change.
+    # The general engine at the same kernel and scale, which walks the inscribed ball at O(w³) per cell.
     ball = CGEF.Filtering._build_footprint_nd(grid, CGEF.TopHatKernel(), 12_000.0)
     SUITE["filter_apply!/tophat-3d/$(N)cubed/w6/ball-walk-reference"] =
         BenchmarkTools.@benchmarkable CGEF.Filtering._apply_serial!(
             $out, $u, $grid, $ball, CGEF.Filtering.ZeroFill())
 end
 
-# The three comparisons that used to be wall-clock assertions inside `runtests.jl`. They are real
-# performance claims and belong here, where a slow machine makes a number worse rather than a test red.
+# Two comparisons, each a pair of entries on the same points.
 let
     SER = CGEF.ComputationalBackends.SerialBackend()
     geom = FG.Geometry.CartesianGeometry()
 
-    # 1. Batched vs per-field apply on a STREAMING plan, where the per-point neighbour derivation is
-    #    what the batch shares. K = 9 mirrors `compute_Π!`'s per-scale product count.
+    # 1. Batched and per-field applies on a streaming plan, whose per-point neighbour derivation the
+    #    batch shares. K = 9 is `compute_Π!`'s per-scale product count.
     let N = 96, ker = CGEF.TopHatKernel()
         x_nu = collect(0.0:800.0:(N - 1) * 800.0) .+ [iseven(i) ? 4.0 : -3.5 for i in 1:N]
         grid = FG.Grids.StructuredGrid(geom, x_nu, x_nu, trues(N, N))
         plan = CGEF.Filtering.plan_filter(grid, ker, 15_000.0;
-                                          backend = SER, cache_strategy = CGEF.Filtering.NeverCache())
+                                          execution = SER, cache_strategy = CGEF.Filtering.NeverCache())
         K = 9
         fields = ntuple(_ -> rand(N, N), K)
         outs = ntuple(_ -> zeros(N, N), K)
@@ -280,8 +272,8 @@ let
         gf = FG.Grids.StructuredGrid(geom, xsR, xsR, trues(N, N))
         cg = FG.Grids.CurvilinearGrid(geom, [1000.0 * i for i in 0:(N-1), j in 0:(N-1)],
                                       [1000.0 * j for i in 0:(N-1), j in 0:(N-1)], trues(N, N))
-        pf = CGEF.Filtering.plan_filter(gf, ker, scale; backend = SER)
-        pg = CGEF.Filtering.plan_filter(cg, ker, scale; backend = SER)
+        pf = CGEF.Filtering.plan_filter(gf, ker, scale; execution = SER)
+        pg = CGEF.Filtering.plan_filter(cg, ker, scale; execution = SER)
         f = rand(N, N); o = zeros(N, N)
         SUITE["filter_apply!/gaussian/$(N)x$(N)/separable"] =
             BenchmarkTools.@benchmarkable CGEF.Filtering.filter_apply!($o, $f, $pf)
@@ -294,9 +286,11 @@ end
 # ratio to `compute_Π!` is the count of applies its algebra needs: the strain/convergence split reads
 # the same stress and strain and costs the same, the Favre budget adds the mass-weighted products, and
 # the Germano and Helmholtz splits each form three symmetric tensors. A ratio that drifts off that
-# count is the signal — an extra pass crept in.
+# count is the signal — an extra pass crept in. The vector filter here is the ambient Cartesian
+# components, whose cost is these real-space applies.
 let sgeo = FG.Geometry.SphericalGeometry(), ker = CGEF.GaussianKernel(), ℓ = 200e3
     SER = CGEF.ComputationalBackends.SerialBackend()
+    CC = (; vector_filter = CGEF.Filtering.CartesianComponents())
     nλ, nφ = 256, 128
     lon = range(0.0; step = 2π / nλ, length = nλ)
     lat = range(deg2rad(-80.0); stop = deg2rad(80.0), length = nφ)
@@ -304,19 +298,19 @@ let sgeo = FG.Geometry.SphericalGeometry(), ker = CGEF.GaussianKernel(), ℓ = 2
     u = [cos(p) * sin(l) for l in lon, p in lat]
     v = [cos(p) * cos(l) for l in lon, p in lat]
     ρ = fill(2.5, nλ, nφ); P = fill(1.0e5, nλ, nφ)
-    pl = CGEF.Filtering.plan_filter(grid, ker, ℓ; backend = SER)
-    dp = CGEF.Derivatives.StencilPlan(grid)
+    pl = CGEF.Filtering.plan_filter(grid, ker, ℓ; execution = SER)
+    dp = CGEF.Derivatives.derivative_plan(grid)
     Π = zeros(nλ, nφ)
-    wsΠ = CGEF.Diagnostics.ΠWorkspace(grid)
-    wsc = CGEF.Diagnostics.ΠWorkspace(grid)
-    wd = CGEF.Diagnostics.SphericalPiDecomposedWorkspace(grid)
-    wf = CGEF.Diagnostics.SphericalFavreWorkspace(grid)
-    wt = CGEF.Diagnostics.Sym3TauWorkspace(grid)
+    wsΠ = CGEF.Diagnostics.ΠWorkspace(grid; CC...)
+    wsc = CGEF.Diagnostics.ΠWorkspace(grid; CC...)
+    wd = CGEF.Diagnostics.SphericalPiDecomposedWorkspace(grid; CC...)
+    wf = CGEF.Diagnostics.SphericalFavreWorkspace(grid; CC...)
+    wt = CGEF.Diagnostics.Sym3TauWorkspace(grid; CC...)
 
     SUITE["compute_Pi!/spherical/$(nλ)x$(nφ)/plans-held"] =
         BenchmarkTools.@benchmarkable CGEF.Diagnostics.compute_Π!(
             $Π, $u, $v, nothing, $grid, $ker, $ℓ;
-            workspace = $wsΠ, filter_plan = $pl, deriv_plan = $dp, backend = $SER)
+            workspace = $wsΠ, filter_plan = $pl, deriv_plan = $dp, execution = $SER)
     SUITE["strain_convergence!/spherical/$(nλ)x$(nφ)"] =
         BenchmarkTools.@benchmarkable CGEF.Diagnostics.compute_Π_strain_convergence!(
             $wsc, $u, $v, $grid, $ker, $ℓ; filter_plan = $pl, deriv_plan = $dp)
@@ -331,6 +325,48 @@ let sgeo = FG.Geometry.SphericalGeometry(), ker = CGEF.GaussianKernel(), ℓ = 2
             $wt, $u, $v, $grid, $ker, $ℓ; filter_plan = $pl)
 end
 
+# The generalized convolution on the same sphere: spin-weighted transforms at the grid's band limit, one
+# analysis per field and one synthesis per filtered field, independent of the kernel's width. A
+# workspace on the sphere holds them, so a flux reads no filter plan. NUFSHT's transforms are recorded
+# where its extension is loaded.
+if Base.get_extension(CGEF, :CoarseGrainingEnergyFluxesNUFSHTExt) !== nothing
+    let sgeo = FG.Geometry.SphericalGeometry(), SER = CGEF.ComputationalBackends.SerialBackend()
+        nλ, nφ = 256, 128
+        lon = range(0.0; step = 2π / nλ, length = nλ)
+        lat = range(deg2rad(-80.0); stop = deg2rad(80.0), length = nφ)
+        grid = FG.Grids.StructuredGrid(sgeo, lon, lat, trues(nλ, nφ))
+        u = [cos(p) * sin(l) for l in lon, p in lat]
+        v = [cos(p) * cos(l) for l in lon, p in lat]
+        dp = CGEF.Derivatives.derivative_plan(grid)
+        Π = zeros(nλ, nφ)
+        ws = CGEF.Diagnostics.ΠWorkspace(grid)
+        for (kname, ker) in (("gaussian", CGEF.GaussianKernel()), ("tophat", CGEF.TopHatKernel()))
+            SUITE["compute_Pi!/spherical-generalized/$(nλ)x$(nφ)/$kname"] =
+                BenchmarkTools.@benchmarkable CGEF.Diagnostics.compute_Π!(
+                    $Π, $u, $v, nothing, $grid, $ker, 200e3; workspace = $ws, deriv_plan = $dp, execution = $SER)
+        end
+    end
+end
+
+# The in-core direct sum, which serves a sphere with no transform library loaded: O(M·lmax²) per
+# transform over M cells, here M = 2048 at lmax = 31.
+let sgeo = FG.Geometry.SphericalGeometry(), SER = CGEF.ComputationalBackends.SerialBackend()
+    nλ, nφ = 64, 32
+    lon = range(0.0; step = 2π / nλ, length = nλ)
+    lat = range(deg2rad(-80.0); stop = deg2rad(80.0), length = nφ)
+    grid = FG.Grids.StructuredGrid(sgeo, lon, lat, trues(nλ, nφ))
+    u = [cos(p) * sin(l) for l in lon, p in lat]
+    v = [cos(p) * cos(l) for l in lon, p in lat]
+    dp = CGEF.Derivatives.derivative_plan(grid)
+    Π = zeros(nλ, nφ)
+    ws = CGEF.Diagnostics.ΠWorkspace(grid; transform = CGEF.SpectralBackends.DirectSumSpectralBackend(),
+                                     vector_filter = CGEF.Filtering.GeneralizedConvolution(; lmax = 31))
+    SUITE["compute_Pi!/spherical-generalized-direct/$(nλ)x$(nφ)/lmax31"] =
+        BenchmarkTools.@benchmarkable CGEF.Diagnostics.compute_Π!(
+            $Π, $u, $v, nothing, $grid, CGEF.GaussianKernel(), 800e3; workspace = $ws, deriv_plan = $dp,
+            execution = $SER)
+end
+
 # The same three, over a true-3-D volume, where every tensor carries six components.
 let geom = FG.Geometry.CartesianGeometry(), ker = CGEF.GaussianKernel(), ℓ = 4000.0
     SER = CGEF.ComputationalBackends.SerialBackend()
@@ -341,8 +377,8 @@ let geom = FG.Geometry.CartesianGeometry(), ker = CGEF.GaussianKernel(), ℓ = 4
     v = [cos(i / 3) * sin(k / 6) for i in 1:n, j in 1:n, k in 1:n]
     w = [sin(j / 5) * cos(k / 4) for i in 1:n, j in 1:n, k in 1:n]
     ρ = fill(2.5, n, n, n); P = fill(1.0e5, n, n, n)
-    pl = CGEF.Filtering.plan_filter(grid, ker, ℓ; backend = SER)
-    dp = CGEF.Derivatives.StencilPlan(grid)
+    pl = CGEF.Filtering.plan_filter(grid, ker, ℓ; execution = SER)
+    dp = CGEF.Derivatives.derivative_plan(grid)
     Π = zeros(n, n, n)
     wsΠ = CGEF.Diagnostics.ΠWorkspace(grid; has_w = true)
     wt = CGEF.Diagnostics.Sym3TauWorkspace(grid)
@@ -352,7 +388,7 @@ let geom = FG.Geometry.CartesianGeometry(), ker = CGEF.GaussianKernel(), ℓ = 4
     SUITE["compute_Pi!/volume-$(n)^3/plans-held"] =
         BenchmarkTools.@benchmarkable CGEF.Diagnostics.compute_Π!(
             $Π, $u, $v, $w, $grid, $ker, $ℓ;
-            workspace = $wsΠ, filter_plan = $pl, deriv_plan = $dp, backend = $SER)
+            workspace = $wsΠ, filter_plan = $pl, deriv_plan = $dp, execution = $SER)
     SUITE["tau_decomposition!/volume-$(n)^3"] =
         BenchmarkTools.@benchmarkable CGEF.Diagnostics.tau_decomposition!(
             $wt, $u, $v, $w, $grid, $ker, $ℓ; filter_plan = $pl)
@@ -375,19 +411,19 @@ let sgeo = FG.Geometry.SphericalGeometry(6.371e6), ker = CGEF.GaussianKernel()
         grid = FG.Grids.HEALPixGrid(sgeo, ns)
         n = length(FG.Grids.mask(grid))
         scale = 4 * 6.371e6 * sqrt(4π / n)          # ~4 cell widths
-        plan = CGEF.Filtering.plan_filter(grid, ker, scale; backend = SER)
+        plan = CGEF.Filtering.plan_filter(grid, ker, scale; execution = SER)
         f = rand(n); o = zeros(n)
         SUITE["plan_filter/node-csr/healpix-nside$(ns)"] =
-            BenchmarkTools.@benchmarkable CGEF.Filtering.plan_filter($grid, $ker, $scale; backend = $SER)
+            BenchmarkTools.@benchmarkable CGEF.Filtering.plan_filter($grid, $ker, $scale; execution = $SER)
         SUITE["filter_apply!/node-csr/healpix-nside$(ns)"] =
             BenchmarkTools.@benchmarkable CGEF.Filtering.filter_apply!($o, $f, $plan)
     end
 end
 
 # Threaded batch barrier cost. A K-field separable batch is K threaded applies, each two `tforeach`
-# sweeps, so it crosses `2K` barriers per scale. Fusing to two would need K live full-grid pass buffers,
-# so what decides it is the barrier cost against the batch. These two entries measure exactly that: the
-# batch, and the same count of empty parallel regions over the same index range.
+# sweeps, so it crosses `2K` barriers per scale; two barriers per scale take K live full-grid pass
+# buffers. The two entries are the batch and the same count of empty parallel regions over the same
+# index range.
 #
 # Requires `using OhMyThreads` for the threaded backend; skipped where the extension is absent.
 if Base.get_extension(CGEF, :CoarseGrainingEnergyFluxesOhMyThreadsExt) !== nothing
@@ -398,7 +434,7 @@ if Base.get_extension(CGEF, :CoarseGrainingEnergyFluxesOhMyThreadsExt) !== nothi
             ax = range(0.0, 1.0e6; length = N + 1)[1:N]
             grid = FG.Grids.StructuredGrid(geom, ax, ax; periodic = (true, true))
             plan = CGEF.Filtering.plan_filter(grid, CGEF.GaussianKernel(), 6.0e4;
-                                              backend = CGEF.ComputationalBackends.ThreadedBackend())
+                                              execution = CGEF.ComputationalBackends.ThreadedBackend())
             fields = ntuple(_ -> rand(N, N), K)
             outs = ntuple(_ -> zeros(N, N), K)
             sched = OMT.DynamicScheduler()

@@ -1,12 +1,8 @@
 # ---------------------------------------------------------------------------
-# Separable Gaussian fast path. `exp(-α(Δx²+Δy²)/ℓ²)` factors as `Gx(Δx)·Gy(Δy)`, so a 2D convolution
-# becomes a row pass then a column pass: O(N·r) against O(N·r²), up to the truncation-shape difference
-# noted below. The factorization needs a rectilinear grid, not a uniform one — a stretched axis makes
-# `Gx` depend on position as well as offset, which is a wider weight table (see
-# `_separable_axis_weights`) rather than a different algorithm.
-#
-# Cartesian only: great-circle distance does not factor, so a spherical grid takes the per-latitude-band
-# path instead.
+# Separable-kernel engine. A `SeparableKernel` factors as `Gx(Δx)·Gy(Δy)` (the Gaussian
+# `exp(-α(Δx²+Δy²)/ℓ²)` among them), so the 2D convolution is a row pass then a column pass, O(N·r).
+# On a stretched axis `Gx` depends on position as well as offset; see `_separable_axis_weights`.
+# Cartesian grids only: great-circle distance does not factor.
 # ---------------------------------------------------------------------------
 
 """
@@ -15,11 +11,8 @@
 The separable engine's two pass buffers: the masked input, and the intermediate the row pass writes
 and the column pass reads.
 
-Every table the engine holds — the per-axis tap weights, the denominator profiles, `invrenorm` — is a
-function of the filter scale, so these buffers are the whole of what the scales of a sweep can share.
-They are sized by the grid alone, hence one set per sweep rather than one per scale.
-
-One set serves one apply at a time, so a driver running applies concurrently needs one per worker.
+Sized by the grid alone, so one set serves every scale of a sweep. One set serves one apply at a time,
+so a driver running applies concurrently needs one per worker.
 """
 struct SeparableScratch{T<:AbstractFloat, MT<:AbstractMatrix{T}} <: AbstractFilterScratch
     masked_input::MT
@@ -36,27 +29,22 @@ end
 """
     SeparableFootprint{T}
 
-Precomputed 1D Gaussian weight vectors (`gx`,`gy`) plus preallocated scratch buffers for the
-row-pass/column-pass separable convolution. `invrenorm` (Deformable on a masked grid) is the
-precomputed reciprocal local kernel mass over active cells — the separable machinery run once, at
-plan-build time, on `Float.(mask)` in place of `field`. `Nx_profile`/`Ny_profile` are the
-mask-independent denominator profiles otherwise: `ZeroFill`'s full kernel mass, its in-domain offsets
-and those past a bounded edge, and `Deformable`'s in-domain offsets on a fully active grid. Each is
-separable into one Nx-length and one Ny-length vector, since which offsets lie in the domain depends
-only on `i` (resp. `j`) and periodicity.
+Per-axis kernel weight tables (`gx`, `gy`, read through `_sepw`), the denominator, and the scratch
+buffers of the two-pass separable convolution.
 
-Note: unlike the disk-truncated (`d <= rad`) non-separable footprint, this truncates each axis
-independently at the SAME per-axis `rad` (the Gaussian's own 1D marginal decays at the identical rate
-`kernel_radius` was derived from) — a square window, not a disk. The Gaussian has no true hard
-support (only a numerical truncation tolerance), so this is an equally valid truncation, just a
-different shape — matched against `RealSpace` within a measured tolerance, not asserted bit-identical.
+The denominator is `invrenorm` for `Deformable` on a masked grid: the reciprocal kernel mass over
+active cells, the same two-pass convolution applied to the mask. Otherwise it is the outer product of
+`Nx_profile` and `Ny_profile`: `ZeroFill` counts the offsets in the domain and past a bounded edge,
+`Deformable` on a fully active grid only those in the domain. Whether an offset lies in the domain
+depends on `i` and `j` separately, so the profiles are rank-1.
+
+Each axis is truncated at `rad` on its own, so the window is a square. For the Gaussian it differs from
+the disk-truncated engines by weights below the truncation tolerance of `kernel_radius`.
 """
 struct SeparableFootprint{
     T<:AbstractFloat,
     GX<:AbstractVecOrMat{T},
-    # One type parameter per axis: a uniform axis gives a length-`2·lim+1` offset vector and a stretched
-    # one a `(n, 2·lim+1)` position-major table, so a grid uniform in x and stretched in y carries one
-    # of each.
+    # A uniform axis gives a length-`2·lim+1` vector, a stretched one an `(n, 2·lim+1)` table.
     GY<:AbstractVecOrMat{T},
     PVT<:Union{Nothing,AbstractVector{T}},
     MT<:AbstractMatrix{T},
@@ -79,31 +67,22 @@ struct SeparableFootprint{
     row_pass::MT
 end
 
-# The per-row and per-column bodies, factored out so the ThreadedBackend extension parallelizes over
-# `j` through these same functions. The row pass at row `j` reads only `src[:, j]`, so it parallelizes
-# over `j`; the column pass reads `row_pass[:, jj]` across rows, so it must run as a separate pass
-# after every row's `row_pass` is written, and cannot be fused with it.
 """
     _sepw(g, i, k) -> T
 
-Weight of stencil slot `k` at axis position `i`.
-
-The Gaussian factorizes on ANY rectilinear grid — `exp(-α(Δx²+Δy²)/ℓ²) = Gx(Δx)·Gy(Δy)` needs no
-constant spacing — but on a uniform axis `Gx` depends on the OFFSET alone, while on a stretched one it
-depends on the position too. Both are the same convolution with a different weight table, so the two
-are one code path distinguished by the table's rank: a vector is shared across positions and a matrix
-is `(2·lim+1) × N`, column-major so each position's stencil is contiguous.
+Weight of stencil slot `k` at axis position `i`: `g[k]` for a uniform axis, whose weight depends on
+the offset alone, and `g[i, k]` for a stretched axis's `n × (2·lim+1)` table.
 """
 @inline _sepw(g::AbstractVector, ::Int, k::Int) = @inbounds g[k]
 @inline _sepw(g::AbstractMatrix, i::Int, k::Int) = @inbounds g[i, k]
 
+# Row `j` of the row pass reads only `src[:, j]`. The column pass reads `row_pass` across rows, so it
+# starts after every row is written. The parallel backend extensions call both per `j`.
 @inline function _separable_row_pass_at!(
     row_pass::AbstractMatrix{T}, src::AbstractMatrix{T}, gx::AbstractVecOrMat{T},
     di_lim::Int, periodic_x::Bool, Nx::Int, j::Int,
 ) where {T<:AbstractFloat}
-    # Taps outermost, position innermost. Accumulating one output point at a time makes the inner loop
-    # an FP reduction, which cannot be reassociated and so never vectorizes; this way the inner loop is
-    # a unit-stride axpy over `i` and does. Measured 1.29 → 0.30 ns per weighted add at Nx=512, w=32.
+    # Taps outermost, so each inner loop is a unit-stride axpy over `i` and vectorizes.
     @inbounds begin
         for i in 1:Nx
             row_pass[i, j] = zero(T)
@@ -111,8 +90,7 @@ is `(2·lim+1) × N`, column-major so each position's stencil is contiguous.
         for ddi in (-di_lim):di_lim
             k = ddi + di_lim + 1
             if periodic_x && abs(ddi) < Nx
-                # A wrapped tap is two contiguous runs, each at a CONSTANT offset. Writing it as one
-                # loop over `mod1` costs the vectorization, since the index is then data-dependent.
+                # A wrapped tap is two contiguous runs, each at a constant offset.
                 if ddi >= 0
                     @simd for i in 1:(Nx - ddi)
                         row_pass[i, j] += _sepw(gx, i, k) * src[i + ddi, j]
@@ -147,8 +125,6 @@ end
     dst::AbstractMatrix{T}, row_pass::AbstractMatrix{T}, gy::AbstractVecOrMat{T},
     dj_lim::Int, periodic_y::Bool, Nx::Int, Ny::Int, j::Int,
 ) where {T<:AbstractFloat}
-    # Same inversion as the row pass, and here the weight is constant across `i` — it is indexed by the
-    # output column `j` — so it hoists out of the inner loop entirely.
     @inbounds begin
         for i in 1:Nx
             dst[i, j] = zero(T)
@@ -168,11 +144,8 @@ end
     return nothing
 end
 
-# Row-pass (over axis 1) then column-pass (over axis 2) of `src` into `dst`, using `fp`'s scratch
-# `row_pass` buffer — the single shared primitive both the plan-build-time `invrenorm` computation
-# and every serial `apply_separable!` call use, so they can never drift out of sync with
-# each other. The ThreadedBackend extension calls `_separable_row_pass_at!`/`_separable_column_pass_at!`
-# directly (parallelized over `j`) instead of this serial driver.
+# Row pass over axis 1, then column pass over axis 2, of `src` into `dst` through `fp.row_pass`, which
+# neither may alias. The build of `invrenorm` and the serial apply both run it.
 function _separable_convolve!(dst::AbstractMatrix{T}, src::AbstractMatrix{T}, fp::SeparableFootprint{T}, Nx::Int, Ny::Int) where {T<:AbstractFloat}
     gx, gy = fp.gx, fp.gy
     di_lim, dj_lim = fp.di_lim, fp.dj_lim
@@ -190,26 +163,22 @@ end
 """
     _separable_axis_weights(x, lim, periodic, period, kernel, scale, wfac) -> AbstractVecOrMat
 
-A separable kernel's per-axis weight table: `Kernels.kernel_profile(kernel, Δx, ℓ)` over the stencil,
-in the layout [`_sepw`](@ref) reads. Any kernel with a 1-D profile takes this path — the Gaussian,
-whose radial form happens to factor, and [`Kernels.HighOrderKernel`](@ref), which is separable by
-definition and has no radial form at all.
+A separable kernel's per-axis weight table, `Kernels.profile_cell_average` over the stencil, in the
+layout [`_sepw`](@ref) reads. Serves the Gaussian and [`Kernels.HighOrderKernel`](@ref).
 
-Uniform axis: the displacement is `ddi·Δ` wherever the stencil sits, so one vector serves every
-position. Stretched axis: the displacement depends on the position too, so the table gains a position
-axis, `(2·lim+1) × N`, and the apply stays `O(N·lim)`.
+Uniform axis: the displacement is `ddi·Δ` at every position, so one vector serves them all. Stretched
+axis: an `n × (2·lim+1)` table, one stencil per position, each weight times the neighbour's width.
 
-`lim` comes from the smallest gap on the axis, so on a stretched axis a coarse region's stencil carries
-slots beyond its support; they hold exact zeros, and the inner loop's bounds stay static. A periodic
-displacement carries the image offset, matching the tiling convention the scattered engine uses.
+`lim` comes from the smallest gap on the axis, so on a stretched axis a coarse region's stencil has
+slots past `rad`, holding the kernel's negligible or zero tail. A periodic displacement includes the
+image shift, so each image of a cell counts at its own distance.
 """
 function _separable_axis_weights(
     x::AbstractRange{T}, lim::Int, ::Bool, ::T, kernel::Kernels.AbstractFilterKernel, scale::T,
     ::AbstractVector{T},
 ) where {T<:AbstractFloat}
     Δ = abs(T(step(x)))
-    # `profile_cell_average` is the point sample for every smooth kernel and the exact cell integral
-    # for a discontinuous one — see `Kernels.profile_cell_average`.
+    # The constant cell width cancels in the normalization, so it is left out of the weight.
     return [Kernels.profile_cell_average(kernel, T(ddi) * Δ, Δ, scale) for ddi in -lim:lim]
 end
 
@@ -218,9 +187,8 @@ function _separable_axis_weights(
     kernel::Kernels.AbstractFilterKernel, scale::T, wfac::AbstractVector{T},
 ) where {T<:AbstractFloat}
     n = length(x)
-    # POSITION-major, `(n, 2·lim+1)`: the passes hold a tap fixed and sweep position, so position must
-    # be the contiguous axis or every inner loop gathers with stride `2·lim+1`.
-    # An untouched slot is an exact zero: outside the domain.
+    # Position-major, since the passes sweep position at a fixed tap. A slot left zero lies past a
+    # bounded edge.
     g = zeros(T, n, 2 * lim + 1)
     s = (n > 1 && x[n] < x[1]) ? -one(T) : one(T)   # coordinate direction of increasing index
     @inbounds for i in 1:n, ddi in -lim:lim
@@ -231,162 +199,20 @@ function _separable_axis_weights(
             shift = s * T(fld(ii - 1, n)) * period
             ii = mod1(ii, n)
         end
-        # The NEIGHBOUR's measure factor, so the two passes together weight by `kernel · cell area` —
-        # the same quantity the scattered engine forms as `kernel_weight(d) * area(grid, ii, jj)`.
-        # A rectilinear measure is itself a product of per-axis factors, so it splits over the passes
-        # exactly as the kernel does. On a uniform axis it is a constant that cancels in the
-        # normalization, which is why the vector method above can leave it out.
-        # `wfac[ii]` is the neighbour cell's width, so it doubles as the averaging window: the weight
-        # is the kernel's INTEGRAL over that cell, not its value at the node. Identical to the point
-        # sample for a smooth kernel (`profile_cell_average`'s default), and the difference between
-        # working and not for a discontinuous one on a stretched axis.
+        # The kernel averaged over neighbour cell `ii`, times its width `wfac[ii]`: the two passes
+        # together weight by `kernel · cell area`, a rectilinear measure being a product of widths.
         g[i, ddi + lim + 1] =
             Kernels.profile_cell_average(kernel, x[ii] + shift - x[i], wfac[ii], scale) * wfac[ii]
     end
     return g
 end
 
-# ---------------------------------------------------------------------------
-# HighOrderKernel on a grid: weights that carry its vanishing moments.
-#
-# On a grid the filter is the sum `Σₖ wₖ f(x + sₖ)` over the stencil's cells, `sₖ` a cell's node
-# displacement, so its order is set by the moments `Σₖ wₖ sₖⁿ`. The kernel's cell integrals `w̃ₖ` zero
-# `∫ G(s) sⁿ ds`, which that sum matches only as `Δ → 0`. The weights are the least change to `w̃`, over
-# the cells the support touches, that gives `Σₖ wₖ sₖⁿ = δₙ₀ Σₖ w̃ₖ` for `n = 0…P`:
-#
-#     w = w̃ + Vᵀλ,   (VVᵀ) λ = t − V w̃,   Vₙₖ = (sₖ/ℓ)ⁿ,   t = (Σₖ w̃ₖ, 0, …, 0).
-#
-# The identity filter meets these conditions, so they always have a solution; where too few cells make
-# `VVᵀ` singular (`ℓ` within a few cells) the minimum-norm one is taken. The stencil is continued past a
-# bounded edge at the edge gap, as `ZeroFill` continues the lattice.
-# ---------------------------------------------------------------------------
-
-# Node displacements and widths of the stencil's cells about position `i`, into `ss` and `wcs`: wrapped
-# across a periodic seam, continued at the edge gap past a bounded edge.
-function _stencil_cells!(
-    ss::AbstractVector{T}, wcs::AbstractVector{T}, x::AbstractVector{T}, i::Int, lim::Int,
-    periodic::Bool, period::T, wfac::AbstractVector{T},
-) where {T<:AbstractFloat}
-    n = length(x)
-    sgn = (n > 1 && x[n] < x[1]) ? -one(T) : one(T)
-    for ddi in -lim:lim
-        k = ddi + lim + 1
-        ii = i + ddi
-        if 1 <= ii <= n
-            ss[k], wcs[k] = T(x[ii]) - T(x[i]), wfac[ii]
-        elseif periodic
-            jj = mod1(ii, n)
-            ss[k], wcs[k] = T(x[jj]) + sgn * T(fld(ii - 1, n)) * period - T(x[i]), wfac[jj]
-        else
-            gap = ii < 1 ? T(x[2] - x[1]) : T(x[n] - x[n - 1])
-            xe = ii < 1 ? T(x[1]) + (ii - 1) * gap : T(x[n]) + (ii - n) * gap
-            ss[k], wcs[k] = xe - T(x[i]), abs(gap)
-        end
-    end
-    return ss, wcs
-end
-
-# `(1, q, q², …, q^(M−1))`.
-@inline function _moment_powers(q::T, ::Val{M}) where {T, M}
-    return SA.SVector{M, T}(ntuple(Val(M)) do n
-        p = one(T)
-        for _ in 2:n
-            p *= q
-        end
-        p
-    end)
-end
-
-# The kernel's cell integrals `w` over the cells `(ss, wcs)`, corrected in place to the weights above.
-function _highorder_correct!(
-    w::AbstractVector{T}, k::Kernels.HighOrderKernel{P}, ss::AbstractVector{T}, wcs::AbstractVector{T},
-    ℓ::T,
-) where {P, T<:AbstractFloat}
-    M = Val(P + 1)
-    R = Kernels.kernel_radius(k, ℓ)
-    G = zero(SA.SMatrix{P + 1, P + 1, T})
-    r = zero(SA.SVector{P + 1, T})
-    m₀ = zero(T)
-    for t in eachindex(w)
-        m₀ += w[t]
-        abs(ss[t]) - wcs[t] / T(2) < R || continue
-        v = _moment_powers(ss[t] / ℓ, M)
-        G += v * v'
-        r -= w[t] * v
-    end
-    e₁ = _moment_powers(zero(T), M)
-    r += m₀ * e₁
-    λ = try
-        G \ r
-    catch err
-        err isa LinearAlgebra.SingularException || rethrow()
-        LinearAlgebra.pinv(G) * r
-    end
-    moments = -m₀ * e₁
-    for t in eachindex(w)
-        abs(ss[t]) - wcs[t] / T(2) < R || continue
-        v = _moment_powers(ss[t] / ℓ, M)
-        w[t] += LinearAlgebra.dot(λ, v)
-        moments += w[t] * v
-    end
-    maximum(abs, moments) <= sqrt(eps(T)) * sum(abs, w) || _no_highorder_weights(k, ℓ)
-    return w
-end
-
-@noinline _no_highorder_weights(::Kernels.HighOrderKernel{P}, ℓ) where {P} = throw(ArgumentError(
-    "HighOrderKernel{$P} at ℓ = $ℓ: the weights on this axis's cells did not reach $P vanishing moments",
-))
-
-# Position `i`'s weights over its stencil cells, those continued past a bounded edge included.
-function _highorder_cell_weights!(
-    w::AbstractVector{T}, ss::AbstractVector{T}, wcs::AbstractVector{T}, x::AbstractVector{T}, i::Int,
-    lim::Int, periodic::Bool, period::T, kernel::Kernels.HighOrderKernel, scale::T,
-    wfac::AbstractVector{T},
-) where {T<:AbstractFloat}
-    _stencil_cells!(ss, wcs, x, i, lim, periodic, period, wfac)
-    for t in eachindex(w)
-        w[t] = Kernels.profile_cell_average(kernel, ss[t], wcs[t], scale) * wcs[t]
-    end
-    return _highorder_correct!(w, kernel, ss, wcs, scale)
-end
-
-function _separable_axis_weights(
-    x::AbstractRange{T}, lim::Int, ::Bool, ::T, kernel::Kernels.HighOrderKernel, scale::T,
-    ::AbstractVector{T},
-) where {T<:AbstractFloat}
-    Δ = abs(T(step(x)))
-    ss = [T(d) * Δ for d in -lim:lim]
-    wcs = fill(Δ, 2lim + 1)
-    w = [Kernels.profile_cell_average(kernel, s, Δ, scale) for s in ss]
-    return _highorder_correct!(w, kernel, ss, wcs, scale)
-end
-
-function _separable_axis_weights(
-    x::AbstractVector{T}, lim::Int, periodic::Bool, period::T,
-    kernel::Kernels.HighOrderKernel, scale::T, wfac::AbstractVector{T},
-) where {T<:AbstractFloat}
-    n = length(x)
-    g = zeros(T, n, 2lim + 1)
-    w = Vector{T}(undef, 2lim + 1)
-    ss = Vector{T}(undef, 2lim + 1)
-    wcs = Vector{T}(undef, 2lim + 1)
-    for i in 1:n
-        _highorder_cell_weights!(w, ss, wcs, x, i, lim, periodic, period, kernel, scale, wfac)
-        for ddi in -lim:lim
-            (1 <= i + ddi <= n || periodic) || continue   # past a bounded edge: an exact zero, as for every kernel
-            g[i, ddi + lim + 1] = w[ddi + lim + 1]
-        end
-    end
-    return g
-end
-
 """
-    _build_separable_footprint(grid, kernel::GaussianKernel, scale; mask_strategy=ZeroFill(), kwargs...) -> SeparableFootprint
+    _build_separable_footprint(grid, kernel::SeparableKernel, scale; mask_strategy=ZeroFill(), scratch=nothing, kwargs...) -> SeparableFootprint
 
-Build the per-axis weight tables, the mask-dependent normalization data for `mask_strategy`, and the
-preallocated scratch buffers for the separable path. `kwargs...` absorbs (and ignores)
-`cache_strategy`/`cache_byte_budget` — there is no per-point neighbour list to cache here at all, so
-those knobs (which only govern the scattered path) don't apply.
+Build the per-axis weight tables, the denominator for `mask_strategy`, and the pass buffers of the
+separable engine. A given `scratch`, a `SeparableScratch`, supplies the buffers. `kwargs...`
+absorbs and ignores `cache_strategy`/`cache_byte_budget`.
 """
 function _build_separable_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
@@ -398,17 +224,13 @@ function _build_separable_footprint(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     rad = Kernels.kernel_radius(kernel, scale)
-    # The smallest gap on each axis, so the stencil never under-covers: a coarser region's slots then
-    # hold exact zeros rather than missing neighbours.
+    # Stencil half-widths from the smallest gap on each axis, so the stencil covers `rad` everywhere.
     dx = FlowGeometries.Grids.minimum_spacing(grid, 1)
     dy = FlowGeometries.Grids.minimum_spacing(grid, 2)
     di_lim = (isfinite(dx) && dx > 0) ? ceil(Int, rad / dx) : 0
     dj_lim = (isfinite(dy) && dy > 0) ? ceil(Int, rad / dy) : 0
     periodic_x = FlowGeometries.Grids.isperiodic(grid, 1)
     periodic_y = FlowGeometries.Grids.isperiodic(grid, 2)
-    # The cell measure enters the weights, so the two passes together form `kernel · area` — the same
-    # product the scattered engine builds per candidate. A rectilinear measure is separable by
-    # construction, so it splits over the passes; anything else cannot take this path at all.
     mf = FlowGeometries.Grids.measure_factors(grid)
     mf === nothing && throw(ArgumentError(
         "the separable path needs a separable cell measure, but this grid's measure is dense",
@@ -422,8 +244,6 @@ function _build_separable_footprint(
         T(FlowGeometries.Grids.period(grid, 2)), kernel, scale, convert(AbstractVector{T}, mf[2]),
     )
 
-    # Both pass buffers are sized by the grid alone, so a sweep hands in one set for every scale
-    # instead of each scale owning its own pair.
     sc = scratch === nothing ? _separable_scratch(grid) : scratch
     masked_input = sc.masked_input
     row_pass = sc.row_pass
@@ -447,8 +267,7 @@ function _build_separable_footprint(
             mask_strategy, !fully_active, bound, masked_input, row_pass,
         )
     else
-        # Deformable: precompute invrenorm = 1/separable_convolve(Float.(mask)) ONCE — the mask never
-        # changes across repeated `filter_apply!` calls on a fixed plan.
+        # Deformable on a masked grid: `invrenorm = 1 / (two-pass convolution of the mask)`.
         maskf = T.(FlowGeometries.Grids.mask(grid))
         denom = zeros(T, Nx, Ny)
         _separable_convolve!(denom, maskf, fp_partial, Nx, Ny)
@@ -489,29 +308,6 @@ function _separable_profile(
     return profile
 end
 
-# On a stretched axis a position's weights, continued cells included, come from one correction, so a
-# position whose stencil leaves a bounded axis sums those directly; elsewhere its row of the table is
-# the whole stencil, with exact zeros past a bounded edge.
-function _separable_profile(
-    x::AbstractVector, lim::Int, g::AbstractMatrix{T}, periodic::Bool,
-    kernel::Kernels.HighOrderKernel, scale::T, wfac::AbstractVector{T}, exterior::Bool,
-) where {T<:AbstractFloat}
-    N = length(x)
-    profile = zeros(T, N)
-    w = Vector{T}(undef, 2lim + 1)
-    ss = Vector{T}(undef, 2lim + 1)
-    wcs = Vector{T}(undef, 2lim + 1)
-    @inbounds for i in 1:N
-        if exterior && !periodic && (i - lim < 1 || i + lim > N)
-            _highorder_cell_weights!(w, ss, wcs, x, i, lim, false, zero(T), kernel, scale, wfac)
-            profile[i] = sum(w)
-        else
-            profile[i] = sum(view(g, i, :))
-        end
-    end
-    return profile
-end
-
 # A uniform axis's weight depends on the offset alone. A stretched axis continues at its edge gap, and
 # the cell there carries the weight `_separable_axis_weights` gives a cell of that width.
 @inline _separable_exterior_weight(g::AbstractVector, _, _, _, k::Int, _, _) = @inbounds g[k]
@@ -529,9 +325,9 @@ end
 """
     apply_separable!(out, field, grid, fp::SeparableFootprint, strategy) -> out
 
-Apply the separable fast path: `masked_input = mask .* field` (the SAME numerator input for
-both mask strategies — see the struct docstring), one shared row-pass/column-pass convolution, then
-divide by whichever mask-strategy-specific denominator `fp` holds.
+Filter `field` into `out`: the two-pass convolution of `mask .* field`, normalized by the denominator
+`fp` holds. Where the strategies normalize differently (`fp.bound`), `strategy` must be the one `fp`
+was built for, or this throws an `ArgumentError`.
 """
 function apply_separable!(
     out::AbstractMatrix{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid, fp::SeparableFootprint{T}, strategy::AbstractMaskStrategy,
@@ -555,17 +351,15 @@ end
     ))
 end
 
-# The denominator is fixed at build time — rank-1 profiles, or a dense `invrenorm` for Deformable on a
-# masked grid — so where the strategies differ (`fp.bound`) the apply accepts only the one it was built
-# for.
+# The denominator is fixed at build time, so where the strategies differ (`fp.bound`) only the one `fp`
+# was built for may apply.
 @inline function _separable_check_strategy(fp::SeparableFootprint, strategy::AbstractMaskStrategy)
     (!fp.bound || typeof(strategy) === typeof(fp.strategy)) || _separable_strategy_mismatch()
     return nothing
 end
 
-# Shared denominator-normalize epilogue, used identically by the serial path above and the
-# ThreadedBackend extension's parallel-row-pass/column-pass path. `Deformable` on a masked grid zeroes
-# an inactive target; `ZeroFill` keeps its value, the filter of the zero-extended field there.
+# `Deformable` on a masked grid zeroes an inactive target; `ZeroFill` keeps its value, the filter of the
+# zero-extended field there.
 function _separable_normalize_and_mask!(
     out::AbstractMatrix{T}, fp::SeparableFootprint{T}, mask::AbstractMatrix{Bool}, Nx::Int, Ny::Int,
 ) where {T<:AbstractFloat}
@@ -584,14 +378,14 @@ function _separable_normalize_and_mask!(
 end
 
 """
-    build_footprint(grid::StructuredGrid{T,Cartesian,2,S,TP,<:Tuple{AbstractRange,AbstractRange}}, kernel::GaussianKernel, scale; kwargs...) -> SeparableFootprint
+    build_footprint(grid::StructuredGrid{T,<:CartesianGeometry,2,S,TP,<:Tuple{AbstractRange,AbstractVector}}, kernel::SeparableKernel, scale; kwargs...) -> SeparableFootprint
 
-Fast path for a `GaussianKernel` on a uniform (`Range`-axis) Cartesian grid — see the "Separable
-Gaussian fast path" section above. More specific than the generic Range-axis method (constrained on
-kernel type too), so Julia picks this one whenever `kernel isa GaussianKernel`.
+The separable engine on a Cartesian grid whose axis 1 is a `Range`. More specific than both the banded
+method for that axis pair and the separable method for any axes, so a separable kernel there takes the
+two-pass engine.
 """
 function build_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2,S,TP,<:Tuple{AbstractRange,AbstractRange}},
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2,S,TP,<:Tuple{AbstractRange{T},AbstractVector{T}}},
     kernel::SeparableKernel,
     scale::T;
     kwargs...,
@@ -600,16 +394,11 @@ function build_footprint(
 end
 
 """
-    build_footprint(grid::StructuredGrid{T,Cartesian,2}, kernel::GaussianKernel, scale; kwargs...) -> SeparableFootprint
+    build_footprint(grid::StructuredGrid{T,<:CartesianGeometry,2}, kernel::SeparableKernel, scale; kwargs...) -> SeparableFootprint
 
-Separability does not require constant spacing: `exp(-α(Δx²+Δy²)/ℓ²)` factorizes on any rectilinear
-grid, and a stretched axis only makes the per-axis weight depend on position as well as offset — see
-`_separable_axis_weights`. So a stretched Cartesian grid gets the same two-pass `O(N·(wx+wy))`
-convolution rather than falling to the `O(N·wx·wy)` scattered engine, which for a Gaussian at `w = 20`
-is a factor `(2w+1)/2` in operations and a much larger one in per-operation cost.
-
-The Range-axis method above is strictly more specific and resolves what would otherwise be an
-ambiguity with the generic Range-axis method; both build the same footprint.
+The separable two-pass engine, `O(N·(wx+wy))`, on any rectilinear Cartesian grid: a stretched axis
+gets a per-position weight table (see `_separable_axis_weights`). Keywords as for
+`_build_separable_footprint`.
 """
 function build_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
@@ -624,7 +413,7 @@ end
     apply_footprint!(out, field, grid, fp, strategy, periodic_x, periodic_y)
 
 Convolve `field` with a precomputed `fp` into `out`, applying the mask `strategy`. `out` and
-`field` are 2D (a single layer). The masking branch specializes on the strategy type.
+`field` are 2D (a single layer). Periodicity comes from `fp`; `periodic_x`/`periodic_y` are unused.
 """
 function apply_footprint!(
     out::AbstractMatrix{T},
@@ -644,9 +433,8 @@ function apply_footprint!(
     return out
 end
 
-# A plan's `invden` was accumulated under one mask strategy. `ZeroFill` divides by the kernel's full
-# mass and `Deformable` by the mass of the active in-domain taps: one number where every cell is active
-# and no window leaves the grid, which is when `fp.bound` is false and either strategy may apply.
+# `ZeroFill` divides by the kernel's full mass and `Deformable` by the mass of the active in-domain taps.
+# The two agree when every cell is active and no window leaves the grid, which is when `fp.bound` is false.
 @noinline function _banded_strategy_mismatch()
     throw(ArgumentError(
         "FilterFootprint is being applied with a different mask strategy than it was built for, on a " *
@@ -663,10 +451,10 @@ end
 end
 
 """
-    _banded_source(fp, field) -> src
+    _banded_source(fp, field, slot = 1) -> src
 
-The array the tap loop actually convolves: `mask · field` on a masked grid, and the caller's array
-itself when there is nothing masked out, since the copy would then be pure cost.
+The array the tap loop convolves: on a masked grid the scratch slot `slot`, which `_banded_fill_source!`
+must have filled with `mask · field`; otherwise `field` itself.
 """
 @inline _banded_source(fp::FilterFootprint, field::AbstractMatrix, slot::Int = 1) =
     fp.masked ? @inbounds(fp.scratch.masked_inputs[slot]) : field
@@ -686,15 +474,12 @@ end
 
 """
     prepare_row_apply!(fp, field, grid) -> nothing
-    prepare_row_apply!(fp, fields, grid) -> nothing
+    prepare_row_apply_batch!(fp, fields, grid) -> nothing
 
-Whole-grid work an engine needs done ONCE before any of its per-row applies run.
-
-Every parallel backend decomposes over rows and calls `apply_footprint_row!` /
-`apply_footprint_row_batch!` directly rather than going through the whole-grid entry point, so
-anything that is not per-row has to be hoisted here or it is silently skipped on those paths. The
-banded engine needs its `mask · field` source materialized; the other engines need nothing, and get
-the no-op fallback.
+Whole-grid work an engine needs done once before any of its per-row applies run: the banded engine
+materializes its `mask · field` source, one slot per field for the batch form; the other engines need
+nothing. A row-parallel backend calls `apply_footprint_row!` / `apply_footprint_row_batch!` directly,
+so it must call this first.
 
 Call it before opening a parallel region, never inside one: it writes the whole buffer.
 """
@@ -723,12 +508,8 @@ end
     apply_footprint_row!(out, field, grid, fp, strategy, periodic_x, periodic_y, j)
 
 Fill output row `j` (`out[:, j]`) from a precomputed footprint, as one contiguous axpy per tap
-normalized by the plan's `invden`. Rows are independent (each writes a disjoint column of the
-column-major output), so this is the unit of parallelism for the threaded / distributed backends.
-
-The whole row is written, including the columns within one filter radius of an axis-1 edge and every
-column of a masked grid: a tap reaching past an edge contributes over the in-range part of the row,
-and `invden` holds the matching mass.
+scaled by the plan's `invden`. Writes every entry of `out[:, j]` and nothing else, so rows may run
+concurrently once `prepare_row_apply!` has run.
 """
 function apply_footprint_row!(
     out::AbstractMatrix{T},
@@ -741,16 +522,15 @@ function apply_footprint_row!(
     j::Integer,
 ) where {T<:AbstractFloat}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    b = _banded_band(fp.nbands, j)
     oc = view(out, :, j)
     @inbounds @simd for i in 1:Nx
         oc[i] = zero(T)
     end
     _banded_row_accumulate!(
-        oc, _banded_source(fp, field), fp.di, fp.dj, fp.w, fp.ptr[b], fp.ptr[b + 1] - 1,
+        oc, _banded_source(fp, field), fp.taps, _banded_band(fp.nbands, j),
         fp.periodic_x, fp.periodic_y, Nx, Ny, j,
     )
-    # `invden` carries the target test, so no branch is needed here.
+    # `invden` is zero at a target the strategy skips.
     invden = fp.invden
     @inbounds @simd for i in 1:Nx
         oc[i] *= invden[i, j]
@@ -761,9 +541,8 @@ end
 """
     apply_footprint!(out, field, grid, fp::ScatteredFilterPlan, strategy, periodic_x, periodic_y)
 
-Whole-grid convolve using a [`ScatteredFilterPlan`](@ref) (the nonuniform-axis/curvilinear fallback).
-`periodic_x`/`periodic_y` are accepted only for a uniform call signature with the `FilterFootprint`
-method above — periodicity for this footprint kind lives in `fp` itself, not these arguments.
+Whole-grid convolve using a [`ScatteredFilterPlan`](@ref), the engine for nonuniform-axis and
+curvilinear grids. Periodicity comes from `fp`; `periodic_x`/`periodic_y` are unused.
 """
 function apply_footprint!(
     out::AbstractMatrix{T},
@@ -786,12 +565,9 @@ end
     apply_footprint_row!(out, field, grid, fp::ScatteredFilterPlan, strategy, periodic_x, periodic_y, j)
 
 Fill output row `j` from a [`ScatteredFilterPlan`](@ref): if `fp.cache !== nothing`, read the
-precomputed per-point neighbour list (absolute `(ii,jj)` indices, periodic wrap already resolved at
-build time); otherwise recompute each point's neighbours/weights on the fly from `fp`'s compact
-scalar metadata. Both branches enumerate candidates through `_scattered_foldl`, so they are
-bit-identical by construction rather than by convention. The accumulator is threaded through the
-fold's return value rather than captured and mutated, which is what keeps the streaming branch free
-of per-iteration allocation (verified by `@allocated` tests) without a second copy of the loop.
+precomputed per-point neighbour list (absolute `(ii,jj)` indices, periodic wrap resolved at build
+time); otherwise recompute each point's neighbours and weights through the grid's ball query, the
+enumeration the cache was built from. A target the strategy skips is left unwritten.
 """
 function apply_footprint_row!(
     out::AbstractMatrix{T},
@@ -803,7 +579,7 @@ function apply_footprint_row!(
     periodic_y::Bool,
     j::Integer,
 ) where {T<:AbstractFloat}
-    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
+    Nx = FlowGeometries.Grids.size_tuple(grid)[1]
     cache = fp.cache
     zerofill = strategy isa ZeroFill
     if cache !== nothing
@@ -832,32 +608,24 @@ function apply_footprint_row!(
             out[i, j] = _normalized(weighted_sum, weight_norm)
         end
     else
-        kernel = fp.kernel
-        scale = fp.scale
-        dim = _kernel_dim(grid)
-        di_lim, dj_lim = fp.di_lim, fp.dj_lim
-        fp_periodic_x, fp_periodic_y = fp.periodic_x, fp.periodic_y
-        x_period, y_period = fp.x_period, fp.y_period
-        is_cartesian = fp.is_cartesian
-        rad = fp.rad
-        # One candidate buffer for the row, not one per point: an indexed query fills it, and each row
-        # is its own task under a row-parallel backend, so nothing is shared across tasks.
-        sc = FlowGeometries.Connectivity.ball_scratch()
+        rule = fp.weights
+        # The query's candidate buffer, one per call, so concurrent rows never share one.
+        sc = FlowGeometries.Connectivity.ball_scratch(fp.topology)
         for i in 1:Nx
             _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
-            target = FlowGeometries.Grids.coords(SA.SVector, grid, i, j)
-            weighted_sum, weight_norm = _scattered_foldl(
-                (zero(T), zero(T)), grid, target, i, j, Nx, Ny, di_lim, dj_lim,
-                fp_periodic_x, fp_periodic_y, x_period, y_period, is_cartesian, rad, fp.topology, sc,
-            ) do acc, iin, jjn, d
+            t = i + (j - 1) * Nx
+            I = (Int(i), Int(j))
+            weighted_sum, weight_norm = _ball_fold(
+                (zero(T), zero(T)), grid, I[1], I[2], fp.rad, fp.is_cartesian, fp.topology, sc,
+            ) do acc, J, d
                 ws, wn = acc
-                active = FlowGeometries.Grids.isactive(grid, iin, jjn)
-                w = Kernels.kernel_weight(kernel, d, scale, dim) * FlowGeometries.Grids.area(grid, iin, jjn)
+                active = FlowGeometries.Grids.isactive(grid, J[1], J[2])
+                w = last(_cell_weight(rule, grid, t, I, J, d))
                 if zerofill
-                    return (active ? ws + w * field[iin, jjn] : ws, wn + w)
+                    return (active ? ws + w * field[J[1], J[2]] : ws, wn + w)
                 else
                     active || return acc
-                    return (ws + w * field[iin, jjn], wn + w)
+                    return (ws + w * field[J[1], J[2]], wn + w)
                 end
             end
             zerofill && (weight_norm = _add_exterior(weight_norm, fp.exterior, i, j))

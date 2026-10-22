@@ -1,19 +1,12 @@
 # ---------------------------------------------------------------------------
-# General N-dimensional engine (1D + 3D Cartesian); the 2D path uses the per-row engine above.
+# N-dimensional engines for 1-D and 3-D Cartesian grids
 # ---------------------------------------------------------------------------
 
-# One shared offset set for the whole grid, so it needs both uniform spacing (`AbstractRange` axes) and
-# a position-independent metric. A spherical metric is position-dependent — arc length varies with
-# latitude, and in 3D with radius — so a spherical 1D/3D grid takes the general path below.
 """
     SeparableFootprintND{N,T}
 
-A separable kernel in `N` dimensions: one weight table per axis, applied as `N` successive 1-D
-passes.
-
-This is the same factorization the 2-D path uses, and the reason it matters grows with `N`. A
-`FilterFootprintND` enumerates the whole `∏(2wᵈ+1)` box per point; `N` passes cost `∑(2wᵈ+1)`. At
-`w = 20` in 3-D that is 68,921 multiply-adds per point against 123.
+A separable kernel in `N` dimensions: one weight table per axis, applied as `N` successive 1-D passes,
+`∑(2wᵈ+1)` multiply-adds per point.
 
 Weight tables follow [`_sepw`](@ref): a vector where the axis is uniform, an `Nᵈ × (2wᵈ+1)` matrix where
 it is stretched.
@@ -30,7 +23,7 @@ struct SeparableFootprintND{
     lim::NTuple{N,Int}
     periodic::NTuple{N,Bool}
     profiles::PVT      # rank-1 denominator, one factor per axis
-    invrenorm::IAT     # dense Deformable denominator on a masked grid, or nothing
+    invrenorm::IAT     # dense reciprocal Deformable denominator on a masked grid, or nothing
     strategy::MS       # the strategy the denominator was built for
     masked::Bool
     bound::Bool        # the strategies' denominators differ: a cell is inactive or a window leaves the grid
@@ -41,9 +34,9 @@ end
 """
     _sep_serial(f, indices)
 
-The default pass driver: apply `f` to every index in order. Every output point of a pass is
-independent, so a backend can substitute a parallel driver of the same shape and get a bit-identical
-result — only the barrier BETWEEN passes is required.
+The default pass driver: apply `f` to every index in order. A substitute driver may call `f` on the
+indices in any order or concurrently, and must return once every call has completed; each call writes
+its own outputs, so the result is bit-identical.
 """
 @inline function _sep_serial(f::F, indices) where {F}
     for I in indices
@@ -52,19 +45,25 @@ result — only the barrier BETWEEN passes is required.
     return nothing
 end
 
+"""
+    _drive_pass!(f, driver, indices, dst)
+    _drive_pointwise!(f, driver, indices)
+
+A separable pass's sweep under `driver`, `f(I)` writing line `I` of `dst`, and the normalization's
+pointwise sweep, which reads and writes its output in place. Both call `driver(f, indices)`; a driver
+that divides a pass among processes defines its own methods, assembling `dst` on each.
+"""
+@inline _drive_pass!(f::F, driver::D, indices, _dst) where {F,D} = driver(f, indices)
+@inline _drive_pointwise!(f::F, driver::D, indices) where {F,D} = driver(f, indices)
+
 @inline function _separable_pass!(
     dst::AbstractArray{T,N}, src::AbstractArray{T,N}, g::AbstractVecOrMat{T},
     lim::Int, periodic::Bool, dims::NTuple{N,Int}, ::Val{d}, driver::D,
 ) where {T<:AbstractFloat, N, d, D}
     n = dims[d]
-    # Driven over COLUMNS, not points: taps move to the outer loop so the inner loop always walks
-    # dimension 1 with unit stride, whichever axis the pass is along. A per-point form cannot do this —
-    # for `d ≥ 2` it strides by `∏dims[1:d-1]` on every tap. Each column is written by exactly one task,
-    # so this is as race-free as a per-point form and every backend gets the same answer.
-    #
-    # Rank 1 needs no separate branch: `Base.tail((n,))` is `()` and `CartesianIndices(())` holds one
-    # 0-dimensional index, so the column pass runs once over the whole vector.
-    driver(CartesianIndices(Base.tail(dims))) do J
+    # One driver call per dimension-1 line, which that call alone writes. On rank 1 `CartesianIndices(())`
+    # holds one index, so the column pass runs once over the whole vector.
+    _drive_pass!(driver, CartesianIndices(Base.tail(dims)), dst) do J
         if d == 1
             _separable_col_pass!(dst, src, g, lim, periodic, dims[1], Tuple(J))
         else
@@ -74,8 +73,8 @@ end
     return dst
 end
 
-# One line along dimension `d > 1`. The weight is indexed by the OUTPUT position along `d`, which is
-# fixed for this line, so it hoists out of the inner loop entirely and each tap is a plain axpy.
+# The pass along dimension `d > 1` into the dimension-1 line at `J`. The weight depends on the output
+# position `J[d-1]` along `d`, constant over the line, so each tap is an axpy.
 @inline function _separable_slab_pass!(
     dst::AbstractArray{T}, src::AbstractArray{T}, g::AbstractVecOrMat{T},
     lim::Int, periodic::Bool, n::Int, n1::Int, J::Tuple, ::Val{d},
@@ -145,13 +144,9 @@ end
     return nothing
 end
 
-# The passes, unrolled by recursion on `Val(d)`. Buffers alternate and the last pass writes `dst`, so
-# nothing aliases: pass 1 reads the caller's masked input and writes `scratch`, and every later pass
-# reads what its predecessor just wrote. `masked_input` is free to be reused from pass 2 on.
-# The two alternating intermediates are passed IN rather than taken from the footprint, because a batched
-# apply needs batch-sized ones and the footprint's are sized for a single slice. `dims` is the driven
-# array's shape, so trailing batch axes ride along; `Val(N)` is the number of PASSES, which stays at the
-# grid's rank so no pass ever differences along a batch axis.
+# Passes `d…N`, unrolled by recursion on `Val(d)`: pass `d < N` writes `b1` for odd `d` and `b2` for even
+# `d`, and pass `N` writes `dst`. `src` may alias `b2`; `dst` aliases neither buffer. `dims` is the driven
+# shape, trailing batch axes included, and `N` is the grid's rank, the number of passes.
 @inline _sep_pass_chain!(dst, src, fp, dims, ::Val{N}, ::Val{N}, driver::D, b1, b2) where {N,D} =
     _separable_pass!(dst, src, fp.g[N], fp.lim[N], fp.periodic[N], dims, Val(N), driver)
 
@@ -232,14 +227,13 @@ end
 """
     apply_separable_nd!(out, field, grid, fp, strategy, driver = _sep_serial)
 
-Run the `N` separable passes and the pointwise normalization. `driver` supplies the per-pass index
-sweep — see [`_sep_serial`](@ref); a threaded backend passes its own and gets the same answer, since
-every point within a pass is independent and the passes themselves stay ordered.
+Filter `field` into `out`: the `R` separable passes, then the pointwise normalization. `driver` runs
+each pass's index sweep under [`_sep_serial`](@ref)'s contract. `strategy` must match the footprint's
+wherever the two strategies' denominators differ (`fp.bound`).
 
-`out` and `field` may carry trailing batch axes beyond the grid's rank `R`: each pass is driven over the
-array's shape, so a whole batch is one pass (one launch on a device), and the pass count stays `R`. The
-profile tables, the renormalization array and the mask are spatial, indexed by the leading `R`
-components of the driven index.
+`out` and `field` may carry trailing batch axes beyond the grid's rank `R`; each pass covers the whole
+batch. The profiles, the renormalization array and the mask are indexed by the leading `R` components
+of the driven index.
 """
 function apply_separable_nd!(
     out::AbstractArray{T}, field::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid,
@@ -253,7 +247,7 @@ function apply_separable_nd!(
     _sep_pass_chain!(out, b2, fp, dims, Val(R), Val(1), driver, b1, b2)
     prof = fp.profiles
     inv = fp.invrenorm
-    driver(CartesianIndices(dims)) do I
+    _drive_pointwise!(driver, CartesianIndices(dims)) do I
         @inbounds begin
             Is = CartesianIndex(ntuple(d -> I[d], Val(R)))
             if inv === nothing
@@ -267,17 +261,13 @@ function apply_separable_nd!(
     return out
 end
 
-# The footprint's own pass buffers when the apply is unbatched; batch-sized ones otherwise, since the
-# chain's intermediates must match the driven shape.
+# The footprint's own pass buffers for an unbatched apply, fresh batch-sized ones otherwise.
 @inline function _sep_nd_buffers(fp, out::AbstractArray{T}, ::Val{R}) where {T,R}
     ndims(out) == R && return (fp.scratch, fp.masked_input)
     return (similar(out), similar(out))
 end
 
-# A Gaussian on a 1-D or true-3-D Cartesian grid is separable exactly as it is in 2-D, so it takes the
-# `N`-pass engine rather than `FilterFootprintND`'s full-box enumeration. More specific than the
-# generic-kernel methods below (constrained on the kernel too), and unconstrained in the axis types
-# because separability does not require uniform spacing — see `_separable_axis_weights`.
+# A `SeparableKernel` on a 1-D or 3-D Cartesian grid of any spacing takes the `N`-pass engine.
 build_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,1},
     kernel::SeparableKernel, scale::T; kwargs...,
@@ -290,10 +280,8 @@ build_footprint(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
     _build_separable_nd(grid, kernel, scale; kwargs...)
 
-# Range axes AND a Gaussian is more specific than either of the two methods that would otherwise both
-# apply (kernel-specific with free axes, axis-specific with a free kernel), so these resolve that pair.
-# They route to the separable engine as well: uniform spacing makes the weight tables vectors instead
-# of matrices, not a different algorithm.
+# `Range` axes with a `SeparableKernel` match both the methods above and those below; these resolve the
+# ambiguity, to the separable engine.
 build_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,1,S,TP,<:Tuple{AbstractRange}},
     kernel::SeparableKernel, scale::T; kwargs...,

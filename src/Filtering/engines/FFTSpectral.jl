@@ -14,7 +14,6 @@ function _fft_layout(grid::FlowGeometries.Grids.StructuredGrid{T}) where {T<:Abs
     Nx, Ny = size(FlowGeometries.Grids.mask(grid))
     px = FlowGeometries.Grids.isperiodic(grid, 1)
     py = FlowGeometries.Grids.isperiodic(grid, 2)
-    # A periodic axis's spacing is its period over its length; a bounded one's is its step.
     dx = px ? T(FlowGeometries.Grids.period(grid, 1)) / Nx : abs(T(FlowGeometries.Grids.spacing(grid, 1)))
     dy = py ? T(FlowGeometries.Grids.period(grid, 2)) / Ny : abs(T(FlowGeometries.Grids.spacing(grid, 2)))
     Px = px ? Nx : 2 * nextprod((2, 3, 5), Nx)
@@ -25,7 +24,7 @@ function _fft_layout(grid::FlowGeometries.Grids.StructuredGrid{T}) where {T<:Abs
 end
 
 """
-    distributed_fft_grid_plan(grid; backend::DistributedBackend, batch) -> AbstractGridPlan
+    distributed_fft_grid_plan(grid; execution::DistributedBackend, batch) -> AbstractGridPlan
     distributed_fft_filter_plan(grid_plan, kernel, scale, mask_strategy) -> AbstractFilterPlan
 
 An FFT spectral plan whose two-direction transform is divided among the worker processes: each worker
