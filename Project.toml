@@ -9,12 +9,14 @@ projects = ["test", "docs"]
 [sources]
 ComputationalBackends = { url = "https://github.com/jbphyswx/ComputationalBackends.jl" }
 FlowGeometries = { url = "https://github.com/jbphyswx/FlowGeometries.jl" }
+FlowTransformBindings = { url = "https://github.com/jbphyswx/FlowTransformBindings.jl.git" }
 NUFSHT = { url = "https://github.com/jbphyswx/NUFSHT.jl" }
 SpectralBackends = { url = "https://github.com/jbphyswx/SpectralBackends.jl" }
 
 [deps]
 ComputationalBackends = "5c6e2104-4040-447f-8fc0-66ec2223b019"
 FlowGeometries = "0ccd6995-f618-4175-b01e-f437d0cb4974"
+FlowTransformBindings = "73c6b5d6-1010-4337-8b9e-d550f02c124c"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 SpectralBackends = "289ded02-b044-41b2-8b2d-71f2a47755d1"
@@ -24,7 +26,6 @@ StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
-FINUFFT = "d8beea63-0952-562e-9c6a-8e8ef7364055"
 FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
@@ -36,9 +37,9 @@ SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 [extensions]
 CoarseGrainingEnergyFluxesCairoMakieExt = ["CairoMakie"]
 CoarseGrainingEnergyFluxesDistributedExt = ["Distributed", "SharedArrays"]
+CoarseGrainingEnergyFluxesFFTWDistributedExt = ["FFTW", "Distributed", "SharedArrays"]
 CoarseGrainingEnergyFluxesFFTWExt = ["FFTW"]
-CoarseGrainingEnergyFluxesFINUFFTExt = ["FINUFFT"]
-CoarseGrainingEnergyFluxesFastSphericalHarmonicsExt = ["FastSphericalHarmonics"]
+CoarseGrainingEnergyFluxesFastSphericalHarmonicsExt = ["FastSphericalHarmonics", "FFTW"]
 CoarseGrainingEnergyFluxesKernelAbstractionsExt = ["KernelAbstractions"]
 CoarseGrainingEnergyFluxesMPIExt = ["MPI"]
 CoarseGrainingEnergyFluxesNUFSHTExt = ["NUFSHT"]
@@ -50,10 +51,10 @@ CairoMakie = "0.15"
 ComputationalBackends = "0.1"
 Distributed = "1"
 FFTW = "1"
-FINUFFT = "3"
 FastSphericalHarmonics = "1"
 FlowGeometries = "0.1"
-KernelAbstractions = "0.9"
+FlowTransformBindings = "0.1"
+KernelAbstractions = "0.9, 0.10"
 LinearAlgebra = "1"
 MPI = "0.20"
 NUFSHT = "0.1"

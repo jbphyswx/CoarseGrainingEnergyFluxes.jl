@@ -56,7 +56,7 @@ function slice_workload(; nslices = 256, dx = 1000.0, scale = 8000.0)
     plans = map(counts) do n
         xs = rand(n) .* (dx * 60); ys = rand(n) .* (dx * 60)
         g = FG.Grids.UnstructuredGrid(cart, xs, ys, trues(n); k = 12, areas = fill(dx * dx, n))
-        F.plan_filter(g, ker, scale; backend = CB.SerialBackend(), method = F.RealSpace())
+        F.plan_filter(g, ker, scale; execution = CB.SerialBackend(), method = F.RealSpace())
     end
     fields = [randn(n) for n in counts]
     outs = [zeros(n) for n in counts]
@@ -66,11 +66,11 @@ end
 function main()
     nt = Threads.nthreads()
     outs, fields, plans, counts = slice_workload()
-    F.filter_slices!(outs, fields, plans; backend = CB.SerialBackend())
-    F.filter_slices!(outs, fields, plans; backend = CB.ThreadedBackend())
+    F.filter_slices!(outs, fields, plans; execution = CB.SerialBackend())
+    F.filter_slices!(outs, fields, plans; execution = CB.ThreadedBackend())
 
-    t_ser = best_ms(() -> F.filter_slices!(outs, fields, plans; backend = CB.SerialBackend()), 5)
-    t_thr = best_ms(() -> F.filter_slices!(outs, fields, plans; backend = CB.ThreadedBackend()), 5)
+    t_ser = best_ms(() -> F.filter_slices!(outs, fields, plans; execution = CB.SerialBackend()), 5)
+    t_thr = best_ms(() -> F.filter_slices!(outs, fields, plans; execution = CB.ThreadedBackend()), 5)
     c_cmp = ceiling_compute()
     c_gat = ceiling_gather()
 

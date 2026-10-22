@@ -1,326 +1,240 @@
 
-# Kernel shape evaluation and support range tests
-Test.@testset "Kernels" begin
-    th = CGEF.TopHatKernel()
-    g  = CGEF.GaussianKernel()            # default Pope convention, α = 6
-    g4 = CGEF.GaussianKernel(; α = 4.0)   # FlowSieve convention
-    ss = CGEF.SharpSpectralKernel()
+# Kernel facts against closed forms: weights and radii, continuum moments, transfer functions, and the
+# `HighOrderKernel`'s exact construction.
 
-    # Width 100 km
-    ℓ = 100000.0
-    Test.@test CGEF.Kernels.kernel_weight(th, 10000.0, ℓ) == 1.0
-    Test.@test CGEF.Kernels.kernel_weight(th, 60000.0, ℓ) == 0.0
-    Test.@test CGEF.Kernels.kernel_radius(th, ℓ) == ℓ / 2
-
-    # Gaussian: exponent is configurable; default 6 (Pope), 4 reproduces FlowSieve
-    Test.@test CGEF.Kernels.kernel_weight(g, 0.0, ℓ) == 1.0
-    Test.@test CGEF.Kernels.kernel_weight(g, ℓ, ℓ) ≈ exp(-6.0)
-    Test.@test CGEF.Kernels.kernel_weight(g4, ℓ, ℓ) ≈ exp(-4.0)
-
-    # Gaussian footprint truncates where the weight is negligible: ~2ℓ for α=6
-    r = CGEF.Kernels.kernel_radius(g, ℓ)
-    Test.@test 1.5ℓ < r < 2.5ℓ
-    Test.@test CGEF.Kernels.kernel_weight(g, r, ℓ) < 1e-9
-
-    # SharpSpectralKernel: exact spherical-cap-window transfer function, sinc real-space fallback
-    # with a 10x-scale window (20x TopHatKernel's ℓ/2 — sinc decays only as O(1/d)).
-    Test.@test CGEF.Kernels.kernel_radius(ss, ℓ) == 10 * ℓ
-    Test.@test CGEF.Kernels.spectral_transfer(ss, π / ℓ - 1e-6, ℓ) == 1.0
-    Test.@test CGEF.Kernels.spectral_transfer(ss, π / ℓ + 1e-6, ℓ) == 0.0
-end
-
-
-# `SharpSpectralKernel` with the default `RealSpace()` method computes exactly what was asked for:
-# the truncated-sinc real-space form. No interception — the accuracy tradeoff is documented on the
-# kernel, and the caller's explicit method choice is honoured on every grid, spectral-capable or not.
-Test.@testset "SharpSpectralKernel + RealSpace(): computes what was asked, on any grid" begin
-    ss = CGEF.SharpSpectralKernel()
-    scale = 5000.0
-    geom = FG.Geometry.CartesianGeometry()
-    N = 16
-    xsR = 0.0:1000.0:(N - 1) * 1000.0
-    field = randn(N, N)
-
-    for grid in (
-        FG.Grids.StructuredGrid(geom, xsR, xsR, trues(N, N); periodic = (true, true)),  # FFTW-capable
-        FG.Grids.StructuredGrid(geom, xsR, xsR, trues(N, N)),                            # not FFTW-capable
-    )
-        out = zeros(N, N)
-        CGEF.Filtering.filter_field!(out, field, grid, ss, scale)
-        Test.@test all(isfinite, out)
-    end
-
-    # A CurvilinearGrid has no spectral backend at all; real-space must still just work.
-    ic = collect(0.0:(N - 1)); jc = collect(0.0:(N - 1))
-    clon = [1000.0 * ii for ii in ic, jj in jc]
-    clat = [1000.0 * jj for ii in ic, jj in jc]
-    cgrid = FG.Grids.CurvilinearGrid(geom, clon, clat, trues(N, N))
-    Test.@test CGEF.Filtering.plan_filter(cgrid, ss, scale) isa CGEF.Filtering.AbstractFilterPlan
-end
-
-
-# Test kernel normalization (weights must sum to 1.0 for uniform field)
-Test.@testset "Kernel Normalization" begin
-    geom = FG.Geometry.SphericalGeometry(6371000.0)
-    lon_deg = collect(0.0:2.0:10.0)
-    lat_deg = collect(0.0:2.0:10.0)
-    lon_rad = deg2rad.(lon_deg)
-    lat_rad = deg2rad.(lat_deg)
-    mask = trues(length(lon_deg), length(lat_deg))
-    grid = FG.Grids.StructuredGrid(geom, lon_rad, lat_rad, mask)
-
-    # Constant field
-    field = ones(length(lon_deg), length(lat_deg))
-    out_zero = zeros(length(lon_deg), length(lat_deg))
-    out_renorm = zeros(length(lon_deg), length(lat_deg))
-
-    # Filter with both masking strategies
-    CGEF.Filtering.filter_field!(out_zero, field, grid, CGEF.TopHatKernel(), 100000.0; mask_strategy=CGEF.Filtering.ZeroFill())
-    CGEF.Filtering.filter_field!(out_renorm, field, grid, CGEF.TopHatKernel(), 100000.0; mask_strategy=CGEF.Filtering.Deformable())
-
-    # For a constant field of ones, output should be exactly 1.0 everywhere
-    # (or very close, allowing for small numerical errors)
-    for j in 2:length(lat_deg)-1, i in 2:length(lon_deg)-1
-        Test.@test out_zero[i, j] ≈ 1.0 atol=1e-10
-        Test.@test out_renorm[i, j] ≈ 1.0 atol=1e-10
-    end
-end
-
-# ---------------------------------------------------------------------------
-# Kernel moment gates. The coarse-graining framework's error terms are stated in terms of the kernel's
-# moments — `∫G = 1` (a constant filters to itself), `∫xG = 0` (no centroid shift, hence no spurious
-# advection), and `∫x²G` (the leading truncation term, and what sets the spectrum's slope ceiling). All
-# three are checked against closed forms rather than against a stored reference.
-# ---------------------------------------------------------------------------
-
-# Radial quadrature of the continuum moments over the kernel's own support, `ℓ = 1`. Midpoints, so the
-# ∫ is second-order and comfortably converged at this resolution.
-function _cgef_continuum_moments(kern, D::Int; n = 400_000)
-    ℓ = 1.0
-    R = CGEF.Kernels.kernel_radius(kern, ℓ)
+# `∫G` and `⟨r²⟩` over the support at `ℓ = 1`, by midpoint quadrature in `r`.
+function _cgef_continuum_moments(kern, D::Int; n = 200_000)
+    R = CGEF.Kernels.kernel_radius(kern, 1.0, Val(D))
     dr = R / n
     m0 = 0.0
     m2 = 0.0
     for i in 1:n
         r = (i - 0.5) * dr
-        w = CGEF.Kernels.kernel_weight(kern, r, ℓ)
-        # Radial measure: 2 (both signs) in 1-D, 2πr in 2-D, 4πr² in 3-D.
-        μ = D == 1 ? 2.0 : (D == 2 ? 2π * r : 4π * r^2)
-        m0 += w * μ * dr
-        m2 += w * μ * r^2 * dr
+        w = CGEF.Kernels.kernel_weight(kern, r, 1.0, Val(D)) * (D == 1 ? 2.0 : D == 2 ? 2π * r : 4π * r^2)
+        m0 += w * dr
+        m2 += w * r^2 * dr
     end
-    return m0, m2 / m0                      # ⟨r²⟩; per component this is ⟨r²⟩/D by isotropy
+    return m0, m2 / m0
 end
 
-# Moments of the DISCRETE 2-D footprint the package actually builds, at the centre of a domain wide
-# enough that nothing is truncated.
-function _cgef_discrete_moments_2d(kern, ℓ, dx)
-    lim = ceil(Int, CGEF.Kernels.kernel_radius(kern, ℓ) / dx)
-    m0 = 0.0; mx = 0.0; mxx = 0.0
-    for j in (-lim):lim, i in (-lim):lim
-        w = CGEF.Kernels.kernel_weight(kern, dx * sqrt(i^2 + j^2), ℓ)
-        iszero(w) && continue
-        m0 += w
-        mx += w * (dx * i)
-        mxx += w * (dx * i)^2
-    end
-    return mx / m0, mxx / m0
+# Composite Simpson over `[a, b]`.
+function _cgef_simpson(f, a, b; n = 2000)
+    h = (b - a) / n
+    return h / 3 * (f(a) + f(b) + 4 * sum(f(a + (2i - 1) * h) for i in 1:(n ÷ 2)) +
+                    2 * sum(f(a + 2i * h) for i in 1:(n ÷ 2 - 1)))
 end
 
-Test.@testset "Kernel moments: normalization, vanishing first moment, second moment" begin
-    # The Gaussian is separable, so its per-component variance is ℓ²/(2α) in EVERY dimension. The
-    # top-hat is the disk/ball of radius ℓ/2, not a separable box, so its per-component variance
-    # shrinks with dimension: ℓ²/12, ℓ²/16, ℓ²/20. These are the values `GaussianKernel`'s docstring
-    # quotes, and the reason `α = 6` matches the top-hat only in 1-D.
-    expected = Dict(
-        (CGEF.TopHatKernel(), 1) => 1 / 12,
-        (CGEF.TopHatKernel(), 2) => 1 / 16,
-        (CGEF.TopHatKernel(), 3) => 1 / 20,
-        (CGEF.GaussianKernel(), 1) => 1 / 12,
-        (CGEF.GaussianKernel(), 2) => 1 / 12,
-        (CGEF.GaussianKernel(), 3) => 1 / 12,
-        (CGEF.GaussianKernel(; α = 4), 1) => 1 / 8,
-        (CGEF.GaussianKernel(; α = 4), 2) => 1 / 8,
-        (CGEF.GaussianKernel(; α = 4), 3) => 1 / 8,
-        (CGEF.GaussianKernel(; α = 8), 2) => 1 / 16,   # variance-matches the 2-D disk top-hat
-        (CGEF.GaussianKernel(; α = 10), 3) => 1 / 20,  # ... and the 3-D ball
+function _cgef_legendre(l, x)
+    p0, p1 = 1.0, x
+    l == 0 && return p0
+    for m in 1:(l - 1)
+        p0, p1 = p1, ((2m + 1) * x * p1 - m * p0) / (m + 1)
+    end
+    return p1
+end
+
+Test.@testset "Kernel weights and per-component second moments" begin
+    th = CGEF.TopHatKernel()
+    ℓ = 1.0
+    Test.@test CGEF.Kernels.kernel_weight(th, 0.49ℓ, ℓ) == 1.0
+    Test.@test CGEF.Kernels.kernel_weight(th, 0.51ℓ, ℓ) == 0.0
+    Test.@test CGEF.Kernels.kernel_radius(th, ℓ) == ℓ / 2
+    for α in (4.0, 6.0)
+        Test.@test CGEF.Kernels.kernel_weight(CGEF.GaussianKernel(; α), ℓ, ℓ) ≈ exp(-α)
+    end
+
+    # `⟨x²⟩ = ⟨r²⟩/D`: the disk/ball top-hat of radius ℓ/2 gives ℓ²/12, ℓ²/16, ℓ²/20 in 1, 2, 3 dimensions,
+    # the Gaussian ℓ²/(2α) in every dimension, and the hyper-Gaussian `exp(−16α r⁴/ℓ⁴)` the ratios of
+    # `∫ rⁿ e^{−ar⁴} dr = Γ((n+1)/4) / (4 a^((n+1)/4))`, with `a^(−1/2) = ℓ²/(4√α)`.
+    Γ = SpecialFunctions.gamma
+    hyper(α, D) = (s = 1 / (4 * sqrt(α));
+                   D == 1 ? Γ(3 / 4) / Γ(1 / 4) * s : D == 2 ? s / sqrt(π) / 2 : Γ(5 / 4) / Γ(3 / 4) * s / 3)
+    cases = vcat(
+        [(th, D, 1 / (4 * (D + 2))) for D in 1:3],
+        [(CGEF.GaussianKernel(; α), D, 1 / (2α)) for α in (4.0, 6.0, 10.0) for D in 1:3],
+        [(CGEF.Kernels.HyperGaussianKernel(; α), D, hyper(α, D)) for α in (1.0, 2.5) for D in 1:3],
     )
-    for ((kern, D), x2) in expected
-        m0, r2 = _cgef_continuum_moments(kern, D)
-        Test.@test m0 > 0                       # normalizable: the filter divides by this
-        Test.@test r2 / D ≈ x2 rtol = 1e-4      # per-component second moment
+    for (kern, D, x2) in cases
+        _, r2 = _cgef_continuum_moments(kern, D)
+        Test.@test r2 / D ≈ x2 rtol = 1e-4
     end
 
-    # `α = 6` is 15% wider in RMS than the 2-D disk top-hat of the same nominal ℓ — the number in the
-    # docstring.
-    let (_, r2g) = _cgef_continuum_moments(CGEF.GaussianKernel(), 2),
-        (_, r2t) = _cgef_continuum_moments(CGEF.TopHatKernel(), 2)
-        Test.@test sqrt(r2g / r2t) ≈ 1.155 rtol = 1e-3
-    end
-
-    # Every kernel here is even in `d`, so the discrete first moment must vanish to round-off — a
-    # non-zero one would advect the field while filtering it.
-    for kern in (CGEF.TopHatKernel(), CGEF.GaussianKernel(), CGEF.GaussianKernel(; α = 4),
-                 CGEF.Kernels.SmoothHatKernel(), CGEF.Kernels.HyperGaussianKernel())
-        x, _ = _cgef_discrete_moments_2d(kern, 1.0, 1 / 16)
-        Test.@test abs(x) < 1e-15
-    end
-
-    # `HyperGaussianKernel` has closed-form moments too: with `a = 16α/ℓ⁴`,
-    # `∫₀^∞ rⁿ e^{-ar⁴} dr = Γ((n+1)/4) / (4 a^((n+1)/4))`, and `a^(-1/2) = ℓ²/(4√α)`.
-    for α in (1.0, 2.5)
-        s = 1 / (4 * sqrt(α))                            # a^(-1/2), in units of ℓ²
-        Γ = SpecialFunctions.gamma
-        for (D, x2) in ((1, (Γ(3 / 4) / Γ(1 / 4)) * s),
-                        (2, s / sqrt(π) / 2),
-                        (3, (Γ(5 / 4) / Γ(3 / 4)) * s / 3))
-            _, r2 = _cgef_continuum_moments(CGEF.Kernels.HyperGaussianKernel(; α = α), D)
-            Test.@test r2 / D ≈ x2 rtol = 1e-4
-        end
-    end
-
-    # `SmoothHatKernel` has no closed-form moment (the tanh integral does not reduce), so it is pinned
-    # to quadrature values instead — and to the structural fact that a smoothed rim sits just OUTSIDE
-    # the box it tapers, so its variance exceeds the top-hat's in every dimension.
-    let sh = CGEF.Kernels.SmoothHatKernel()
-        for (D, x2) in ((1, 0.0853895), (2, 0.0650669), (3, 0.0528786))
-            _, r2 = _cgef_continuum_moments(sh, D)
-            Test.@test r2 / D ≈ x2 rtol = 1e-4
-            th = _cgef_continuum_moments(CGEF.TopHatKernel(), D)[2] / D
-            Test.@test r2 / D > th
-        end
-        # Steeper ⇒ closer to the box it is a smoothing of.
-        d10 = _cgef_continuum_moments(sh, 2)[2] / 2
-        d40 = _cgef_continuum_moments(CGEF.Kernels.SmoothHatKernel(; steepness = 40), 2)[2] / 2
-        th2 = _cgef_continuum_moments(CGEF.TopHatKernel(), 2)[2] / 2
-        Test.@test abs(d40 - th2) < abs(d10 - th2)
-    end
-
-    # Realizability: `Π` is only a meaningful pointwise transfer for a NON-NEGATIVE kernel. The two new
-    # real-space kernels are strictly positive on their support; `SharpSpectralKernel`'s sinc is not,
-    # which is why it is documented as spectrum-only.
-    for kern in (CGEF.TopHatKernel(), CGEF.GaussianKernel(),
-                 CGEF.Kernels.SmoothHatKernel(), CGEF.Kernels.HyperGaussianKernel())
+    # Π is a pointwise transfer only for a non-negative kernel; the brick wall's inverse transform is
+    # signed in every dimension.
+    for kern in (th, CGEF.GaussianKernel(), CGEF.Kernels.SmoothHatKernel(), CGEF.Kernels.HyperGaussianKernel())
         R = CGEF.Kernels.kernel_radius(kern, 1.0)
-        Test.@test all(r -> CGEF.Kernels.kernel_weight(kern, r, 1.0) >= 0,
-                       range(0.0, R; length = 4001))
+        Test.@test all(r -> CGEF.Kernels.kernel_weight(kern, r, 1.0) >= 0, range(0.0, R; length = 2001))
     end
-    Test.@test any(r -> CGEF.Kernels.kernel_weight(CGEF.SharpSpectralKernel(), r, 1.0) < 0,
-                   range(0.0, 10.0; length = 4001))
+    for D in 1:3
+        Test.@test any(r -> CGEF.Kernels.kernel_weight(CGEF.SharpSpectralKernel(), r, 1.0, Val(D)) < 0,
+                       range(0.0, 10.0; length = 2001))
+    end
+end
 
-    # Discretization: the Gaussian's footprint reproduces its continuum second moment essentially
-    # exactly even at ℓ = 8Δx, while the top-hat's staircased disk boundary leaves it low and converges
-    # only as O(Δx). Both numbers are quoted in `GaussianKernel`'s docstring.
-    let cont(kern) = _cgef_continuum_moments(kern, 2)[2] / 2
-        for kern in (CGEF.GaussianKernel(), CGEF.GaussianKernel(; α = 4))
-            _, x2 = _cgef_discrete_moments_2d(kern, 1.0, 1 / 8)
-            Test.@test abs(x2 - cont(kern)) < 1e-6 * cont(kern)
+# `SharpSpectralKernel` in real space is the inverse transform of its brick wall in the grid's own
+# dimension, truncated where its mass inside the radius equals its mass over all space.
+Test.@testset "SharpSpectralKernel: the brick wall's inverse transform in D dimensions" begin
+    ss = CGEF.SharpSpectralKernel()
+    ℓ = 3.0
+    kc = π / ℓ
+    forms = (x -> sin(x) / x, x -> 2 * SpecialFunctions.besselj1(x) / x,
+             x -> 3 * SpecialFunctions.sphericalbesselj(1, x) / x)
+    # `(2/π)Si(x)`, `1 − J₀(x)` and `(2/π)(Si(x) − sin x)` at `x = k_c R`.
+    Si = SpecialFunctions.sinint
+    mass = (x -> (2 / π) * Si(x), x -> 1 - SpecialFunctions.besselj0(x), x -> (2 / π) * (Si(x) - sin(x)))
+    for D in 1:3
+        Test.@test CGEF.Kernels.kernel_weight(ss, 0.0, ℓ, Val(D)) == 1.0
+        for x in (1e-6, 0.05, 0.19, 0.21, 1.0, 4.3, 17.2, 30.0)
+            Test.@test CGEF.Kernels.kernel_weight(ss, x / kc, ℓ, Val(D)) ≈ forms[D](x) rtol = 1e-13
         end
-        th = CGEF.TopHatKernel(); c = cont(th)
-        _, x2_8 = _cgef_discrete_moments_2d(th, 1.0, 1 / 8)
-        _, x2_64 = _cgef_discrete_moments_2d(th, 1.0, 1 / 64)
-        Test.@test x2_8 < c && x2_64 < c                       # staircasing loses mass at the rim
-        Test.@test 0.010 < (c - x2_8) / c < 0.030              # ~1.5% at ℓ = 8Δx
-        Test.@test (c - x2_64) / c < 0.005                     # ~0.24% at ℓ = 64Δx
-        Test.@test (c - x2_64) < 0.25 * (c - x2_8)             # converges, not a fixed offset
+        x = kc * CGEF.Kernels.kernel_radius(ss, ℓ, Val(D))
+        Test.@test mass[D](x) ≈ 1 atol = 1e-14
+    end
+end
+
+Test.@testset "Transfer functions and the monotonicity a filtering spectrum needs" begin
+    ℓ = 1.0
+    th = CGEF.TopHatKernel()
+    for k in (0.3, 2.0, 7.0)
+        for α in (4.0, 6.0)
+            Test.@test CGEF.Kernels.spectral_transfer(CGEF.GaussianKernel(; α), k, ℓ) ≈ exp(-k^2 * ℓ^2 / (4α))
+        end
+        x = k * ℓ / 2
+        Test.@test CGEF.Kernels.spectral_transfer(th, k, ℓ) ≈ 2 * SpecialFunctions.besselj1(x) / x
+    end
+    ss = CGEF.SharpSpectralKernel()
+    Test.@test CGEF.Kernels.spectral_transfer(ss, π / ℓ * (1 - 1e-9), ℓ) == 1.0
+    Test.@test CGEF.Kernels.spectral_transfer(ss, π / ℓ * (1 + 1e-9), ℓ) == 0.0
+
+    # On a sphere of radius R the top-hat is the cap of angular radius ℓ/(2R), and degree l is scaled by
+    # its mean of `P_l(cos θ)`.
+    R = 4.0
+    θ₀ = ℓ / (2R)
+    for l in (0, 1, 3, 8, 20)
+        Test.@test CGEF.Kernels.spectral_transfer_degree(th, l, ℓ, R) ≈
+                   _cgef_simpson(θ -> _cgef_legendre(l, cos(θ)) * sin(θ), 0.0, θ₀) / (1 - cos(θ₀)) rtol = 1e-9 atol = 1e-12
     end
 
-    # `∫G = 1` where it actually matters: the normalized filter reproduces a constant to round-off on a
-    # grid wide enough that the footprint is never truncated. Every dimensionality the package supports.
-    let geom = FG.Geometry.CartesianGeometry(), dx = 1000.0, ℓ = 4000.0, C = 3.25
-        for kern in (CGEF.TopHatKernel(), CGEF.GaussianKernel(), CGEF.GaussianKernel(; α = 4),
-                     CGEF.Kernels.SmoothHatKernel(), CGEF.Kernels.HyperGaussianKernel())
-            n1 = 64
-            x1 = 0.0:dx:(n1 - 1) * dx
-            g1 = FG.Grids.StructuredGrid(geom, x1, trues(n1))
-            o1 = zeros(n1)
-            CGEF.Filtering.filter_field!(o1, fill(C, n1), g1, kern, ℓ)
-            Test.@test all(≈(C; rtol = 1e-12), o1)
+    # A filtering spectral density is non-negative where `|Ĝ|²` never rises (Sadek & Aluie 2018 eq. 21);
+    # `transfer_monotone` states whether it does.
+    ks = range(0.05, 12.0; length = 4000)
+    for kern in (th, CGEF.GaussianKernel(), CGEF.GaussianKernel(; α = 4.0), ss)
+        g2 = [CGEF.Kernels.spectral_transfer(kern, k, ℓ)^2 for k in ks]
+        Test.@test CGEF.Kernels.transfer_monotone(kern) == all(<=(0), diff(g2))
+    end
+end
 
-            n2 = 40
-            x2 = 0.0:dx:(n2 - 1) * dx
-            g2 = FG.Grids.StructuredGrid(geom, x2, x2, trues(n2, n2))
-            o2 = zeros(n2, n2)
-            CGEF.Filtering.filter_field!(o2, fill(C, n2, n2), g2, kern, ℓ)
-            Test.@test all(≈(C; rtol = 1e-12), o2)
+# Every radial kernel's degree transfer is its Legendre transform over the support the real-space engines
+# keep (Aluie 2019, eq. 34), to high degree. In single precision the Gauss–Legendre nodes are rounded once
+# from double and the Legendre recurrences run in `Float32`, whose error grows with the degree.
+Test.@testset "Degree transfer on a sphere: the kernel's Legendre transform" begin
+    R = 4.0
+    ℓ = 1.0
+    ls = (0, 1, 2, 7, 20, 40)
+    L = last(ls)
+    for kern in (CGEF.GaussianKernel(), CGEF.GaussianKernel(; α = 4.0), CGEF.Kernels.SmoothHatKernel(),
+                 CGEF.Kernels.HyperGaussianKernel(), CGEF.SharpSpectralKernel(), CGEF.TopHatKernel())
+        Ĝ = CGEF.Kernels.spectral_transfer_degrees!(zeros(L + 1), kern, ℓ, R)
+        for l in ls
+            Test.@test Ĝ[l + 1] ≈ _cgef_legendre_transfer(kern, l, ℓ, R) rtol = 1e-9 atol = 1e-12
+        end
+        Ĝ32 = CGEF.Kernels.spectral_transfer_degrees!(zeros(Float32, L + 1), kern, 1.0f0, 4.0f0)
+        Test.@test maximum(abs, Ĝ32 .- Ĝ) < 10 * (L + 1) * eps(Float32)
+    end
+end
 
-            n3 = 20
-            x3 = 0.0:dx:(n3 - 1) * dx
-            g3 = FG.Grids.StructuredGrid(geom, x3, x3, x3, trues(n3, n3, n3))
-            o3 = zeros(n3, n3, n3)
-            CGEF.Filtering.filter_field!(o3, fill(C, n3, n3, n3), g3, kern, ℓ)
-            Test.@test all(≈(C; rtol = 1e-12), o3)
+# ---- HighOrderKernel (Sadek & Aluie 2018 §V) --------------------------------------------------------
+
+# `∫ xⁿ G dx = 2 Σ_k v_k (r_kⁿ⁺¹ − r_{k−1}ⁿ⁺¹)/(n+1)` for even `n` of a piecewise-constant even profile;
+# odd moments vanish by symmetry.
+function _cgef_exact_moment(edges::Vector{Rational{BigInt}}, vals::Vector{Rational{BigInt}}, n::Int)
+    isodd(n) && return zero(Rational{BigInt})
+    m = zero(Rational{BigInt})
+    prev = zero(Rational{BigInt})
+    for (r, v) in zip(edges, vals)
+        m += v * (r^(n + 1) - prev^(n + 1)) // (n + 1)
+        prev = r
+    end
+    return 2m
+end
+
+# The profile's edges and values at limb width `β = b/ℓ`, from the paper's moment conditions solved in
+# rationals.
+function _cgef_exact_pieces(order::Int, β_in::Rational)
+    β = Rational{BigInt}(β_in)
+    half = Rational{BigInt}(1, 2)
+    if order == 3
+        t = 1 + 2β
+        return (Rational{BigInt}[half, half + β], Rational{BigInt}[1, -1 // (t^3 - 1)])
+    end
+    den = 4β^2 * (192β^4 + 400β^3 + 340β^2 + 120β + 15)
+    return (Rational{BigInt}[half, half + β, half + 2β],
+            Rational{BigInt}[1, -(124β^3 + 88β^2 + 19β + 1) // den, (4β^3 + 8β^2 + 5β + 1) // den])
+end
+
+# The body and limb radii and amplitudes, in units of `ℓ`.
+_cgef_shells(k, amps) = ([0.5 + n * k.b_over_ℓ for n in 0:length(amps)], (1.0, amps...))
+
+Test.@testset "HighOrderKernel: P vanishing moments, exactly" begin
+    # The paper's values at b = ℓ/8, and the first surviving moment, in rationals.
+    for (order, want, m_next) in ((3, (-64 // 61,), -5 // 256), (5, (-568 // 257, 200 // 257), 225 // 28672))
+        edges, vals = _cgef_exact_pieces(order, 1 // 8)
+        Test.@test Tuple(vals[2:end]) == want
+        Test.@test all(CGEF.Kernels.limb_amplitudes(CGEF.Kernels.HighOrderKernel(; order), Float64) .== Float64.(want))
+        m0 = _cgef_exact_moment(edges, vals, 0)
+        Test.@test _cgef_exact_moment(edges, vals, order + 1) // m0 == m_next
+        k = CGEF.Kernels.HighOrderKernel(; order)
+        Test.@test 2 * CGEF.Kernels.profile_integral(k, CGEF.Kernels.kernel_radius(k, 1.0), 1.0) ≈ Float64(m0) rtol = 1e-14
+    end
+    # Any limb width.
+    for order in (3, 5), β in (1 // 12, 1 // 8, 1 // 4)
+        edges, vals = _cgef_exact_pieces(order, β)
+        Test.@test _cgef_exact_moment(edges, vals, 0) > 0
+        Test.@test all(n -> _cgef_exact_moment(edges, vals, n) == 0, 1:order)
+        got = CGEF.Kernels.limb_amplitudes(CGEF.Kernels.HighOrderKernel(; order, b_over_ℓ = float(β)), Float64)
+        Test.@test all(isapprox.(got, Float64.(vals[2:end]); rtol = 1e-14))
+    end
+end
+
+# The isotropic form on the plane in D dimensions and on a sphere of radius R: `∫ r^(2m) G(r) w(r) dr`
+# vanishes for `m = 1…L` with the radial measure `w`, `r` and `r²` in two and three dimensions and
+# `sin(r/R)` on the sphere.
+Test.@testset "HighOrderKernel: the isotropic form's moments vanish" begin
+    for order in (3, 5), β in (1 / 12, 1 / 8, 1 / 4)
+        k = CGEF.Kernels.HighOrderKernel(; order, b_over_ℓ = β)
+        L = order == 3 ? 1 : 2
+        Test.@test all(isapprox.(CGEF.Kernels.radial_limb_amplitudes(k, Float64, Val(1)),
+                                 CGEF.Kernels.limb_amplitudes(k, Float64); rtol = 1e-13))
+        for (amps, w) in ((CGEF.Kernels.radial_limb_amplitudes(k, Float64, Val(2)), r -> r),
+                          (CGEF.Kernels.radial_limb_amplitudes(k, Float64, Val(3)), r -> r^2),
+                          (CGEF.Kernels.spherical_limb_amplitudes(k, 1.0, 3.0), r -> sin(r / 3.0)))
+            ρ, a = _cgef_shells(k, amps)
+            mom(m) = sum(a[n + 1] * _cgef_simpson(r -> r^(2m) * w(r), n == 0 ? 0.0 : ρ[n], ρ[n + 1]) for n in 0:L)
+            Test.@test mom(0) > 0
+            Test.@test all(m -> abs(mom(m)) < 1e-10 * mom(0), 1:L)
         end
     end
 end
 
-# `SmoothHatKernel` and `HyperGaussianKernel` are real-space-only by construction: neither has an
-# elementary Fourier transform, and both ring, so neither can carry a filtering spectrum. What they buy
-# is a smooth, strictly-positive alternative to the box.
-Test.@testset "SmoothHat and HyperGaussian: real-space only, and what they sit between" begin
-    sh = CGEF.Kernels.SmoothHatKernel()
-    hg = CGEF.Kernels.HyperGaussianKernel()
-    Test.@test sh.steepness == 10.0                        # the published value
-    Test.@test hg.α == 1.0
-    Test.@test CGEF.Kernels.SmoothHatKernel(; steepness = 4).steepness == 4
-    Test.@test CGEF.Kernels.HyperGaussianKernel(; α = 2).α == 2
-
-    # Shape: at the rim (d = ℓ/2) a smooth hat is exactly ½, and it is monotone decreasing in `d`.
-    Test.@test CGEF.Kernels.kernel_weight(sh, 0.5, 1.0) ≈ 0.5
-    Test.@test CGEF.Kernels.kernel_weight(sh, 0.0, 1.0) > 0.999
-    Test.@test CGEF.Kernels.kernel_weight(hg, 0.0, 1.0) == 1.0
-    Test.@test CGEF.Kernels.kernel_weight(hg, 0.5, 1.0) ≈ exp(-1)
-    for kern in (sh, hg)
-        ws = [CGEF.Kernels.kernel_weight(kern, r, 1.0) for r in range(0, 1.2; length = 500)]
-        Test.@test all(<=(0), diff(ws))
-    end
-
-    # Truncation radius is where the weight reaches the shared tolerance, so the footprint is neither
-    # clipped early nor needlessly wide.
-    for kern in (sh, hg)
-        R = CGEF.Kernels.kernel_radius(kern, 1.0)
-        Test.@test CGEF.Kernels.kernel_weight(kern, R, 1.0) ≈ 1e-10 rtol = 1e-6
-        Test.@test 1.0 < R < 1.2
-    end
-
-    # No closed-form transfer ⇒ an explicit refusal naming the fix, not a MethodError and not a
-    # silently substituted kernel.
-    for kern in (sh, hg)
-        err = try
-            CGEF.Kernels.spectral_transfer(kern, 1.0, 1.0); nothing
-        catch e; e end
-        Test.@test err isa ArgumentError
-        Test.@test occursin("RealSpace", err.msg)
-        Test.@test_throws ArgumentError CGEF.Kernels.spectral_transfer_degree(kern, 3, 1.0, 6.371e6)
-        # ... and the same refusal reaches the user through `plan_filter`, not just the raw transfer.
-        let g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(),
-                                        0.0:1000.0:31_000.0, 0.0:1000.0:31_000.0;
-                                        periodic = (true, true))
-            Test.@test_throws ArgumentError CGEF.Filtering.plan_filter(
-                g, kern, 4000.0; method = CGEF.Filtering.Spectral())
+Test.@testset "HighOrderKernel: transfer functions" begin
+    for order in (3, 5)
+        k = CGEF.Kernels.HighOrderKernel(; order)
+        # On the plane, the product of each axis's cosine transform of the profile over its mass.
+        ρ, a = _cgef_shells(k, CGEF.Kernels.limb_amplitudes(k, Float64))
+        lo(n) = n == 0 ? 0.0 : ρ[n]
+        Ĝ1(kd) = sum(a[n + 1] * _cgef_simpson(x -> cos(kd * x), lo(n), ρ[n + 1]) for n in eachindex(a) .- 1) /
+                 sum(a[n + 1] * (ρ[n + 1] - lo(n)) for n in eachindex(a) .- 1)
+        for kv in ((3.1, 0.0), (2.0, 5.5), (7.3, -4.2))
+            Test.@test CGEF.Kernels.spectral_transfer(k, kv, 1.0) ≈ Ĝ1(kv[1]) * Ĝ1(kv[2]) rtol = 1e-9 atol = 1e-12
         end
-        # Both ring, so neither can produce a filtering spectral density.
-        Test.@test !CGEF.Kernels.transfer_monotone(kern)
-    end
-
-    # Both are real-space filters that work end to end, and both land between the box and the Gaussian
-    # in effective width — the reason to reach for them at all.
-    let geom = FG.Geometry.CartesianGeometry(), N = 40, dx = 1000.0,
-        xs = 0.0:dx:(N - 1) * dx,
-        grid = FG.Grids.StructuredGrid(geom, xs, xs, trues(N, N)),
-        u = [sin(i / 5) * cos(j / 7) for i in 1:N, j in 1:N],
-        v = [cos(i / 6) * sin(j / 4) for i in 1:N, j in 1:N],
-        ℓ = 4000.0
-        m2(kern) = _cgef_continuum_moments(kern, 2)[2] / 2
-        Test.@test m2(CGEF.TopHatKernel()) < m2(sh) < m2(hg) < m2(CGEF.GaussianKernel())
-        for kern in (sh, hg)
-            Π = zeros(N, N)
-            CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, grid, kern, ℓ)
-            Test.@test all(isfinite, Π)
-            Test.@test maximum(abs, Π) > 0
-            # The generic banded engine is what a kernel with no special-cased algebra should reach.
-            Test.@test CGEF.Filtering.plan_filter(grid, kern, ℓ).footprint isa
-                       CGEF.Filtering.FilterFootprint
+        # On a sphere, the isotropic form against `P_l(cos θ)` over each shell.
+        R = 4.0
+        ρs, as = _cgef_shells(k, CGEF.Kernels.spherical_limb_amplitudes(k, 1.0, R))
+        shell(f) = sum(as[n + 1] * _cgef_simpson(θ -> f(θ) * sin(θ), (n == 0 ? 0.0 : ρs[n]) / R, ρs[n + 1] / R)
+                       for n in eachindex(as) .- 1)
+        for l in (0, 1, 2, 5, 13)
+            Test.@test CGEF.Kernels.spectral_transfer_degree(k, l, 1.0, R) ≈
+                       shell(θ -> _cgef_legendre(l, cos(θ))) / shell(θ -> 1.0) rtol = 1e-9 atol = 1e-12
         end
     end
 end

@@ -1,9 +1,13 @@
 # Spherical regional coarse-graining demo: cross-scale kinetic-energy flux Π(x, ℓ) and the filtering
 # spectrum on a synthetic non-divergent velocity field over a masked lon/lat patch.
 #
-# The velocity is built as u = ∇⊥ψ (a streamfunction), so it is non-divergent — the regime in which
-# the planetary-Cartesian filtering of Aluie (2019) / Storer et al. (2022) is exact. Masked cells are
-# handled by the default deformable kernel renormalization.
+# The velocity is built as u = ∇⊥ψ (a streamfunction), so it is non-divergent. Its ambient Cartesian
+# components are filtered and rotated back to the local frame (`vector_filter = CartesianComponents()`),
+# which equals the generalized convolution of Aluie (2019) for a non-divergent field on the whole sphere.
+# The generalized convolution, the default, transforms in global spherical harmonics to this grid's
+# resolution, degree ≈ πR/Δx ≈ 2000 at 0.1°: O(lmax³) work per transform through NUFSHT, and O(M·lmax²)
+# over the M cells by the in-core direct sum. Under the default `ZeroFill` the masked cells are fluid at
+# rest.
 
 using Random: Random
 using Statistics: Statistics
@@ -15,10 +19,8 @@ Random.seed!(2024)
 # Regional spherical patch: 20°×20° box at mid-latitude, 0.1° resolution.
 R = 6.371e6
 geom = FG.Geometry.SphericalGeometry(R)
-# A Range, not `deg2rad.(collect(...))` (broadcast returns a Vector, losing the fast translation-
-# invariant footprint path) — `range(...; length=...)` from the ALREADY-computed degree-range length
-# (not re-deriving it from the deg2rad-scaled start/stop, which rounds to a different point count due
-# to floating-point error in the scaled step).
+# Ranges keep the translation-invariant footprint path. Each takes the point count of its degree range:
+# the radian endpoints round, and a range rebuilt from them can hold a different count.
 lon_deg = -70.0:0.1:-50.0
 lat_deg = 30.0:0.1:50.0
 lon = range(deg2rad(first(lon_deg)); step = deg2rad(step(lon_deg)), length = length(lon_deg))
@@ -49,11 +51,11 @@ for j in 1:Nlat, i in 1:Nlon
 end
 
 scales = collect(20e3:20e3:200e3)              # 20–200 km
-# A Gaussian, not a top-hat: this script prints the filtering spectral density below, and the
-# top-hat's |Ĝ|² is not monotone so `coarse_grain` refuses to produce one for it.
-result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel())
+# A Gaussian's |Ĝ|² is monotone, so `coarse_grain` returns the filtering spectral density printed below.
+result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.GaussianKernel(),
+                           vector_filter = CGEF.Filtering.CartesianComponents())
 
-println("scale [km]   cumulative-KE     mean|Π| [W/m³]")
+println("scale [km]   cumulative-KE     mean|Π| [m²/s³]")
 for (i, ℓ) in enumerate(scales)
     println(
         rpad(round(ℓ / 1e3; digits = 1), 13),

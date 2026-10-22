@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Masking strategy (singleton types — specializable, unlike Symbol dispatch)
+# Mask strategies
 # ---------------------------------------------------------------------------
 
 """
@@ -12,31 +12,38 @@ abstract type AbstractMaskStrategy end
 """
     ZeroFill <: AbstractMaskStrategy
 
-Excluded cells are treated as zero-valued: they contribute to the denominator (kernel weight) but
-zero to the numerator. The kernel is homogeneous (same shape everywhere), which preserves domain
-averages and commutation with derivatives (the Storer 2022 / Aluie 2019 "fixed kernel" mode).
+Masked cells and the domain's exterior are zero-velocity water (Aluie et al. 2018; Storer et al.
+2022): they contribute nothing to the numerator, and the kernel keeps its full mass, the cells past a
+bounded edge included. The kernel is then the same everywhere, so filtering commutes with derivatives
+and conserves the integral over all space, which on a periodic grid is the grid (Aluie 2019; Grooms
+et al. 2021, eq. 7).
+
+The filtered field is defined at every cell, a masked one too: within the kernel's reach of an active
+cell it is nonzero over land.
 """
 struct ZeroFill <: AbstractMaskStrategy end
 
 """
     Deformable <: AbstractMaskStrategy
 
-Masked cells are excluded from BOTH numerator and denominator, so the kernel is renormalized over the
-locally-included area only ("deformable kernel"). Excluded cells are genuinely dropped, but the kernel
-becomes inhomogeneous near a mask boundary (breaks the strict commutation theorems).
+Masked cells and the exterior are excluded from both numerator and denominator, so the kernel is
+renormalized over the active cells in its window ("deformable kernel"), and a masked cell is zero. A
+constant is reproduced exactly next to a boundary, but the kernel changes shape there, so filtering
+neither commutes with derivatives nor conserves the domain integral.
 """
 struct Deformable <: AbstractMaskStrategy end
 
 # ---------------------------------------------------------------------------
-# Filtering method: physical direct-sum (default) vs spectral (FFT/SHT/NUFFT via extensions)
+# Filtering methods
 # ---------------------------------------------------------------------------
 
 """
     AbstractFilterMethod
 
-How the convolution is evaluated: [`RealSpace`](@ref) (physical-space footprint, any grid/mask) or
-[`Spectral`](@ref) (transform-space multiply — FFT for uniform periodic Cartesian, spherical
-harmonics for the uniform sphere, NUFFT/NUFSHT for scattered points; provided by extensions).
+How the convolution is evaluated: [`RealSpace`](@ref) (physical-space footprint, any grid/mask),
+[`AutoMethod`](@ref) (the same sum by its fastest engine) or [`Spectral`](@ref) (transform-space
+multiply, provided by extensions: an FFT on a uniform Cartesian grid, zero-padded along a bounded axis;
+spherical harmonics on a Clenshaw–Curtis sphere; a NUFFT or NUFSHT on scattered points).
 """
 abstract type AbstractFilterMethod end
 
@@ -47,35 +54,33 @@ struct RealSpace <: AbstractFilterMethod end
     Spectral <: AbstractFilterMethod
 
 Transform-space filtering (kernel applied as a multiply on the transformed field). Requires a
-spectral extension and a compatible grid (e.g. `using FFTW` for a uniform, periodic Cartesian grid).
+spectral extension and a compatible grid (e.g. `using FFTW` for a uniform Cartesian grid, periodic or
+bounded).
 """
 struct Spectral <: AbstractFilterMethod end
 
 """
     AutoMethod <: AbstractFilterMethod
 
-Pick the engine from real capability, the same contract [`AutoCache`](@ref) and `AutoBackend` follow:
-[`Spectral`](@ref) only where a transform is available AND exact for this grid, otherwise
-[`RealSpace`](@ref).
-
-Selects [`Spectral`](@ref) only where every axis is periodic and uniform and a transform backend is
-loaded — the case where a periodic transform is the exact filter. Otherwise [`RealSpace`](@ref).
+The [`RealSpace`](@ref) convolution, evaluated by the fastest engine that computes its sum: the direct
+engines, or a transform of the same sampled kernel where the grid allows one — the FFT engine on a
+uniform Cartesian grid (circular along periodic axes, zero-padded along bounded ones) and the
+transform along the longitude ring of a global rectilinear sphere. These agree with the direct sum to
+round-off. [`Spectral`](@ref), which multiplies by the kernel's transfer function, is a different
+discretization and is never selected.
 """
 struct AutoMethod <: AbstractFilterMethod end
 
 """
     AbstractFilterPlan
 
-A prebuilt filter (grid + kernel + scale + mask strategy + backend) that can be applied to many
-fields without redoing setup. Physical-space backends precompute a `FilterFootprint`; the spectral
-extensions (FFTW/FINUFFT/SHT) hold cached transform plans. Declared here rather than alongside
-`PhysicalFilterPlan` further down so that `filter_field!`'s `filter_plan::Union{Nothing,
-AbstractFilterPlan}` keyword annotation, just below, can name it.
+A prebuilt filter (grid + kernel + scale + mask strategy + execution backend), applied to many fields
+with no repeated setup. A physical-space plan holds a precomputed footprint; a spectral plan holds its
+transform plans.
 """
 abstract type AbstractFilterPlan end
 
-# A plan owns FFTW/FINUFFT/SHT plan objects, whose own `show` walks the library's internal plan tree —
-# 6 KB of output for a 16×16 transform, and a call into the C library from wherever the plan happens to
-# be printed, including a worker that does not own it. The type name is what a plan usefully prints.
+# A plan prints its type name only: the `show` of a transform-library plan it owns can call into a C
+# library, on a worker that does not own the plan too.
 Base.show(io::IO, p::AbstractFilterPlan) = print(io, nameof(typeof(p)), "(…)")
 Base.show(io::IO, ::MIME"text/plain", p::AbstractFilterPlan) = show(io, p)

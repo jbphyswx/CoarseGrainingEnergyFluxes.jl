@@ -6,14 +6,14 @@ CurrentModule = CoarseGrainingEnergyFluxes
 
 All examples follow the package import policy: bring each module in under a stable alias and qualify
 every call. Only a minimal set of names is exported at the top level — the sweep entry points
-(`coarse_grain`, `coarse_grain!`, `coarse_grain_profile`, `coarse_grain_batch!`,
-`coarse_grain_slices!`), their result types, `check_setup`, the three headline kernels, and
-`plot_Π_map`/`plot_spectrum`. Everything else — `filter_field!`, `compute_Π!`,
+(`coarse_grain`, `coarse_grain!`, `coarse_grain_profile`, `coarse_grain_profile!`,
+`coarse_grain_batch!`, `coarse_grain_slices!`), their result types, `check_setup`, the three headline
+kernels, and `plot_Π_map`/`plot_spectrum`. Everything else — `filter_field!`, `compute_Π!`,
 `compute_Π_strain_convergence`, `compute_Π_decomposed`, `tau_decomposition`, `tracer_variance_flux`,
 `enstrophy_flux`, `band_energies`, the remaining kernels, backends, mask strategies,
 `Spectral()`/`RealSpace()` — is reached through its submodule (`CGEF.Filtering...`,
-`CGEF.Diagnostics...`, `CGEF.Kernels...`, `CGEF.ComputationalBackends...`), never a flattened
-top-level re-export. Geometries and grid types come from FlowGeometries.jl.
+`CGEF.Diagnostics...`, `CGEF.Kernels...`, `CGEF.ComputationalBackends...`). Geometries and grid types
+come from FlowGeometries.jl.
 
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
@@ -23,8 +23,9 @@ using FlowGeometries: FlowGeometries as FG
 ## Start here: `check_setup`
 
 Before running anything, ask what will actually happen. [`check_setup`](@ref) reports the engine, the
-backend, what the kernel can and cannot support, and how wide the contaminated band along a coast is —
-without building a plan, so it is safe even on a configuration whose plan would be enormous.
+execution backend, what the kernel can and cannot support, and how far from a coast or domain edge the result
+depends on the mask strategy. It builds no plan, so it is cheap on a configuration whose plan runs to
+gigabytes.
 
 ```julia
 julia> CGEF.check_setup(grid, CGEF.TopHatKernel(), 6_000.0)
@@ -34,27 +35,28 @@ CoarseGrainingEnergyFluxes setup check
   kernel          : TopHatKernel
   masking         : ZeroFill
   method          : default for this grid
-  backend         : AutoBackend -> SerialBackend
+  execution       : AutoBackend -> SerialBackend
   real-space engine: prefix-sum top-hat, exact, O(N·w_y)
   ℓ resolvable    : yes
   supports Π      : yes
   spectrum ≥ 0    : NO
   supports Spectral(): NO
-  boundary buffer : (3, 3) cells (contaminated)
+  boundary buffer : (3, 3) cells
   notes:
-    1. points within (3, 3) cells of a coast or domain edge are contaminated by footprint
-       truncation, under either mask strategy — exclude them before averaging.
+    1. within (3, 3) cells of a coast or domain edge the result depends on the mask strategy:
+       ZeroFill treats land and the domain exterior as fluid at rest, Deformable renormalizes the
+       kernel over active cells.
     2. TopHatKernel's |Ĝ|² is not monotone, so a spectral density is not guaranteed
        non-negative: `coarse_grain` needs `kernel = GaussianKernel()`, or
        `spectrum = Diagnostics.ForceSpectrum()` to compute it anyway, or
        `spectrum = Diagnostics.NoSpectrum()` to skip it.
-    3. TopHatKernel's spectral transfer function is provided by a weak dependency that is not
-       loaded, so `method = Spectral()` is unavailable in this session — run
-       `using SpecialFunctions`. Real-space filtering is unaffected.
+    3. `method = Spectral()` is unavailable: ArgumentError: the two-dimensional top-hat transfer
+       and sharp-spectral weight are the jinc `2J₁(x)/x`, provided by the SpecialFunctions weak
+       dependency. Run `using SpecialFunctions`.
 ```
 
 Every field is readable programmatically too (`r.supports_spectrum`, `r.boundary_buffer_cells`, …), so
-a script can gate on it rather than parse the text.
+a script can gate on it.
 
 ## Result shapes and conventions
 
@@ -63,7 +65,7 @@ What every result field's axes mean. `Ns = length(scales)`; the spatial rank `R`
 
 | entry point | field | shape | notes |
 |---|---|---|---|
-| `coarse_grain`/`coarse_grain!` | `Π` | `(spatial…, Ns)` | one contiguous array, not a vector of maps; `Π[…, i]` is `scales[i]` |
+| `coarse_grain`/`coarse_grain!` | `Π` | `(spatial…, Ns)` | one contiguous array; `Π[…, i]` is `scales[i]` |
 | | `scales`, `wavenumber` | `(Ns,)` | `wavenumber = L/ℓ` |
 | | `cumulative_energy`, `filtering_spectrum` | `(Ns,)` | `filtering_spectrum` is `NaN` under `NoSpectrum()` |
 | `coarse_grain_batch!` | `Π` | `(spatial…, Ns, batch…)` | batch axes **trailing**, so each slice is a contiguous view |
@@ -78,11 +80,14 @@ What every result field's axes mean. `Ns = length(scales)`; the spatial rank `R`
 | `band_energies` | `bands` | `(Ns,)` | domain means; with `maps = true`, `band_maps[n]` is the pointwise map |
 | `enstrophy_flux` | `Z` | `(spatial…)` | same gauge as `Π` |
 
-Two conventions worth stating outright, because getting either wrong changes the numbers:
+Two conventions that change the numbers:
 
-- **`ℓ` is a diameter, not a radius.** The top-hat spans the disk of radius `ℓ/2`.
-- **Masked cells are zero in every output**, never `NaN` and never left uninitialized. Points within
-  the `boundary_buffer_cells` reported above are computed but contaminated.
+- **`ℓ` is a diameter.** The top-hat spans the disk of radius `ℓ/2`.
+- **Under the default `ZeroFill`, land and the domain exterior are fluid at rest** (Aluie et al. 2018;
+  Grooms et al. 2021). Every output is defined on every cell, land included: `Π` over land is the flux
+  of the zero-extended field, nonzero within the kernel's reach of the coast and zero beyond it, and a
+  domain mean sums every cell and divides by the water area (Storer et al. 2022). Under `Deformable`
+  masked cells are zero. No output is `NaN`, whatever the input holds on land.
 
 ## Visual Results
 
@@ -117,11 +122,10 @@ Two conventions worth stating outright, because getting either wrong changes the
 ![Tracer flux](assets/tracer_flux.png)
 
 ### Masking: zero-fill vs deformable
-`ZeroFill` is the default: masked cells contribute nothing and the kernel stays position-independent,
-so filtering commutes with spatial derivatives — the step the flux budget is derived by. `Deformable`
-renormalizes over the locally-active area, reproducing constants exactly next to a boundary at the cost
-of that commutation. On a masked domain `Deformable` conserves better (measured 4.8e-4 vs 1.1e-2
-relative imbalance); under either choice, points within ≈ℓ of the mask are contaminated.
+`ZeroFill` is the default: land and the domain exterior count as fluid at rest and the kernel keeps its
+full mass at every cell, so filtering commutes with spatial derivatives — the step the flux budget is
+derived by — and conserves the domain integral. `Deformable` renormalizes over the locally-active area,
+reproducing constants exactly next to a boundary at the cost of both.
 
 ![Masking](assets/masking.png)
 
@@ -166,7 +170,7 @@ scales = collect(5e3:5e3:50e3)
 result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKernel(),
                            spectrum = CGEF.Diagnostics.NoSpectrum())
 @view result.Π[:, :, 3]      # flux map at scales[3] — result.Π is a stacked (Nx,Ny,Nscales) array
-result.cumulative_energy     # ½ρ₀⟨|ū_ℓ|²⟩ per scale (Sadek–Aluie Eq. 15)
+result.cumulative_energy     # ½⟨|ū_ℓ|²⟩ per scale, per unit mass (Sadek–Aluie Eq. 15)
 result.wavenumber            # k_ℓ = L/ℓ
 
 # The spectral density needs a kernel whose |Ĝ|² is monotone — see the note below.
@@ -176,12 +180,12 @@ spec.filtering_spectrum      # Ẽ(k_ℓ) density (Eq. 14)
 
 !!! note "The top-hat's filtering spectrum is not guaranteed non-negative"
     `TopHatKernel`'s `|Ĝ|²` is not monotone decreasing, so Sadek & Aluie (2018) eq. 21 does not apply
-    and the spectral density may dip below zero. That condition is **sufficient, not necessary** — the
-    top-hat's `|Ĝ|²` falls to zero at `kℓ ≈ 7.66` and then climbs back to only `0.0175` at `kℓ ≈ 10.27`
-    (the first Airy sidelobe; later ones reach `0.0042` and `0.0016`), so the violation is confined to
-    the far sub-filter tail at under 2% of the DC value. The density is usually perfectly usable and
-    the default merely declines to vouch for it. Three ways forward, per
-    [`Diagnostics.AbstractSpectrumPolicy`](@ref):
+    and the spectral density may dip below zero. That condition is **sufficient but not necessary**:
+    the top-hat's `|Ĝ|²` falls to zero at `kℓ ≈ 7.66` and then climbs back to only `0.0175` at
+    `kℓ ≈ 10.27` (the first Airy sidelobe; later ones reach `0.0042` and `0.0016`), so the violation is
+    confined to the far sub-filter tail at under 2% of the DC value. The density is usually usable; by
+    default `coarse_grain` fills it with `NaN` and `Diagnostics.filtering_spectrum` throws. Three ways
+    forward, per [`Diagnostics.AbstractSpectrumPolicy`](@ref):
 
     | you want | pass |
     |---|---|
@@ -197,6 +201,7 @@ spec.filtering_spectrum      # Ẽ(k_ℓ) density (Eq. 14)
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries as FG
+using NUFSHT: NUFSHT                             # fast spin-weighted transforms for the vector filter
 
 geom = FG.Geometry.SphericalGeometry(6.371e6)
 lon = deg2rad.(collect(0.0:0.25:359.75))
@@ -209,13 +214,20 @@ result = CGEF.coarse_grain(u, v, grid; scales = scales, kernel = CGEF.TopHatKern
                            spectrum = CGEF.Diagnostics.NoSpectrum())
 ```
 
-The `ZeroFill` mask strategy (default) treats excluded cells as zeros, keeping the kernel
-position-independent so that filtering commutes with spatial derivatives — the property the Π budget
-is derived by. Pass `mask_strategy = CGEF.Filtering.Deformable()` to renormalize the kernel over
-active points near the boundary instead: that reproduces a constant field exactly there, but the
-kernel changes shape, so it neither commutes with derivatives nor conserves the domain average.
-Either way, points within `≈ℓ` of a mask boundary are contaminated — see
-[`Filtering.filter_field!`](@ref) for the measured artifacts.
+On a sphere the velocity and the stress are filtered by the generalized convolution of Aluie (2019),
+which commutes with the surface derivatives: spin-weighted spherical-harmonic transforms to the grid's
+resolution, through NUFSHT (or FastSphericalHarmonics on its own grid), and an in-core direct sum with
+neither loaded. See
+[Filtering vectors and tensors on the sphere](@ref).
+
+The `ZeroFill` mask strategy (default) treats land as fluid at rest and keeps the kernel's full mass,
+so filtering commutes with spatial derivatives — the property the Π budget is derived by — and `Π`
+over land is the flux of the zero-extended field. A latitude edge short of a pole continues to the
+pole, so a regional grid's kernel mass is the same as a global one's. Pass
+`mask_strategy = CGEF.Filtering.Deformable()` to renormalize the kernel over active points near the
+boundary instead: that reproduces a constant field exactly there, but the kernel changes shape, so it
+neither commutes with derivatives nor conserves the domain average, and a vector is filtered by its
+ambient Cartesian components. See [`Filtering.filter_field!`](@ref).
 
 ## Curvilinear (model-native) grids
 
@@ -248,15 +260,19 @@ result = CGEF.coarse_grain(u, v, grid; scales = collect(10e3:10e3:60e3),
 along-track altimetry): k-d tree neighbor search and Voronoi cell areas at construction time, WLSQ
 gradients over that adjacency, and both filtering methods. `RealSpace()` is the default, as on every
 other grid: the compact kernel applied exactly as written, through a gather over each point's metric
-ball, which holds next to a boundary or a masked region. Pass `method = CGEF.Filtering.Spectral()`
-for the transform — exact for a band-limited field on a homogeneous domain, and `O(n log n)`.
+ball, which holds next to a boundary or a masked region. `method = CGEF.Filtering.Spectral()` is the
+`O(n log n)` spectral filter: it estimates the Fourier coefficients on a box with the quadrature rule of
+the grid's cell areas and multiplies by `Ĝ(k)`. The box is the grid's `period` in a direction declared
+periodic; elsewhere it pads the length the nodes cover (`FG.Grids.domain_length`: the extent plus one
+spacing) as FFTW pads a bounded axis, the field being zero beyond it. On a uniform lattice this is the
+FFTW result on the same grid.
 
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries as FG
 using NearestNeighbors: NearestNeighbors        # enables k-d tree neighbor search
 using DelaunayTriangulation: DelaunayTriangulation  # enables exact Voronoi cell areas (Cartesian)
-using FINUFFT: FINUFFT                          # enables scattered-Cartesian spectral filtering
+using NonuniformFFTs: NonuniformFFTs            # enables scattered-Cartesian spectral filtering (or FINUFFT)
 
 npts = 2_000
 geom = FG.Geometry.CartesianGeometry()         # a placeholder — UnstructuredGrid has no fixed spacing
@@ -269,9 +285,9 @@ u = randn(npts); v = randn(npts)
 CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, grid, CGEF.GaussianKernel(), 8_000.0)
 ```
 
-For scattered spherical observations, build `grid` with `FG.Geometry.SphericalGeometry(R)` instead and load
-`Quickhull` (Voronoi areas) and `NUFSHT` (spectral filtering) in place of `DelaunayTriangulation`/
-`FINUFFT`.
+For scattered spherical observations, build `grid` with `FG.Geometry.SphericalGeometry(R)` and load
+`Quickhull` (Voronoi areas) in place of `DelaunayTriangulation`, and `NUFSHT`, whose transforms filter
+the velocity and the stress there and serve spectral filtering.
 
 ## Sphere pixelizations: ring, cubed-sphere, healpix, icosahedral, Yin–Yang
 
@@ -280,12 +296,13 @@ engine as a scattered point cloud: a gather over each cell's own metric ball, wi
 by its own area. The grid declares `Grids.cell_address(grid) === Grids.FlatCells()` and the whole
 pipeline follows — filtering, gradients, `compute_Π!`, a scale sweep, every execution backend, and
 the tensor diagnostics (`tau_decomposition`, `tracer_variance_flux`, `vorticity`, `enstrophy_flux`,
-and on a Cartesian metric `compute_Π_strain_convergence`, `compute_Π_decomposed` and
-`compressible_flux`). Nothing in the call names the layout.
+`compute_Π_strain_convergence`, `compute_Π_decomposed` and `compressible_flux`). Nothing in the call
+names the layout.
 
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries as FG
+using NUFSHT: NUFSHT                                # fast transforms for the vector filter over the cells
 
 geom = FG.Geometry.SphericalGeometry(6.371e6)
 
@@ -313,10 +330,9 @@ unavailable on them and `check_setup` reports no axis spacing.
 
 ## True 3D volumetric flux (Cartesian and spherical)
 
-Distinct from the vertical-profile method below: a true 3D `StructuredGrid` filters in all three
-directions with one kernel and computes the genuinely coupled 9-component strain/stress
-contraction — the right tool for homogeneous/isotropic turbulence, not the standard
-large-scale thin-layer level-stacking approach.
+A true 3D `StructuredGrid` filters in all three directions with one kernel and computes the coupled
+9-component strain/stress contraction, for homogeneous/isotropic turbulence. The large-scale
+thin-layer method, which stacks independent levels, is the vertical profile below.
 
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
@@ -342,9 +358,8 @@ sgrid = FG.Grids.StructuredGrid(sgeom, lon, lat, r)
 
 ## Vertical profile (2.5D per-level) vertical structure
 
-The literature-standard method (Aluie, Hecht & Vallis 2018): run the existing 2D/2.5D `compute_Π!`
-independently at each vertical level of a 3D `(x, y, z)` array and stack the profile — not to be
-confused with the coupled true-3D method above.
+The literature-standard method (Aluie, Hecht & Vallis 2018): run the 2D/2.5D `compute_Π!`
+independently at each vertical level of a 3D `(x, y, z)` array and stack the profile.
 
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
@@ -367,20 +382,23 @@ batch.slices[2].Π                   # level 2's own (x, y, scale) result, a zer
 
 ## Execution backends (real-space `RealSpace`)
 
-The backend only changes *how* the same footprint convolution is evaluated — results are identical.
-Every backend reuses a footprint/plan built once per `(grid, kernel, scale)`, not rebuilt per call.
+The execution backend, the `execution` keyword, changes only *how* a call runs: every map is identical
+to the serial one, and on a `GPUBackend` a domain sum such as `cumulative_energy` is reduced in the
+device's order, equal to round-off. Every backend applies the footprint/plan built once per
+`(grid, kernel, scale)`.
 
 ```julia
 using OhMyThreads: OhMyThreads          # enables ThreadedBackend (2D row-parallel + 1D/3D point-parallel)
-result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = CGEF.ComputationalBackends.ThreadedBackend())
+result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), execution = CGEF.ComputationalBackends.ThreadedBackend())
 
-using KernelAbstractions: KernelAbstractions   # enables GPUBackend (2D grids only)
-# Takes the device to run on — `KernelAbstractions.CPU()` here, `CUDABackend()`/`ROCBackend()` on a GPU.
+using KernelAbstractions: KernelAbstractions   # enables GPUBackend
+# Takes the device to run on — `KernelAbstractions.CPU()` here, `CUDABackend()`/`ROCBackend()` on a GPU,
+# where `u` and `v` are that device's arrays and `result.Π` is one too.
 result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(),
-                           backend = CGEF.ComputationalBackends.GPUBackend(KernelAbstractions.CPU()))
+                           execution = CGEF.ComputationalBackends.GPUBackend(KernelAbstractions.CPU()))
 
-using MPI: MPI                          # enables MPIBackend (2D grids; requires MPI.Init() first)
-result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), backend = CGEF.ComputationalBackends.MPIBackend())
+using MPI: MPI                          # enables MPIBackend (requires MPI.Init() first)
+result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = CGEF.Diagnostics.NoSpectrum(), execution = CGEF.ComputationalBackends.MPIBackend())
 
 # AutoBackend (default) picks ThreadedBackend when Threads.nthreads() > 1, else SerialBackend.
 ```
@@ -388,7 +406,7 @@ result = CGEF.coarse_grain(u, v, grid; scales = scales, spectrum = CGEF.Diagnost
 `MPIBackend`'s real multi-rank behavior (round-robin row decomposition + `Allreduce!`) is only
 meaningfully exercised under `mpiexec -n P`; see `test/mpi_runtests.jl` for a runnable reference.
 
-## Planning a sweep once instead of once per scale
+## Planning a whole sweep at once
 
 A filter plan splits by how often each part changes: what the **grid** fixes (transform objects,
 measure prefix scans, a scattered point sort), what the **scale** fixes (tap tables, `Ĝ(ℓ)`, the
@@ -412,7 +430,7 @@ end
 ```
 
 A `FilterPlanFamily` is an `AbstractVector` of the per-scale plans, so it can be indexed, iterated, and
-passed anywhere a plain vector of plans was. `coarse_grain` builds one internally for a one-shot sweep;
+passed anywhere a plain vector of plans is accepted. `coarse_grain` builds one internally for a one-shot sweep;
 `coarse_grain!` is the entry point that takes a prebuilt one.
 
 Because the scales of one family share a scratch buffer, **a family may not be applied from several
@@ -425,8 +443,11 @@ convolution, which on some grids means evaluating it by transform:
 
 ```julia
 # Global sphere + a radial kernel: each latitude band becomes a circular convolution along longitude.
+# The generalized convolution reads no scalar filter, so the evaluator applies to the scalars a
+# diagnostic filters, and to the ambient Cartesian components.
 res_fast = CGEF.coarse_grain(u, v, sphere_grid; scales = scales, kernel = CGEF.GaussianKernel(),
                              method = CGEF.Filtering.AutoMethod(),
+                             vector_filter = CGEF.Filtering.CartesianComponents(),
                              spectrum = CGEF.Diagnostics.NoSpectrum())
 
 # Which engine did that pick, and what would RealSpace() have used?
@@ -434,9 +455,9 @@ CGEF.check_setup(sphere_grid, CGEF.GaussianKernel(), 800e3; method = CGEF.Filter
 CGEF.check_setup(sphere_grid, CGEF.GaussianKernel(), 800e3)   # notes that AutoMethod would be faster
 ```
 
-These are the same compact kernel with the same weights, so they agree with the direct sum to
-round-off rather than exactly — which is why `RealSpace()` remains the default. Neither is
-`method = Spectral()`: no transfer function is sampled and no spherical-harmonic truncation happens.
+These are the same compact kernel with the same weights, and they agree with the direct sum to
+round-off; `RealSpace()` remains the default. Neither is `method = Spectral()`: no transfer function
+is sampled and no spherical-harmonic truncation happens.
 
 ## Workspaces sized to what you asked for
 
@@ -451,23 +472,39 @@ CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, grid, kernel, ℓ; workspace = w
 CGEF.Diagnostics.cumulative_energy!(E, u, v, nothing, grid, kernel, scales; workspace = ew)
 ```
 
-`has_w` must be given at construction, because the buffers have to exist before the first call — a
-workspace built without them refuses a `w` rather than returning a wrong answer. Spherical and true-3-D
-grids always carry the full set, since the spherical branch works in three planetary-Cartesian
-components whether or not a vertical velocity was supplied.
+`has_w` must be given at construction, because the buffers have to exist before the first call; a
+workspace built without them refuses a `w` with an error. True-3-D grids always carry the full set. On
+the surface of a sphere a workspace holds the spin-weighted transforms of the generalized convolution
+(NUFSHT's, FastSphericalHarmonics' on its own grid, or the in-core direct sum) and the buffers of the
+plane; built with
+`vector_filter = CGEF.Filtering.CartesianComponents()`, the filter `Deformable` needs, it carries the full
+set, three ambient Cartesian components whether or not a vertical velocity was supplied. A
+workspace lives in the memory of its `execution` keyword's backend:
+`ΠWorkspace(grid; execution = CGEF.Filtering.plan_execution(plan))` for a plan built on a device.
+
+```julia
+using NUFSHT: NUFSHT
+ws  = CGEF.Diagnostics.ΠWorkspace(sphere_grid)                               # generalized convolution
+wsc = CGEF.Diagnostics.ΠWorkspace(sphere_grid; vector_filter = CGEF.Filtering.CartesianComponents())
+CGEF.Diagnostics.compute_Π!(Π, u, v, nothing, sphere_grid, kernel, ℓ; workspace = ws)
+```
 
 ## Spectral filtering (`method = Spectral()`)
 
-Spectral filtering multiplies by Ĝ(k) and is selected by the grid type (FFTW / FINUFFT /
-FastSphericalHarmonics / NUFSHT). It requires a homogeneous (periodic / global) domain, but a partial
-mask is supported — `ZeroFill`/`Deformable` work exactly as they do for `RealSpace()` (normalized
-convolution, evaluated in Fourier/spherical-harmonic space). `GaussianKernel`/`SharpSpectralKernel`
-work with no extra dependency; `TopHatKernel` needs `using SpecialFunctions` (for its exact planar
-Bessel-`J₁` transfer function — the spherical-cap analog needs no extra dependency).
+Spectral filtering multiplies by Ĝ(k) and is selected by the grid type (FFTW, the nonuniform FFT,
+FastSphericalHarmonics, NUFSHT). A bounded Cartesian direction is zero-padded, so the result is the
+filter of the field extended by zero beyond the domain; the spherical-harmonic transforms need the whole
+sphere. A partial mask is supported by normalized convolution, `ZeroFill`/`Deformable` defined as for
+`RealSpace()`. `GaussianKernel` filters spectrally with no extra dependency, and so does
+`SharpSpectralKernel` on the plane; `TopHatKernel` on a two-dimensional plane needs
+`using SpecialFunctions` (for its exact planar Bessel-`J₁` transfer function — the one- and
+three-dimensional forms and the spherical cap need no extra dependency), as does `SharpSpectralKernel` in
+real space on a two-dimensional grid and on a sphere, where its degree transfer is the Legendre transform
+of that two-dimensional weight.
 
 ```julia
 using FlowGeometries: FlowGeometries as FG
-using FFTW: FFTW                       # uniform periodic Cartesian
+using FFTW: FFTW                       # uniform Cartesian
 N = 128; dx = 1.0
 geom = FG.Geometry.CartesianGeometry()
 x = collect(0.0:dx:dx*(N - 1))
@@ -477,17 +514,22 @@ out = zeros(N, N)
 CGEF.Filtering.filter_field!(out, u, grid, CGEF.GaussianKernel(), 4.0; method = CGEF.Filtering.Spectral())
 ```
 
-Scattered Cartesian points use `FINUFFT` on an `UnstructuredGrid{Cartesian}`; uniform spherical grids
-use `FastSphericalHarmonics` on a `StructuredGrid{Spherical}`; scattered spherical points use `NUFSHT`
-on an `UnstructuredGrid{Spherical}`. In every case the call is the same `filter_field!(…; method =
-CGEF.Filtering.Spectral())` — only the grid type differs.
+Scattered Cartesian points in one to three dimensions use the nonuniform FFT on an
+`UnstructuredGrid{Cartesian}` (`using NonuniformFFTs` or `using FINUFFT`; with both loaded
+`transform = FlowTransformBindings.FINUFFTBackend()` or `NonuniformFFTsBackend()` picks one);
+a global sphere on `FastSphericalHarmonics`' own nodes — built with
+`FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), N)`, `N` latitudes by
+`2N − 1` longitudes — uses `FastSphericalHarmonics`; scattered spherical points use `NUFSHT` on an
+`UnstructuredGrid{Spherical}`. Any other grid is filtered over its
+cells as a node set by the transform of its geometry. In every case the call is the same
+`filter_field!(…; method = CGEF.Filtering.Spectral())` — only the grid type differs.
 
 ## Rotational / divergent (Helmholtz) flux decomposition
 
 Pass the rotational (solenoidal) velocity from a Helmholtz solver
 ([HelmholtzDecomposition.jl](https://github.com/jbphyswx/HelmholtzDecomposition.jl)); the divergent
 part is taken as the complement. Both the strain and the stress are split before contracting (see
-[Theory](theory.md)), giving three exact channels rather than a one-sided approximation.
+[Theory](theory.md)), giving three exact channels.
 
 ```julia
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
@@ -503,9 +545,9 @@ dec.divergent    # Π_DD   (divergent → divergent)      dec.rotational .+ dec.
 The true-3D method has the same signature with `w`/`w_rot` added, on a Cartesian volume or a spherical
 shell.
 
-On a spherical grid the call is identical. The three stress pieces are formed as generalized second
-moments in planetary-Cartesian coordinates and rotated back to the local frame, and each part's strain
-carries the frame's `tanφ/R` curvature terms, so `dec.total` still equals `compute_Π!` — the suite
+On a spherical grid the call is identical. The three stress pieces are generalized second moments under
+the generalized convolution, which keeps each filtered part rotational or divergent, and each part's
+strain carries the frame's `tanφ/R` curvature terms, so `dec.total` still equals `compute_Π!` — the suite
 asserts it. Pass `SphericalPiDecomposedWorkspace(grid)` to `compute_Π_decomposed!` to reuse the
 buffers across a sweep.
 
@@ -517,8 +559,10 @@ buffers across a sweep.
 ```
 
 A true-3D method exists too (`tracer_variance_flux(u, v, w, θ, grid, kernel, scale)`). On a spherical
-grid the velocity is rotated to planetary Cartesian before filtering and the subfilter tracer flux
-rotated back to east/north(/radial), the same convention `compute_Π!` uses.
+grid the vectors `u` and `uθ` are filtered by the vector filter `compute_Π!` uses and `θ̄` by the same
+transforms at spin 0, and the subfilter tracer flux comes back in east/north components; in a spherical
+shell it is formed in
+ambient Cartesian components and rotated back to east/north/radial.
 
 ## Stress decomposition (Leonard / Cross / Reynolds)
 
@@ -527,8 +571,8 @@ d = CGEF.Diagnostics.tau_decomposition(u, v, grid, CGEF.TopHatKernel(), 20_000.0
 d.L.xx; d.C.xy; d.R.yy        # d.L + d.C + d.R == τ exactly
 ```
 
-On a spherical grid, `xx`/`xy`/`yy` are local east/north components (the moments are taken in
-planetary-Cartesian coordinates, then rotated back — see [Theory](theory.md)).
+On a spherical grid, `xx`/`xy`/`yy` are local east/north components of the moments under the
+generalized convolution (see [Theory](theory.md)).
 
 Add `w` for the true-3-D split, on a Cartesian volume or a spherical shell. Each tensor then comes
 back with all six independent components, `(; xx, xy, xz, yy, yz, zz)`, and `L + C + R = τ` holds
@@ -541,8 +585,7 @@ d3.L.xz; d3.C.yz; d3.R.zz
 
 ## Strain / convergence decomposition of Π
 
-The same flux split by diagonalizing the filtered strain instead of decomposing the velocity
-(Srinivasan, Barkan & McWilliams 2023). `Π_α` is deformation production, `Π_δ` the frontogenetic
+The same flux split by diagonalizing the filtered strain (Srinivasan, Barkan & McWilliams 2023). `Π_α` is deformation production, `Π_δ` the frontogenetic
 convergence term that vanishes for a non-divergent field.
 
 ```julia
@@ -574,8 +617,7 @@ CGEF.Diagnostics.enstrophy_flux!(Z, ws, u, v, grid, ker, ℓ; filter_plan = plan
 
 ## Energy by scale band
 
-The repeated-filter Germano identity, which splits the kinetic energy into bands that **sum to the
-total** — unlike band-passing the velocity, whose cross terms have indefinite sign.
+The repeated-filter Germano identity splits the kinetic energy into bands that **sum to the total**.
 
 ```julia
 # `scales` ASCENDING: band n is what the n-th, progressively coarser, filter removes.
@@ -590,7 +632,7 @@ r.band_maps[2]                # the pointwise map for band 2
 
 Use a **non-negative** kernel here: band energies are variances, and they are pointwise positive only
 if the kernel is. The identity is exact on a periodic unmasked domain and carries an `O(ℓ/L)` residual
-wherever the footprint truncates — see [`Diagnostics.band_energies`](@ref) for the measured numbers.
+wherever the footprint truncates; see [`Diagnostics.band_energies`](@ref).
 
 ## Visualization (CairoMakie extension)
 

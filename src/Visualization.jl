@@ -2,10 +2,6 @@ module Visualization
 
 export plot_Π_map, plot_spectrum
 
-# Parent-owned stub functions. The CairoMakie package extension adds the real methods; without
-# CairoMakie loaded these fallbacks raise a helpful error (mirroring the backend-hook stubs in
-# `Filtering`). Keeping the generic functions here lets the extension extend rather than shadow them.
-
 """
     plot_Π_map(res, scale_idx, grid; colormap=:balance, title=nothing) -> Figure
 
@@ -24,9 +20,6 @@ run `using CairoMakie` to enable it.
 """
 function plot_spectrum end
 
-# Catch-alls reporting why a call did not land on an extension method: either the extension is absent,
-# or it is loaded and these argument types have no method in it. Reporting only the first would send a
-# caller who already has CairoMakie loaded chasing an import they have.
 function _no_plot_method(name::Symbol, args)
     loaded = Base.get_extension(parentmodule(@__MODULE__), :CoarseGrainingEnergyFluxesCairoMakieExt) !== nothing
     throw(ArgumentError(loaded ?

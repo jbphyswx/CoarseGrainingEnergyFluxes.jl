@@ -4,9 +4,6 @@ using CairoMakie: CairoMakie
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries
 
-# Methods for the parent-owned visualization stubs (`CGEF.plot_Π_map`, `CGEF.plot_spectrum`). Every
-# Makie call stays qualified (`CairoMakie.Figure`, …) per the package's explicit-import policy.
-
 """
     plot_Π_map(res, scale_idx, grid; colormap=:balance, title=nothing) -> Figure
 
@@ -35,7 +32,6 @@ function CGEF.plot_Π_map(
             "Energy flux Π at ℓ = $(round(scale / 1000; digits = 1)) km" : title,
     )
 
-    # Symmetric limits centered on zero for the divergent cascade colormap.
     max_val = maximum(abs, Π_map)
     colorrange = max_val > 0 ? (-max_val, max_val) : (-one(T), one(T))
 
