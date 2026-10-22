@@ -8,6 +8,11 @@ using ComputationalBackends: ComputationalBackends
 using FlowGeometries: FlowGeometries
 using SpectralBackends: SpectralBackends
 
+public FlowTransformBindings
+public ComputationalBackends
+public FlowGeometries
+public SpectralBackends
+
 include("Kernels.jl")
 include("Filtering.jl")
 include("Derivatives.jl")
