@@ -258,7 +258,7 @@ CGEF.Filtering.spectral_grid_plan(
     _fftw_grid_plan_for(_fft_axes(grid), sb, grid, kernel; kwargs...)
 
 _fftw_grid_plan_for(
-    ::_FFTAxes, _, grid, _;
+    ::_FFTAxes, _sb, grid, _kernel;
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy = CGEF.Filtering.ZeroFill(),
     execution::CGEF.ComputationalBackends.AbstractExecutionBackend = CGEF.ComputationalBackends.AutoBackend(),
     batch::Union{Nothing,Integer} = nothing,
