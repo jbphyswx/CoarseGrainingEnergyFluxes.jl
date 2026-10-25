@@ -32,10 +32,10 @@ The approach follows Aluie (2011, 2019) and Aluie, Hecht, & Vallis (2018), using
 `RealSpace()` names that operator: a local space average against the compact kernel. Which engine
 evaluates it is chosen from the grid and kernel — exact prefix sums for a top-hat in 2-D and 3-D, separable passes for the factorizing
 kernels, a vectorized banded footprint otherwise — and
-[`check_setup`](@ref) reports the choice and its cost before anything runs. Two further engines
-evaluate the same convolution by transform under `method = AutoMethod()`: a padded FFT of the sampled
-kernel on a uniform Cartesian lattice, and a transform along the longitude ring on a global sphere,
-where a great-circle kernel depends on the longitude difference alone. See
+[`check_setup`](@ref) reports the choice and its cost before anything runs. Where it takes fewer
+operations than that engine, the same convolution is evaluated by transform: a padded FFT of the
+sampled kernel on a uniform Cartesian lattice in any dimension, and a transform along longitude on a
+sphere of uniform longitude, where a great-circle kernel depends on the longitude offset alone. See
 [Architecture](architecture.md#Real-space-engines) for the full table.
 
 For a sweep over scales, [`Filtering.plan_filter_sweep`](@ref) builds the parts of a plan the scale

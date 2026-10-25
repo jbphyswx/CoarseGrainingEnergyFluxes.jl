@@ -167,14 +167,15 @@ function CGEF.Filtering.distributed_filter_field!(
     s_out = SharedArrays.SharedArray{T}(dims)
     fill!(s_out, zero(T))
     cart = CartesianIndices(dims)
-    # The point functions decide which targets the strategy filters.
     if fp isa CGEF.Filtering.FilterFootprintND
-        periodic = FlowGeometries.Grids.periodic_flags(grid)
-        @sync Distributed.@distributed for lin in 1:length(s_out)
-            I = cart[lin]
-            s_out[I] = CGEF.Filtering._footprint_nd_point(field, fp, mask_strategy, dims, periodic, mask, I)
+        # Each line along axis 1 writes only itself.
+        src = CGEF.Filtering._nd_source!(fp, field, grid)
+        lines = CartesianIndices(Base.tail(dims))
+        @sync Distributed.@distributed for q in 1:length(lines)
+            CGEF.Filtering._nd_out_line!(s_out, src, fp, Tuple(lines[q]))
         end
     elseif fp.cache !== nothing
+        # The point functions decide which targets the strategy filters.
         lin_idx = LinearIndices(dims)
         cache = fp.cache
         exterior = fp.exterior

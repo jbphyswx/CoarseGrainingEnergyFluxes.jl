@@ -10,8 +10,8 @@ using BenchmarkTools: BenchmarkTools
 
 const OUT_DIR = joinpath(@__DIR__, "baseline")
 
-# Top level, not inside `main`: `include` defines `SUITE` in a newer world age than a function body
-# reading it, which Julia 1.12 warns about and will make an error.
+# At top level: `include` defines `SUITE` in a newer world age than a function body reading it, which
+# Julia 1.12 warns about and will make an error.
 include(joinpath(@__DIR__, "benchmarks.jl"))
 
 function main()

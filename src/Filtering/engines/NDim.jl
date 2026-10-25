@@ -168,22 +168,7 @@ function _build_separable_nd(
     kwargs...,
 ) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     dims = FlowGeometries.Grids.size_tuple(grid)
-    rad = Kernels.kernel_radius(kernel, scale)
-    periodic = FlowGeometries.Grids.periodic_flags(grid)
-    lim = ntuple(Val(N)) do d
-        s = FlowGeometries.Grids.minimum_spacing(grid, d)
-        (isfinite(s) && s > 0) ? ceil(Int, rad / s) : 0
-    end
-    mf = FlowGeometries.Grids.measure_factors(grid)
-    mf === nothing && throw(ArgumentError(
-        "the separable path needs a separable cell measure, but this grid's measure is dense",
-    ))
-    g = ntuple(Val(N)) do d
-        _separable_axis_weights(
-            FlowGeometries.Grids.coordinates(grid, d), lim[d], periodic[d],
-            T(FlowGeometries.Grids.period(grid, d)), kernel, scale, convert(AbstractVector{T}, mf[d]),
-        )
-    end
+    (; g, lim, periodic, mf) = _separable_tables(grid, kernel, scale)
 
     masked_input = zeros(T, dims)
     scratch = zeros(T, dims)
@@ -297,8 +282,193 @@ build_footprint(
 build_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,1,S,TP,<:Tuple{AbstractRange}},
     kernel::Kernels.AbstractFilterKernel, scale::T; kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, S, TP<:NTuple{1,FlowGeometries.Grids.AbstractTopology}} = _build_footprint_nd(grid, kernel, scale)
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, S, TP<:NTuple{1,FlowGeometries.Grids.AbstractTopology}} =
+    _build_footprint_nd(grid, kernel, scale; kwargs...)
 build_footprint(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,3,S,TP,<:Tuple{AbstractRange,AbstractRange,AbstractRange}},
     kernel::Kernels.AbstractFilterKernel, scale::T; kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, S, TP<:NTuple{3,FlowGeometries.Grids.AbstractTopology}} = _build_footprint_nd(grid, kernel, scale)
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, S, TP<:NTuple{3,FlowGeometries.Grids.AbstractTopology}} =
+    _build_footprint_nd(grid, kernel, scale; kwargs...)
+
+"""
+    LineRuns{M,VO,VI,VT}
+
+The taps of a translation-invariant footprint in `M + 1` dimensions by line: run `s` covers the
+consecutive axis-1 offsets `di0[s] + t − 1` at offsets `tail[s]` along axes `2…M+1`, with weights
+`w[start[s] + t − 1]` for `t = 1:(start[s+1] − start[s])`.
+"""
+struct LineRuns{M, VO<:AbstractVector{NTuple{M,Int}}, VI<:AbstractVector{Int}, VT<:AbstractVector}
+    tail::VO
+    di0::VI
+    start::VI
+    w::VT
+end
+
+# The runs of taps listed with the axis-1 offset varying fastest, a run broken wherever the offsets along
+# the other axes change or the axis-1 offset skips.
+function _line_runs(offsets::AbstractVector{NTuple{N,Int}}, w::AbstractVector) where {N}
+    tail = NTuple{N - 1,Int}[]
+    di0 = Int[]
+    start = Int[]
+    for k in eachindex(offsets)
+        o = offsets[k]
+        if k == firstindex(offsets) || Base.tail(o) != Base.tail(offsets[k - 1]) || o[1] != offsets[k - 1][1] + 1
+            push!(tail, Base.tail(o))
+            push!(di0, o[1])
+            push!(start, k)
+        end
+    end
+    push!(start, lastindex(offsets) + 1)
+    return LineRuns(tail, di0, start, w)
+end
+
+"""
+    FilterFootprintND{N,T}
+
+Translation-invariant footprint of a 1-D or 3-D Cartesian grid with uniform axes: the in-support
+neighbour offsets (`NTuple{N,Int}`) and their weights `w = kernel_weight(distance) · cell_measure`, which
+a device applies point by point, and the same taps as [`LineRuns`](@ref), which the host applies as one
+contiguous axpy per tap along axis 1; both sum a point's taps in the order `offsets` lists them.
+`invden` is the reciprocal window mass under `strategy`, `ZeroFill`'s including the mass past a bounded
+edge ([`_exterior_mass`](@ref)); it is zero where the window is empty or, under `Deformable`, the target
+inactive.
+"""
+struct FilterFootprintND{
+    N, T<:AbstractFloat, VO<:AbstractVector{NTuple{N,Int}}, VT<:AbstractVector{T},
+    RT<:LineRuns, A<:AbstractArray{T,N}, MS<:AbstractMaskStrategy,
+}
+    offsets::VO
+    w::VT
+    runs::RT
+    periodic::NTuple{N,Bool}
+    strategy::MS       # the strategy `invden` was accumulated under
+    masked::Bool       # the grid has an inactive cell, so the sweep reads `mask · field`
+    bound::Bool        # the strategies' denominators differ: a cell is inactive or a window leaves the grid
+    invden::A
+    masked_input::A    # `mask · field` per apply on a masked grid; empty otherwise
+end
+
+# Every tap's contribution to output line `J`, the indices along axes `2…N`, added into `oc` from `src`.
+@inline function _nd_line_accumulate!(
+    oc::AbstractVector{T}, src::AbstractArray, runs::LineRuns{M}, J::NTuple{M,Int},
+    dims::NTuple{N,Int}, periodic::NTuple{N,Bool},
+) where {T, M, N}
+    tdims, tperiodic = Base.tail(dims), Base.tail(periodic)
+    w = runs.w
+    @inbounds for s in eachindex(runs.tail)
+        JJ = map((j, o, n, p) -> (jj = j + o; 1 <= jj <= n ? jj : p ? mod1(jj, n) : 0), J, runs.tail[s], tdims, tperiodic)
+        all(>(0), JJ) || continue
+        fc = view(src, :, JJ...)
+        k0 = runs.start[s]
+        _run_accumulate!(oc, fc, w, k0, runs.start[s + 1] - 1, runs.di0[s] - k0, periodic[1], dims[1])
+    end
+    return oc
+end
+
+"""
+    _nd_out_line!(out, src, fp::FilterFootprintND, J) -> nothing
+
+Output line `J` (`out[:, J...]`) from the source [`_nd_source!`](@ref) returned, scaled by the reciprocal
+window mass. Writes that line alone, so lines may run concurrently.
+"""
+@inline function _nd_out_line!(
+    out::AbstractArray{T,N}, src::AbstractArray, fp::FilterFootprintND{N,T}, J::NTuple{M,Int},
+) where {T, N, M}
+    oc = view(out, :, J...)
+    @inbounds @simd for i in eachindex(oc)
+        oc[i] = zero(T)
+    end
+    _nd_line_accumulate!(oc, src, fp.runs, J, size(out), fp.periodic)
+    inv = view(fp.invden, :, J...)
+    @inbounds @simd for i in eachindex(oc)
+        oc[i] *= inv[i]
+    end
+    return nothing
+end
+
+"""
+    _nd_source!(fp::FilterFootprintND, field, grid) -> src
+
+The array the line sweep reads: on a masked grid the plan's buffer, filled with `mask · field`;
+otherwise `field` itself. Call it before the lines run.
+"""
+function _nd_source!(fp::FilterFootprintND, field::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid)
+    fp.masked || return field
+    mask = FlowGeometries.Grids.mask(grid)
+    @. fp.masked_input = mask * field   # a `Bool` strong zero: an inactive cell contributes nothing
+    return fp.masked_input
+end
+
+@noinline _nd_strategy_mismatch() = throw(ArgumentError(
+    "FilterFootprintND is being applied with a different mask strategy than it was built for, on a grid " *
+    "where the two normalize differently: a cell is inactive, or a window reaches past a bounded edge. " *
+    "Rebuild the plan with the `mask_strategy` you intend to apply with.",
+))
+
+@inline function _nd_check_strategy(fp::FilterFootprintND, strategy::AbstractMaskStrategy)
+    (!fp.bound || typeof(strategy) === typeof(fp.strategy)) || _nd_strategy_mismatch()
+    return nothing
+end
+
+function apply_footprint_nd!(
+    out::AbstractArray{T,N}, field::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
+    fp::FilterFootprintND{N,T}, strategy::AbstractMaskStrategy,
+) where {N, T<:AbstractFloat, G}
+    _nd_check_strategy(fp, strategy)
+    src = _nd_source!(fp, field, grid)
+    for J in CartesianIndices(Base.tail(size(out)))
+        _nd_out_line!(out, src, fp, Tuple(J))
+    end
+    return out
+end
+
+function _build_footprint_nd(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
+    kwargs...,
+) where {N, T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    rad = Kernels.kernel_radius(kernel, scale, Val(N))
+    # The caller's dispatch guarantees every coordinate axis is a `Range`.
+    spacing = ntuple(d -> step(FlowGeometries.Grids.coordinates(grid, d)), N)
+    A = FlowGeometries.Grids.measure(grid)[ntuple(_ -> 1, N)...]   # uniform Cartesian cell measure
+    lim = ntuple(d -> spacing[d] > 0 ? ceil(Int, rad / spacing[d]) : 0, N)
+    offsets = NTuple{N,Int}[]
+    w = T[]
+    sizehint!(offsets, prod(2 .* lim .+ 1))
+    sizehint!(w, prod(2 .* lim .+ 1))
+    for off in CartesianIndices(ntuple(d -> (-lim[d]):lim[d], N))
+        o = Tuple(off)
+        d2 = zero(T)
+        for d in 1:N
+            d2 += (T(o[d]) * spacing[d])^2
+        end
+        dist = sqrt(d2)
+        if dist <= rad
+            push!(offsets, o)
+            push!(w, Kernels.kernel_weight(kernel, dist, scale, Val(N)) * A)
+        end
+    end
+    runs = _line_runs(offsets, w)
+    dims = FlowGeometries.Grids.size_tuple(grid)
+    periodic = FlowGeometries.Grids.periodic_flags(grid)
+    mask = FlowGeometries.Grids.mask(grid)
+    masked = !all(mask)
+    zerofill = mask_strategy isa ZeroFill
+    exterior = _exterior_mass(grid, kernel, scale)
+    # Window mass: `ZeroFill` counts every in-support cell and those past a bounded edge, `Deformable`
+    # only the active in-domain ones.
+    massf = zerofill ? fill(one(T), dims) : T.(mask)
+    den = zeros(T, dims)
+    for J in CartesianIndices(Base.tail(dims))
+        _nd_line_accumulate!(view(den, :, Tuple(J)...), massf, runs, Tuple(J), dims, periodic)
+    end
+    zerofill && exterior !== nothing && (den .+= exterior)
+    @inbounds for I in CartesianIndices(dims)
+        den[I] = (zerofill || mask[I]) ? _inv_mass(den[I]) : zero(T)
+    end
+    buf = masked ? zeros(T, dims) : zeros(T, ntuple(_ -> 0, Val(N)))
+    bound = masked || _reaches_exterior(grid, kernel, scale)
+    return FilterFootprintND(offsets, w, runs, periodic, mask_strategy, masked, bound, den, buf)
+end

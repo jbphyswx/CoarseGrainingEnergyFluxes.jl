@@ -90,12 +90,42 @@ Base.show(io::IO, plan::NUFFTFilterPlan) =
 _mode_count(N::Int) = isodd(N) ? N : N + 1
 _edge_weight(::Type{T}, f::Int, N::Int) where {T} = (iseven(N) && abs(f) == N ÷ 2) ? T(1 // 2) : one(T)
 
-# `points` is the share of the points this plan transforms, `_owned(execution, npts)` unless given.
+"""
+    _KernelBox(radius, cutoff)
+
+The box of a kernel sum ([`NUFFTSumFootprint`](@ref)): a bounded direction padded by the kernel's radius,
+so every image of a point lies at least `radius` from the others, and every mode with `|k| ≤ cutoff`.
+"""
+struct _KernelBox{T<:AbstractFloat}
+    radius::T
+    cutoff::T
+end
+
+# The box periods and mode counts. A spectral filter's box holds a mode per node along a periodic direction
+# and a bounded one padded as `_fft_layout` pads an axis; a kernel sum's holds the modes up to the cutoff,
+# an odd count per direction.
+function _nufft_box(::Nothing, grid, periodic::NTuple{D,Bool}, spans::Tuple{T,Vararg{T}}) where {D,T}
+    nodes = FlowGeometries.Grids.node_counts(grid)
+    counts = ntuple(d -> periodic[d] ? nodes[d] : 2 * nextprod((2, 3, 5), nodes[d]), Val(D))
+    L = ntuple(d -> periodic[d] ? spans[d] : counts[d] * T(FlowGeometries.Grids.domain_length(grid, d)) / nodes[d],
+               Val(D))
+    return L, counts
+end
+
+function _nufft_box(b::_KernelBox, _, periodic::NTuple{D,Bool}, spans::Tuple{T,Vararg{T}}) where {D,T}
+    L = ntuple(d -> periodic[d] ? spans[d] : spans[d] + T(b.radius), Val(D))
+    return L, map(Ld -> 2 * floor(Int, T(b.cutoff) * Ld / T(2π)) + 1, L)
+end
+
+# `points` is the share of the points this plan transforms, `_owned(execution, npts)` unless given. `box`
+# is `nothing` for a spectral filter or a `_KernelBox`; `tol` is the transforms' tolerance.
 function _nufft_grid_plan(
     nufft, grid::FlowGeometries.Grids.UnstructuredGrid{T,G,D};
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     batch::Union{Nothing,Integer} = nothing,
     points::Union{Nothing,AbstractVector{Int}} = nothing,
+    box::Union{Nothing,_KernelBox} = nothing,
+    tol::Real = FlowTransformBindings.default_tolerance(T),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}, D}
     1 <= D <= 3 || throw(ArgumentError(
         "nonuniform-FFT spectral filtering takes 1, 2 or 3 coordinates; this grid has $D"))
@@ -109,17 +139,14 @@ function _nufft_grid_plan(
     all(>(0), spans) || throw(ArgumentError(
         "nonuniform-FFT spectral filtering needs a box of positive size; the points span $spans. A " *
         "point set with no extent in a direction needs `periodic` and `period` declared for it."))
-    nodes = FlowGeometries.Grids.node_counts(grid)
-    counts = ntuple(d -> periodic[d] ? nodes[d] : 2 * nextprod((2, 3, 5), nodes[d]), Val(D))
-    L = ntuple(d -> periodic[d] ? spans[d] : counts[d] * T(FlowGeometries.Grids.domain_length(grid, d)) / nodes[d],
-               Val(D))
+    L, counts = _nufft_box(box, grid, periodic, spans)
     nmodes = map(_mode_count, counts)
     # This process's points, their weights and mask go where `execution` runs, and the library plans in
     # that memory. Type 1 is a sum over points, so the processes' partial spectra sum to the whole one.
     own = points === nothing ? _owned(execution, npts) : points
     part(v) = own === nothing ? v : v[own]
     xb = map(v -> _on_backend(execution, T.(part(v))), x)
-    kw = (; period = L, origin = lo, nthreads = _library_threads(execution))
+    kw = (; period = L, origin = lo, nthreads = _library_threads(execution), tol = tol)
     plan = FlowTransformBindings.plan_nufft(nufft, T, xb, nmodes; kw...)
     nb = batch === nothing ? 0 : Int(batch)
     batched = nb == 0 ? nothing : FlowTransformBindings.plan_nufft(nufft, T, xb, nmodes; ntrans = nb, kw...)
@@ -362,3 +389,112 @@ function filter_synthesize!(out::AbstractMatrix{T}, F̂::AbstractArray, plan::NU
     FlowTransformBindings.nufft_type2!(p.values, b, p.modes)
     return _store_filtered!(out, p.values, plan.invrenorm, plan.grid_plan)
 end
+
+# ---------------------------------------------------------------------------
+# A radial kernel's sum over a Cartesian node set, by nonuniform FFT
+# ---------------------------------------------------------------------------
+
+"""
+    NUFFTSumFootprint
+
+The real-space filter over a Cartesian grid's cells as points, `Σⱼ G(|x − xⱼ|) Aⱼ fⱼ / Σⱼ G(|x − xⱼ|) Aⱼ`
+over the cells the strategy counts, its sums taken by nonuniform FFT. On a box whose bounded directions
+are padded by the kernel's radius, so that every image of a point lies past the radius from every other,
+
+    Σⱼ G(x − xⱼ) Aⱼ cⱼ = Σ_k Ĝ(k) e^{ik⋅x} Σⱼ (Aⱼ / ∏L) cⱼ e^{−ik⋅xⱼ}
+
+(Potts & Steidl 2003), with `|k|` up to [`Kernels.transfer_cutoff`](@ref). It is the node CSR engine's
+sum with the kernel continued past its truncation radius, where it is below
+`Kernels.GAUSSIAN_TRUNCATION_TOL` of its peak, and the transforms run at that tolerance.
+
+`invden` is the reciprocal of the denominator, zero where it vanishes or, under `Deformable`, at an
+inactive node. `bound` is whether the two strategies' denominators differ, which they do on a masked grid.
+
+# References
+- Potts & Steidl (2003), *SIAM J. Sci. Comput.* 24(6), "Fast summation at nonequispaced knots by NFFTs".
+"""
+struct NUFFTSumFootprint{
+    T<:AbstractFloat, GP<:NUFFTGridPlan{T}, A<:AbstractArray{T}, V<:AbstractVector{T},
+    MS<:AbstractMaskStrategy, SC<:NUFFTScratch,
+}
+    grid_plan::GP
+    transfer::A
+    invden::V
+    strategy::MS
+    bound::Bool
+    scratch::SC
+end
+
+Base.show(io::IO, fp::NUFFTSumFootprint) = print(io, "NUFFTSumFootprint(", fp.grid_plan.plan, ")")
+
+_driven_footprint(::NUFFTSumFootprint) = true
+
+"""
+    nufft_sum_footprint(grid, kernel, scale; mask_strategy = ZeroFill(), execution = SerialBackend())
+        -> NUFFTSumFootprint
+
+The [`NUFFTSumFootprint`](@ref) of a kernel with a [`Kernels.transfer_cutoff`](@ref) over the cells of a
+Cartesian grid with no lattice of its own, a node set or a curvilinear mesh, read and written in the
+grid's linear cell order. The transforms run on the NUFFT library `AutoSpectralBackend` takes, on
+`_library_threads(execution)` threads.
+"""
+nufft_sum_footprint(
+    grid::FlowGeometries.Grids.AbstractGrid{G,T}, kernel::Kernels.AbstractFilterKernel, scale::T; kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}} =
+    _nufft_sum_footprint(_node_set(grid), kernel, scale; kwargs...)
+
+function _nufft_sum_footprint(
+    grid::FlowGeometries.Grids.UnstructuredGrid{T,G,D}, kernel::Kernels.AbstractFilterKernel, scale::T;
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.SerialBackend(),
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}, D}
+    nufft = _nufft_library(SpectralBackends.AutoSpectralBackend())
+    box = _KernelBox(T(Kernels.kernel_radius(kernel, scale, Val(D))), T(Kernels.transfer_cutoff(kernel, scale)))
+    gp = _nufft_grid_plan(nufft, grid; execution, box, tol = T(Kernels.GAUSSIAN_TRUNCATION_TOL))
+    sc = _nufft_scratch(gp)
+    transfer = _nufft_transfer(gp, kernel, scale)
+    # The denominator is the same sum over the weights of the nodes the strategy counts.
+    deformable = mask_strategy isa Deformable && gp.mask !== nothing
+    deformable ? (@. sc.values = gp.mask * gp.weights) : (sc.values .= gp.weights)
+    _analysis!(sc.modes, gp.plan, sc.values, gp)
+    sc.modes .*= transfer
+    FlowTransformBindings.nufft_type2!(sc.values, gp.plan, sc.modes)
+    invden = deformable ? ifelse.(gp.mask, _inv_mass.(sc.values), zero(T)) : _inv_mass.(sc.values)
+    return NUFFTSumFootprint(gp, transfer, invden, mask_strategy, gp.mask !== nothing, sc)
+end
+
+@noinline _nufft_sum_strategy_mismatch() = throw(ArgumentError(
+    "NUFFTSumFootprint is being applied with a different mask strategy than it was built for, on a masked " *
+    "grid, where the two normalize differently. Rebuild the plan with the `mask_strategy` you intend to " *
+    "apply with.",
+))
+
+function _check_strategy(fp::NUFFTSumFootprint, strategy::AbstractMaskStrategy)
+    (!fp.bound || typeof(strategy) === typeof(fp.strategy)) || _nufft_sum_strategy_mismatch()
+    return nothing
+end
+
+# The library runs the transforms on the plan's threads, so a driver has nothing to divide. `field` and
+# `out` are read and written in linear cell order.
+function apply_footprint!(
+    out::AbstractArray, field::AbstractArray, grid, fp::NUFFTSumFootprint{T}, strategy::AbstractMaskStrategy,
+    driver::D = _sep_serial,
+) where {T, D}
+    _check_strategy(fp, strategy)
+    gp, sc = fp.grid_plan, fp.scratch
+    c, w, m = sc.values, gp.weights, gp.mask
+    # A `Bool` is a strong zero: an inactive cell adds nothing even where the field is NaN.
+    @inbounds for s in eachindex(c)
+        c[s] = m === nothing ? T(w[s] * field[s]) : T(m[s] * (w[s] * field[s]))
+    end
+    _analysis!(sc.modes, gp.plan, c, gp)
+    sc.modes .*= fp.transfer
+    FlowTransformBindings.nufft_type2!(c, gp.plan, sc.modes)
+    invden = fp.invden
+    @inbounds for s in eachindex(c)
+        out[s] = c[s] * invden[s]
+    end
+    return out
+end
+
+_apply_serial!(out, field, grid, fp::NUFFTSumFootprint, strategy) = apply_footprint!(out, field, grid, fp, strategy)

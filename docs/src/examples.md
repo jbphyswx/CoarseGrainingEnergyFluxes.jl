@@ -204,9 +204,9 @@ using FlowGeometries: FlowGeometries as FG
 using NUFSHT: NUFSHT                             # fast spin-weighted transforms for the vector filter
 
 geom = FG.Geometry.SphericalGeometry(6.371e6)
-lon = deg2rad.(collect(0.0:0.25:359.75))
+lon = FG.Axes.PeriodicAxis(0.0, 2π, 1440)        # a 0.25° longitude ring; a plain vector or range is a regional box
 lat = deg2rad.(collect(-80.0:0.25:80.0))
-grid = FG.Grids.StructuredGrid(geom, lon, lat)   # full-circle lon ⇒ periodic auto-detected
+grid = FG.Grids.StructuredGrid(geom, lon, lat)
 # u, v = load_velocity(...)
 
 scales = collect(10e3:10e3:300e3)
@@ -436,27 +436,22 @@ passed anywhere a plain vector of plans is accepted. `coarse_grain` builds one i
 Because the scales of one family share a scratch buffer, **a family may not be applied from several
 tasks at once**. Give each concurrent worker its own — the batch and slice drivers already do.
 
-## Choosing the evaluator: `AutoMethod()`
+## Which engine evaluates `RealSpace()`
 
-`RealSpace()` computes the direct sum. `AutoMethod()` picks the fastest engine that computes the *same*
-convolution, which on some grids means evaluating it by transform:
+`RealSpace()` is the convolution with the compact kernel. On a CPU backend it is evaluated by transform
+where that computes the same sum in fewer operations: along longitude on a sphere of uniform longitude,
+where for a fixed pair of latitude rows the great-circle weight depends on the column offset alone, and
+by a zero-padded FFT of the sampled kernel on a uniform Cartesian grid. A kernel a few cells wide keeps
+its real-space engine.
 
 ```julia
-# Global sphere + a radial kernel: each latitude band becomes a circular convolution along longitude.
-# The generalized convolution reads no scalar filter, so the evaluator applies to the scalars a
-# diagnostic filters, and to the ambient Cartesian components.
-res_fast = CGEF.coarse_grain(u, v, sphere_grid; scales = scales, kernel = CGEF.GaussianKernel(),
-                             method = CGEF.Filtering.AutoMethod(),
-                             vector_filter = CGEF.Filtering.CartesianComponents(),
-                             spectrum = CGEF.Diagnostics.NoSpectrum())
-
-# Which engine did that pick, and what would RealSpace() have used?
-CGEF.check_setup(sphere_grid, CGEF.GaussianKernel(), 800e3; method = CGEF.Filtering.AutoMethod())
-CGEF.check_setup(sphere_grid, CGEF.GaussianKernel(), 800e3)   # notes that AutoMethod would be faster
+# The 0.25° grid of the spherical example above.
+CGEF.check_setup(grid, CGEF.GaussianKernel(), 100e3).engine   # "zonal-FFT along longitude, …"
+CGEF.check_setup(grid, CGEF.GaussianKernel(), 25e3).engine    # "banded footprint, …"
 ```
 
 These are the same compact kernel with the same weights, and they agree with the direct sum to
-round-off; `RealSpace()` remains the default. Neither is `method = Spectral()`: no transfer function
+round-off. Neither is `method = Spectral()`: no transfer function
 is sampled and no spherical-harmonic truncation happens.
 
 ## Workspaces sized to what you asked for

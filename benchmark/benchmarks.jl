@@ -1,10 +1,30 @@
 # Benchmark suite (PkgBenchmark-compatible: defines a global `SUITE::BenchmarkGroup`).
+#
+# The transform and geometry libraries a user loads are loaded, so `plan_filter` picks among every
+# engine. A row that times one engine builds it with `direct_plan`; the others time what `plan_filter`
+# picks.
 
 using BenchmarkTools: BenchmarkTools
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries as FG
+using FFTW: FFTW
+using NonuniformFFTs: NonuniformFFTs
+using NUFSHT: NUFSHT
+using NearestNeighbors: NearestNeighbors
+using DelaunayTriangulation: DelaunayTriangulation
+using Quickhull: Quickhull
+using Random: Random
 
 const SUITE = BenchmarkTools.BenchmarkGroup()
+
+# A plan on the direct real-space engine `build_footprint` builds — the banded sum on a sphere, prefix
+# sums for a top-hat, separable passes for a separable kernel — where `plan_filter` may take a padded or
+# zonal FFT.
+function direct_plan(grid, kernel, scale; execution = CGEF.ComputationalBackends.SerialBackend())
+    fp = CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = CGEF.Filtering.ZeroFill())
+    return CGEF.Filtering.PhysicalFilterPlan(CGEF.Filtering.prepare_workspace(execution, grid, fp), grid,
+                                             CGEF.Filtering.ZeroFill(), kernel, scale, execution)
+end
 
 let
     N = 128
@@ -160,9 +180,7 @@ let
         grid = FG.Grids.StructuredGrid(geom, ax, ax, trues(N, N))
         for scale in (20_000.0, 40_000.0)
             w = round(Int, scale / (2 * dx))
-            plan = CGEF.Filtering.plan_filter(
-                grid, ker, scale; execution = CGEF.ComputationalBackends.SerialBackend(),
-            )
+            plan = direct_plan(grid, ker, scale)
             SUITE["filter_apply!/tophat/$(N)x$(N)/$axname/w$w"] =
                 BenchmarkTools.@benchmarkable CGEF.Filtering.filter_apply!($(outs[1]), $(fields[1]), $plan)
             # The batch entry is the one that moves when the support walk is shared across fields.
@@ -205,17 +223,16 @@ let
     grid = FG.Grids.StructuredGrid(geom, lon, lat, trues(Nlon, Nlat))
     u = rand(Nlon, Nlat)
     out = zeros(Nlon, Nlat)
-    SER = CGEF.ComputationalBackends.SerialBackend()
 
     for (name, scale) in (("200km", 200e3), ("800km", 800e3))
-        plan = CGEF.Filtering.plan_filter(grid, CGEF.GaussianKernel(), scale; execution = SER)
+        plan = direct_plan(grid, CGEF.GaussianKernel(), scale)
         SUITE["filter_apply!/gaussian-spherical/$(Nlon)x$(Nlat)/$name"] =
             BenchmarkTools.@benchmarkable CGEF.Filtering.filter_apply!($out, $u, $plan)
     end
 
     # Top-hat on the same grid takes the prefix-sum engine instead, so the two are directly comparable
     # and show what a fast engine is worth at the same scale.
-    plan_th = CGEF.Filtering.plan_filter(grid, CGEF.TopHatKernel(), 800e3; execution = SER)
+    plan_th = direct_plan(grid, CGEF.TopHatKernel(), 800e3)
     SUITE["filter_apply!/tophat-spherical/$(Nlon)x$(Nlat)/800km"] =
         BenchmarkTools.@benchmarkable CGEF.Filtering.filter_apply!($out, $u, $plan_th)
 end
@@ -229,10 +246,9 @@ let
     grid = FG.Grids.StructuredGrid(geom, ax, ax, ax, trues(N, N, N))
     u = rand(N, N, N)
     out = zeros(N, N, N)
-    SER = CGEF.ComputationalBackends.SerialBackend()
 
     for (kname, ker) in (("tophat", CGEF.TopHatKernel()), ("gaussian", CGEF.GaussianKernel()))
-        plan = CGEF.Filtering.plan_filter(grid, ker, 12_000.0; execution = SER)
+        plan = direct_plan(grid, ker, 12_000.0)
         SUITE["filter_apply!/$kname-3d/$(N)cubed/w6"] =
             BenchmarkTools.@benchmarkable CGEF.Filtering.filter_apply!($out, $u, $plan)
     end
@@ -272,7 +288,7 @@ let
         gf = FG.Grids.StructuredGrid(geom, xsR, xsR, trues(N, N))
         cg = FG.Grids.CurvilinearGrid(geom, [1000.0 * i for i in 0:(N-1), j in 0:(N-1)],
                                       [1000.0 * j for i in 0:(N-1), j in 0:(N-1)], trues(N, N))
-        pf = CGEF.Filtering.plan_filter(gf, ker, scale; execution = SER)
+        pf = direct_plan(gf, ker, scale)
         pg = CGEF.Filtering.plan_filter(cg, ker, scale; execution = SER)
         f = rand(N, N); o = zeros(N, N)
         SUITE["filter_apply!/gaussian/$(N)x$(N)/separable"] =
@@ -433,8 +449,8 @@ if Base.get_extension(CGEF, :CoarseGrainingEnergyFluxesOhMyThreadsExt) !== nothi
         for N in (512, 1024)
             ax = range(0.0, 1.0e6; length = N + 1)[1:N]
             grid = FG.Grids.StructuredGrid(geom, ax, ax; periodic = (true, true))
-            plan = CGEF.Filtering.plan_filter(grid, CGEF.GaussianKernel(), 6.0e4;
-                                              execution = CGEF.ComputationalBackends.ThreadedBackend())
+            plan = direct_plan(grid, CGEF.GaussianKernel(), 6.0e4;
+                               execution = CGEF.ComputationalBackends.ThreadedBackend())
             fields = ntuple(_ -> rand(N, N), K)
             outs = ntuple(_ -> zeros(N, N), K)
             sched = OMT.DynamicScheduler()
@@ -445,5 +461,55 @@ if Base.get_extension(CGEF, :CoarseGrainingEnergyFluxesOhMyThreadsExt) !== nothi
                     $OMT.tforeach(_ -> nothing, 1:$N; scheduler = $sched)
                 end
         end
+    end
+end
+
+# `coarse_grain(u, v, grid; scales, kernel)` with every other keyword at its default, on each kind of
+# grid, and beside it one scalar filter through the plan `plan_filter` builds at each of those scales:
+# a sweep's time over the mean of those is the number of filters it costs.
+let cart = FG.Geometry.CartesianGeometry{Float64}(), R = 6.371e6
+    Random.seed!(4)
+    s(t) = t + 0.15 * sin(π * t)
+    nx, ny = 384, 320
+    xv = [1e3 * (400 * s(i / nx) + 40 * (j / ny)) for i in 0:nx, j in 0:ny]
+    yv = [1e3 * (320 * s(j / ny) + 25 * sin(2π * i / nx)) for i in 0:nx, j in 0:ny]
+    mid(q) = [(q[i, j] + q[i + 1, j] + q[i, j + 1] + q[i + 1, j + 1]) / 4 for i in 1:nx, j in 1:ny]
+    hole = trues(nx, ny)
+    hole[150:200, 120:170] .= false
+    N, M, L = 1024, 100_000, 1000e3
+    xs = range(0.0, N * 1e3; length = N + 1)[1:N]
+    xn, yn = L .* rand(M), L .* rand(M)
+    cases = (
+        ("cartesian-$(N)x$(N)-periodic", CGEF.TopHatKernel(), [16e3, 64e3, 256e3],
+         FG.Grids.StructuredGrid(cart, xs, xs; periodic = (true, true), period = (N * 1e3, N * 1e3))),
+        ("sphere-720x360", CGEF.TopHatKernel(), [200e3, 500e3, 1000e3],
+         FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), FG.Axes.PeriodicAxis(0.0, 2π, 720),
+                                 range(-π / 2 + π / 720, π / 2 - π / 720; length = 360))),
+        ("node-set-$M", CGEF.TopHatKernel(), [20e3, 50e3, 100e3], FG.Grids.UnstructuredGrid(cart, xn, yn; k = 8)),
+        ("node-set-$M", CGEF.GaussianKernel(), [20e3, 50e3, 100e3], FG.Grids.UnstructuredGrid(cart, xn, yn; k = 8)),
+        ("curvilinear-$(nx)x$(ny)-stretched-hole", CGEF.TopHatKernel(), [8e3, 20e3, 50e3],
+         FG.Grids.CurvilinearGrid(cart, mid(xv), mid(yv), hole; corners = (xv, yv))),
+    )
+    for (label, ker, scales, grid) in cases
+        kname = lowercase(string(nameof(typeof(ker))))
+        sz = size(FG.Grids.mask(grid))
+        u, v, out = randn(sz...), randn(sz...), zeros(sz...)
+        SUITE["coarse_grain/$kname/$label/3-scales"] =
+            BenchmarkTools.@benchmarkable CGEF.coarse_grain($u, $v, $grid; scales = $scales, kernel = $ker)
+        for ℓ in scales
+            plan = CGEF.Filtering.plan_filter(grid, ker, ℓ)
+            SUITE["filter_apply!/$kname/$label/$(round(Int, ℓ / 1e3))km-default-plan"] =
+                BenchmarkTools.@benchmarkable CGEF.Filtering.filter_apply!($out, $u, $plan)
+        end
+    end
+
+    # The spectral filter over points on the sphere: a fit weighted by the cells' areas and a synthesis
+    # per apply.
+    if Base.get_extension(CGEF, :CoarseGrainingEnergyFluxesNUFSHTExt) !== nothing
+        gp = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(R), 2π .* rand(M), asin.(2 .* rand(M) .- 1); k = 8)
+        p = CGEF.Filtering.plan_filter(gp, CGEF.GaussianKernel(), 500e3; method = CGEF.Filtering.Spectral())
+        f, o = randn(M), zeros(M)
+        SUITE["filter_apply!/gaussian-spectral/sphere-node-set-$M/500km"] =
+            BenchmarkTools.@benchmarkable CGEF.Filtering.filter_apply!($o, $f, $p)
     end
 end

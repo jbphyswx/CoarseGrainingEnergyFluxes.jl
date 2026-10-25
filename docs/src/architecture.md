@@ -98,8 +98,9 @@ Two orthogonal choices control *how* a filter is evaluated:
    - An explicit request for a backend on a grid shape it has no hook for raises an `ArgumentError`;
      only `AutoBackend` downgrades to serial.
    - Every flat-cell layout — a node set, and the ring/cubed-sphere/healpix/icosahedral/Yin–Yang
-     pixelizations — builds a `NodeFilterPlan` from the grid's own ball query, and takes `RealSpace()`
-     by default like every other architecture.
+     pixelizations — builds a `NodeFilterPlan`, a Cartesian node set's read from its point bins and any
+     other's from the grid's own ball query, and takes `RealSpace()` by default like every other
+     architecture.
 
 ## Real-space engines
 
@@ -114,7 +115,9 @@ evaluates it is chosen from the grid and kernel:
 | separable N-pass | the same, 1-D or true 3-D Cartesian | `O(N·Σ w_d)` |
 | banded footprint | other radial kernels on a 2-D grid whose axis 1 is uniform, one band on a uniform Cartesian grid and one per row otherwise (a stretched `y` or any latitude axis); `HighOrderKernel` on a sphere of uniform longitude, one correction per latitude | `O(N·wx·wy)` |
 | scattered footprint | a nonuniform axis 1, or a curvilinear mesh; `HighOrderKernel` corrected per point | `O(N·wx·wy)`, optional neighbour cache |
-| node CSR gather | any flat-cell layout: a node set, or a ring/cubed-sphere/healpix/icosahedral/Yin–Yang pixelization | `O(N·⟨neighbours⟩)` |
+| binned prefix-sum top-hat | `TopHatKernel` over Cartesian points, a node set or a curvilinear mesh: points binned about one spacing wide, per line of bins a scan of the bin totals | `O(N·(r/h)^{D−1})`, exact |
+| nonuniform-FFT kernel sum | a kernel with a transfer cutoff (`GaussianKernel`) over Cartesian points, where it costs fewer operations than the neighbour list or the list exceeds the cache budget | `O(N log N)`, to the transform's tolerance |
+| node CSR gather | any flat-cell layout: a node set, its list read from the point bins where Cartesian, or a ring/cubed-sphere/healpix/icosahedral/Yin–Yang pixelization | `O(N·⟨neighbours⟩)` |
 
 Every one of these has a device kernel. The prefix-sum engines run as two launches — a scan that is
 sequential along axis 1 and parallel across the rows (2-D) or planes (3-D), then a per-point window
@@ -124,20 +127,27 @@ precision, whatever the row length. On the device that difference locates its ow
 window table where the axis is uniform and by a binary search over the extended axis where it is not,
 an extra `log` factor per point; the host walks the intervals with a monotone two-pointer sweep.
 
-Two further engines evaluate that **same** convolution by transform, and are reached with
-`method = AutoMethod()`:
+Two further engines evaluate that **same** convolution by transform. On a CPU backend `RealSpace()`
+takes one where it applies and costs fewer operations than the kernel's own engine, counted with a
+fused multiply-add as one: one per tap of a direct sum or separable pass, a few per band and scan entry
+of the prefix sums, and `2.5 n log₂ n` per real transform of length `n`.
 
-- **FFT of the sampled kernel** — uniform Cartesian, for kernels with no factored engine. Along a
-  periodic axis the transform is circular, with the kernel summed over its images; along a bounded one
-  it is zero-padded, so it computes the *linear* convolution and holds on bounded and masked domains.
-- **zonal FFT along the longitude ring** — a global rectilinear sphere with a radial kernel. For a
-  fixed pair of latitudes the great-circle weight depends on the longitude difference alone, so each
-  latitude band is a circular convolution. It is worth most near the poles, where the direct engine's
-  longitude window widens as `1/cos φ` and a transform's cost does not.
+- **FFT of the sampled kernel** — uniform Cartesian, in one, two or three directions, for every kernel,
+  over the weights the replaced engine sums: a separable kernel's per-axis tables with their profile
+  denominators, a radial kernel's ball. Along a periodic axis the transform is circular, with the kernel
+  summed over its images; along a bounded one it is zero-padded, so it computes the *linear*
+  convolution and holds on bounded and masked domains. Under `ZeroFill` a radial kernel's denominator
+  is its mass over the whole ball of lattice offsets, which the continued lattice gives every cell.
+- **zonal FFT along longitude** — a sphere of uniform longitude, a ring or a regional box (zero-padded
+  along longitude), with a radial kernel or a `HighOrderKernel` whose latitude rows share one
+  correction. For a fixed pair of latitudes the great-circle weight depends on the longitude offset
+  alone, so each latitude band is a convolution along longitude, over the banded engine's taps and
+  weights. It is worth most near the poles, where the direct engine's longitude window widens as
+  `1/cos φ` and a transform's cost does not.
 
-Both use the same compact kernel and weights and agree with the direct sum to round-off. Neither is
-the default; `check_setup` names the engine each method selects, and reports when `AutoMethod`
-chooses a faster one.
+Both agree with the direct sum to round-off. A kernel a few cells wide costs less as a direct sum and
+keeps it, and a device, Distributed or MPI plan takes the direct engines. `check_setup` names the engine
+a call takes.
 
 Neither is [`Filtering.Spectral`](@ref): no transfer function is sampled and no spherical-harmonic
 truncation is involved, so the kernel keeps its compact support.
@@ -171,11 +181,12 @@ FastSphericalHarmonics runs in the calling process.
 On the surface of a sphere the diagnostics filter vectors and tensors by the generalized convolution,
 `Filtering.GeneralizedConvolution`, through spin-weighted transforms of spins 0, 1 and 2 that a
 workspace holds (`Filtering.spin_transforms`): FastSphericalHarmonics' on its own grid, NUFSHT's
-quadrature over any other spherical grid's cells, and with neither loaded `Filtering.DirectSpinTransforms`,
-the same quadrature summed directly. The libraries run in host memory at the execution backend's thread
-count, and a device workspace stages its fields through a host copy; the direct sum runs in the
-workspace's memory under its loops, one work item per order in the analysis and per cell in the
-synthesis.
+quadrature over any other spherical grid's cells where a NUFFT library runs it, and otherwise the same
+quadrature summed directly: `Filtering.RingSpinTransforms` by rows on a latitude–longitude `StructuredGrid`,
+`Filtering.DirectSpinTransforms` cell by cell elsewhere. The libraries run in host memory at the execution
+backend's thread count, and a device workspace stages its fields through a host copy; the direct sums
+run in the workspace's memory under its loops, one work item per order in the analysis and per cell (per
+row, by rows) in the synthesis.
 
 ## Type Hierarchy
 
@@ -203,8 +214,8 @@ AbstractGrid{G,T}
 
 AbstractExecutionBackend            AbstractFilterMethod    AbstractMaskStrategy
 ├── SerialBackend                   ├── RealSpace           ├── ZeroFill
-├── ThreadedBackend                 ├── Spectral            └── Deformable
-├── GPUBackend{B}                   └── AutoMethod
+├── ThreadedBackend                 └── Spectral            └── Deformable
+├── GPUBackend{B}
 ├── DistributedBackend{Inner}
 ├── MPIBackend{Inner}
 └── AutoBackend

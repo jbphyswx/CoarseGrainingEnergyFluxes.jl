@@ -393,9 +393,13 @@ multiply every degree-`ℓ` coefficient by `Ĝ(ℓ)`, and synthesize. A vertical
 
 **Transforms.** [`Filtering.GeneralizedConvolution`](@ref) runs FastSphericalHarmonics' spin transforms on
 a `Float64` `ClenshawCurtisSampling` grid of `2N − 1` longitudes by `N` latitudes, exact for a field of
-degree below `N`; NUFSHT's on every other spherical grid where it is loaded; and otherwise
-[`Filtering.DirectSpinTransforms`](@ref), the same sums evaluated directly in `O(M·ℓ_max²)` for `M` cells,
-the Wigner `d` from their three-term recurrence in `ℓ`. Its seed `d^{|m|}_{m,n} ≈ sin^{|m|} θ` falls below
+degree below `N`; NUFSHT's on every other spherical grid where it and a NUFFT library are loaded; and
+otherwise the same sums
+evaluated directly, the Wigner `d` from their three-term recurrence in `ℓ`: on a latitude–longitude
+`StructuredGrid` by rows ([`Filtering.RingSpinTransforms`](@ref)), whose cells share a colatitude per
+row, so the sums along the rows are one product with `e^{imφ_i}` and the recurrence runs once per row, in
+`O(M·ℓ_max + n_lat·ℓ_max²)` for `M` cells; on any other grid cell by cell
+([`Filtering.DirectSpinTransforms`](@ref)), in `O(M·ℓ_max²)`. Its seed `d^{|m|}_{m,n} ≈ sin^{|m|} θ` falls below
 the floating-point range where `ℓ_max · sin θ · log₁₀(1/sin θ)` exceeds the decimal exponent range, about
 `ℓ_max ≈ 240` in `Float32` and `1900` in `Float64`, for orders that still reach `O(ℓ^{−1/2})` past the
 turning point `ℓ sin θ = |m|`; the recurrence carries such a value as a significand and its own binary

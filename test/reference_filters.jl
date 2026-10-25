@@ -147,7 +147,8 @@ end
 
 # The definition over the grid's own cells, for a grid with no lattice to continue: a curvilinear mesh, a
 # node set or a sphere pixelization. `ZeroFill` keeps every cell in the denominator and filters an
-# inactive target; `Deformable` normalizes over the active cells and zeroes an inactive target.
+# inactive target; `Deformable` normalizes over the active cells and zeroes an inactive target. On a
+# periodic Cartesian direction every image inside the support counts.
 function _cgef_cellset_filter(grid, kernel, ℓ, f, strategy = CGEF.Filtering.ZeroFill())
     geo = FG.Grids.grid_geometry(grid)
     dim = Val(FG.Grids.ncoordinates(grid))
@@ -157,11 +158,31 @@ function _cgef_cellset_filter(grid, kernel, ℓ, f, strategy = CGEF.Filtering.Ze
     pts = [NTuple{N,Float64}(Tuple(FG.Grids.coords(grid, Tuple(I)...))) for I in cells]
     act = BitArray([FG.Grids.isactive(grid, Tuple(I)...) for I in cells])
     meas = [Float64(FG.Grids.measure(grid, Tuple(I)...)) for I in cells]
+    tiles = ntuple(d -> geo isa FG.Geometry.CartesianGeometry && FG.Grids.isperiodic(grid, d), N)
+    P = ntuple(d -> tiles[d] ? Float64(FG.Grids.period(grid, d)) : 0.0, N)
+    M = ntuple(d -> tiles[d] ? ceil(Int, rad / P[d]) + 1 : 0, N)
+    images = [ntuple(d -> m[d] * P[d], N) for m in CartesianIndices(ntuple(d -> (-M[d]):M[d], N))]
     return _cgef_direct_sum(geo, kernel, Float64(ℓ), Float64(rad), dim, pts, act, pts, meas, Float64.(f), act,
-                            [ntuple(_ -> 0.0, N)], strategy isa CGEF.Filtering.ZeroFill)
+                            vec(images), strategy isa CGEF.Filtering.ZeroFill)
 end
 
 _cgef_relerr(a, b) = maximum(abs, a .- b) / maximum(abs, b)
+
+# Composite Simpson over `[a, b]`.
+function _cgef_simpson(f, a, b; n = 2000)
+    h = (b - a) / n
+    return h / 3 * (f(a) + f(b) + 4 * sum(f(a + (2i - 1) * h) for i in 1:(n ÷ 2)) +
+                    2 * sum(f(a + 2i * h) for i in 1:(n ÷ 2 - 1)))
+end
+
+function _cgef_legendre(l, x)
+    p0, p1 = 1.0, x
+    l == 0 && return p0
+    for m in 1:(l - 1)
+        p0, p1 = p1, ((2m + 1) * x * p1 - m * p0) / (m + 1)
+    end
+    return p1
+end
 
 # The factor a radial kernel scales a degree-`l` harmonic by on a sphere of radius `R`: its Legendre
 # transform over its support, normalized to 1 at `l = 0` (Aluie 2019, eq. 34), by Simpson's rule in the

@@ -351,14 +351,15 @@ end
 # Padded-FFT real-space engine
 # ---------------------------------------------------------------------------
 #
-# The direct footprint sum of a non-separable kernel, evaluated by transform. A periodic axis keeps its
+# A direct footprint sum, evaluated by transform: a radial kernel's weights over the disk of its radius,
+# a separable kernel's the separable engine's per-axis tables multiplied. A periodic axis keeps its
 # length, and the sampled kernel is accumulated modulo it, the sum over every image. A bounded axis is
 # zero-padded to at least `N + min(w, N - 1)`, `w` the support's half-width in cells, the least length
 # at which the circular convolution equals the linear one.
 #
 # The numerator is `conv(mask·f, g)`; the denominator depends on grid, kernel, scale and mask strategy
-# alone and is built with the plan.
-struct PaddedFFTFootprint{T<:AbstractFloat, A<:AbstractMatrix{T}, C<:AbstractMatrix{Complex{T}}, FP, IP, S}
+# alone and is built with the plan, as the real-space engine for the kernel builds it.
+struct PaddedFFTFootprint{T<:AbstractFloat, A<:AbstractArray{T}, C<:AbstractArray{Complex{T}}, FP, IP, S, D}
     Ĝ::C            # kernel spectrum on the transform grid
     den::A          # the normalization over the grid, built for `strategy`
     pad::A          # transform-grid scratch for mask·field
@@ -367,101 +368,145 @@ struct PaddedFFTFootprint{T<:AbstractFloat, A<:AbstractMatrix{T}, C<:AbstractMat
     fwd::FP
     inv::IP
     strategy::S     # the strategy `den` was built for; `apply_footprint!` refuses any other
-    N::NTuple{2,Int}
-    P::NTuple{2,Int}   # transform length per axis
+    dims::NTuple{D,Int}
+    P::NTuple{D,Int}   # transform length per axis
 end
 
-# Transform length along one axis: the axis itself where it wraps, else the least 2·3·5-smooth length
-# holding the data and the widest offset between two of its cells.
-_padded_length(N::Int, w::Int, periodic::Bool) = periodic ? N : nextprod((2, 3, 5), N + min(w, N - 1))
-
 function CGEF.Filtering.padded_fft_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
     kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T;
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy = CGEF.Filtering.ZeroFill(),
     threads::Integer = 1,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    dx = abs(step(FlowGeometries.Grids.coordinates(grid, 1)))
-    dy = abs(step(FlowGeometries.Grids.coordinates(grid, 2)))
-    px = FlowGeometries.Grids.isperiodic(grid, 1)
-    py = FlowGeometries.Grids.isperiodic(grid, 2)
-    rad = CGEF.Kernels.kernel_radius(kernel, scale, Val(2))
+) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    dims = FlowGeometries.Grids.size_tuple(grid)
     # A periodic axis reaches every image inside the support; a bounded one no farther than its extent.
-    wx = px ? ceil(Int, rad / dx) : min(ceil(Int, rad / dx), Nx - 1)
-    wy = py ? ceil(Int, rad / dy) : min(ceil(Int, rad / dy), Ny - 1)
-    Px = _padded_length(Nx, wx, px)
-    Py = _padded_length(Ny, wy, py)
-    A = FlowGeometries.Grids.area(grid, 1, 1)
+    w = CGEF.Filtering._padded_halfwidths(grid, kernel, scale)
+    P = ntuple(d -> CGEF.Filtering._padded_length(dims[d], w[d], FlowGeometries.Grids.isperiodic(grid, d)), Val(N))
 
-    # The kernel over the disk `d <= rad` of the direct footprint, wrapped so index (1,1) is the zero offset.
-    gpad = zeros(T, Px, Py)
-    for dj in (-wy):wy, di in (-wx):wx
-        d = hypot(di * dx, dj * dy)
-        d <= rad || continue
-        wt = CGEF.Kernels.kernel_weight(kernel, d, scale, Val(2)) * A
-        iszero(wt) && continue
-        gpad[mod1(1 + di, Px), mod1(1 + dj, Py)] += wt
-    end
-
+    # The weights wrapped so index (1,…,1) is the zero offset.
+    gpad = zeros(T, P)
+    _sample_kernel!(gpad, grid, kernel, scale, w)
     fwd = FFTW.plan_rfft(gpad; num_threads = threads)
     Ĝ = fwd * gpad
     spec = similar(Ĝ)
-    inv = FFTW.plan_irfft(spec, Px; num_threads = threads)
+    inv = FFTW.plan_irfft(spec, P[1]; num_threads = threads)
+    den = _padded_denominator(grid, kernel, scale, mask_strategy, fwd, inv, Ĝ, P)
+    return PaddedFFTFootprint(Ĝ, den, zeros(T, P), zeros(T, P), similar(Ĝ), fwd, inv, mask_strategy, dims, P)
+end
 
-    # `Deformable` divides by the kernel mass over active cells; `ZeroFill` by its full mass, the
-    # in-domain part through the transform and the part past a bounded edge from `_exterior_mass`.
-    zerofill = mask_strategy isa CGEF.Filtering.ZeroFill
+# The offset `o` wrapped onto a transform grid of lengths `P`, the zero offset at index (1,…,1).
+@inline _wrapped(o::CartesianIndex{N}, P::NTuple{N,Int}) where {N} = CartesianIndex(ntuple(d -> mod1(1 + o[d], P[d]), Val(N)))
+
+# A radial kernel over the ball `d <= rad` of the direct footprint within half-widths `w`, each weight
+# times the cell measure.
+function _sample_kernel!(gpad::AbstractArray{T,N}, grid, kernel, scale::T, w::NTuple{N,Int}) where {T,N}
+    Δ = ntuple(d -> CGEF.Filtering._axis_step(grid, d), Val(N))
+    rad = CGEF.Kernels.kernel_radius(kernel, scale, Val(N))
+    A = T(FlowGeometries.Grids.measure(grid, ntuple(_ -> 1, Val(N))...))
+    for o in CartesianIndices(map(wd -> (-wd):wd, w))
+        d = hypot(ntuple(k -> o[k] * Δ[k], Val(N))...)
+        d <= rad || continue
+        wt = CGEF.Kernels.kernel_weight(kernel, d, scale, Val(N)) * A
+        iszero(wt) && continue
+        gpad[_wrapped(o, size(gpad))] += wt
+    end
+    return gpad
+end
+
+# A separable kernel: the separable engine's per-axis tables over its box stencil.
+function _sample_kernel!(gpad::AbstractArray{T,N}, grid, kernel::CGEF.Filtering.SeparableKernel, scale::T,
+                         w::NTuple{N,Int}) where {T,N}
+    (; g, lim) = CGEF.Filtering._separable_tables(grid, kernel, scale)
+    for o in CartesianIndices(map(wd -> (-wd):wd, w))
+        gpad[_wrapped(o, size(gpad))] += prod(ntuple(k -> g[k][o[k] + lim[k] + 1], Val(N)))
+    end
+    return gpad
+end
+
+# The kernel mass over the active cells at each cell, through the plan's transform.
+function _transform_mass(grid, fwd, inv, Ĝ, P)
+    dims = FlowGeometries.Grids.size_tuple(grid)
+    T = real(eltype(Ĝ))
     maskv = FlowGeometries.Grids.mask(grid)
-    dpad = zeros(T, Px, Py)
-    @inbounds for j in 1:Ny, i in 1:Nx
-        dpad[i, j] = (zerofill || maskv[i, j]) ? one(T) : zero(T)
+    dpad = zeros(T, P)
+    @inbounds for I in CartesianIndices(dims)
+        dpad[I] = maskv[I] ? one(T) : zero(T)
     end
     spec = fwd * dpad
     spec .*= Ĝ
-    denfull = inv * spec
-    den = Array{T}(undef, Nx, Ny)
-    @inbounds for j in 1:Ny, i in 1:Nx
-        den[i, j] = denfull[i, j]
-    end
-    exterior = zerofill ? CGEF.Filtering._exterior_mass(grid, kernel, scale) : nothing
-    exterior === nothing || (den .+= exterior)
+    return (inv * spec)[CartesianIndices(dims)]
+end
 
-    return PaddedFFTFootprint(
-        Ĝ, den, zeros(T, Px, Py), zeros(T, Px, Py), similar(Ĝ), fwd, inv, mask_strategy, (Nx, Ny),
-        (Px, Py),
-    )
+# A radial kernel under `ZeroFill`: the grid's lattice continues uniformly past a bounded edge, so a cell's
+# in-domain and exterior mass add to the kernel's mass over the whole ball of lattice offsets, the same at
+# every cell. Under `Deformable`, the mass over the active cells.
+function _padded_denominator(grid, kernel, scale, strategy, fwd, inv, Ĝ, P)
+    strategy isa CGEF.Filtering.ZeroFill || return _transform_mass(grid, fwd, inv, Ĝ, P)
+    T = real(eltype(Ĝ))
+    N = length(P)
+    Δ = ntuple(d -> CGEF.Filtering._axis_step(grid, d), N)
+    rad = CGEF.Kernels.kernel_radius(kernel, scale, Val(N))
+    A = T(FlowGeometries.Grids.measure(grid, ntuple(_ -> 1, N)...))
+    mass = zero(T)
+    for o in CartesianIndices(ntuple(d -> (-floor(Int, rad / Δ[d])):floor(Int, rad / Δ[d]), N))
+        d = hypot(ntuple(k -> o[k] * Δ[k], N)...)
+        d <= rad && (mass += CGEF.Kernels.kernel_weight(kernel, d, scale, Val(N)) * A)
+    end
+    return fill(mass, FlowGeometries.Grids.size_tuple(grid))
+end
+
+# A separable kernel's is the separable engine's: the product of the per-axis profiles, every offset
+# counted under `ZeroFill` and the in-domain ones under `Deformable` on an unmasked grid, and the mass
+# over the active cells under `Deformable` on a masked one.
+function _padded_denominator(grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::CGEF.Filtering.SeparableKernel,
+                             scale, strategy, fwd, inv, Ĝ, P) where {T,G,N}
+    zerofill = strategy isa CGEF.Filtering.ZeroFill
+    zerofill || all(FlowGeometries.Grids.mask(grid)) || return _transform_mass(grid, fwd, inv, Ĝ, P)
+    (; g, lim, periodic, mf) = CGEF.Filtering._separable_tables(grid, kernel, scale)
+    prof = ntuple(Val(N)) do d
+        CGEF.Filtering._separable_profile(FlowGeometries.Grids.coordinates(grid, d), lim[d], g[d], periodic[d], kernel,
+                                          scale, convert(AbstractVector{T}, mf[d]), zerofill)
+    end
+    return [prod(ntuple(d -> prof[d][I[d]], Val(N))) for I in CartesianIndices(FlowGeometries.Grids.size_tuple(grid))]
 end
 
 # ---------------------------------------------------------------------------
 # Zonal-FFT engine: the compact great-circle kernel, evaluated by transform along longitude.
 #
-# For a target in latitude row `j` and a source in row `jj`, the great-circle distance
-#
-#     cos d = sin φ_j sin φ_jj + cos φ_j cos φ_jj cos(Δλ)
-#
-# depends on the longitude difference alone, and a rectilinear spherical cell's area `R² cos φ_jj Δλ Δφ`
-# is independent of longitude. The weight is then a function `w_{j,jj}(di)` of the index offset, and
-# each band contributes a circular cross-correlation along the longitude ring:
+# On uniform longitude the great-circle distance between a target in latitude row `j` and a source in row
+# `jj` depends on the longitude offset alone, and a cell's area on its latitude alone, so the direct sum's
+# weight is a function `w_{j,jj}(di)` of the index offset and each band is a cross-correlation along
+# longitude:
 #
 #     out[i, j] = Σ_jj Σ_di w_{j,jj}[di] · src[i+di, jj]
 #
-# `w_{j,jj}` is even in `di`, so its spectrum is real and is stored as reals.
+# The taps are the banded engine's (`_sphere_band_rows`, or `_highorder_rows`), the same offsets and
+# weights. `w_{j,jj}` is even in `di`, so its spectrum is real and is stored as reals. On a ring of `Nx`
+# columns the correlation is circular of length `Nx`. On a regional box longitude is zero-padded to
+# `Px ≥ Nx + a`, `a` the widest offset among the taps, where the circular correlation is the linear one.
+#
+# A radial kernel's weight is `G(d)·A_jj`, with `d` symmetric in the two rows and `A_jj` the source row's
+# cell area, so one spectrum of `G` serves both orders of a pair of rows: `Ŵ[:, |dj| + 1, min(j, jj)]`,
+# and each source row's spectrum is multiplied by its area. A `HighOrderKernel`'s weights are corrected
+# per target row, so it keeps one spectrum per ordered pair.
 # ---------------------------------------------------------------------------
 
 struct ZonalFFTFootprint{
-    T<:AbstractFloat, A<:AbstractMatrix{T}, R3<:AbstractArray{T,3},
+    T<:AbstractFloat, A<:AbstractMatrix{T}, R3<:AbstractArray{T,3}, AR,
     C<:AbstractMatrix{Complex{T}}, FP, IP, MS<:CGEF.Filtering.AbstractMaskStrategy,
 }
-    Ŵ::R3           # (Nx÷2+1, 2·dj_lim+1, Ny) real kernel spectra, per (band offset, target row)
+    Ŵ::R3           # real kernel spectra: (Px÷2+1, dj_lim+1, Ny) per unordered row pair when `area` is a
+                    # vector, (Px÷2+1, 2·dj_lim+1, Ny) per (band offset, target row) when it is `nothing`
     invden::A       # (Nx, Ny) reciprocal window mass, built through this same transform
     dj_lim::Int
+    area::AR        # (Ny) cell area per latitude row, or `nothing`
     bound::Bool     # the strategies' denominators differ: a cell is inactive or a window leaves the grid
     strategy::MS    # the strategy `invden` was built for
-    src::A          # (Nx, Ny) scratch for `mask · field`
-    F::C            # (Nx÷2+1, Ny) scratch: every source row's spectrum
-    acc::C          # (Nx÷2+1, Ny) scratch: the accumulated spectrum per target row
+    src::A          # (Px, Ny) scratch for `mask · field`, zero past column `Nx`
+    wide::A         # (Px, Ny) scratch: the correlation on the padded axis; empty on a ring, `Px == Nx`
+    F::C            # (Px÷2+1, Ny) scratch: every source row's spectrum
+    acc::C          # (Px÷2+1, Ny) scratch: the accumulated spectrum per target row
     fwd::FP         # batched rfft along longitude
     inv::IP
 end
@@ -473,8 +518,35 @@ function _zonal_accumulate!(
     rows::D = CGEF.Filtering._sep_serial,
 ) where {T<:AbstractFloat, D}
     LA.mul!(fp.F, fp.fwd, src)
-    nk = size(fp.F, 1)
-    Ŵ, F, acc, dj_lim = fp.Ŵ, fp.F, fp.acc, fp.dj_lim
+    _scale_rows!(fp.F, fp.area)
+    _band_sum!(fp.acc, fp.Ŵ, fp.F, fp.dj_lim, fp.area, Ny, rows)
+    acc = fp.acc
+    Nx = size(out, 1)
+    if size(fp.src, 1) == Nx
+        LA.mul!(out, fp.inv, acc)
+    else
+        LA.mul!(fp.wide, fp.inv, acc)
+        out .= view(fp.wide, 1:Nx, :)
+    end
+    return out
+end
+
+_scale_rows!(F::AbstractMatrix, ::Nothing) = F
+function _scale_rows!(F::AbstractMatrix, area::AbstractVector)
+    @inbounds for j in axes(F, 2)
+        a = area[j]
+        @simd for n in axes(F, 1)
+            F[n, j] *= a
+        end
+    end
+    return F
+end
+
+# `acc[:, j] = Σ_dj Ŵ_{j, j+dj} F[:, j+dj]` over the rows in the grid, from either layout of `Ŵ`.
+function _band_sum!(acc::AbstractMatrix{Complex{T}}, Ŵ::AbstractArray{T,3}, F::AbstractMatrix{Complex{T}},
+                    dj_lim::Int, area, Ny::Int, rows::D) where {T<:AbstractFloat, D}
+    nk = size(F, 1)
+    sym = area !== nothing
     rows(1:Ny) do j
         @inbounds begin
             @simd for n in 1:nk
@@ -483,16 +555,15 @@ function _zonal_accumulate!(
             for dj in (-dj_lim):dj_lim
                 jj = j + dj
                 (1 <= jj <= Ny) || continue
-                b = dj + dj_lim + 1
+                b, r = sym ? (abs(dj) + 1, min(j, jj)) : (dj + dj_lim + 1, j)
                 @simd for n in 1:nk
-                    acc[n, j] += Ŵ[n, b, j] * F[n, jj]
+                    acc[n, j] += Ŵ[n, b, r] * F[n, jj]
                 end
             end
         end
         return nothing
     end
-    LA.mul!(out, fp.inv, acc)
-    return out
+    return acc
 end
 
 function CGEF.Filtering.zonal_fft_footprint(
@@ -503,66 +574,35 @@ function CGEF.Filtering.zonal_fft_footprint(
     threads::Integer = 1,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    geo = FlowGeometries.Grids.grid_geometry(grid)
-    R = FlowGeometries.Geometry.radius(geo)
-    lat = FlowGeometries.Grids.coordinates(grid, 2)
-    dλ = step(FlowGeometries.Grids.coordinates(grid, 1))
-    rad = CGEF.Filtering._query_radius(grid, kernel, scale)
+    rows = kernel isa CGEF.Kernels.HighOrderKernel ? CGEF.Filtering._highorder_rows(grid, kernel, scale) :
+        CGEF.Filtering._sphere_band_rows(grid, kernel, scale, CGEF.Filtering._query_radius(grid, kernel, scale))
+    di, dj, w, ptr = rows
+    dj_lim = maximum(abs, dj; init = 0)
+    area = kernel isa CGEF.Kernels.HighOrderKernel ? nothing :
+        T[FlowGeometries.Grids.area(grid, 1, j) for j in 1:Ny]
+    nb = area === nothing ? 2 * dj_lim + 1 : dj_lim + 1
+    Px = FlowGeometries.Grids.isperiodic(grid, 1) ? Nx : nextprod((2, 3, 5), Nx + maximum(abs, di; init = 0))
 
-    # Latitude band bound from the axis's minimum gap as a physical distance, the banded builder's rule,
-    # so both engines cover the same source rows.
-    min_dφ = FlowGeometries.Grids.minimum_spacing(grid, 2)
-    dφ_phys = R * min_dφ
-    dj_lim = (isfinite(dφ_phys) && dφ_phys > 0) ? min(Ny - 1, ceil(Int, rad / dφ_phys)) : 0
-    nb = 2 * dj_lim + 1
-
-    # The support test `d ≤ rad` as `cos d ≥ cos rad`, with `rad/R` capped at `π`.
-    cosΔλ = T[cos(T(di) * dλ) for di in 0:(Nx - 1)]
-    cos_rad = cos(min(rad / R, T(π)))
-
-    sample = zeros(T, Nx, Ny)
+    sample = zeros(T, Px, Ny)
     fwd = FFTW.plan_rfft(sample, 1; num_threads = threads)
     Fbuf = fwd * sample
-    iplan = FFTW.plan_irfft(Fbuf, Nx, 1; num_threads = threads)
+    iplan = FFTW.plan_irfft(Fbuf, Px, 1; num_threads = threads)
     nk = size(Fbuf, 1)
 
     Ŵ = zeros(T, nk, nb, Ny)
-    gcol = zeros(T, Nx, nb)
+    gcol = zeros(T, Px, nb)
     gplan = FFTW.plan_rfft(gcol, 1; num_threads = threads)
-    rows = kernel isa CGEF.Kernels.HighOrderKernel ? CGEF.Filtering._highorder_rows(grid, kernel, scale) : nothing
+    Ĝ = gplan * gcol
     for j in 1:Ny
-        if rows !== nothing
-            # A `HighOrderKernel`'s weights come per row from its correction, each at its offset.
-            di, dj, w, ptr = rows
-            fill!(gcol, zero(T))
-            for q in ptr[j]:(ptr[j + 1] - 1)
-                gcol[mod(di[q], Nx) + 1, dj[q] + dj_lim + 1] += w[q]
-            end
-            Ĝ = gplan * gcol
-            @inbounds for b in 1:nb, n in 1:nk
-                Ŵ[n, b, j] = real(Ĝ[n, b])
-            end
-            continue
-        end
-        φj = lat[j]
-        sj, cj = sin(φj), cos(φj)
         fill!(gcol, zero(T))
-        for dj in (-dj_lim):dj_lim
-            jj = j + dj
-            (1 <= jj <= Ny) || continue
-            b = dj + dj_lim + 1
-            φk = lat[jj]
-            A0 = sj * sin(φk)
-            B0 = cj * cos(φk)
-            area = FlowGeometries.Grids.area(grid, 1, jj)   # longitude-independent on this grid
-            for di in 0:(Nx - 1)
-                cd = A0 + B0 * cosΔλ[di + 1]
-                cd >= cos_rad || continue
-                d = R * acos(clamp(cd, -one(T), one(T)))
-                gcol[di + 1, b] = CGEF.Kernels.kernel_weight(kernel, d, scale, Val(2)) * area
+        for q in ptr[j]:(ptr[j + 1] - 1)
+            if area === nothing
+                gcol[mod(di[q], Px) + 1, dj[q] + dj_lim + 1] += w[q]
+            elseif dj[q] >= 0
+                gcol[mod(di[q], Px) + 1, dj[q] + 1] += w[q] / area[j + dj[q]]
             end
         end
-        Ĝ = gplan * gcol
+        LA.mul!(Ĝ, gplan, gcol)
         @inbounds for b in 1:nb, n in 1:nk
             Ŵ[n, b, j] = real(Ĝ[n, b])
         end
@@ -570,8 +610,8 @@ function CGEF.Filtering.zonal_fft_footprint(
 
     bound = !all(FlowGeometries.Grids.mask(grid)) || CGEF.Filtering._reaches_exterior(grid, kernel, scale)
     fp = ZonalFFTFootprint(
-        Ŵ, zeros(T, Nx, Ny), dj_lim, bound, mask_strategy,
-        zeros(T, Nx, Ny), Fbuf, similar(Fbuf), fwd, iplan,
+        Ŵ, zeros(T, Nx, Ny), dj_lim, area, bound, mask_strategy,
+        zeros(T, Px, Ny), Px == Nx ? zeros(T, 0, 0) : zeros(T, Px, Ny), Fbuf, similar(Fbuf), fwd, iplan,
     )
 
     # Window mass through the same operator: `ZeroFill` counts every in-support cell and the rows past a
@@ -583,7 +623,7 @@ function CGEF.Filtering.zonal_fft_footprint(
         fp.src[i, j] = (zerofill || maskv[i, j]) ? one(T) : zero(T)
     end
     den = zeros(T, Nx, Ny)
-    if zerofill && rows !== nothing
+    if zerofill && kernel isa CGEF.Kernels.HighOrderKernel
         # Each row's whole support mass, the continued lattice included.
         mass = rows[5]
         @inbounds for j in 1:Ny, i in 1:Nx
@@ -600,7 +640,7 @@ function CGEF.Filtering.zonal_fft_footprint(
     return fp
 end
 
-CGEF.Filtering._transform_footprint(::Union{ZonalFFTFootprint, PaddedFFTFootprint}) = true
+CGEF.Filtering._driven_footprint(::Union{ZonalFFTFootprint, PaddedFFTFootprint}) = true
 
 # `rows(f, 1:Ny)` visits every latitude row; each row writes only its own column of every buffer.
 function CGEF.Filtering.apply_footprint!(
@@ -639,33 +679,37 @@ CGEF.Filtering._apply_serial!(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}} =
     CGEF.Filtering.apply_footprint!(out, field, grid, fp, strategy)
 
+# `rows(f, 1:n)` visits every index along the last direction; each writes only its own slab. The padding
+# past the grid's cells is zero from construction, and the forward transform leaves its input as it is.
 function CGEF.Filtering.apply_footprint!(
-    out::AbstractMatrix{T}, field::AbstractMatrix,
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
+    out::AbstractArray{T,N}, field::AbstractArray,
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
     fp::PaddedFFTFootprint{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
     rows::D = CGEF.Filtering._sep_serial,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, D}
+) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.CartesianGeometry{T}, D}
     strategy === fp.strategy || throw(ArgumentError(
         "this padded-FFT footprint was built for $(typeof(fp.strategy)); its denominator is not the " *
         "one $(typeof(strategy)) needs. Rebuild the plan with the strategy you intend to apply.",
     ))
-    Nx, Ny = fp.N
+    dims = fp.dims
+    slab = CartesianIndices(Base.front(dims))
     maskv = FlowGeometries.Grids.mask(grid)
     pad, num, den = fp.pad, fp.num, fp.den
     zerofill = strategy isa CGEF.Filtering.ZeroFill
-    fill!(pad, zero(T))
-    rows(1:Ny) do j
-        @inbounds @simd for i in 1:Nx
-            pad[i, j] = maskv[i, j] ? T(field[i, j]) : zero(T)
+    rows(1:dims[N]) do k
+        @inbounds for I in slab
+            J = CartesianIndex(Tuple(I)..., k)
+            pad[J] = maskv[J] ? T(field[J]) : zero(T)
         end
         return nothing
     end
     LA.mul!(fp.spec, fp.fwd, pad)
     fp.spec .*= fp.Ĝ
     LA.mul!(num, fp.inv, fp.spec)
-    rows(1:Ny) do j
-        @inbounds @simd for i in 1:Nx
-            out[i, j] = (zerofill || maskv[i, j]) ? CGEF.Filtering._normalized(num[i, j], den[i, j]) : zero(T)
+    rows(1:dims[N]) do k
+        @inbounds for I in slab
+            J = CartesianIndex(Tuple(I)..., k)
+            out[J] = (zerofill || maskv[J]) ? CGEF.Filtering._normalized(num[J], den[J]) : zero(T)
         end
         return nothing
     end
@@ -674,5 +718,76 @@ end
 
 CGEF.Filtering._apply_serial!(out, field, grid, fp::PaddedFFTFootprint, strategy) =
     CGEF.Filtering.apply_footprint!(out, field, grid, fp, strategy)
+
+# ---------------------------------------------------------------------------
+# The longitude step of `RingSpinTransforms` on a whole ring of uniform longitude
+# ---------------------------------------------------------------------------
+#
+# With `φ_i = φ₁ + σ(i − 1)·2π/n`, `σ = ±1` the axis's direction, the row sum of order `m` is
+# `e^{−imφ₁}` times bin `mod(σm, n)` of the row's discrete Fourier transform, and the synthesis puts each
+# order's term `e^{imφ₁}·ring[m]` in that bin and transforms back unnormalized. Orders `m` and `m + n`
+# share a bin, as `e^{imφ_i}` does on the ring.
+
+"""
+    FFTLongitudes
+
+The longitude step of `Filtering.RingSpinTransforms` by one FFT per row, on a grid whose longitude is a
+`FlowGeometries.Axes.PeriodicAxis`: the in-place transforms of the `(nlon, nlat)` scratch they are
+planned on, the phases `e^{−imφ₁}` and each order's bin.
+"""
+struct FFTLongitudes{P,Q,V,I,B}
+    fwd::P
+    bwd::Q
+    phase::V
+    bin::I
+    execution::B
+end
+
+_plan_fft!(A::Array, nt::Int) = FFTW.plan_fft!(A, 1; num_threads = nt)
+_plan_fft!(A::AbstractArray, ::Int) = FFTW.plan_fft!(A, 1)
+_plan_bfft!(A::Array, nt::Int) = FFTW.plan_bfft!(A, 1; num_threads = nt)
+_plan_bfft!(A::AbstractArray, ::Int) = FFTW.plan_bfft!(A, 1)
+
+function CGEF.Filtering._ring_longitudes(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2,S,TP,<:Tuple{FlowGeometries.Axes.PeriodicAxis,AbstractVector}},
+    φ::AbstractVector{T}, L::Int, wf, execution,
+) where {T<:AbstractFloat, G, S, TP}
+    n = length(φ)
+    σ = FlowGeometries.Axes.wrap_sign(FlowGeometries.Grids.coordinates(grid, 1)) > 0 ? 1 : -1
+    nt = CGEF.Filtering._library_threads(execution)
+    put(a) = FlowGeometries.Execution.on_backend(execution, a)
+    return FFTLongitudes(_plan_fft!(wf, nt), _plan_bfft!(wf, nt), put([cis(-T(m) * φ[1]) for m in -L:L]),
+                         put([mod(σ * m, n) + 1 for m in -L:L]), execution)
+end
+
+function CGEF.Filtering._longitude_sums!(ring, wf, lon::FFTLongitudes)
+    lon.fwd * wf
+    phase, bin = lon.phase, lon.bin
+    FlowGeometries.Execution.run_indices(size(ring, 2), lon.execution) do j
+        @inbounds for col in axes(ring, 1)
+            ring[col, j] = phase[col] * wf[bin[col], j]
+        end
+        return nothing
+    end
+    return ring
+end
+
+function CGEF.Filtering._longitude_synthesis!(F, ring, wf, lon::FFTLongitudes)
+    phase, bin = lon.phase, lon.bin
+    FlowGeometries.Execution.run_indices(size(ring, 2), lon.execution) do j
+        @inbounds begin
+            for i in axes(wf, 1)
+                wf[i, j] = zero(eltype(wf))
+            end
+            for col in axes(ring, 1)
+                wf[bin[col], j] += conj(phase[col]) * ring[col, j]
+            end
+        end
+        return nothing
+    end
+    lon.bwd * wf
+    copyto!(F, wf)
+    return F
+end
 
 end # module

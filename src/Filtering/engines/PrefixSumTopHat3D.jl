@@ -114,7 +114,18 @@ end
                 periodic[2] || continue
                 jj = mod1(jj, Ny)
             end
-            if periodic[1]
+            if periodic[1] && 2 * w + 1 < Nx
+                # A window shorter than the period wraps only for the `w` cells at either end.
+                for i in 1:w
+                    oc[i] += _scan_diff(Ph, Pl, Nx + 1, Nx + i - w, jj, kk) + _scan_diff(Ph, Pl, i + w + 1, 1, jj, kk)
+                end
+                @simd for i in (w + 1):(Nx - w)
+                    oc[i] += _scan_diff(Ph, Pl, i + w + 1, i - w, jj, kk)
+                end
+                for i in (Nx - w + 1):Nx
+                    oc[i] += _scan_diff(Ph, Pl, Nx + 1, i - w, jj, kk) + _scan_diff(Ph, Pl, i + w - Nx + 1, 1, jj, kk)
+                end
+            elseif periodic[1]
                 # The `2w+1` raw offsets are `q` whole turns of the axis and a remainder of `rc` cells,
                 # each cell counted once per image the offsets land on.
                 q, rc = divrem(2 * w + 1, Nx)
@@ -282,35 +293,6 @@ build_footprint(grid::FlowGeometries.Grids.StructuredGrid{T,G,1}, kernel::Kernel
 build_footprint(grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, kernel::Kernels.AbstractFilterKernel, scale::T; kwargs...) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
     _build_footprint_nd_scattered(grid, kernel, scale; kwargs...)
 
-function _build_footprint_nd(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
-    kernel::Kernels.AbstractFilterKernel,
-    scale::T,
-) where {N, T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    rad = Kernels.kernel_radius(kernel, scale, Val(N))
-    # The caller's dispatch guarantees every coordinate axis is a `Range`.
-    spacing = ntuple(d -> step(FlowGeometries.Grids.coordinates(grid, d)), N)
-    A = FlowGeometries.Grids.measure(grid)[ntuple(_ -> 1, N)...]   # uniform Cartesian cell measure
-    lim = ntuple(d -> spacing[d] > 0 ? ceil(Int, rad / spacing[d]) : 0, N)
-    offsets = NTuple{N,Int}[]
-    w = T[]
-    sizehint!(offsets, prod(2 .* lim .+ 1))
-    sizehint!(w, prod(2 .* lim .+ 1))
-    for off in CartesianIndices(ntuple(d -> (-lim[d]):lim[d], N))
-        o = Tuple(off)
-        d2 = zero(T)
-        for d in 1:N
-            d2 += (T(o[d]) * spacing[d])^2
-        end
-        dist = sqrt(d2)
-        if dist <= rad
-            push!(offsets, o)
-            push!(w, Kernels.kernel_weight(kernel, dist, scale, Val(N)) * A)
-        end
-    end
-    return FilterFootprintND(offsets, w, _exterior_mass(grid, kernel, scale))
-end
-
 """
     NDScatteredCache{N, T}
 
@@ -445,59 +427,8 @@ end
 @inline _image_convention(::FlowGeometries.Geometry.AbstractGeometry) =
     FlowGeometries.Connectivity.NearestImage()
 
-# Shifted neighbour multi-index with per-axis periodic wrap; returns (index, in-bounds?).
-@inline function _shift_index(I::NTuple{N,Int}, o::NTuple{N,Int}, dims::NTuple{N,Int}, periodic::NTuple{N,Bool}) where {N}
-    J = ntuple(N) do d
-        jj = I[d] + o[d]
-        (jj < 1 || jj > dims[d]) ? (periodic[d] ? mod1(jj, dims[d]) : 0) : jj
-    end
-    return J, !any(==(0), J)
-end
-
-# The three point functions below return zero at a target the strategy skips, so a caller evaluates
-# them at every point. The parallel backend extensions call them too.
-@inline function _footprint_nd_point(
-    field::AbstractArray, fp::FilterFootprintND{N,T}, strategy::AbstractMaskStrategy,
-    dims::NTuple{N,Int}, periodic::NTuple{N,Bool}, mask, I::CartesianIndex{N},
-) where {N, T<:AbstractFloat}
-    _filters_target(strategy, @inbounds mask[I]) || return zero(T)
-    Ti = Tuple(I)
-    ws = zero(T)
-    wn = zero(T)
-    zerofill = strategy isa ZeroFill
-    @inbounds for k in eachindex(fp.offsets)
-        J, valid = _shift_index(Ti, fp.offsets[k], dims, periodic)
-        valid || continue
-        active = mask[J...]
-        wk = fp.w[k]
-        if zerofill
-            wn += wk
-            active && (ws += wk * field[J...])
-        elseif active
-            wn += wk
-            ws += wk * field[J...]
-        end
-    end
-    zerofill && (wn = _add_exterior(wn, fp.exterior, I))
-    return _normalized(ws, wn)
-end
-
-function apply_footprint_nd!(
-    out::AbstractArray{T,N},
-    field::AbstractArray,
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
-    fp::FilterFootprintND{N,T},
-    strategy::AbstractMaskStrategy,
-) where {N, T<:AbstractFloat, G}
-    dims = FlowGeometries.Grids.size_tuple(grid)
-    periodic = FlowGeometries.Grids.periodic_flags(grid)
-    mask = FlowGeometries.Grids.mask(grid)
-    @inbounds for I in CartesianIndices(out)
-        out[I] = _footprint_nd_point(field, fp, strategy, dims, periodic, mask, I)
-    end
-    return out
-end
-
+# The two point functions below return zero at a target the strategy skips, so a caller evaluates them
+# at every point. The parallel backend extensions call them too.
 @inline function _footprint_nd_point_cached(
     field::AbstractArray, cache::NDScatteredCache{N,T}, exterior, strategy::AbstractMaskStrategy,
     mask, lin::LinearIndices{N}, I::CartesianIndex{N},

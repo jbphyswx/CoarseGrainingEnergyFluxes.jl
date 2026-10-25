@@ -208,6 +208,42 @@ function _separable_axis_weights(
 end
 
 """
+    _separable_tables(grid, kernel::SeparableKernel, scale) -> (; g, lim, periodic, mf)
+
+The separable engines' per-axis weight tables `g` ([`_separable_axis_weights`](@ref)) and stencil
+half-widths `lim`, from the smallest gap on each axis so the stencil covers the kernel's radius
+everywhere, with each axis's periodicity and the grid's measure factors `mf`.
+"""
+function _separable_tables(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::SeparableKernel, scale::T,
+) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    lim = _separable_halfwidths(grid, kernel, scale)
+    periodic = FlowGeometries.Grids.periodic_flags(grid)
+    mf = FlowGeometries.Grids.measure_factors(grid)
+    mf === nothing && throw(ArgumentError(
+        "the separable path needs a separable cell measure, but this grid's measure is dense",
+    ))
+    g = ntuple(Val(N)) do d
+        _separable_axis_weights(
+            FlowGeometries.Grids.coordinates(grid, d), lim[d], periodic[d],
+            T(FlowGeometries.Grids.period(grid, d)), kernel, scale, convert(AbstractVector{T}, mf[d]),
+        )
+    end
+    return (; g, lim, periodic, mf)
+end
+
+# The stencil half-widths in cells along each axis, from its smallest gap.
+function _separable_halfwidths(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::SeparableKernel, scale::T,
+) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    rad = Kernels.kernel_radius(kernel, scale)
+    return ntuple(Val(N)) do d
+        s = FlowGeometries.Grids.minimum_spacing(grid, d)
+        (isfinite(s) && s > 0) ? ceil(Int, rad / s) : 0
+    end
+end
+
+"""
     _build_separable_footprint(grid, kernel::SeparableKernel, scale; mask_strategy=ZeroFill(), scratch=nothing, kwargs...) -> SeparableFootprint
 
 Build the per-axis weight tables, the denominator for `mask_strategy`, and the pass buffers of the
@@ -223,26 +259,10 @@ function _build_separable_footprint(
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    rad = Kernels.kernel_radius(kernel, scale)
-    # Stencil half-widths from the smallest gap on each axis, so the stencil covers `rad` everywhere.
-    dx = FlowGeometries.Grids.minimum_spacing(grid, 1)
-    dy = FlowGeometries.Grids.minimum_spacing(grid, 2)
-    di_lim = (isfinite(dx) && dx > 0) ? ceil(Int, rad / dx) : 0
-    dj_lim = (isfinite(dy) && dy > 0) ? ceil(Int, rad / dy) : 0
-    periodic_x = FlowGeometries.Grids.isperiodic(grid, 1)
-    periodic_y = FlowGeometries.Grids.isperiodic(grid, 2)
-    mf = FlowGeometries.Grids.measure_factors(grid)
-    mf === nothing && throw(ArgumentError(
-        "the separable path needs a separable cell measure, but this grid's measure is dense",
-    ))
-    gx = _separable_axis_weights(
-        FlowGeometries.Grids.coordinates(grid, 1), di_lim, periodic_x,
-        T(FlowGeometries.Grids.period(grid, 1)), kernel, scale, convert(AbstractVector{T}, mf[1]),
-    )
-    gy = _separable_axis_weights(
-        FlowGeometries.Grids.coordinates(grid, 2), dj_lim, periodic_y,
-        T(FlowGeometries.Grids.period(grid, 2)), kernel, scale, convert(AbstractVector{T}, mf[2]),
-    )
+    (; g, lim, periodic, mf) = _separable_tables(grid, kernel, scale)
+    gx, gy = g
+    di_lim, dj_lim = lim
+    periodic_x, periodic_y = periodic
 
     sc = scratch === nothing ? _separable_scratch(grid) : scratch
     masked_input = sc.masked_input

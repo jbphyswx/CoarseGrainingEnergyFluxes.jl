@@ -103,9 +103,9 @@ end
 """
     _banded_row_accumulate!(oc, src, taps::BandTable, b, periodic_x, periodic_y, Nx, Ny, j) -> oc
 
-Add output row `j`'s weighted tap sum over band `b` into `oc`, one contiguous axpy along `x` per tap.
-`src` is `mask · field` for the numerator at apply time and the mass field for `invden` at plan build.
-On a bounded axis 1 a tap covers the columns whose source index stays in range.
+Add output row `j`'s weighted tap sum over band `b` into `oc`, the taps of each run by
+[`_run_accumulate!`](@ref). `src` is `mask · field` for the numerator at apply time and the mass field for
+`invden` at plan build. On a bounded axis 1 a tap covers the columns whose source index stays in range.
 """
 @inline function _banded_row_accumulate!(
     oc::AbstractVector{T}, src::AbstractMatrix, taps::BandTable, b::Integer,
@@ -120,36 +120,68 @@ On a bounded axis 1 a tap covers the columns whose source index stays in range.
         end
         fc = view(src, :, jj)
         k0 = taps.start[s]
-        d0 = taps.di0[s] - k0
-        for k in k0:(taps.start[s + 1] - 1)
+        _run_accumulate!(oc, fc, w, k0, taps.start[s + 1] - 1, taps.di0[s] - k0, periodic_x, Nx)
+    end
+    return oc
+end
+
+const _TAP_BLOCK = 16
+
+"""
+    _run_accumulate!(oc, fc, w, k0, k1, d0, periodic, n) -> oc
+
+`oc[i] += w[k] · fc[i + d0 + k]` for the taps `k0:k1` of one run, in that order for every output `i`.
+Where every tap's source lies on the line, blocks of `_TAP_BLOCK` outputs stay in registers across the
+run's taps, so each tap reads its sources once and the line is loaded and stored once per run; the
+outputs at either end take each tap on its own, wrapped where the line is periodic.
+"""
+@inline function _run_accumulate!(oc::AbstractVector{T}, fc::AbstractVector, w, k0::Int, k1::Int, d0::Int,
+                                  periodic::Bool, n::Int) where {T}
+    ilo = max(1, 1 - (d0 + k0))
+    ihi = min(n, n - (d0 + k1))
+    nblock = max(0, ihi - ilo + 1) ÷ _TAP_BLOCK
+    lo_end, hi_start = nblock == 0 ? (n, n + 1) : (ilo - 1, ilo + nblock * _TAP_BLOCK)
+    @inbounds for k in k0:k1
+        wk = T(w[k])
+        _tap_add_range!(oc, fc, wk, d0 + k, periodic, n, 1, lo_end)
+        _tap_add_range!(oc, fc, wk, d0 + k, periodic, n, hi_start, n)
+    end
+    @inbounds for b in 0:(nblock - 1)
+        i0 = ilo + b * _TAP_BLOCK - 1
+        acc = ntuple(q -> oc[i0 + q], Val(_TAP_BLOCK))
+        for k in k0:k1
             wk = T(w[k])
-            d = d0 + k
-            if periodic_x && abs(d) < Nx
-                # With `|d| < Nx` the wrapped tap is two contiguous runs, each at a constant offset.
-                if d >= 0
-                    @simd for i in 1:(Nx - d)
-                        oc[i] += wk * fc[i + d]
-                    end
-                    @simd for i in (Nx - d + 1):Nx
-                        oc[i] += wk * fc[i + d - Nx]
-                    end
-                else
-                    @simd for i in 1:(-d)
-                        oc[i] += wk * fc[i + d + Nx]
-                    end
-                    @simd for i in (1 - d):Nx
-                        oc[i] += wk * fc[i + d]
-                    end
-                end
-            elseif periodic_x
-                @simd for i in 1:Nx
-                    oc[i] += wk * fc[mod1(i + d, Nx)]
-                end
-            else
-                @simd for i in max(1, 1 - d):min(Nx, Nx - d)
-                    oc[i] += wk * fc[i + d]
-                end
-            end
+            o = i0 + d0 + k
+            acc = ntuple(q -> acc[q] + wk * fc[o + q], Val(_TAP_BLOCK))
+        end
+        for q in 1:_TAP_BLOCK
+            oc[i0 + q] = acc[q]
+        end
+    end
+    return oc
+end
+
+# `oc[i] += wk · fc[i + d]` for `i ∈ lo:hi` whose source is on the line, or is brought back onto it where
+# the line is periodic. With `|d| < n` the sources below, on and above the line are each a contiguous range
+# of `i` at a constant offset.
+@inline function _tap_add_range!(oc, fc, wk, d::Int, periodic::Bool, n::Int, lo::Int, hi::Int)
+    @inbounds if !periodic
+        @simd for i in max(lo, 1 - d):min(hi, n - d)
+            oc[i] += wk * fc[i + d]
+        end
+    elseif abs(d) < n
+        @simd for i in lo:min(hi, -d)
+            oc[i] += wk * fc[i + d + n]
+        end
+        @simd for i in max(lo, 1 - d):min(hi, n - d)
+            oc[i] += wk * fc[i + d]
+        end
+        @simd for i in max(lo, n - d + 1):hi
+            oc[i] += wk * fc[i + d - n]
+        end
+    else
+        @simd for i in lo:hi
+            oc[i] += wk * fc[mod1(i + d, n)]
         end
     end
     return oc
@@ -585,23 +617,6 @@ build_footprint(
     kwargs...,
 ) where {T<:AbstractFloat} = _build_footprint_curvilinear(grid, kernel, scale; kwargs...)
 
-"""
-    FilterFootprintND{N, T}
-
-Translation-invariant footprint of a 1-D or 3-D Cartesian grid with uniform axes: one set of in-support
-neighbour offsets (`NTuple{N,Int}`) and their weights `w = kernel_weight(distance) · cell_measure`.
-`exterior` is the mass past a bounded edge that `ZeroFill` adds to each point's denominator
-([`_exterior_mass`](@ref)), or `nothing`.
-"""
-struct FilterFootprintND{
-    N, T<:AbstractFloat, VO<:AbstractVector{NTuple{N,Int}}, VT<:AbstractVector{T},
-    EX<:Union{Nothing,AbstractArray{T,N}},
-}
-    offsets::VO
-    w::VT
-    exterior::EX
-end
-
 # `wn` plus the exterior mass at a point, for `ZeroFill`'s full-mass denominator.
 @inline _add_exterior(wn, ::Nothing, I...) = wn
 @inline _add_exterior(wn, E::AbstractArray, I...) = wn + @inbounds(E[I...])
@@ -678,13 +693,17 @@ function build_footprint(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, S, TP<:NTuple{2,FlowGeometries.Grids.AbstractTopology}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     rad = Kernels.kernel_radius(kernel, scale, Val(2))
+    if !(G <: FlowGeometries.Geometry.CartesianGeometry{T})
+        di, dj, w, ptr = _sphere_band_rows(grid, kernel, scale, rad)
+        return _banded_footprint(grid, di, dj, w, ptr, Ny, mask_strategy, kernel, scale)
+    end
 
     di = Int[]
     dj = Int[]
     w = T[]
     ptr = Int[1]
 
-    if G <: FlowGeometries.Geometry.CartesianGeometry{T} && FlowGeometries.Grids.coordinates(grid, 2) isa AbstractRange
+    if FlowGeometries.Grids.coordinates(grid, 2) isa AbstractRange
         dx = step(FlowGeometries.Grids.coordinates(grid, 1))
         dy = step(FlowGeometries.Grids.coordinates(grid, 2))
         A = FlowGeometries.Grids.area(grid, 1, 1)   # uniform Cartesian cell area
@@ -703,55 +722,64 @@ function build_footprint(
         end
         push!(ptr, length(di) + 1)
         return _banded_footprint(grid, di, dj, w, ptr, 1, mask_strategy, kernel, scale)
-    elseif G <: FlowGeometries.Geometry.CartesianGeometry{T}
+    else
         _banded_cartesian_rows!(di, dj, w, ptr, grid, kernel, scale, rad)
         return _banded_footprint(grid, di, dj, w, ptr, Ny, mask_strategy, kernel, scale)
-    else
-        # Band `j`'s window, from `metric_window`, holds for every row its ball reaches: a row nearer a
-        # pole spans more longitude at the same radius. `_banded_lon_offsets` turns it into offsets.
-        dλ = step(FlowGeometries.Grids.coordinates(grid, 1))
-        periodic_λ = FlowGeometries.Grids.isperiodic(grid, 1)
-        offsets = Vector{NTuple{3,UnitRange{Int}}}(undef, Ny)
-        dj_lims = Vector{Int}(undef, Ny)
-        total_entries = 0
-        for j in 1:Ny
-            dl, djl = FlowGeometries.Connectivity.metric_window(grid, (1, j), rad)
-            offsets[j] = _banded_lon_offsets(dl, Nx, dλ, periodic_λ)
-            dj_lims[j] = djl
-            for ddj in -djl:djl
-                jj = j + ddj
-                (1 <= jj <= Ny) || continue
-                total_entries += sum(length, offsets[j])
-            end
+    end
+end
+
+"""
+    _sphere_band_rows(grid, kernel, scale, rad) -> (di, dj, w, ptr)
+
+The taps of a sphere of uniform longitude by latitude row: row `j`'s entries `ptr[j]:ptr[j+1]-1` hold
+the longitude and latitude offsets of the cells within great-circle distance `rad` of a target in row `j`
+and their weights `kernel_weight(d)·area`. Uniform longitude makes them the same for every target of a
+row.
+"""
+function _sphere_band_rows(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.AbstractFilterKernel, scale::T, rad::T,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
+    geo = FlowGeometries.Grids.grid_geometry(grid)
+    lat = FlowGeometries.Grids.coordinates(grid, 2)
+    # Band `j`'s window, from `metric_window`, holds for every row its ball reaches: a row nearer a pole
+    # spans more longitude at the same radius. `_banded_lon_offsets` turns it into offsets.
+    dλ = step(FlowGeometries.Grids.coordinates(grid, 1))
+    periodic_λ = FlowGeometries.Grids.isperiodic(grid, 1)
+    offsets = Vector{NTuple{3,UnitRange{Int}}}(undef, Ny)
+    dj_lims = Vector{Int}(undef, Ny)
+    total_entries = 0
+    for j in 1:Ny
+        dl, djl = FlowGeometries.Connectivity.metric_window(grid, (1, j), rad)
+        offsets[j] = _banded_lon_offsets(dl, Nx, dλ, periodic_λ)
+        dj_lims[j] = djl
+        for ddj in -djl:djl
+            (1 <= j + ddj <= Ny) && (total_entries += sum(length, offsets[j]))
         end
-        sizehint!(di, total_entries)
-        sizehint!(dj, total_entries)
-        sizehint!(w, total_entries)
-        for j in 1:Ny
-            φ = FlowGeometries.Grids.coordinates(grid, 2)[j]
-            for ddj in -dj_lims[j]:dj_lims[j]
-                jj = j + ddj
-                (1 <= jj <= Ny) || continue
-                φ2 = FlowGeometries.Grids.coordinates(grid, 2)[jj]
-                A = FlowGeometries.Grids.area(grid, 1, jj)   # spherical cell area depends only on latitude
-                for range in offsets[j], ddi in range
-                    # Great-circle distance with Δλ = ddi·dλ (longitude-translation-invariant).
-                    d = FlowGeometries.Geometry.distance(
-                        FlowGeometries.Grids.grid_geometry(grid),
-                        SA.SVector{2,T}(zero(T), φ),
-                        SA.SVector{2,T}(T(ddi) * dλ, φ2),
-                    )
-                    if d <= rad
-                        push!(di, ddi)
-                        push!(dj, ddj)
-                        push!(w, Kernels.kernel_weight(kernel, d, scale, Val(2)) * A)
-                    end
+    end
+    di = sizehint!(Int[], total_entries)
+    dj = sizehint!(Int[], total_entries)
+    w = sizehint!(T[], total_entries)
+    ptr = Int[1]
+    for j in 1:Ny
+        for ddj in -dj_lims[j]:dj_lims[j]
+            jj = j + ddj
+            (1 <= jj <= Ny) || continue
+            A = FlowGeometries.Grids.area(grid, 1, jj)   # spherical cell area depends only on latitude
+            for range in offsets[j], ddi in range
+                d = FlowGeometries.Geometry.distance(
+                    geo, SA.SVector{2,T}(zero(T), lat[j]), SA.SVector{2,T}(T(ddi) * dλ, lat[jj]),
+                )
+                if d <= rad
+                    push!(di, ddi)
+                    push!(dj, ddj)
+                    push!(w, Kernels.kernel_weight(kernel, d, scale, Val(2)) * A)
                 end
             end
-            push!(ptr, length(di) + 1)
         end
-        return _banded_footprint(grid, di, dj, w, ptr, Ny, mask_strategy, kernel, scale)
+        push!(ptr, length(di) + 1)
     end
+    return di, dj, w, ptr
 end
 
 """

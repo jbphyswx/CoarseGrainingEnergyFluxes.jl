@@ -208,12 +208,12 @@ tracks the work as it lands.
   contiguous axpy now covers masked grids and the columns within one filter radius of an edge, which
   previously had no vectorized path at all; and a batched prefix-sum apply shares one support walk
   across fields where the axis is nonuniform.
-- **`AutoMethod()` reaches two transform-based evaluators of the same real-space convolution**: a
-  padded FFT of the sampled kernel on a uniform Cartesian lattice, and a transform along the longitude
-  ring on a global sphere, where a great-circle kernel depends on the longitude difference alone. Both
-  use the same compact kernel and weights and agree with the direct sum to round-off, so `RealSpace()`
-  remains the default; `check_setup` names the engine each method selects and flags when `AutoMethod`
-  would pick a faster one.
+- **`RealSpace()` reaches two transform-based evaluators of the same convolution**: a padded FFT of the
+  sampled kernel on a uniform Cartesian lattice, and a transform along longitude on a sphere of uniform
+  longitude, a ring or a regional box, where a great-circle kernel depends on the longitude offset
+  alone. Both use the banded engine's weights and agree with the direct sum to round-off; a plan takes
+  one where it costs fewer operations than the direct sum, and `check_setup` names the engine.
+  `AutoMethod()` is removed.
 - **Workspaces are sized to the requested configuration.** `ΠWorkspace(grid; has_w)` allocates only the
   buffers that configuration can reach (15 of the former 30 for a 2-D flux without a vertical
   component). `has_w` is a construction argument because the buffers must exist before the first call —

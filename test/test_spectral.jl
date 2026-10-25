@@ -188,7 +188,8 @@ Test.@testset "Spherical harmonics are scaled by Ĝ_l" begin
     lat = vec([π / 2 - θ for θ in Θ, φ in Φ])
     lon = vec([φ for θ in Θ, φ in Φ])
     n = length(lat)
-    ug = FG.Grids.UnstructuredGrid(geo, lon, lat, ones(n), trues(n))
+    area = vec(permutedims(collect(FG.Grids.measure(cc))))
+    ug = FG.Grids.UnstructuredGrid(geo, lon, lat, area, trues(n))
     modes = ((2, 0, 1.0), (5, -3, 0.6), (9, 4, -0.8))
     f = sum(a .* vec(ylm(l, m)) for (l, m, a) in modes)
     for k in kernels
@@ -204,7 +205,7 @@ Test.@testset "Spherical harmonics are scaled by Ĝ_l" begin
     # `Deformable` divides the filtered `c·mask` by the filtered mask: a constant comes back at every active
     # point and a masked point reads zero.
     mask = lat .< deg2rad(40)
-    pd = CGEF.Filtering.plan_filter(FG.Grids.UnstructuredGrid(geo, lon, lat, ones(n), mask), CGEF.GaussianKernel(), 1e6;
+    pd = CGEF.Filtering.plan_filter(FG.Grids.UnstructuredGrid(geo, lon, lat, area, mask), CGEF.GaussianKernel(), 1e6;
                                     method = _CGEF_SPECTRAL, mask_strategy = CGEF.Filtering.Deformable())
     cd = CGEF.Filtering.filter_apply!(zeros(n), fill(1.7, n), pd)
     Test.@test cd[mask] ≈ fill(1.7, count(mask)) rtol = 1e-10
