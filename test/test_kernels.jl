@@ -17,22 +17,6 @@ function _cgef_continuum_moments(kern, D::Int; n = 200_000)
     return m0, m2 / m0
 end
 
-# Composite Simpson over `[a, b]`.
-function _cgef_simpson(f, a, b; n = 2000)
-    h = (b - a) / n
-    return h / 3 * (f(a) + f(b) + 4 * sum(f(a + (2i - 1) * h) for i in 1:(n ÷ 2)) +
-                    2 * sum(f(a + 2i * h) for i in 1:(n ÷ 2 - 1)))
-end
-
-function _cgef_legendre(l, x)
-    p0, p1 = 1.0, x
-    l == 0 && return p0
-    for m in 1:(l - 1)
-        p0, p1 = p1, ((2m + 1) * x * p1 - m * p0) / (m + 1)
-    end
-    return p1
-end
-
 Test.@testset "Kernel weights and per-component second moments" begin
     th = CGEF.TopHatKernel()
     ℓ = 1.0

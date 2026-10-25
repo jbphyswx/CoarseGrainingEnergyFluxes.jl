@@ -26,7 +26,10 @@ _cgef_a_nufft(gp, sc) = @allocated begin
     FTB.nufft_type1!(sc.modes, gp.plan, sc.values)
     FTB.nufft_type2!(sc.values, gp.plan, sc.modes)
 end
-_cgef_a_nusht(o, f, xfer, plan, ws, rtol) = @allocated NUFSHT.nusht_filter!(o, f, xfer, plan; ws, rtol)
+_cgef_a_nusht(o, C, f, xfer, op, plan, ws, rtol) = @allocated begin
+    NUFSHT.nusht_solve!(C, f, op; ws, rtol)
+    NUFSHT.nusht_synthesize!(o, C, xfer, plan)
+end
 _cgef_a_tau(ws, u, v, g, k, ℓ, p, dp) =
     @allocated CGEF.Diagnostics.tau_decomposition!(ws, u, v, g, k, ℓ; filter_plan = p, derived_plan = dp)
 _cgef_a_sc(ws, u, v, g, k, ℓ, p, d) =
@@ -228,16 +231,18 @@ Test.@testset "Allocations" begin
         sg = FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), 17; geometry = FG.Geometry.SphericalGeometry(R))
         ps = CGEF.Filtering.plan_filter(sg, ga, π * R / 8; execution = SER, method = CGEF.Filtering.Spectral())
         Test.@test _cgef_second(() -> _cgef_a_apply(zeros(33, 17), field((33, 17)), ps)) <= TASK_SLACK
-        # NUFSHT allocates inside its own fit; the extension adds nothing over the same upstream call.
+        # NUFSHT allocates inside its own fit; the extension adds nothing over the same upstream calls.
         M = 200
         lat = asin.(clamp.(2 .* mod.(0.618 .* (1:M), 1.0) .- 1, -1, 1))
         lon = 2π .* mod.(0.4142 .* (1:M), 1.0)
-        nug = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(R), lon, lat, ones(M), trues(M))
+        nug = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(R), lon, lat, fill(4π * R^2 / M, M), trues(M))
         pq = CGEF.Filtering.plan_filter(nug, ga, π * R / 8; execution = SER, method = CGEF.Filtering.Spectral())
         f = sin.(lon) .* cos.(lat)
         CGEF.Filtering.filter_apply!(zeros(M), f, pq)
         rtol = Base.get_extension(CGEF, :CoarseGrainingEnergyFluxesNUFSHTExt)._fit_rtol(pq.grid_plan.plan.tol, Float64)
-        upstream = _cgef_second(() -> _cgef_a_nusht(zeros(M), f, pq.filter, pq.grid_plan.plan, pq.scratch.ws, rtol))
+        gq = pq.grid_plan
+        upstream = _cgef_second(() -> _cgef_a_nusht(zeros(M), NUFSHT.allocate_coefficients(gq.plan), f, pq.filter, gq.op,
+                                                    gq.plan, pq.scratch.ws, rtol))
         Test.@test _cgef_second(() -> _cgef_a_apply(zeros(M), f, pq)) <= upstream + TASK_SLACK
     end
 

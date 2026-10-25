@@ -37,12 +37,16 @@ _cgef_d(::Nothing) = nothing
 _cgef_same(d::AbstractArray, h::AbstractArray) = d isa JLArrays.JLArray && Array(d) == h && any(!iszero, h)
 _cgef_same(d::NamedTuple, h::NamedTuple) = keys(d) == keys(h) && all(k -> _cgef_same(d[k], h[k]), keys(d))
 
+# A device result whose host counterpart evaluates the same sums in another order, `n` terms per value.
+_cgef_close(d::AbstractArray, h::AbstractArray, n) =
+    d isa JLArrays.JLArray && isapprox(Array(d), h; rtol = 2n * eps()) && any(!iszero, h)
+
 # The bound on two orders of the area mean `Σ xᵢ Aᵢ / area` over the active cells of `og`.
 _cgef_mean_atol(x, og, area) = 2 * length(x) * eps() * FG.Grids.integrate(abs.(x), og) / area
 
 # Smooth fields on `g` from its coordinates divided by `s`, and a positive density.
 function _cgef_dev_fields(g, s)
-    c = [FG.Grids.coords(g, Tuple(I)...) ./ s for I in CartesianIndices(FG.Grids.size_tuple(g))]
+    c = [Tuple(FG.Grids.coords(g, Tuple(I)...)) ./ s for I in CartesianIndices(FG.Grids.size_tuple(g))]
     q(p, k) = length(p) >= k ? p[k] : 0.0
     u = [sin(q(p, 1) + 0.3) * cos(0.7 * q(p, 2)) + 0.2 * cos(q(p, 3)) for p in c]
     v = [cos(0.8 * q(p, 1)) * sin(q(p, 2) + 0.5) + 0.1 * sin(q(p, 3)) for p in c]
@@ -109,12 +113,18 @@ Test.@testset "compute_Π! on the device" begin
     same(gc, ga, 4e3, ub, vb, nothing)
 
     # Spheres: a regular latitude range, and a Clenshaw–Curtis sampling's latitudes, which are a vector.
+    # NUFSHT's spin transforms run their NUFFT on the device workspace's threads, and the host plan of the
+    # ring takes the transform along longitude where the device plan takes the banded sum: each pair is
+    # one sum in two orders, a term per cell.
     gs = _cgef_dev_sphere()
     us, vs, _ = _cgef_dev_fields(gs, 1.0)
+    near(g, k, ℓ, u, v, w; kw...) =
+        Test.@test _cgef_close(flux(g, k, ℓ, u, v, w, _CGEF_DEV; kw...), flux(g, k, ℓ, u, v, w, _CGEF_HOST; kw...),
+                               length(FG.Grids.mask(g)))
     for k in (ga, th)
-        same(gs, k, deg2rad(30.0) * _CGEF_R, us, vs, nothing)
+        near(gs, k, deg2rad(30.0) * _CGEF_R, us, vs, nothing)
     end
-    same(gs, ga, deg2rad(30.0) * _CGEF_R, us, vs, nothing; mask_strategy = CGEF.Filtering.Deformable())
+    near(gs, ga, deg2rad(30.0) * _CGEF_R, us, vs, nothing; mask_strategy = CGEF.Filtering.Deformable())
     # The in-core spin transforms run in the device's memory under its loops.
     same(gs, ga, deg2rad(30.0) * _CGEF_R, us, vs, nothing; transform = CGEF.SpectralBackends.DirectSumSpectralBackend())
     gq = FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), 9;
@@ -162,20 +172,23 @@ Test.@testset "Flux decompositions and budgets on the device" begin
     D = CGEF.Diagnostics
     k = CGEF.GaussianKernel()
     gc, gs = _cgef_dev_cartesian(), _cgef_dev_sphere()
-    for (g, s, ℓ) in ((gc, 5000.0, 4e3), (gs, 1.0, deg2rad(30.0) * _CGEF_R))
+    # On the sphere both sides run the in-core spin transforms and, at this scale, the banded sum the
+    # device takes for a scalar.
+    sph = (; transform = CGEF.SpectralBackends.DirectSumSpectralBackend())
+    for (g, s, ℓ, kw) in ((gc, 5000.0, 4e3, (;)), (gs, 1.0, deg2rad(15.0) * _CGEF_R, sph))
         u, v, _, θ, ρ = _cgef_dev_fields(g, s)
         P = 1.0e5 .+ 100 .* θ
         ur, vr = 0.6 .* u, 0.4 .* v
         du, dv, dθ, dρ, dP, dur, dvr = map(_cgef_d, (u, v, θ, ρ, P, ur, vr))
         both(f) = (f(du, dv, dθ, dρ, dP, dur, dvr, _CGEF_DEV), f(u, v, θ, ρ, P, ur, vr, _CGEF_HOST))
         for (d, h) in (
-            both((u, v, θ, ρ, P, ur, vr, b) -> D.tau_decomposition(u, v, g, k, ℓ; execution = b)),
-            both((u, v, θ, ρ, P, ur, vr, b) -> D.compute_Π_strain_convergence(u, v, g, k, ℓ; execution = b)),
-            both((u, v, θ, ρ, P, ur, vr, b) -> D.compute_Π_decomposed(u, v, ur, vr, g, k, ℓ; execution = b)),
-            both((u, v, θ, ρ, P, ur, vr, b) -> (; Πθ = D.tracer_variance_flux(u, v, θ, g, k, ℓ; execution = b))),
-            both((u, v, θ, ρ, P, ur, vr, b) -> (; Z = D.enstrophy_flux(u, v, g, k, ℓ; execution = b))),
+            both((u, v, θ, ρ, P, ur, vr, b) -> D.tau_decomposition(u, v, g, k, ℓ; execution = b, kw...)),
+            both((u, v, θ, ρ, P, ur, vr, b) -> D.compute_Π_strain_convergence(u, v, g, k, ℓ; execution = b, kw...)),
+            both((u, v, θ, ρ, P, ur, vr, b) -> D.compute_Π_decomposed(u, v, ur, vr, g, k, ℓ; execution = b, kw...)),
+            both((u, v, θ, ρ, P, ur, vr, b) -> (; Πθ = D.tracer_variance_flux(u, v, θ, g, k, ℓ; execution = b, kw...))),
+            both((u, v, θ, ρ, P, ur, vr, b) -> (; Z = D.enstrophy_flux(u, v, g, k, ℓ; execution = b, kw...))),
             both((u, v, θ, ρ, P, ur, vr, b) -> (; ω = D.vorticity(u, v, g; execution = b))),
-            both((u, v, θ, ρ, P, ur, vr, b) -> D.compressible_flux(u, v, ρ, P, g, k, ℓ; execution = b)),
+            both((u, v, θ, ρ, P, ur, vr, b) -> D.compressible_flux(u, v, ρ, P, g, k, ℓ; execution = b, kw...)),
         )
             Test.@test _cgef_same(d, h)
         end
@@ -216,20 +229,23 @@ Test.@testset "Energies and sweeps on the device" begin
     x3 = range(0.0, 7000.0; length = 8)
     g3 = FG.Grids.StructuredGrid(_CGEF_CART, x3, x3, x3)
     g1 = FG.Grids.StructuredGrid(_CGEF_CART, range(0.0, 31000.0; length = 32))
-    for (g, s, scales) in ((_cgef_dev_cartesian(), 5000.0, [3e3, 6e3]),
-                           (_cgef_dev_sphere(), 1.0, deg2rad.([20.0, 40.0]) .* _CGEF_R),
-                           (g3, 3000.0, [2e3, 4e3]), (g1, 3000.0, [3e3, 6e3]))
+    # The sphere at scales where the host takes the banded sum, as in the testset above.
+    sph = (; transform = CGEF.SpectralBackends.DirectSumSpectralBackend())
+    for (g, s, scales, kw) in ((_cgef_dev_cartesian(), 5000.0, [3e3, 6e3], (;)),
+                               (_cgef_dev_sphere(), 1.0, deg2rad.([10.0, 15.0]) .* _CGEF_R, sph),
+                               (g3, 3000.0, [2e3, 4e3], (;)), (g1, 3000.0, [3e3, 6e3], (;)))
         u, v, w = _cgef_dev_fields(g, s)
         n = length(u)
         line = ndims(u) == 1
         ww = ndims(u) == 3 ? w : nothing
         if !line
-            Ed = D.cumulative_energy(_cgef_d(u), _cgef_d(v), _cgef_d(ww), g, k, scales; execution = _CGEF_DEV)
-            Eh = D.cumulative_energy(u, v, ww, g, k, scales; execution = _CGEF_HOST)
+            Ed = D.cumulative_energy(_cgef_d(u), _cgef_d(v), _cgef_d(ww), g, k, scales; execution = _CGEF_DEV, kw...)
+            Eh = D.cumulative_energy(u, v, ww, g, k, scales; execution = _CGEF_HOST, kw...)
             Test.@test isapprox(Ed, Eh; rtol = 2n * eps())
 
-            bd = D.band_energies(_cgef_d(u), _cgef_d(v), _cgef_d(ww), g, k, scales; maps = true, execution = _CGEF_DEV)
-            bh = D.band_energies(u, v, ww, g, k, scales; maps = true, execution = _CGEF_HOST)
+            bd = D.band_energies(_cgef_d(u), _cgef_d(v), _cgef_d(ww), g, k, scales; maps = true,
+                                 execution = _CGEF_DEV, kw...)
+            bh = D.band_energies(u, v, ww, g, k, scales; maps = true, execution = _CGEF_HOST, kw...)
             Test.@test all(i -> _cgef_same(bd.band_maps[i], bh.band_maps[i]), eachindex(scales))
             Test.@test _cgef_same(bd.resolved_map, bh.resolved_map)
             og, area = D.output_grid(g, zf), D.active_area(g)
@@ -239,9 +255,10 @@ Test.@testset "Energies and sweeps on the device" begin
         end
 
         rd = line ? CGEF.coarse_grain(_cgef_d(u), g; scales, kernel = k, execution = _CGEF_DEV) :
-                    CGEF.coarse_grain(_cgef_d(u), _cgef_d(v), _cgef_d(ww), g; scales, kernel = k, execution = _CGEF_DEV)
+                    CGEF.coarse_grain(_cgef_d(u), _cgef_d(v), _cgef_d(ww), g; scales, kernel = k,
+                                      execution = _CGEF_DEV, kw...)
         rh = line ? CGEF.coarse_grain(u, g; scales, kernel = k, execution = _CGEF_HOST) :
-                    CGEF.coarse_grain(u, v, ww, g; scales, kernel = k, execution = _CGEF_HOST)
+                    CGEF.coarse_grain(u, v, ww, g; scales, kernel = k, execution = _CGEF_HOST, kw...)
         Test.@test _cgef_same(rd.Π, rh.Π)
         Test.@test _cgef_device_energies(rd, rh, n)
     end

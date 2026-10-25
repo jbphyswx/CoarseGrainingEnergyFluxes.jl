@@ -65,11 +65,10 @@ using FlowGeometries: FlowGeometries
     end
 end
 
-# 1-D / 3-D grids: walks the translation-invariant offset table per point, as the serial
-# `_footprint_nd_point` does.
+# 1-D / 3-D grids: the translation-invariant offset table per point, summed in the host's tap order and
+# scaled by the host-built reciprocal `invden`, as `_cgef_filter_kernel!` does in 2-D.
 @kernel function _cgef_filter_kernel_nd!(
-    out, @Const(field), @Const(mask), @Const(offsets), @Const(w), exterior,
-    dims, periodic, is_zerofill::Bool,
+    out, @Const(field), @Const(mask), @Const(offsets), @Const(w), @Const(invden), dims, periodic,
 )
     lin, b = @index(Global, NTuple)
     T = eltype(out)
@@ -77,45 +76,29 @@ end
     Nb = size(out, length(dims) + 1)
     if lin <= nspatial && b <= Nb
         I = CartesianIndices(dims)[lin]
-        if is_zerofill || mask[I]
-            Ti = Tuple(I)
-            ws = zero(T)
-            wn = zero(T)
-            for k in eachindex(offsets)
-                off = offsets[k]
-                # The `ntuple` closure below only reads captured variables: Julia boxes a captured
-                # variable that is assigned, and a device kernel cannot hold a box.
-                valid = true
-                for d in eachindex(dims)
-                    jj = Ti[d] + off[d]
-                    if (jj < 1 || jj > dims[d]) && !periodic[d]
-                        valid = false
-                    end
-                end
-                if valid
-                    J = ntuple(Val(length(dims))) do d
-                        jj = Ti[d] + off[d]
-                        (jj < 1 || jj > dims[d]) ? mod1(jj, dims[d]) : jj
-                    end
-                    JI = CartesianIndex(J)
-                    active = mask[JI]
-                    wk = w[k]
-                    if is_zerofill
-                        wn += wk
-                        if active
-                            ws += wk * _atI(field, JI, b)
-                        end
-                    elseif active
-                        wn += wk
-                        ws += wk * _atI(field, JI, b)
-                    end
+        Ti = Tuple(I)
+        ws = zero(T)
+        for k in eachindex(offsets)
+            off = offsets[k]
+            # The `ntuple` closure below only reads captured variables: Julia boxes a captured
+            # variable that is assigned, and a device kernel cannot hold a box.
+            valid = true
+            for d in eachindex(dims)
+                jj = Ti[d] + off[d]
+                if (jj < 1 || jj > dims[d]) && !periodic[d]
+                    valid = false
                 end
             end
-            is_zerofill && (wn = CGEF.Filtering._add_exterior(wn, exterior, I))
-            _setI!(out, I, b, CGEF.Filtering._normalized(ws, wn))
-        else
-            _setI!(out, I, b, zero(T))
+            if valid
+                J = ntuple(Val(length(dims))) do d
+                    jj = Ti[d] + off[d]
+                    (jj < 1 || jj > dims[d]) ? mod1(jj, dims[d]) : jj
+                end
+                JI = CartesianIndex(J)
+                ws += T(w[k]) * (mask[JI] ? _atI(field, JI, b) : zero(T))
+            end
         end
+        _setI!(out, I, b, ws * invden[I])
     end
 end
 
@@ -432,8 +415,7 @@ end
                 end
                 w = @inbounds wcell[t+1, j]
                 if w >= 0
-                    lo = max(1, i - w)
-                    hi = min(Nx, i + w)
+                    lo, hi = CGEF.Filtering._prefixsum_wcell_range(tiles_x, i, w, Nx)
                     acc += wyj * CGEF.Filtering._scan_diff(Ph, Pl, hi + 1, lo, jj, b)
                 elseif -a <= c
                     lo = _xe_lower(xe, ne, xc - a)
@@ -600,12 +582,12 @@ struct GPUScatteredNDCached{F, VN, VW, VP, MA, EX} <: GPUResident
 end
 
 # 1-D / true-3-D translation-invariant offset table.
-struct GPUFootprintND{F, VO, VW, MA, EX} <: GPUResident
+struct GPUFootprintND{F, VO, VW, MA, AT} <: GPUResident
     fp::F
     offsets::VO
     w::VW
     maskd::MA
-    exterior::EX
+    invden::AT   # reciprocal window mass, built once on the host with the plan
 end
 
 # Node set: the CSR adjacency and its weights.
@@ -743,9 +725,7 @@ function CGEF.Filtering.prepare_workspace(
     fp::CGEF.Filtering.FilterFootprintND,
 )
     dev = b.backend
-    return GPUFootprintND(
-        fp, move(dev, fp.offsets), move(dev, fp.w), _maskd(dev, grid), _moved(dev, fp.exterior),
-    )
+    return GPUFootprintND(fp, move(dev, fp.offsets), move(dev, fp.w), _maskd(dev, grid), move(dev, fp.invden))
 end
 
 function CGEF.Filtering.prepare_workspace(
@@ -904,11 +884,11 @@ function _run_gpu_kernel!(dev, out, field, ws::GPUSeparableND, grid, periodic_x:
     CGEF.Filtering.apply_separable_nd!(out, field, grid, ws.fp, strategy, GPUDriver(dev))
 end
 
+# `is_zerofill` is unused: the strategy is built into `invden`.
 function _run_gpu_kernel!(dev, out, field, ws::GPUFootprintND, grid, periodic_x::Bool, periodic_y::Bool, is_zerofill::Bool)
     dims = FlowGeometries.Grids.size_tuple(grid)
     _cgef_filter_kernel_nd!(dev)(
-        out, field, ws.maskd, ws.offsets, ws.w, ws.exterior,
-        dims, FlowGeometries.Grids.periodic_flags(grid), is_zerofill;
+        out, field, ws.maskd, ws.offsets, ws.w, ws.invden, dims, FlowGeometries.Grids.periodic_flags(grid);
         ndrange = (prod(dims), size(out, length(dims) + 1)),
     )
 end

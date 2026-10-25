@@ -19,8 +19,9 @@ degree-`n` vector or tensor spherical harmonic is multiplied by the kernel's `Ĝ
 ([`Kernels.spectral_transfer_degrees!`](@ref)), so filtering commutes with the surface gradient,
 divergence and curl (Propositions 1–3). It runs as spin-weighted transforms of the field extended by zero
 over the sphere ([`spin_transforms`](@ref)): FastSphericalHarmonics' on a `Float64`
-`ClenshawCurtisSampling` grid of `2N − 1` by `N`, NUFSHT's on every other spherical grid, and
-[`DirectSpinTransforms`](@ref) with neither loaded. The theory page derives the spin-weighted form.
+`ClenshawCurtisSampling` grid of `2N − 1` by `N`, NUFSHT's on every other spherical grid when a NUFFT
+library is loaded to run it, and otherwise the direct sums, [`RingSpinTransforms`](@ref) on a latitude–longitude `StructuredGrid` and
+[`DirectSpinTransforms`](@ref) elsewhere. The theory page derives the spin-weighted form.
 
 `lmax` is the highest degree the NUFSHT and direct transforms carry, `nothing` the grid's
 [`spin_band_limit`](@ref). FastSphericalHarmonics transforms at its grid's own band limit, so a given
@@ -132,8 +133,9 @@ spin_host(::AbstractSpinTransforms) = true
 The spin transforms of [`GeneralizedConvolution`](@ref) over `grid`'s cells, for a workspace whose loops
 run under the local backend `execution`, a library's on `nthreads` threads. `transform =
 AutoSpectralBackend()` takes FastSphericalHarmonics on its own grids when `lmax` is `nothing`, NUFSHT on
-every spherical grid where it is loaded, and [`DirectSpinTransforms`](@ref) otherwise; `nufft` is the
-NUFFT library NUFSHT runs. `DirectSumSpectralBackend()` takes the direct sum. A library named that no
+every spherical grid where it is loaded with a NUFFT library (`nufft`, or under `Auto` NonuniformFFTs or
+FINUFFT), and the direct sum otherwise. `DirectSumSpectralBackend()` takes the direct sum: [`RingSpinTransforms`](@ref) on a
+latitude–longitude `StructuredGrid`, [`DirectSpinTransforms`](@ref) on any other grid. A library named that no
 loaded extension provides raises an `ArgumentError`.
 """
 spin_transforms(transform::SpectralBackends.AbstractSpectralBackend, grid::FlowGeometries.Grids.AbstractGrid;
@@ -210,7 +212,7 @@ sampling's own band limit, and otherwise `⌈πR/√A⌉ − 1`, the degree whos
 spin_band_limit(grid::FlowGeometries.Grids.AbstractGrid) =
     max(2, _band_limit(FlowGeometries.Grids.sampling(grid), grid))
 
-_band_limit(s::FlowGeometries.SphericalSampling.AbstractSpectralQuadratureSampling, grid) =
+_band_limit(s::FlowGeometries.SphericalSampling.AbstractSpectralQuadratureSampling, grid::FlowGeometries.Grids.AbstractGrid) =
     FlowGeometries.SphericalSampling.bandlimit(s, size(FlowGeometries.Grids.mask(grid), 2))
 
 function _band_limit(_, grid::FlowGeometries.Grids.AbstractGrid{G,T}) where {G,T}

@@ -301,18 +301,20 @@ The per-point engine stores each point's neighbour list when it fits the cache b
 memory available to the process by default and shared by every scale of a `plan_filter_sweep`;
 otherwise it recomputes the list on every apply.
 
-Two further engines evaluate that **same** convolution by transform, and are selected with
-`method = AutoMethod()`:
+Two further engines evaluate that **same** convolution by transform. On a CPU backend `RealSpace()`
+takes one where it applies and costs fewer operations than the kernel's own engine above (a fused
+multiply-add per tap of a direct sum or separable pass, a few per band of the prefix sums, against
+`2.5 n log₂ n` per real transform of length `n`), so a kernel a few cells wide keeps its engine:
 
 | Engine | Applies to | Cost |
 |--------|-----------|------|
-| padded FFT of the sampled kernel | uniform Cartesian, kernels with no factored engine (`SharpSpectralKernel`, `SmoothHatKernel`) | `O(N log N)` |
-| zonal FFT along the longitude ring | global rectilinear sphere, radial kernel or `HighOrderKernel` — for a fixed pair of latitudes the weight depends on the longitude difference alone, so each band is a circular convolution | `O(N·(log Nλ + w_φ))` |
+| padded FFT of the sampled kernel | uniform Cartesian, 1D/2D/3D, any kernel | `O(N log N)` |
+| zonal FFT along longitude | sphere of uniform longitude (a ring, or a regional box zero-padded along longitude), radial kernel or `HighOrderKernel` with one correction per latitude row — for a fixed pair of latitudes the weight depends on the longitude offset alone, so each band is a convolution along longitude | `O(N·(log Nλ + w_φ))` |
 
-Both use the same compact kernel and weights and agree with the direct sum to round-off. `RealSpace()`
-is the default, and `check_setup` reports when `AutoMethod()` selects a faster engine than the method
-asked about. Neither samples a transfer function or truncates in spherical harmonics, so the kernel
-keeps its compact support.
+Each samples the weights the engine it replaces sums — a separable kernel's per-axis tables, a radial
+kernel's ball or the banded engine's rows — and agrees with it to round-off; a device, Distributed or
+MPI plan takes the direct engines. Neither samples a transfer function or truncates in spherical
+harmonics, so the kernel keeps its compact support.
 
 ### Sweeping scales
 

@@ -627,9 +627,11 @@ Test.@testset "Generalized convolution: Ĝ(n) times each degree-n vector harmoni
     end
 end
 
-# The ambient Cartesian components of `e_r × ∇*f` are degree-`n` harmonics and those of `∇*f` carry
-# degrees `n ± 1`: the scalar transform of each component equals the generalized convolution on the first,
-# and differs from it on the second.
+# The ambient Cartesian components of `e_r × ∇*f` are degree-`n` harmonics, so the scalar transform of
+# each component is the generalized convolution there. Those of `∇*f` carry degrees `n ± 1`: with
+# `G = ∇(rⁿf)` on the unit sphere, of degree `n − 1`, and `H = x f − G/(2n+1)` the degree-`(n+1)` part of
+# `x f`, `∇*f = (n+1)/(2n+1)·G − n·H`, so the tangent part of the filtered gradient is
+# `((n+1)Ĝ(n−1) + nĜ(n+1))/(2n+1)` times `∇*f`.
 Test.@testset "CartesianComponents: equal on rotational harmonics, different on gradients" begin
     D = CGEF.Diagnostics
     SER = CGEF.ComputationalBackends.SerialBackend()
@@ -647,7 +649,9 @@ Test.@testset "CartesianComponents: equal on rotational harmonics, different on 
         D.compute_Π!(zeros(sz), -b, a, nothing, cc, kern, ℓ; workspace = wc, filter_plan = fp, execution = SER)
         Test.@test _cgef_vec_err(wc.u_filt, wc.v_filt, -b, a, Ĝ) < tol
         D.compute_Π!(zeros(sz), a, b, nothing, cc, kern, ℓ; workspace = wc, filter_plan = fp, execution = SER)
-        Test.@test _cgef_vec_err(wc.u_filt, wc.v_filt, a, b, Ĝ) > 1e-3
+        c = ((n + 1) * _cgef_legendre_transfer(kern, n - 1, ℓ, R) + n * _cgef_legendre_transfer(kern, n + 1, ℓ, R)) /
+            (2n + 1)
+        Test.@test _cgef_vec_err(wc.u_filt, wc.v_filt, a, b, c) < tol
     end
 end
 
@@ -790,11 +794,11 @@ Test.@testset "Solid-body rotation under the generalized convolution: Π = 0" be
     end
 end
 
-# The in-core direct sum against NUFSHT's spin plans on the same cells and weights, both ways and at every
-# spin `|s| ≤ 2`; and against closed forms on a Gauss–Legendre grid, whose quadrature is exact to twice its
-# band limit: the spin-1 fields of `∇*f` and `e_r × ∇*f` and the spin-2 E-mode of a degree-`n` `f` have
-# coefficients of degree `n` alone, analysis inverts synthesis, and a flux through it scales a vector
-# harmonic by `Ĝ(n)`.
+# The in-core sums, over every cell and by rows, against NUFSHT's spin plans on the same cells and
+# weights, both ways and at every spin `|s| ≤ 2`; and against closed forms on a Gauss–Legendre grid, whose
+# quadrature is exact to twice its band limit: the spin-1 fields of `∇*f` and `e_r × ∇*f` and the spin-2
+# E-mode of a degree-`n` `f` have coefficients of degree `n` alone, analysis inverts synthesis, and a flux
+# through it scales a vector harmonic by `Ĝ(n)`.
 Test.@testset "Direct-sum spin transforms against NUFSHT and closed forms" begin
     F = CGEF.Filtering
     D = CGEF.Diagnostics
@@ -803,46 +807,45 @@ Test.@testset "Direct-sum spin transforms against NUFSHT and closed forms" begin
     g = FG.Connectivity.structured_grid(FG.SphericalSampling.GaussLegendreSampling(), 10;
                                         geometry = FG.Geometry.SphericalGeometry(R))
     L = 9
-    tr = F.DirectSpinTransforms(g; lmax = L)
-    Test.@test F.spin_transforms(CGEF.SpectralBackends.DirectSumSpectralBackend(), g; lmax = L) isa F.DirectSpinTransforms
     θ, φ, w = F._spin_nodes(g)
-    M = length(θ)
-    G1 = ones(L + 1)
-    synth(C, s) = F.spin_synthesize!(F.spin_field(tr), C, F.spin_coefficients(tr), G1, tr, s)
-    analyze(f, s) = F.spin_analyze!(F.spin_coefficients(tr), f, tr, s)
-    for s in -2:2
-        plan = NUFSHT.make_spin_plan(ComplexF64, θ, φ, L, s)
-        f = [complex(sin(3k), cos(5k)) for k in 1:M]
-        Cn = NUFSHT.allocate_coefficients(plan)
-        NUFSHT.nusht_analyze!(Cn, f, plan; weights = w)
-        Test.@test _cgef_relerr(vec(analyze(f, s)), vec(Cn)) < 1e-8
-        C = [l >= max(abs(m), abs(s)) ? complex(cos(l + 2m), sin(3l - m)) : 0.0im for l in 0:L, m in -L:L]
-        fn = zeros(ComplexF64, M)
-        NUFSHT.nusht_type2_spin!(fn, reshape(C, L + 1, 2L + 1, 1), plan)
-        fd = synth(C, s)
-        Test.@test _cgef_relerr(fd, fn) < 1e-8
-        Test.@test _cgef_relerr(analyze(fd, s), C) < 1e-11
-    end
-
-    pts = vec(_cgef_points(g))
-    only_degree(C, n) = maximum(abs, C[[l != n for l in 0:L], :]) < 1e-11 * maximum(abs, C)
-    for (n, _, fλ, fφ) in _CGEF_HARMONICS
-        a = [fλ(p...) for p in pts]
-        b = [fφ(p...) for p in pts]
-        for U in (complex.(a, b), complex.(-b, a))
-            C = analyze(U, 1)
-            Test.@test only_degree(C, n)
-            Test.@test _cgef_relerr(synth(C, 1), U) < 1e-11
+    for tr in (F.DirectSpinTransforms(g; lmax = L), F.RingSpinTransforms(g; lmax = L))
+        M = length(θ)
+        G1 = ones(L + 1)
+        synth(C, s) = F.spin_synthesize!(F.spin_field(tr), C, F.spin_coefficients(tr), G1, tr, s)
+        analyze(f, s) = F.spin_analyze!(F.spin_coefficients(tr), f, tr, s)
+        for s in -2:2
+            plan = NUFSHT.make_spin_plan(ComplexF64, θ, φ, L, s)
+            f = [complex(sin(3k), cos(5k)) for k in 1:M]
+            Cn = NUFSHT.allocate_coefficients(plan)
+            NUFSHT.nusht_analyze!(Cn, f, plan; weights = w)
+            Test.@test _cgef_relerr(vec(analyze(f, s)), vec(Cn)) < 1e-8
+            C = [l >= max(abs(m), abs(s)) ? complex(cos(l + 2m), sin(3l - m)) : 0.0im for l in 0:L, m in -L:L]
+            fn = zeros(ComplexF64, M)
+            NUFSHT.nusht_type2_spin!(fn, reshape(C, L + 1, 2L + 1, 1), plan)
+            fd = synth(C, s)
+            Test.@test _cgef_relerr(fd, fn) < 1e-8
+            Test.@test _cgef_relerr(analyze(fd, s), C) < 1e-11
         end
+
+        pts = vec(_cgef_points(g))
+        only_degree(C, n) = maximum(abs, C[[l != n for l in 0:L], :]) < 1e-11 * maximum(abs, C)
+        for (n, _, fλ, fφ) in _CGEF_HARMONICS
+            a = [fλ(p...) for p in pts]
+            b = [fφ(p...) for p in pts]
+            for U in (complex.(a, b), complex.(-b, a))
+                C = analyze(U, 1)
+                Test.@test only_degree(C, n)
+                Test.@test _cgef_relerr(synth(C, 1), U) < 1e-11
+            end
+        end
+        λs, φs = [p[1] for p in pts], [p[2] for p in pts]
+        Q = complex.((6 .* sin.(φs) .* cos.(φs) .^ 2 .- 4 .* sin.(φs)) .* cos.(2 .* λs), -4 .* cos.(2 .* φs) .* sin.(2 .* λs))
+        C2 = analyze(Q, 2)
+        Test.@test only_degree(C2, 3)
+        Test.@test _cgef_relerr(synth(C2, 2), Q) < 1e-11
     end
-    λs, φs = [p[1] for p in pts], [p[2] for p in pts]
-    Q = complex.((6 .* sin.(φs) .* cos.(φs) .^ 2 .- 4 .* sin.(φs)) .* cos.(2 .* λs), -4 .* cos.(2 .* φs) .* sin.(2 .* λs))
-    C2 = analyze(Q, 2)
-    Test.@test only_degree(C2, 3)
-    Test.@test _cgef_relerr(synth(C2, 2), Q) < 1e-11
 
     ws = D.ΠWorkspace(g; transform = CGEF.SpectralBackends.DirectSumSpectralBackend())
-    Test.@test ws.spin.transforms isa F.DirectSpinTransforms
     sz = FG.Grids.size_tuple(g)
     pg = _cgef_points(g)
     for (n, _, fλ, fφ) in _CGEF_HARMONICS, kern in (CGEF.GaussianKernel(), CGEF.TopHatKernel())

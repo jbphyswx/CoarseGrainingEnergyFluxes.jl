@@ -29,10 +29,10 @@ plan_strategy(plan::PhysicalFilterPlan) = plan.strategy
 """
     plan_method(plan) -> AbstractFilterMethod
 
-The method a plan evaluates: `RealSpace()` for a real-space engine, `AutoMethod()` for one of its
-transform evaluators, `Spectral()` for a transfer-function plan.
+The method a plan evaluates: `RealSpace()` for a physical-space plan, `Spectral()` for a
+transfer-function plan.
 """
-plan_method(plan::PhysicalFilterPlan) = _transform_footprint(plan.footprint) ? AutoMethod() : RealSpace()
+plan_method(::PhysicalFilterPlan) = RealSpace()
 plan_method(::AbstractFilterPlan) = Spectral()
 
 """
@@ -104,7 +104,7 @@ function plan_filter(
     kwargs...,
 ) where {G<:FlowGeometries.Geometry.AbstractGeometry{T}} where {T<:AbstractFloat}
     _validate_scale(scale)
-    if _resolve_method(method) isa Spectral
+    if method isa Spectral
         return spectral_filter_plan(
             transform, grid, kernel, scale;
             mask_strategy = mask_strategy, execution = execution,
@@ -114,12 +114,12 @@ function plan_filter(
     isempty(kwargs) || _unused_keywords(kwargs, method)
     resolved = _resolve_backend(execution, grid)
     _check_backend_compatible(grid, execution)
-    # The transform engines run on the host (see `_transform_footprint`), so `AutoMethod` takes them only
-    # there; a device, distributed or MPI plan keeps the direct engine.
+    # The transform engines run on the host (see `_driven_footprint`); a device, distributed or MPI plan
+    # takes the direct engine.
     host = _host_backend(resolved)
-    fp = if host && _padded_fft_applicable(grid, kernel, method)
+    fp = if host && _takes_padded_fft(grid, kernel, scale)
         padded_fft_footprint(grid, kernel, scale; mask_strategy = mask_strategy, threads = _library_threads(resolved))
-    elseif host && _zonal_fft_applicable(grid, kernel, method)
+    elseif host && _takes_zonal_fft(grid, kernel, scale)
         zonal_fft_footprint(grid, kernel, scale; mask_strategy = mask_strategy, threads = _library_threads(resolved))
     else
         build_footprint(grid, kernel, scale; mask_strategy = mask_strategy,

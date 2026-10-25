@@ -10,6 +10,7 @@ _check_strategy(fp::Union{SeparableFootprint,SeparableFootprintND}, s::AbstractM
     _separable_check_strategy(fp, s)
 _check_strategy(fp::PrefixSumTopHatPlan, s::AbstractMaskStrategy) = _prefixsum_check_strategy(fp, s)
 _check_strategy(fp::PrefixSumTopHat3DPlan, s::AbstractMaskStrategy) = _prefixsum3d_check_strategy(fp, s)
+_check_strategy(fp::FilterFootprintND, s::AbstractMaskStrategy) = _nd_check_strategy(fp, s)
 _check_strategy(_, ::AbstractMaskStrategy) = nothing
 
 # Per-field accumulators: a stack `MVector` for an `NTuple` batch, a `Vector` for an `AbstractVector`
@@ -21,8 +22,6 @@ _apply_serial_batch!(outs, fields, grid, fp::FilterFootprint, strategy) =
     apply_footprint_batch!(outs, fields, grid, fp, strategy, FlowGeometries.Grids.isperiodic(grid, 1), FlowGeometries.Grids.isperiodic(grid, 2))
 _apply_serial_batch!(outs, fields, grid, fp::ScatteredFilterPlan, strategy) =
     apply_footprint_batch!(outs, fields, grid, fp, strategy, FlowGeometries.Grids.isperiodic(grid, 1), FlowGeometries.Grids.isperiodic(grid, 2))
-_apply_serial_batch!(outs, fields, grid, fp::FilterFootprintND, strategy) =
-    apply_footprint_nd_batch!(outs, fields, grid, fp, strategy)
 _apply_serial_batch!(outs, fields, grid, fp::NDScatteredFilterPlan, strategy) =
     apply_footprint_nd_batch!(outs, fields, grid, fp, strategy)
 _apply_serial_batch!(outs, fields, grid, fp::PrefixSumTopHatPlan, strategy) =
@@ -215,7 +214,7 @@ Batched point-indexed apply over the whole grid: each point's neighbours are enu
 fields.
 """
 function apply_footprint_nd_batch!(
-    outs, fields, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, fp::Union{FilterFootprintND{N,T}, NDScatteredFilterPlan{N,T}}, strategy::AbstractMaskStrategy,
+    outs, fields, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, fp::NDScatteredFilterPlan{N,T}, strategy::AbstractMaskStrategy,
 ) where {N, T<:AbstractFloat, G}
     for out in outs
         fill!(out, zero(T))
@@ -223,56 +222,6 @@ function apply_footprint_nd_batch!(
     return apply_footprint_nd_batch_over!(
         outs, fields, grid, fp, strategy, CartesianIndices(FlowGeometries.Grids.size_tuple(grid)),
     )
-end
-
-"""
-    apply_footprint_nd_batch_over!(outs, fields, grid, fp, strategy, indices) -> outs
-
-The batched apply restricted to `indices`. Each point writes only its own output, so disjoint index
-blocks may run concurrently. The caller zeroes `outs`.
-"""
-function apply_footprint_nd_batch_over!(
-    outs, fields, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, fp::FilterFootprintND{N,T}, strategy::AbstractMaskStrategy,
-    indices,
-) where {N, T<:AbstractFloat, G}
-    dims = FlowGeometries.Grids.size_tuple(grid)
-    periodic = FlowGeometries.Grids.periodic_flags(grid)
-    mask = FlowGeometries.Grids.mask(grid)
-    acc_ws = _batch_zeros(outs, T)
-    acc_wn = _batch_zeros(outs, T)
-    zerofill = strategy isa ZeroFill
-    @inbounds for I in indices
-        _filters_target(strategy, mask[I]) || continue
-        Ti = Tuple(I)
-        fill!(acc_ws, zero(T))
-        fill!(acc_wn, zero(T))
-        for k in eachindex(fp.offsets)
-            J, valid = _shift_index(Ti, fp.offsets[k], dims, periodic)
-            valid || continue
-            active = mask[J...]
-            wk = fp.w[k]
-            if zerofill
-                for m in eachindex(fields)
-                    acc_wn[m] += wk
-                end
-                if active
-                    for m in eachindex(fields)
-                        acc_ws[m] += wk * fields[m][J...]
-                    end
-                end
-            elseif active
-                for m in eachindex(fields)
-                    acc_wn[m] += wk
-                    acc_ws[m] += wk * fields[m][J...]
-                end
-            end
-        end
-        for m in eachindex(outs)
-            wn = zerofill ? _add_exterior(acc_wn[m], fp.exterior, I) : acc_wn[m]
-            outs[m][I] = _normalized(acc_ws[m], wn)
-        end
-    end
-    return outs
 end
 
 # One streamed point of the ND batch. An `NTuple` batch folds immutable accumulators and allocates
@@ -343,6 +292,12 @@ end
     return nothing
 end
 
+"""
+    apply_footprint_nd_batch_over!(outs, fields, grid, fp, strategy, indices) -> outs
+
+The batched apply restricted to `indices`. Each point writes only its own output, so disjoint index
+blocks may run concurrently. The caller zeroes `outs`.
+"""
 function apply_footprint_nd_batch_over!(
     outs, fields, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, fp::NDScatteredFilterPlan{N,T}, strategy::AbstractMaskStrategy,
     indices,

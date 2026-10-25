@@ -84,9 +84,18 @@ Test.@testset "compute_Π! over a batch axis equals the per-slice flux" begin
         end
         wsb = D.ΠWorkspace(g, (Nb,); execution = be)
         got = D.compute_Π!(zeros(sz..., Nb), u, v, nothing, g, kern, ℓ; workspace = wsb, kw...)
-        Test.@test got == ref
-        # Each slice is reduced over the same cells, so in the same order.
-        Test.@test D.energy_from_filtered!(zeros(Nb), wsb, fp, false, area) == refE
+        gotE = D.energy_from_filtered!(zeros(Nb), wsb, fp, false, area)
+        if be isa CB.GPUBackend && wsb.spin !== nothing
+            # A device workspace runs the spin transforms' NUFFT on the library's threads, which spread in
+            # a run-dependent order, so two runs agree to the rounding of those sums, one term per cell.
+            n = prod(sz)
+            Test.@test isapprox(got, ref; rtol = 2n * eps())
+            Test.@test isapprox(gotE, refE; rtol = 2n * eps())
+        else
+            Test.@test got == ref
+            # Each slice is reduced over the same cells, so in the same order.
+            Test.@test gotE == refE
+        end
     end
 end
 

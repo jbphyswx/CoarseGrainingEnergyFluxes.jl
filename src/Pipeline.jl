@@ -140,10 +140,9 @@ function _index_spacings(grid::FlowGeometries.Grids.AbstractGrid{G,T}, sz::NTupl
     return ntuple(d -> fine[d], Val(N)), ntuple(d -> coarse[d], Val(N))
 end
 
-# The real-space engine the filter will take and its cost, from the predicates
-# `Filtering.build_footprint` dispatches on; `test/` checks each string against the footprint type
-# built. `w` is the filter half-width in cells on the named axis.
-function _engine_class(grid, kernel, method = nothing; host::Bool = true, scale = nothing)
+# The real-space engine the filter will take and its cost, from the predicates `plan_filter` and
+# `Filtering.build_footprint` dispatch on. `w` is the filter half-width in cells on the named axis.
+function _engine_class(grid, kernel, scale; host::Bool = true)
     is_struct = grid isa FlowGeometries.Grids.StructuredGrid
     is_cart = FlowGeometries.Grids.grid_geometry(grid) isa FlowGeometries.Geometry.CartesianGeometry
     rank = is_struct ? length(FlowGeometries.Grids.size_tuple(grid)) : 0
@@ -152,8 +151,26 @@ function _engine_class(grid, kernel, method = nothing; host::Bool = true, scale 
         d -> FlowGeometries.Grids.coordinates(grid, d) isa AbstractRange, 1:max(rank, 1),
     )
 
+    # Cartesian points, a node set or a curvilinear mesh, in the order `_point_set_footprint` tries them.
+    if host && Filtering._takes_binned_tophat(grid, kernel)
+        return "binned prefix-sum top-hat, exact, O(N·r/h)"
+    end
+    if host && Filtering._takes_nufft_sum(grid, kernel, scale)
+        return "nonuniform-FFT kernel sum, O(N log N)"
+    end
+
     if Filtering._is_flat_cell(grid)
-        return "node CSR gather over the grid's ball query, O(N·⟨neighbours⟩)"
+        return Filtering._binned_list(grid) ? "node CSR gather, its list read from the point bins, O(N·⟨neighbours⟩)" :
+                                              "node CSR gather over the grid's ball query, O(N·⟨neighbours⟩)"
+    end
+
+    # The transform evaluators of the convolution, taken on a host backend in the order `plan_filter`
+    # tries them, where they cost fewer operations.
+    if host && Filtering._takes_padded_fft(grid, kernel, scale)
+        return "padded-FFT of the sampled kernel, O(N log N)"
+    end
+    if host && Filtering._takes_zonal_fft(grid, kernel, scale)
+        return "zonal-FFT along longitude, O(N·(log Nλ + w_φ))"
     end
 
     # The separable engines are Cartesian-only: great-circle distance does not factor.
@@ -170,21 +187,10 @@ function _engine_class(grid, kernel, method = nothing; host::Bool = true, scale 
         return "prefix-sum top-hat, exact, O(N·w_y·w_z)"
     end
 
-    # The transform-based evaluators of the real-space convolution, reachable only under `AutoMethod` on
-    # a host backend, in the order `plan_filter` tries them.
-    if host && method isa Filtering.AutoMethod && is_struct && rank == 2 && is_cart && ranges &&
-       Filtering._padded_fft_applicable(grid, kernel, method)
-        return "padded-FFT of the sampled kernel, O(N log N)"
-    end
-    if host && method isa Filtering.AutoMethod && Filtering._zonal_fft_applicable(grid, kernel, method)
-        return "zonal-FFT along the longitude ring, O(N·(log Nλ + w_φ))"
-    end
-
     # A `HighOrderKernel` on a sphere is corrected once per latitude row where a row's targets share one
     # correction, once per point otherwise; on a regional box that depends on the scale.
     if kernel isa Kernels.HighOrderKernel && is_struct && rank == 2 && !is_cart
-        shares = scale !== nothing &&
-                 Filtering._highorder_shares_rows(grid, kernel, convert(_grid_float(grid), scale))
+        shares = Filtering._highorder_shares_rows(grid, kernel, convert(_grid_float(grid), scale))
         return shares ? "banded footprint, one band and one correction per latitude, O(N·wλ·wφ)" :
                         "scattered per-point footprint, one correction per point, O(N·wx·wy) with an optional neighbour cache"
     end
@@ -292,18 +298,6 @@ function check_setup(
     end
     spectral_note === nothing || push!(notes, spectral_note)
 
-    # `AutoMethod` evaluates the same convolution by transform where the grid allows: a padded FFT on a
-    # uniform Cartesian lattice, or along the longitude ring on a global sphere.
-    let auto = Filtering.AutoMethod()
-        if !(method isa Filtering.AutoMethod)
-            alt = _engine_class(grid, kernel, auto; host, scale = ℓ)
-            if alt != _engine_class(grid, kernel, method; host, scale = ℓ)
-                push!(notes,
-                    "`method = AutoMethod()` evaluates this convolution as \"$alt\": the same compact " *
-                    "kernel and weights, evaluated by transform, equal to the direct sum to round-off.")
-            end
-        end
-    end
     if isempty(sp)
         push!(notes,
             "this grid has no axes, so ℓ-resolvability and the boundary buffer could not be checked " *
@@ -315,7 +309,7 @@ function check_setup(
         _grid_kind(grid), FlowGeometries.Grids.size_tuple(grid), sp, sp_coarse, Float64(ℓ), cps,
         _kname(kernel), string(nameof(typeof(mask_strategy))),
         method === nothing ? "default for this grid" : string(nameof(typeof(method))),
-        string(nameof(typeof(execution))), resolved, _engine_class(grid, kernel, method; host, scale = ℓ),
+        string(nameof(typeof(execution))), resolved, _engine_class(grid, kernel, ℓ; host),
         resolvable, flux_ok, spec_ok, spectral_ok, buf, notes,
     )
 end

@@ -270,10 +270,13 @@ function _prefixsum_scratch(
     return PrefixSumScratch([CompensatedScan(T, length(gp.xe) + 1, Ny)])
 end
 
-# An ascending `Range` axis 1 that does not tile, where a band inside the grid's own columns is a
-# constant ±w cells.
-@inline _prefixsum_uniform_axis(gp::PrefixSumGridPlan, x) =
-    !gp.tiles_x && x isa AbstractRange && step(x) > zero(eltype(x))
+# An ascending `Range` axis 1, where a band shorter than a period is a constant ±w cells.
+@inline _prefixsum_uniform_axis(::PrefixSumGridPlan, x) = x isa AbstractRange && step(x) > zero(eltype(x))
+
+# The extended-axis entries `lo:hi` of a constant-width band at target `i`: `i ± w` clamped to the axis,
+# or, where axis 1 tiles, `±w` about the target's entry in the middle copy.
+@inline _prefixsum_wcell_range(tiles_x::Bool, i::Int, w::Int, Nx::Int) =
+    tiles_x ? (Nx + i - w, Nx + i + w) : (max(1, i - w), min(Nx, i + w))
 
 # The source row of band 0 for target row `j`. On a tiling axis 2 every raw offset `-dj_lim:dj_lim` is
 # one row image; on a bounded one the bands start at the first row in reach, so at most `Ny` of them.
@@ -347,7 +350,7 @@ function _build_prefixsum_tophat(
             h = FlowGeometries.Connectivity.metric_band(grid, 1, y_t, y_t + dy, rad)
             h < zero(T) && continue
             hw[b + 1, j] = h
-            if uniform && h < seam && !(gp.rings_x && 2h >= gp.x_period)
+            if uniform && h < seam && !((gp.rings_x || gp.tiles_x) && 2h >= gp.x_period)
                 # Same `≤` the pointer loop uses, so it makes the same boundary decision.
                 w = 0
                 while (w + 1) * step(x) <= h
@@ -409,8 +412,7 @@ function _prefixsum_build_invden(
             if wcell[b + 1, j] >= 0
                 w = wcell[b + 1, j]
                 for i in 1:Nx
-                    lo = max(1, i - w)
-                    hi = min(Nx, i + w)
+                    lo, hi = _prefixsum_wcell_range(gp.tiles_x, i, w, Nx)
                     den[i, j] += wyj * (use_mask_den ? _scan_diff(Pd, hi + 1, lo, jj) : _scan_diff(Pwx, hi + 1, lo))
                 end
             elseif -a <= c
@@ -588,7 +590,7 @@ function _prefixsum_row!(
             end
         end
         if wcellj[b + 1, j] >= 0
-            _prefixsum_wcell_band!(out, Ph, Pl, wcellj[b + 1, j], wyj, Nx, jj, j)
+            _prefixsum_band!(out, Ph, Pl, gp.tiles_x, wcellj[b + 1, j], wyj, Nx, jj, j)
         elseif -a <= c
             lo = 1
             hi = 0
@@ -617,6 +619,20 @@ function _prefixsum_row!(
         out[i, j] *= invden[i, j]
     end
     return out
+end
+
+@inline _prefixsum_band!(out, Ph, Pl, tiles_x::Bool, w::Int, wyj, Nx::Int, jj::Int, j::Integer) =
+    tiles_x ? _prefixsum_tiled_band!(out, Ph, Pl, w, wyj, Nx, jj, j) :
+              _prefixsum_wcell_band!(out, Ph, Pl, w, wyj, Nx, jj, j)
+
+# A constant-width band on a tiling axis: target `i` sums the extended entries `Nx+i-w:Nx+i+w`.
+@inline function _prefixsum_tiled_band!(
+    out::AbstractMatrix{T}, Ph, Pl, w::Int, wyj::T, Nx::Int, jj::Int, j::Integer,
+) where {T<:AbstractFloat}
+    @inbounds @simd for i in 1:Nx
+        out[i, j] += wyj * _scan_diff(Ph, Pl, Nx + i + w + 1, Nx + i - w, jj)
+    end
+    return nothing
 end
 
 # A constant-width band on a uniform ascending axis: target `i` sums cells `i-w:i+w`, clamped to the axis.
@@ -712,7 +728,7 @@ function apply_prefixsum_tophat_batch_row!(
         if wcellj[b + 1, j] >= 0
             # The bands the single-field row takes at constant width, taken the same way.
             for m in eachindex(outs)
-                _prefixsum_wcell_band!(outs[m], Ps[m].hi, Ps[m].lo, wcellj[b + 1, j], wyj, Nx, jj, j)
+                _prefixsum_band!(outs[m], Ps[m].hi, Ps[m].lo, gp.tiles_x, wcellj[b + 1, j], wyj, Nx, jj, j)
             end
         elseif -a <= c
             lo = 1

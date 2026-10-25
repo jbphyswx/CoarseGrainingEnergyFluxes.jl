@@ -46,13 +46,16 @@ all). A plan built for a trailing batch axis of `nb` fields also holds a
 `NUSHTplan` with `ntrans = nb` over the same nodes, whose fit and synthesis carry every field of the
 batch at once.
 
-The band limit is the largest `L` with `(L+1)(2L+1) ≤ npts`: the `(L+1)²` coefficients are fitted from
-about twice as many points, and a Clenshaw–Curtis grid of degree `L` gets exactly `L`.
+The band limit is `Filtering.spin_band_limit(grid)`, the degree the grid's largest cell resolves, as the
+spin transforms of the generalized convolution take it. The fit weighs each node by its measure over
+`R²`: it minimizes `Σⱼ wⱼ |(A c − f)ⱼ|²`, the discrete form of the squared error integrated over the
+sphere, and each plan's weighted operator is built once (under `DistributedBackend` NUFSHT weighs each
+worker's block per fit).
 
 A `NUSHTplan` holds buffers every transform overwrites, so two tasks may not execute one grid plan
 concurrently; a concurrent driver needs its own grid plan per worker.
 """
-struct NUFSHTGridPlan{P, T<:AbstractFloat, M, CM, BP, B<:CGEF.ComputationalBackends.AbstractExecutionBackend, O} <:
+struct NUFSHTGridPlan{P, T<:AbstractFloat, M, CM, BP, OP, BOP, W, B<:CGEF.ComputationalBackends.AbstractExecutionBackend, O} <:
        CGEF.Filtering.AbstractGridPlan
     plan::P
     radius::T
@@ -60,6 +63,9 @@ struct NUFSHTGridPlan{P, T<:AbstractFloat, M, CM, BP, B<:CGEF.ComputationalBacke
     C_mask::CM       # the mask's fitted coefficients, or nothing when unmasked
     npts::Int        # the grid's node count
     batched::BP      # a `NUSHTplan` with `ntrans = nb`, or nothing
+    op::OP           # `plan` weighted by `weights`, or nothing under `DistributedBackend`
+    batched_op::BOP  # `batched` weighted by `weights`, or nothing
+    weights::W       # this process's nodes' measures over R²
     execution::B
     own::O           # this process's nodes, or nothing for all of them
 end
@@ -104,17 +110,20 @@ CGEF.Filtering.plan_execution(plan::NUFSHTFilterPlan) = plan.grid_plan.execution
 # The fit cannot resolve a relative residual finer than the transform it is built on.
 _fit_rtol(tol, ::Type{T}) where {T<:AbstractFloat} = max(T(10 * tol), sqrt(eps(T)))
 
-# Under `MPIBackend` each rank holds a plan over its own nodes, and the fit is one least-squares problem
-# over every rank's nodes, its coefficients replicated on every rank. A plan divided among
-# `DistributedBackend` workers carries its own solve.
-_solve!(C, f, plan, ws, rtol, ::CGEF.ComputationalBackends.AbstractExecutionBackend) =
-    NUFSHT.nusht_solve!(C, f, plan; ws = ws, rtol = rtol)
-_solve!(C, f, plan, ws, rtol, b::CGEF.ComputationalBackends.AbstractMPIBackend) =
-    NUFSHT.nusht_solve!(C, f, plan, b; ws = ws, rtol = rtol)
+# The weighted fit through `op`, `plan` with the weights `w` on its range. Under `MPIBackend` each rank
+# holds a plan over its own nodes, and the fit is one least-squares problem over every rank's nodes, its
+# coefficients replicated on every rank. A plan divided among `DistributedBackend` workers carries its
+# own solve and weighs each worker's block.
+_solve!(C, f, plan, op, w, ws, rtol, ::CGEF.ComputationalBackends.AbstractExecutionBackend) =
+    NUFSHT.nusht_solve!(C, f, op; ws = ws, rtol = rtol)
+_solve!(C, f, plan, op, w, ws, rtol, b::CGEF.ComputationalBackends.AbstractMPIBackend) =
+    NUFSHT.nusht_solve!(C, f, op, b; ws = ws, rtol = rtol)
+_solve!(C, f, plan, op, w, ws, rtol, ::CGEF.ComputationalBackends.AbstractDistributedBackend) =
+    NUFSHT.nusht_solve!(C, f, plan; weights = w, rtol = rtol)
 
-function _fit!(C, f, plan, ws, backend)
+function _fit!(C, f, plan, op, w, ws, backend)
     rtol = _fit_rtol(plan.tol, real(eltype(C)))
-    _, iters, rel, converged = _solve!(C, f, plan, ws, rtol, backend)
+    _, iters, rel, converged = _solve!(C, f, plan, op, w, ws, rtol, backend)
     converged || throw(ErrorException(
         "NUFSHT spectral filtering: the least-squares fit of the degree-$(plan.lmax) harmonic " *
         "coefficients stopped at relative residual $rel after $iters iterations, above the tolerance " *
@@ -134,6 +143,10 @@ _make_plan(T, θ, φ, lmax, backend::CGEF.ComputationalBackends.AbstractExecutio
 _workspace(plan, ::CGEF.ComputationalBackends.AbstractDistributedBackend) = nothing
 _workspace(plan, ::CGEF.ComputationalBackends.AbstractExecutionBackend) = FTB.LSMRWorkspace(plan)
 
+# `plan` with the weights `w` on its range, built once; a divided plan's workers weigh their blocks.
+_weighted_op(plan, w, ::CGEF.ComputationalBackends.AbstractDistributedBackend) = nothing
+_weighted_op(plan, w, ::CGEF.ComputationalBackends.AbstractExecutionBackend) = FTB.RangeWeighted(plan, w)
+
 # `nufft` is the NUFFT library NUFSHT runs: a FlowTransformBindings tag, or `AutoSpectralBackend()` for
 # NUFSHT's own choice.
 function _nufsht_grid_plan(
@@ -144,22 +157,27 @@ function _nufsht_grid_plan(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     npts = length(FlowGeometries.Grids.coordinates(grid, 1))
     npts > 0 || throw(ArgumentError("NUFSHT spectral filtering needs at least one point."))
-    lmax = max(1, floor(Int, (sqrt(1 + 8 * npts) - 3) / 4))
+    lmax = CGEF.Filtering.spin_band_limit(grid)
+    R = T(FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid)))
     # This process's nodes go where `execution` runs, and NUFSHT plans in the memory they are in.
     own = CGEF.Filtering._owned(execution, npts)
     part(v) = own === nothing ? v : v[own]
     θ = CGEF.Filtering._on_backend(execution, T(π) / 2 .- T.(part(FlowGeometries.Grids.coordinates(grid, 2))))  # colatitude
     φ = CGEF.Filtering._on_backend(execution, T.(part(FlowGeometries.Grids.coordinates(grid, 1))))
+    area = FlowGeometries.Grids.measure(grid)
+    w = CGEF.Filtering._on_backend(execution, part([T(area[k]) / R^2 for k in 1:npts]))
     nplan = _make_plan(T, θ, φ, lmax, execution; nufft = nufft)
     bplan = batch === nothing ? nothing : _make_plan(T, θ, φ, lmax, execution; ntrans = Int(batch), nufft = nufft)
+    op = _weighted_op(nplan, w, execution)
+    bop = bplan === nothing ? nothing : _weighted_op(bplan, w, execution)
     m = FlowGeometries.Grids.mask(grid)
     mask = all(m) ? nothing : CGEF.Filtering._on_backend(execution, part(m))
     C_mask = mask === nothing ? nothing :
              _fit!(NUFSHT.allocate_coefficients(nplan), CGEF.Filtering._on_backend(execution, T.(part(m))), nplan,
-                   _workspace(nplan, execution), execution)
+                   op, w, _workspace(nplan, execution), execution)
     return NUFSHTGridPlan(
-        nplan, T(FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid))), mask,
-        C_mask, npts, bplan, execution, own === nothing ? nothing : CGEF.Filtering._on_backend(execution, own),
+        nplan, R, mask, C_mask, npts, bplan, op, bop, w, execution,
+        own === nothing ? nothing : CGEF.Filtering._on_backend(execution, own),
     )
 end
 
@@ -244,7 +262,7 @@ function CGEF.Filtering.filter_analyze!(
 ) where {T<:AbstractFloat}
     gp, sc = plan.grid_plan, plan.scratch
     f = CGEF.Filtering._local(field, gp.own)
-    return _fit!(Ĉ, _masked(sc.masked_input, f, gp.mask), gp.plan, sc.ws, gp.execution)
+    return _fit!(Ĉ, _masked(sc.masked_input, f, gp.mask), gp.plan, gp.op, gp.weights, sc.ws, gp.execution)
 end
 
 function CGEF.Filtering.filter_synthesize!(
@@ -293,7 +311,7 @@ function CGEF.Filtering.filter_analyze!(
     gp = plan.grid_plan
     bp, p = _batch_parts(plan, field)
     f = CGEF.Filtering._local(field, gp.own)
-    return _fit!(Ĉ, _masked(p.masked_input, f, gp.mask), bp, p.ws, gp.execution)
+    return _fit!(Ĉ, _masked(p.masked_input, f, gp.mask), bp, gp.batched_op, gp.weights, p.ws, gp.execution)
 end
 
 function CGEF.Filtering.filter_synthesize!(
@@ -337,11 +355,21 @@ Base.show(io::IO, tr::NUFSHTSpinTransforms) =
     print(io, "NUFSHTSpinTransforms(", length(tr.weights), " cells, lmax = ", tr.lmax, ")")
 Base.show(io::IO, ::MIME"text/plain", tr::NUFSHTSpinTransforms) = show(io, tr)
 
-# NUFSHT is the library `Auto` takes on a grid FastSphericalHarmonics does not transform.
-CGEF.Filtering._scattered_spin_transforms(
-    ::CGEF.SpectralBackends.AbstractAutoSpectralBackend,
-    grid::FlowGeometries.Grids.AbstractGrid{G,T}; kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}} = _nufsht_spin_transforms(grid; kwargs...)
+# NUFSHT is the library `Auto` takes on a grid FastSphericalHarmonics does not transform, where a NUFFT
+# library runs it. With none loaded and `nufft` left to `Auto`, NUFSHT's NUFFT is a sum over every point
+# and mode, `O(M·lmax²)` per transform with no recurrence to share, and the in-core sums take its place.
+function CGEF.Filtering._scattered_spin_transforms(
+    auto::CGEF.SpectralBackends.AbstractAutoSpectralBackend, grid::FlowGeometries.Grids.AbstractGrid{G,T};
+    nufft::CGEF.SpectralBackends.AbstractSpectralBackend = CGEF.SpectralBackends.AutoSpectralBackend(), kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
+    _nufsht_serves(nufft) || return CGEF.Filtering._direct_spin_transforms(grid; nufft, kwargs...)
+    return _nufsht_spin_transforms(grid; nufft, kwargs...)
+end
+
+# A NUFFT the caller names is taken as given.
+_nufsht_serves(::CGEF.SpectralBackends.AbstractAutoSpectralBackend) =
+    FTB.is_available(FTB.NonuniformFFTsBackend()) || FTB.is_available(FTB.FINUFFTBackend())
+_nufsht_serves(::CGEF.SpectralBackends.AbstractSpectralBackend) = true
 
 CGEF.Filtering._scattered_spin_transforms(
     ::CGEF.SpectralBackends.AbstractNUFSHTSpectralBackend,

@@ -44,7 +44,7 @@ function _spectral_sweep_shared(
     transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
     kwargs...,
 )
-    _resolve_method(method) isa Spectral || return (nothing, nothing)
+    method isa Spectral || return (nothing, nothing)
     gp = spectral_grid_plan(transform, grid, kernel; mask_strategy = mask_strategy, kwargs...)
     return (gp, gp === nothing ? nothing : spectral_scratch(gp))
 end
@@ -56,8 +56,7 @@ function _sweep_shared(
     method::AbstractFilterMethod;
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    _resolve_method(method) isa Spectral &&
-        return _spectral_sweep_shared(grid, kernel, mask_strategy, method; kwargs...)
+    method isa Spectral && return _spectral_sweep_shared(grid, kernel, mask_strategy, method; kwargs...)
     FlowGeometries.Grids.measure_factors(grid) === nothing && return (nothing, nothing)
     gp = _build_prefixsum_grid_plan(grid; mask_strategy = mask_strategy)
     return (gp, _prefixsum_scratch(gp, grid))
@@ -70,8 +69,7 @@ function _sweep_shared(
     method::AbstractFilterMethod;
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
-    _resolve_method(method) isa Spectral &&
-        return _spectral_sweep_shared(grid, kernel, mask_strategy, method; kwargs...)
+    method isa Spectral && return _spectral_sweep_shared(grid, kernel, mask_strategy, method; kwargs...)
     FlowGeometries.Grids.measure_factors(grid) === nothing && return (nothing, nothing)
     return (nothing, _separable_scratch(grid))
 end
@@ -104,7 +102,8 @@ function plan_filter_sweep(
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     meth = method === nothing ? _default_method(grid) : method
-    gp, sc = _sweep_shared(grid, kernel, mask_strategy, meth; kwargs...)
+    gp, sc = _all_transform_engines(grid, kernel, scales, meth, kwargs) ? (nothing, nothing) :
+             _sweep_shared(grid, kernel, mask_strategy, meth; kwargs...)
     # Only the keywords the engine takes are passed; `plan_filter` raises on any other.
     shared = gp === nothing && sc === nothing ? (;) :
              sc === nothing ? (; grid_plan = gp) : (; grid_plan = gp, scratch = sc)
@@ -117,6 +116,15 @@ function plan_filter_sweep(
         p
     end
     return FilterPlanFamily(gp, plans, sc)
+end
+
+# Whether every scale of a real-space sweep takes a transform engine, which reads none of the shared
+# half the real-space engines build.
+function _all_transform_engines(grid::FlowGeometries.Grids.AbstractGrid{G,T}, kernel, scales, method,
+                                kwargs) where {G,T}
+    method isa RealSpace || return false
+    _host_backend(_resolve_backend(get(kwargs, :execution, ComputationalBackends.AutoBackend()), grid)) || return false
+    return all(s -> _takes_padded_fft(grid, kernel, T(s)) || _takes_zonal_fft(grid, kernel, T(s)), scales)
 end
 
 # The grids whose real-space plans hold an optional neighbour cache under a byte budget.
@@ -179,42 +187,254 @@ _backend_supported(grid::FlowGeometries.Grids.AbstractGrid, ::ComputationalBacke
 @inline _fftw_available() =
     Base.get_extension(parentmodule(@__MODULE__), :CoarseGrainingEnergyFluxesFFTWExt) !== nothing
 
-# `AutoMethod` chooses an evaluator of the real-space convolution, so it resolves to `RealSpace`.
-@inline _resolve_method(::AutoMethod) = RealSpace()
-@inline _resolve_method(method::AbstractFilterMethod) = method
+# A transform runs where it evaluates the same sum as the kernel's real-space engine in fewer operations.
+# Counts are per apply, a fused multiply-add counting one: one per tap of the direct sum and of each
+# separable pass; for the prefix-sum top-hat seven per entry of its numerator scan (a compensated
+# addition) and four per cell and band (two scan differences, their sum, the weighted accumulate);
+# `2.5 n log₂ n` per real transform of length `n` (forward or inverse); and per spectral value four for a
+# complex product, two for a real weight times a complex value accumulated.
+_rfft_ops(n::Integer) = 2.5 * n * log2(n)
+_prefixsum_ops(ncell::Integer, nrep::Integer, bands::Integer) = Float64(ncell) * (7nrep + 1) + 4.0 * bands
 
-# Kernels with a factored real-space engine.
-_has_fast_real_space_engine(::Kernels.TopHatKernel) = true       # O(N) prefix sum
-_has_fast_real_space_engine(::SeparableKernel) = true            # O(N·(wx+wy)) separable
-_has_fast_real_space_engine(::Kernels.AbstractFilterKernel) = false
+# Transform length along one axis: the axis itself where it wraps, else the least 2·3·5-smooth length
+# holding the data and the widest offset `w` between two of its cells.
+_padded_length(N::Int, w::Int, periodic::Bool) = periodic ? N : nextprod((2, 3, 5), N + min(w, N - 1))
 
-# `AutoMethod` evaluates a real-space filter with no factored engine on a uniform Cartesian grid by
-# padded transform, the same linear convolution in O(N log N); the transform needs one
-# translation-invariant footprint.
-_padded_fft_applicable(grid, kernel, method::AbstractFilterMethod) = false
-_padded_fft_applicable(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2,S,TP,<:Tuple{AbstractRange,AbstractRange}},
-    kernel::Kernels.AbstractFilterKernel, ::AutoMethod,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, S, TP} =
-    !_has_fast_real_space_engine(kernel) && _fftw_available()
+"""
+    _padded_halfwidths(grid, kernel, scale) -> NTuple{N,Int}
 
-# `AutoMethod` evaluates a spherical real-space filter by transform along longitude when the weights
-# depend on the longitude difference alone (a radial kernel, or a `HighOrderKernel` corrected per row)
-# and longitude is a uniform periodic `Range`; `TopHatKernel` keeps its prefix-sum engine. Latitude may
-# be any axis. The weights are the direct sum's, with compact support.
-_zonal_fft_applicable(grid, kernel, method::AbstractFilterMethod) = false
-_zonal_fft_applicable(
+The half-widths in cells of the direct footprint the padded transform samples on a uniform Cartesian
+grid: the ball of `kernel_radius` for a radial kernel, the separable engine's stencil for a separable
+one. A bounded axis reaches no farther than its extent.
+"""
+function _padded_halfwidths(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::Kernels.AbstractFilterKernel, scale::T,
+) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    rad = Kernels.kernel_radius(kernel, scale, Val(N))
+    return _clamp_bounded(grid, ntuple(d -> ceil(Int, rad / _axis_step(grid, d)), Val(N)))
+end
+
+_padded_halfwidths(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::SeparableKernel, scale::T,
+) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
+    _clamp_bounded(grid, _separable_halfwidths(grid, kernel, scale))
+
+function _clamp_bounded(grid::FlowGeometries.Grids.StructuredGrid, w::NTuple{N,Int}) where {N}
+    dims = FlowGeometries.Grids.size_tuple(grid)
+    return ntuple(d -> FlowGeometries.Grids.isperiodic(grid, d) ? w[d] : min(w[d], dims[d] - 1), Val(N))
+end
+
+@inline _axis_step(grid::FlowGeometries.Grids.StructuredGrid{T}, d::Int) where {T} =
+    abs(T(step(FlowGeometries.Grids.coordinates(grid, d))))
+
+# The lattice offsets of a uniform grid within distance `rad` across the directions `ds`, a bounded
+# direction reaching no farther than its extent.
+function _ball_offsets(grid::FlowGeometries.Grids.StructuredGrid{T}, rad::T, ds::NTuple{K,Int}) where {T,K}
+    dims = FlowGeometries.Grids.size_tuple(grid)
+    reach(d) = (r = floor(Int, rad / _axis_step(grid, d)); FlowGeometries.Grids.isperiodic(grid, d) ? r : min(r, dims[d] - 1))
+    d1, rest = first(ds), Base.tail(ds)
+    count = 0
+    for o in CartesianIndices(map(d -> (-reach(d)):reach(d), rest))
+        r2 = rad^2 - sum(ntuple(k -> (o[k] * _axis_step(grid, rest[k]))^2, Val(K - 1)); init = zero(T))
+        r2 < 0 && continue
+        h = floor(Int, sqrt(r2) / _axis_step(grid, d1))
+        count += 2 * (FlowGeometries.Grids.isperiodic(grid, d1) ? h : min(h, dims[d1] - 1)) + 1
+    end
+    return count
+end
+
+"""
+    _padded_fft_ops(grid, kernel, scale) -> (transform, realspace)
+
+The operations of one apply on a uniform Cartesian grid by the zero-padded transform and by the
+real-space engine `build_footprint` takes for `kernel` ([`_real_space_ops`](@ref)).
+"""
+function _padded_fft_ops(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::Kernels.AbstractFilterKernel, scale::T,
+) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    dims = FlowGeometries.Grids.size_tuple(grid)
+    w = _padded_halfwidths(grid, kernel, scale)
+    P = ntuple(d -> _padded_length(dims[d], w[d], FlowGeometries.Grids.isperiodic(grid, d)), Val(N))
+    transform = 2 * _rfft_ops(prod(P)) + 4 * (P[1] ÷ 2 + 1) * prod(Base.tail(P); init = 1)
+    return transform, _real_space_ops(grid, kernel, scale)
+end
+
+"""
+    _real_space_ops(grid, kernel, scale) -> Float64
+
+The operations of one apply on a uniform Cartesian grid by the real-space engine for `kernel`: the
+direct sum over the ball of radius `kernel_radius`, the prefix-sum top-hat (in two and three
+directions), or the separable passes.
+"""
+function _real_space_ops(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::Kernels.AbstractFilterKernel, scale::T,
+) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    rad = Kernels.kernel_radius(kernel, scale, Val(N))
+    return Float64(_ball_offsets(grid, rad, ntuple(identity, Val(N)))) * prod(FlowGeometries.Grids.size_tuple(grid))
+end
+
+# Two directions: a band per row of the disk, along a tripled axis 1 where it is periodic.
+function _real_space_ops(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.TopHatKernel, scale::T,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    n = prod(FlowGeometries.Grids.size_tuple(grid))
+    nrep = FlowGeometries.Grids.isperiodic(grid, 1) ? 3 : 1
+    return _prefixsum_ops(n, nrep, n * _ball_offsets(grid, Kernels.kernel_radius(kernel, scale), (2,)))
+end
+
+# Three directions: a band per `(j, k)` offset in the disk across directions 2 and 3.
+function _real_space_ops(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, kernel::Kernels.TopHatKernel, scale::T,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    n = prod(FlowGeometries.Grids.size_tuple(grid))
+    return _prefixsum_ops(n, 1, n * _ball_offsets(grid, Kernels.kernel_radius(kernel, scale), (2, 3)))
+end
+
+function _real_space_ops(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::SeparableKernel, scale::T,
+) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    w = _clamp_bounded(grid, _separable_halfwidths(grid, kernel, scale))
+    return Float64(prod(FlowGeometries.Grids.size_tuple(grid))) * sum(d -> 2w[d] + 1, 1:N)
+end
+
+"""
+    _zonal_fft_ops(grid, kernel, scale) -> (transform, realspace)
+
+The operations of one apply on a sphere of uniform longitude by the transform along longitude and by
+the real-space engine: the prefix-sum top-hat for `TopHatKernel`, the banded sum otherwise. Per pair of
+latitude rows the taps are the longitude offsets within great-circle distance `rad`,
+`sin²(Δλ/2) ≤ (sin²(rad/2R) − sin²(Δφ/2)) / (cos φ cos φ′)`, and a pair with any is a band.
+"""
+function _zonal_fft_ops(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.AbstractFilterKernel, scale::T,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
+    R = T(FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid)))
+    lat = FlowGeometries.Grids.coordinates(grid, 2)
+    dλ = abs(T(step(FlowGeometries.Grids.coordinates(grid, 1))))
+    rad = _query_radius(grid, kernel, scale)
+    min_dφ = R * T(FlowGeometries.Grids.minimum_spacing(grid, 2))
+    dj_lim = (isfinite(min_dφ) && min_dφ > 0) ? min(Ny - 1, ceil(Int, rad / min_dφ)) : 0
+    h = sin(min(rad / (2R), T(π) / 2))^2
+    taps = 0
+    pairs = 0
+    bands = 0
+    reach = 0
+    for j in 1:Ny, jj in max(1, j - dj_lim):min(Ny, j + dj_lim)
+        pairs += 1
+        s = sin((lat[jj] - lat[j]) / 2)^2
+        s <= h || continue
+        bands += 1
+        c = cos(lat[j]) * cos(lat[jj])
+        half = (c <= 0 || h - s >= c) ? Nx : floor(Int, 2 * asin(sqrt((h - s) / c)) / dλ)
+        taps += min(Nx, 2 * half + 1)
+        reach = max(reach, min(half, Nx - 1))
+    end
+    Px = FlowGeometries.Grids.isperiodic(grid, 1) ? Nx : nextprod((2, 3, 5), Nx + reach)
+    realspace = kernel isa Kernels.TopHatKernel ? _prefixsum_ops(Nx * Ny, Nx > 1 ? 3 : 1, Nx * bands) :
+                Float64(taps) * Nx
+    return 2 * Ny * _rfft_ops(Px) + 2 * (Px ÷ 2 + 1) * pairs, realspace
+end
+
+# The padded transform evaluates the direct footprint sum of any kernel on a uniform Cartesian grid.
+_takes_padded_fft(grid, kernel, scale) = false
+function _takes_padded_fft(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N,S,TP,<:NTuple{N,AbstractRange}},
+    kernel::Kernels.AbstractFilterKernel, scale,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, N, S, TP}
+    _fftw_available() || return false
+    transform, realspace = _padded_fft_ops(grid, kernel, T(scale))
+    return transform < realspace
+end
+
+# The transform along longitude evaluates the sum on a sphere whose longitude is a uniform `Range` (a
+# ring or a regional box), latitude any axis, when the weights depend on the longitude offset alone.
+_takes_zonal_fft(grid, kernel, scale) = false
+function _takes_zonal_fft(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2,S,TP,<:Tuple{AbstractRange,<:AbstractVector}},
-    kernel::Kernels.AbstractFilterKernel, ::AutoMethod,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}, S, TP} =
-    !(kernel isa Kernels.TopHatKernel) && (Kernels.is_radial(kernel) || kernel isa Kernels.HighOrderKernel) &&
-    FlowGeometries.Grids.isperiodic(grid, 1) && _fftw_available()
+    kernel::Kernels.AbstractFilterKernel, scale,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}, S, TP}
+    (_zonal_weights(grid, kernel, T(scale)) && _fftw_available()) || return false
+    transform, realspace = _zonal_fft_ops(grid, kernel, T(scale))
+    return transform < realspace
+end
+
+# The Cartesian grids filtered over their cells as points: node sets and curvilinear meshes.
+const _CartesianPoints{T,G} = Union{FlowGeometries.Grids.UnstructuredGrid{T,G}, FlowGeometries.Grids.CurvilinearGrid{T,G}}
+
+# A top-hat over Cartesian points takes the binned engine on the host: its plan is one sweep over `O(n)`
+# memory, its apply reads `O((r/h)^{D−1})` bin runs and partial bins per target, where the neighbour list
+# holds `O((r/h)^D)` entries and is built in two passes over them.
+_takes_binned_tophat(grid, kernel) = false
+_takes_binned_tophat(::_CartesianPoints{T,G}, ::Kernels.TopHatKernel) where {T, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}} = true
+
+# A kernel with a transfer cutoff over Cartesian points takes the nonuniform-FFT sum where building its plan
+# and applying it once costs fewer operations than building the neighbour list and applying it once, or
+# where the list's bytes exceed the cache budget.
+_takes_nufft_sum(grid, kernel, scale) = false
+function _takes_nufft_sum(
+    grid::_CartesianPoints{T,G}, kernel::Kernels.AbstractFilterKernel, scale,
+) where {T, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}}
+    K = Kernels.transfer_cutoff(kernel, T(scale))
+    (K === nothing || _nufft_library(SpectralBackends.AutoSpectralBackend()) === nothing) && return false
+    transform, entries, build = _nufft_sum_ops(grid, kernel, T(scale), K)
+    return 2 * transform < build + entries || entries * (sizeof(Int) + sizeof(T)) > default_cache_byte_budget()
+end
+
+"""
+    _nufft_sum_ops(grid, kernel, scale, cutoff) -> (transform, entries, build)
+
+The operations of one apply over Cartesian points by the nonuniform-FFT sum, and the neighbour list's
+entries (one operation each per apply) and the operations of its build. The sum is two transforms of
+`M·w^D` spreading and `2.5 N log₂ N` over the twice-oversampled box of `n_d = 2⌊K L_d/2π⌋ + 1` modes, `w`
+the spreading width `⌈−log₁₀ tol⌉ + 1` and `L_d` the box of [`_KernelBox`](@ref); building its plan is one
+such apply, the window masses. The list holds each point's neighbours at the mean density,
+`V_D r^D · M/ΣA`, and is built from the point bins ([`_binned_csr`](@ref)) in two passes over the points of
+the bins within reach, `D + 1` operations each (a squared distance and its test), and a weight and a store
+per entry.
+"""
+function _nufft_sum_ops(grid, kernel, scale::T, K::T) where {T<:AbstractFloat}
+    D = FlowGeometries.Grids.ncoordinates(grid)
+    M = length(FlowGeometries.Grids.mask(grid))
+    R = T(Kernels.kernel_radius(kernel, scale, Val(D)))
+    ball = D == 1 ? 2R : D == 2 ? T(π) * R^2 : T(4π) / 3 * R^3
+    entries = Float64(M) * min(M, ball * M / sum(FlowGeometries.Grids.measure(grid)))
+    _, h, nb, _, _ = _binned_lattice(grid, Val(D))
+    lines, _, wout = _binned_lines(h, R, R)
+    candidates = Float64(M) * M / prod(nb) * sum(q -> 2 * wout[q] + 1, eachindex(lines))
+    build = 2 * (D + 1) * candidates + 2 * entries
+    n = ntuple(D) do d
+        x = FlowGeometries.Grids.coordinates(grid, d)
+        L = FlowGeometries.Grids.isperiodic(grid, d) ? T(FlowGeometries.Grids.period(grid, d)) :
+            maximum(x) - minimum(x) + R
+        2 * floor(Int, K * L / T(2π)) + 1
+    end
+    w = ceil(Int, -log10(Kernels.GAUSSIAN_TRUNCATION_TOL)) + 1
+    transform = 2 * (Float64(M) * w^D + _rfft_ops(prod(2 .* n))) + prod(n)
+    return transform, entries, build
+end
+
+# The engine of a grid filtered over its cells as points: on the host, the binned top-hat or the
+# nonuniform-FFT sum where they apply, and the grid's own `build_footprint` otherwise.
+function _point_set_footprint(grid, kernel, scale, mask_strategy, resolved; kwargs...)
+    if _host_backend(resolved)
+        _takes_binned_tophat(grid, kernel) && return binned_tophat_plan(grid, kernel, scale; mask_strategy)
+        _takes_nufft_sum(grid, kernel, scale) &&
+            return nufft_sum_footprint(grid, kernel, scale; mask_strategy, execution = resolved)
+    end
+    return build_footprint(grid, kernel, scale; kwargs...)
+end
+
+# A radial kernel's weights depend on the offsets alone; a `HighOrderKernel`'s do where one correction
+# serves each latitude row.
+_zonal_weights(grid, kernel::Kernels.AbstractFilterKernel, scale) = Kernels.is_radial(kernel)
+_zonal_weights(grid, kernel::Kernels.HighOrderKernel, scale) = _highorder_shares_rows(grid, kernel, scale)
 
 @inline _threading_available() =
     Base.get_extension(parentmodule(@__MODULE__), :CoarseGrainingEnergyFluxesOhMyThreadsExt) !== nothing
 
-# The backends whose applies run in this process's own loops, where the transform engines
-# (`_transform_footprint`) are available.
+# The backends whose applies run in this process's own loops, where the host engines
+# (`_driven_footprint`) run.
 _host_backend(b::ComputationalBackends.AbstractExecutionBackend) =
     b isa Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend}
 
@@ -248,13 +468,13 @@ end
 """
     build_footprint(grid, kernel, scale; kwargs...) -> NodeFilterPlan
 
-Real-space footprint for a flat-cell grid (see [`_is_flat_cell`](@ref)) from
-`Connectivity.fold_within`, the grid's own metric ball query, so the neighbourhood follows the
-geometry's distance and periodic wrap and each weight takes the distance the fold returns. Raises for a
-grid whose cells are an index tuple and that no rectilinear or curvilinear engine matches.
-
-The ball queries run on the topology `Connectivity.default_sweep_topology` returns: a spatial index,
-`O(n log n)` over the grid, when `NearestNeighbors` is loaded, and a linear scan, `O(n²)`, otherwise.
+Real-space footprint for a flat-cell grid (see [`_is_flat_cell`](@ref)): every cell's neighbours within
+`kernel_radius` and their weights. A Cartesian node set's are read from its bins
+([`_binned_csr`](@ref)), each image of a cell across a periodic direction at its own distance; any other
+grid's come from `Connectivity.fold_within`, the grid's own metric ball query on the cell list
+`Connectivity.default_sweep_topology` returns, so the neighbourhood follows the geometry's distance and
+periodic wrap. Raises for a grid whose cells are an index tuple and that no rectilinear or curvilinear
+engine matches.
 """
 build_footprint(
     grid::FlowGeometries.Grids.AbstractGrid{G,T},
@@ -278,31 +498,99 @@ function _build_footprint_flat(
     grid::FlowGeometries.Grids.AbstractGrid{G,T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.SerialBackend(),
     kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    return NodeFilterPlan(_node_list(grid, kernel, scale, _build_backend(execution))...)
+end
+
+# Whether a flat-cell grid's neighbour list is read from its bins, every image of a cell across a periodic
+# direction at its own distance: a Cartesian node set. Any other is built over the grid's own ball query.
+_binned_list(::FlowGeometries.Grids.UnstructuredGrid{T,G}) where {T, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}} = true
+_binned_list(_) = false
+
+function _node_list(grid, kernel, scale, backend)
+    _binned_list(grid) && return _binned_csr(grid, kernel, scale, backend)
+    built, perm = _build_order(grid)
+    return _renumbered(_node_csr(built, kernel, scale, backend), perm)
+end
+
+# The backend a node plan's build runs on: the host's threads where the plan's apply is threaded, each
+# thread taking rows as it finishes since their neighbour counts differ; the calling thread otherwise.
+_build_backend(::ComputationalBackends.AbstractThreadedBackend) = FlowGeometries.Execution.BalancedThreads()
+_build_backend(::ComputationalBackends.AbstractExecutionBackend) = ComputationalBackends.SerialBackend()
+
+# The order a node plan is built in. A point cloud's ids need not follow its points through space, and a
+# ball query then reads its candidates from all over memory, so the plan is built over the nodes in a
+# space-filling order (`spatial_order`) and renumbered back. A pixelization's ids already do.
+_build_order(grid::FlowGeometries.Grids.UnstructuredGrid) =
+    (perm = FlowGeometries.Grids.spatial_order(grid); (FlowGeometries.Grids.reorder(grid, perm), perm))
+_build_order(grid) = (grid, nothing)
+
+# A list built over the nodes in the order `perm` lists them, with its rows and neighbours named by the
+# grid's own ids: built node `s` is node `perm[s]`.
+_renumbered(csr::Tuple, ::Nothing) = csr
+function _renumbered((bnbrs, bw, bptr)::Tuple, perm::AbstractVector{<:Integer})
+    n = length(perm)
+    ptr = Vector{Int}(undef, n + 1)
+    ptr[1] = 1
+    len = Vector{Int}(undef, n)
+    @inbounds for s in 1:n
+        len[perm[s]] = bptr[s + 1] - bptr[s]
+    end
+    @inbounds for t in 1:n
+        ptr[t + 1] = ptr[t] + len[t]
+    end
+    nbrs, w = similar(bnbrs), similar(bw)
+    @inbounds for s in 1:n
+        o = ptr[perm[s]] - bptr[s]
+        for k in bptr[s]:(bptr[s + 1] - 1)
+            nbrs[k + o] = perm[bnbrs[k]]
+            w[k + o] = bw[k]
+        end
+    end
+    return nbrs, w, ptr
+end
+
+# Every node's neighbours within the kernel's radius and their weights, as CSR in the grid's node order:
+# one pass counts each row, the next fills it, so every row is written where the counts put it and the
+# rows run on `backend` independently.
+function _node_csr(
+    grid::FlowGeometries.Grids.AbstractGrid{G,T}, kernel::Kernels.AbstractFilterKernel, scale::T, backend,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     dim = _kernel_dim(grid)
     rad = Kernels.kernel_radius(kernel, scale, dim)
     n = length(FlowGeometries.Grids.mask(grid))
-    ptr = Vector{Int}(undef, n + 1)
-    nbrs = Int[]
-    w = T[]
-    ptr[1] = 1
     mt = _query_topology(grid, rad)
-    scratch = FlowGeometries.Connectivity.ball_scratch()
-    for t in 1:n
-        # `active_only = false` keeps the plan mask-independent, the mask entering at apply time;
-        # `self = true` includes the centre cell.
-        FlowGeometries.Connectivity.fold_within(
-            nothing, grid, t; ball = rad, self = true, active_only = false,
-            topology = mt, scratch = scratch,
-        ) do _, j, d
-            push!(nbrs, j)
-            push!(w, Kernels.kernel_weight(kernel, T(d), scale, dim) * FlowGeometries.Grids.measure(grid, j))
-            return nothing
+    # `active_only = false` keeps the plan mask-independent, the mask entering at apply time;
+    # `self = true` includes the centre cell.
+    query(f::F, acc, t, sc) where {F} = FlowGeometries.Connectivity.fold_within(
+        f, acc, grid, t; ball = rad, self = true, active_only = false, topology = mt, scratch = sc,
+    )
+    ptr = Vector{Int}(undef, n + 1)
+    ptr[1] = 1
+    FlowGeometries.Execution.run_chunks(n, backend) do rng
+        sc = FlowGeometries.Connectivity.ball_scratch(mt)
+        @inbounds for t in rng
+            ptr[t + 1] = query((m, _, _) -> m + 1, 0, t, sc)
         end
-        ptr[t+1] = length(nbrs) + 1
     end
-    return NodeFilterPlan(nbrs, w, ptr)
+    @inbounds for t in 1:n
+        ptr[t + 1] += ptr[t]
+    end
+    nbrs = Vector{Int}(undef, ptr[n + 1] - 1)
+    w = Vector{T}(undef, ptr[n + 1] - 1)
+    FlowGeometries.Execution.run_chunks(n, backend) do rng
+        sc = FlowGeometries.Connectivity.ball_scratch(mt)
+        @inbounds for t in rng
+            query(ptr[t], t, sc) do k, j, d
+                nbrs[k] = j
+                w[k] = Kernels.kernel_weight(kernel, T(d), scale, dim) * FlowGeometries.Grids.measure(grid, j)
+                return k + 1
+            end
+        end
+    end
+    return nbrs, w, ptr
 end
 
 # A `HighOrderKernel`'s weights are corrected about each node ([`_highorder_targets`](@ref)), and a node
@@ -396,7 +684,7 @@ function plan_filter(
     isempty(kwargs) || _unused_keywords(kwargs, method)
     _check_backend_compatible(grid, execution)
     resolved = _resolve_backend(execution, grid)
-    fp = build_footprint(grid, kernel, scale)
+    fp = _point_set_footprint(grid, kernel, scale, mask_strategy, resolved; execution = resolved)
     return PhysicalFilterPlan(prepare_workspace(resolved, grid, fp), grid, mask_strategy, kernel, scale, resolved)
 end
 
@@ -422,7 +710,8 @@ function plan_filter(
     isempty(kwargs) || _unused_keywords(kwargs, method)
     resolved = _resolve_backend(execution, grid)
     _check_backend_compatible(grid, execution)
-    fp = build_footprint(grid, kernel, scale; cache_strategy = cache_strategy, cache_byte_budget = cache_byte_budget)
+    fp = _point_set_footprint(grid, kernel, scale, mask_strategy, resolved;
+                              cache_strategy = cache_strategy, cache_byte_budget = cache_byte_budget)
     return PhysicalFilterPlan(prepare_workspace(resolved, grid, fp), grid, mask_strategy, kernel, scale, resolved)
 end
 

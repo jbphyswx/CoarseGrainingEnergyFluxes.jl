@@ -532,6 +532,17 @@ transform over its mass.
 @inline spectral_transfer(kernel::HighOrderKernel, k::NTuple{D,T}, ℓ::T) where {D,T<:AbstractFloat} =
     prod(map(kd -> _profile_transfer(kernel, kd, ℓ), k))
 
+"""
+    transfer_cutoff(kernel, ℓ::T) -> T or nothing
+
+The wavenumber past which `|Ĝ(k, ℓ)| ≤ GAUSSIAN_TRUNCATION_TOL` in every dimension, the relative weight the
+real-space footprints truncate at, or `nothing` for a kernel without such a bound in closed form.
+`GaussianKernel(α)`: `exp(−k²ℓ²/(4α))` falls below `tol` past `k = √(4α ln(1/tol))/ℓ`.
+"""
+transfer_cutoff(::AbstractFilterKernel, ::AbstractFloat) = nothing
+transfer_cutoff(k::GaussianKernel, ℓ::T) where {T<:AbstractFloat} =
+    sqrt(-T(4) * T(k.α) * log(T(GAUSSIAN_TRUNCATION_TOL))) / ℓ
+
 @noinline spectral_transfer(k::HighOrderKernel, ::AbstractFloat, ::AbstractFloat) =
     throw(ArgumentError(
         "$(nameof(typeof(k))) on the plane is the product G(x)G(y), whose transfer function depends on " *

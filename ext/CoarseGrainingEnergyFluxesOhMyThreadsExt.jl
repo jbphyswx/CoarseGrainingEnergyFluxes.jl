@@ -4,6 +4,7 @@ using OhMyThreads: OhMyThreads
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries
 using FlowTransformBindings: FlowTransformBindings as FTB
+using LinearAlgebra: LinearAlgebra
 
 # A scheduler object of concrete type, so every `tforeach` call below resolves its scheduler statically.
 const _SCHED = OhMyThreads.DynamicScheduler()
@@ -33,7 +34,7 @@ function CGEF.Filtering.threaded_filter_field!(
         return _threaded_apply_separable!(out, field, grid, fp, mask_strategy)
     elseif fp isa CGEF.Filtering.PrefixSumTopHatPlan
         return _threaded_apply_prefixsum_tophat!(out, field, grid, fp, mask_strategy)
-    elseif CGEF.Filtering._transform_footprint(fp)
+    elseif CGEF.Filtering._driven_footprint(fp)
         return CGEF.Filtering.apply_footprint!(out, field, grid, fp, mask_strategy, _omt_driver)
     end
     periodic_x = FlowGeometries.Grids.isperiodic(grid, 1)
@@ -129,7 +130,9 @@ function CGEF.Filtering.threaded_filter_fields!(
     if fp isa CGEF.Filtering.PrefixSumTopHatPlan
         return _threaded_apply_prefixsum_tophat_batch!(outs, fields, grid, fp, mask_strategy)
     end
-    if fp isa CGEF.Filtering.SeparableFootprint || CGEF.Filtering._transform_footprint(fp)
+    CGEF.Filtering._driven_footprint(fp) &&
+        return CGEF.Filtering._driven_batch!(outs, fields, grid, fp, mask_strategy, _omt_driver)
+    if fp isa CGEF.Filtering.SeparableFootprint
         for k in eachindex(outs)
             CGEF.Filtering.threaded_filter_field!(outs[k], fields[k], grid, kernel, scale, mask_strategy, fp)
         end
@@ -179,9 +182,12 @@ function CGEF.Filtering.threaded_filter_fields!(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
     fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
     CGEF.Filtering._check_strategy(fp, mask_strategy)
-    # These engines pass every field through the plan's one set of pass/scan buffers, so they apply per
-    # field.
-    if fp isa Union{CGEF.Filtering.SeparableFootprintND, CGEF.Filtering.PrefixSumTopHat3DPlan}
+    CGEF.Filtering._driven_footprint(fp) &&
+        return CGEF.Filtering._driven_batch!(outs, fields, grid, fp, mask_strategy, _omt_driver)
+    # These engines pass every field through the plan's one set of pass/scan/source buffers, so they apply
+    # per field.
+    if fp isa Union{CGEF.Filtering.SeparableFootprintND, CGEF.Filtering.PrefixSumTopHat3DPlan,
+                    CGEF.Filtering.FilterFootprintND}
         for k in eachindex(outs)
             CGEF.Filtering.threaded_filter_field!(outs[k], fields[k], grid, kernel, scale, mask_strategy, fp)
         end
@@ -221,11 +227,13 @@ function CGEF.Filtering.threaded_filter_field!(
         return CGEF.Filtering.apply_separable_nd!(out, field, grid, fp, mask_strategy, _omt_driver)
     elseif fp isa CGEF.Filtering.PrefixSumTopHat3DPlan
         return _threaded_apply_prefixsum_tophat_3d!(out, field, grid, fp, mask_strategy)
+    elseif CGEF.Filtering._driven_footprint(fp)
+        return CGEF.Filtering.apply_footprint!(out, field, grid, fp, mask_strategy, _omt_driver)
     elseif fp isa CGEF.Filtering.FilterFootprintND
-        # The point functions decide which targets the strategy filters.
-        periodic = FlowGeometries.Grids.periodic_flags(grid)
-        OhMyThreads.tforeach(CartesianIndices(out); scheduler = _sched()) do I
-            out[I] = CGEF.Filtering._footprint_nd_point(field, fp, mask_strategy, dims, periodic, mask, I)
+        # Each line along axis 1 writes only itself.
+        src = CGEF.Filtering._nd_source!(fp, field, grid)
+        OhMyThreads.tforeach(CartesianIndices(Base.tail(dims)); scheduler = _sched()) do J
+            CGEF.Filtering._nd_out_line!(out, src, fp, Tuple(J))
         end
     elseif fp.cache !== nothing
         lin = LinearIndices(dims)
@@ -277,10 +285,33 @@ function CGEF.Filtering.threaded_filter_fields!(
     return outs
 end
 
+# The host engines of a node set, through their drivers.
+const _NodeDriven = Union{CGEF.Filtering.BinnedTopHatPlan, CGEF.Filtering.NUFFTSumFootprint}
 
-# Runs `f` with FastTransforms on one OpenMP thread, for tasks that each run a whole serial apply or
-# sweep.
-_farm(f) = Base.ScopedValues.with(f, FTB.FASTTRANSFORMS_THREADS => 1)
+CGEF.Filtering.threaded_filter_field!(
+    out::AbstractVector{T}, field::AbstractVector, grid::FlowGeometries.Grids.UnstructuredGrid{T},
+    kernel::CGEF.Kernels.AbstractFilterKernel, scale::T, mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
+    fp::_NodeDriven,
+) where {T<:AbstractFloat} = CGEF.Filtering.apply_footprint!(out, field, grid, fp, mask_strategy, _omt_driver)
+
+CGEF.Filtering.threaded_filter_fields!(
+    outs, fields, grid::FlowGeometries.Grids.UnstructuredGrid{T},
+    kernel::CGEF.Kernels.AbstractFilterKernel, scale::T, mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
+    fp::_NodeDriven,
+) where {T<:AbstractFloat} = CGEF.Filtering._driven_batch!(outs, fields, grid, fp, mask_strategy, _omt_driver)
+
+
+# Runs `f` with FastTransforms on one OpenMP thread and BLAS on one thread, for tasks that each run a whole
+# serial apply or sweep. BLAS's count is process-global, restored after.
+function _farm(f)
+    prev = LinearAlgebra.BLAS.get_num_threads()
+    try
+        LinearAlgebra.BLAS.set_num_threads(1)
+        return Base.ScopedValues.with(f, FTB.FASTTRANSFORMS_THREADS => 1)
+    finally
+        LinearAlgebra.BLAS.set_num_threads(prev)
+    end
+end
 
 # Slice-parallel apply. Each slice runs serially and writes only its own output.
 function CGEF.Filtering.threaded_filter_slices!(outs, fields, plans)

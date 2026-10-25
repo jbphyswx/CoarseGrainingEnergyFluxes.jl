@@ -24,17 +24,27 @@ function padded_fft_footprint(args...; kwargs...)
     throw(ArgumentError("The padded-FFT real-space engine needs FFTW — run `using FFTW`."))
 end
 
-# Zonal-FFT real-space engine (FFTW extension). On a global rectilinear sphere, for a fixed pair of
+# Zonal-FFT real-space engine (FFTW extension). On a sphere of uniform longitude, for a fixed pair of
 # latitudes a great-circle kernel depends on the longitude difference alone, so each latitude band is a
-# circular convolution along the longitude ring, with the direct sum's weights.
+# convolution along longitude, circular on a ring and zero-padded on a regional box, with the direct
+# sum's weights.
 function zonal_fft_footprint(args...; kwargs...)
     throw(ArgumentError("The zonal-FFT spherical engine needs FFTW — run `using FFTW`."))
 end
 
-# Whether `fp` is one of those two transform engines. They run on the host: serially, or under
-# `ThreadedBackend` through `apply_footprint!(out, field, grid, fp, strategy, driver)` with a row
-# driver of `_sep_serial`'s shape.
-_transform_footprint(::Any) = false
+# Whether `fp` is a host engine applied through `apply_footprint!(out, field, grid, fp, strategy, driver)`,
+# serially or under `ThreadedBackend` with a driver of `_sep_serial`'s shape: the padded and zonal FFTs, the
+# node-set NUFFT sum and the binned top-hat.
+_driven_footprint(::Any) = false
+
+# A batch through a driven engine, field by field; an engine that shares its work across the fields of a
+# batch has its own method.
+function _driven_batch!(outs, fields, grid, fp, strategy, driver = _sep_serial)
+    for k in eachindex(outs)
+        apply_footprint!(outs[k], fields[k], grid, fp, strategy, driver)
+    end
+    return outs
+end
 
 const _DistributedBackends =
     Union{ComputationalBackends.AbstractDistributedBackend, ComputationalBackends.AbstractMPIBackend}

@@ -175,14 +175,15 @@ function CGEF.Filtering.mpi_filter_field!(
 
     fill!(out, zero(T))
     cart = CartesianIndices(dims)
-    # The point functions decide which targets the strategy filters.
     if fp isa CGEF.Filtering.FilterFootprintND
-        periodic = FlowGeometries.Grids.periodic_flags(grid)
-        for lin in (rank + 1):nproc:length(out)
-            I = cart[lin]
-            out[I] = CGEF.Filtering._footprint_nd_point(field, fp, mask_strategy, dims, periodic, mask, I)
+        # Ranks take a round-robin stride of the lines along axis 1.
+        src = CGEF.Filtering._nd_source!(fp, field, grid)
+        lines = CartesianIndices(Base.tail(dims))
+        for q in (rank + 1):nproc:length(lines)
+            CGEF.Filtering._nd_out_line!(out, src, fp, Tuple(lines[q]))
         end
     elseif fp.cache !== nothing
+        # The point functions decide which targets the strategy filters.
         lin_idx = LinearIndices(dims)
         for lin in (rank + 1):nproc:length(out)
             I = cart[lin]

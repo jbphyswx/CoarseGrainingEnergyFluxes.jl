@@ -9,7 +9,7 @@ using LinearAlgebra: LinearAlgebra
 using StaticArrays: StaticArrays as SA
 
 export AbstractMaskStrategy, ZeroFill, Deformable
-export AbstractFilterMethod, RealSpace, Spectral, AutoMethod
+export AbstractFilterMethod, RealSpace, Spectral
 export AbstractCacheStrategy, AutoCache, AlwaysCache, NeverCache
 export filter_field!, filter_fields!, filter_slices!
 export AbstractFilterPlan, plan_filter, filter_apply!, filter_apply_batch!
@@ -22,6 +22,7 @@ const SeparableKernel = Union{Kernels.GaussianKernel, Kernels.HighOrderKernel}
 include("Filtering/Strategies.jl")
 include("Filtering/VectorFilter.jl")
 include("Filtering/SpinDirect.jl")
+include("Filtering/SpinRings.jl")
 include("Filtering/Lifetimes.jl")
 include("Filtering/CacheStrategy.jl")
 include("Filtering/Hooks.jl")
@@ -33,6 +34,7 @@ include("Filtering/engines/PrefixSumTopHat.jl")
 include("Filtering/engines/Separable.jl")
 include("Filtering/engines/NDim.jl")
 include("Filtering/engines/PrefixSumTopHat3D.jl")
+include("Filtering/engines/BinnedTopHat.jl")
 include("Filtering/Apply.jl")
 include("Filtering/Plans.jl")
 include("Filtering/Selection.jl")

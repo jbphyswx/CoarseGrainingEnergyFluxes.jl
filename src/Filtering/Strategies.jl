@@ -40,14 +40,23 @@ struct Deformable <: AbstractMaskStrategy end
 """
     AbstractFilterMethod
 
-How the convolution is evaluated: [`RealSpace`](@ref) (physical-space footprint, any grid/mask),
-[`AutoMethod`](@ref) (the same sum by its fastest engine) or [`Spectral`](@ref) (transform-space
-multiply, provided by extensions: an FFT on a uniform Cartesian grid, zero-padded along a bounded axis;
-spherical harmonics on a Clenshaw–Curtis sphere; a NUFFT or NUFSHT on scattered points).
+How the convolution is evaluated: [`RealSpace`](@ref) (physical-space footprint, any grid/mask) or
+[`Spectral`](@ref) (transform-space multiply, provided by extensions: an FFT on a uniform Cartesian
+grid, zero-padded along a bounded axis; spherical harmonics on a Clenshaw–Curtis sphere; a NUFFT or
+NUFSHT on scattered points).
 """
 abstract type AbstractFilterMethod end
 
-"Physical-space direct-sum convolution (works on any grid, mask, and geometry)."
+"""
+    RealSpace <: AbstractFilterMethod
+
+The physical-space convolution with the compact kernel, on any grid, mask and geometry. The grid and
+kernel decide the engine that evaluates its sum. On a host backend that includes a transform of the same
+sampled kernel where the grid allows one: the FFT on a uniform Cartesian grid (circular along periodic
+axes, zero-padded along bounded ones) and the transform along longitude on a sphere of uniform
+longitude, which agree with the direct sum to round-off. [`Spectral`](@ref), which multiplies by the
+kernel's transfer function, is a different discretization.
+"""
 struct RealSpace <: AbstractFilterMethod end
 
 """
@@ -58,18 +67,6 @@ spectral extension and a compatible grid (e.g. `using FFTW` for a uniform Cartes
 bounded).
 """
 struct Spectral <: AbstractFilterMethod end
-
-"""
-    AutoMethod <: AbstractFilterMethod
-
-The [`RealSpace`](@ref) convolution, evaluated by the fastest engine that computes its sum: the direct
-engines, or a transform of the same sampled kernel where the grid allows one — the FFT engine on a
-uniform Cartesian grid (circular along periodic axes, zero-padded along bounded ones) and the
-transform along the longitude ring of a global rectilinear sphere. These agree with the direct sum to
-round-off. [`Spectral`](@ref), which multiplies by the kernel's transfer function, is a different
-discretization and is never selected.
-"""
-struct AutoMethod <: AbstractFilterMethod end
 
 """
     AbstractFilterPlan

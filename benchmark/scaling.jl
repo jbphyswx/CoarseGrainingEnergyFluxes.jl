@@ -1,9 +1,9 @@
 # Parallel scaling harness.
 #
-# Reports speedup AND the machine's own ceiling for the same access pattern, so a number can be read
-# as a fraction of what the hardware can actually deliver rather than against an ideal `n×` that a
-# memory-bound kernel can never reach. A filtering sweep over scattered neighbours is a gather: it is
-# latency-bound, and on a desktop its ceiling is roughly half the core count.
+# Reports speedup and the machine's own ceiling for the same access pattern, so a number reads as a
+# fraction of what the hardware can deliver; a memory-bound kernel never reaches `n×`. A filtering
+# sweep over scattered neighbours is a gather: it is latency-bound, and on a desktop its ceiling is
+# roughly half the core count.
 #
 # Run once per thread count, e.g.
 #   for t in 1 2 4 8; do julia --project=benchmark -t$t benchmark/scaling.jl; done
@@ -31,8 +31,7 @@ function ceiling_compute()
     return best_ms(w, 5)
 end
 
-# Memory-bound: the gather pattern the real-space engines actually have. This is the ceiling that
-# applies to filtering, not the compute one.
+# Memory-bound: the gather pattern the real-space engines have, and the ceiling filtering is held to.
 function ceiling_gather(; n = 600_000, k = 12)
     Random.seed!(1)
     src = randn(n); idx = rand(1:n, n * k); dst = zeros(n)
