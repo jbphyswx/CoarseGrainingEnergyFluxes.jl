@@ -2,6 +2,109 @@
 # Spin-weighted transforms by direct summation over a grid's cells
 # ---------------------------------------------------------------------------
 
+# The Wigner `d^ℓ_{m,n}(θ)` run up FlowTransformBindings' three-term recurrence in `ℓ` from
+# `ℓ₀ = max(|m|, |n|)`, as NUFSHT's ring engine runs it: the closed form at `ℓ₀`, Reinsch's step in `Float32`
+# and the plain one with `cos θ` carried to twice the working precision otherwise, and a value held as
+# `y·2^{Kk}` with an integer scale `k ≤ 0`, rescaled as it grows and summed once `k ≥ −1`.
+
+# Whether transforms in `T` step in Reinsch's form.
+@inline _wigner_reinsch(::Type{Float32}) = true
+@inline _wigner_reinsch(::Type{<:AbstractFloat}) = false
+
+"""
+    _wigner_nodes(T, S, θ) -> (; x, xl, u, pos, lc, ls, cs)
+
+Per colatitude `θ_k`: `cos θ_k` as `x + xl` to twice `T`'s precision (the plain step's), `pos = θ_k ≤ π/2`
+and `u = 2sin²(θ_k/2)` where `pos`, `2cos²(θ_k/2)` elsewhere (Reinsch's), and `log₂ cos(θ_k/2)`,
+`log₂ sin(θ_k/2)` and `cos(θ_k/2) sin(θ_k/2)` in `S`, which the starting values read.
+"""
+function _wigner_nodes(::Type{T}, ::Type{S}, θ::AbstractVector) where {T<:AbstractFloat, S<:AbstractFloat}
+    n = length(θ)
+    x = zeros(T, n); xl = zeros(T, n); u = zeros(T, n); pos = Vector{Bool}(undef, n)
+    lc = zeros(S, n); ls = zeros(S, n); cs = zeros(S, n)
+    for k in 1:n
+        h = S(θ[k]) / 2
+        sh, ch = sincos(h)
+        pos[k] = 2h <= S(π) / 2
+        u[k] = T(2 * (pos[k] ? sh : ch)^2)
+        lc[k] = log2(ch)
+        ls[k] = log2(sh)
+        cs[k] = ch * sh
+    end
+    _wigner_reinsch(T) || setprecision(BigFloat, 2 * precision(T) + 8) do
+        for k in 1:n
+            c = cos(BigFloat(θ[k]))
+            x[k] = T(c)
+            xl[k] = T(c - x[k])
+        end
+    end
+    return (; x, xl, u, pos, lc, ls, cs)
+end
+
+# `starts[m + L + 1, n + 3]`: the constants of `d^{ℓ₀}_{m,n}`, `|m| ≤ L`, `|n| ≤ 2`.
+_wigner_starts(::Type{S}, L::Int) where {S} =
+    [FlowTransformBindings.wigner_d_start(S, m, n) for m in -L:L, n in -2:2]
+
+# The step coefficients per degree a table holds: `(α, β, γ, c₊, c₋)` for Reinsch's form, `(α, β, γ)` for the
+# plain one.
+@inline _wigner_ncoef(::Type{T}) where {T} = _wigner_reinsch(T) ? 5 : 3
+
+# Column `col`, order `m = col − L − 1`, of the step coefficients at spin `n`: rows `cℓ+1 … cℓ+c`,
+# `c = _wigner_ncoef(T)`, hold degree `ℓ`'s, formed in `S` and rounded to the table's type `T`.
+@inline function _wigner_coefficients!(coef, ::Type{S}, L::Int, n::Int, col::Int) where {S}
+    T = eltype(coef)
+    m = col - L - 1
+    @inbounds for ℓ in max(abs(m), abs(n)):(L - 1)
+        α, β, γ, c₊, c₋ = FlowTransformBindings.wigner_d_coeffs(S, ℓ, m, n)
+        i = _wigner_ncoef(T) * ℓ
+        coef[i + 1, col] = T(α)
+        coef[i + 2, col] = T(β)
+        coef[i + 3, col] = T(γ)
+        if _wigner_reinsch(T)
+            coef[i + 4, col] = T(c₊)
+            coef[i + 5, col] = T(c₋)
+        end
+    end
+    return nothing
+end
+
+# Degree `ℓ`'s `(α, β, γ, c₊, c₋)` from column `col` of the table; zero `c±` in the plain form.
+@inline function _table_coeffs(coef, ℓ::Int, col::Int)
+    T = eltype(coef)
+    i = _wigner_ncoef(T) * ℓ
+    @inbounds if _wigner_reinsch(T)
+        return (coef[i + 1, col], coef[i + 2, col], coef[i + 3, col], coef[i + 4, col], coef[i + 5, col])
+    else
+        return (coef[i + 1, col], coef[i + 2, col], coef[i + 3, col], zero(T), zero(T))
+    end
+end
+
+function _wigner_coefficients!(coef, ::Type{S}, L::Int, n::Int, execution) where {S}
+    FlowGeometries.Execution.run_indices(2L + 1, execution) do col
+        _wigner_coefficients!(coef, S, L, n, col)
+    end
+    return coef
+end
+
+# `d^{ℓ+1}` from degree `ℓ` at one node, `(y, e)` the state: `e = y_{ℓ−1}` in the plain form, Reinsch's
+# companion otherwise.
+@inline function _wigner_step(coef, ℓ::Int, col::Int, pos::Bool, u::T, x::T, xl::T, y::T, e::T) where {T}
+    α, β, γ, c₊, c₋ = _table_coeffs(coef, ℓ, col)
+    if _wigner_reinsch(T)
+        σα, c, σγ, σ = FlowTransformBindings.wigner_d_signed(pos, α, c₊, c₋, γ)
+        return FlowTransformBindings.wigner_d_step(σα, c, σγ, σ, u, y, e)
+    else
+        return FlowTransformBindings.wigner_d_step_plain(α, β, γ, x, xl, y, e)
+    end
+end
+
+# The state's second value at `ℓ₀`: `y` in Reinsch's form, `y_{ℓ₀−1} = 0` in the plain one.
+@inline _wigner_e0(y::T) where {T} = _wigner_reinsch(T) ? y : zero(T)
+
+# The weight of a value at scale `k`: whole at `0`, `dn = 2^{−K}` at `−1`, left out below.
+@inline _wigner_weight(k::Int32, dn::T) where {T} =
+    ifelse(k == Int32(0), one(T), ifelse(k == Int32(-1), dn, zero(T)))
+
 """
     DirectSpinTransforms(grid; lmax = nothing, execution = SerialBackend())
 
@@ -13,22 +116,26 @@ backend `execution`, whose loops run them. With `ₛY_ℓm(θ, φ) = N_ℓ d^ℓ
 and the synthesis is `F_k = Σ_ℓm Ĝ(ℓ) C_ℓm ₛY_ℓm(x_k)`, one work item per cell. The coefficients are
 `C[ℓ+1, m+lmax+1]`.
 
-The Wigner `d^ℓ_{m,−s}` run up the three-term recurrence in `ℓ` from `ℓ₀ = max(|m|, |s|)`, where `d` is a
-product of powers of `cos(θ/2)` and `sin(θ/2)` built order by order, of size about `sin^|m| θ`. A value
-below `2^−B`, `B` half the element type's largest binary exponent, is carried as a significand and its
-own exponent, so an order whose seed lies below the floating-point range keeps the values it reaches at
-higher degree. A transform costs `O(M·lmax²)` over `M` cells and allocates nothing. `lmax = nothing`
-takes [`spin_band_limit`](@ref).
+The Wigner `d^ℓ_{m,−s}` run up FlowTransformBindings' recurrence in `ℓ` from `ℓ₀ = max(|m|, |s|)`, a value
+below the floating-point range carried with its own scale, so an order whose start lies below the range
+keeps the values it reaches at higher degree. A transform costs `O(M·lmax²)` over `M` cells and fills its
+spin's step coefficients, `O(lmax²)`. `lmax = nothing` takes [`spin_band_limit`](@ref).
 """
-struct DirectSpinTransforms{T<:AbstractFloat, V<:AbstractVector{T}, Q<:AbstractMatrix{T}, B} <: AbstractSpinTransforms
-    c::V          # cos(θ_k/2)
-    s::V          # sin(θ_k/2)
-    x::V          # cos θ_k
+struct DirectSpinTransforms{
+    T<:AbstractFloat, S<:AbstractFloat, V<:AbstractVector{T}, VB<:AbstractVector{Bool}, VS<:AbstractVector{S},
+    ST<:AbstractMatrix{FlowTransformBindings.WignerDStart{S}}, Q<:AbstractMatrix{T}, B,
+} <: AbstractSpinTransforms
+    x::V          # cos θ_k …
+    xl::V         # … and its rest, to twice the precision
+    u::V          # Reinsch's 1 ∓ cos θ_k
+    pos::VB       # θ_k ≤ π/2
+    lc::VS        # log₂ cos(θ_k/2)
+    ls::VS        # log₂ sin(θ_k/2)
     φ::V          # longitude
     w::V          # measure over R²
     norm::V       # N_ℓ, ℓ = 0 … lmax
-    q::Q          # q[j+1, a+1] = √(j² − a²) for a ≤ j, zero above
-    r::Q          # r[j+1, n+3] = √((2j+2)(2j+1)/((j+1+n)(j+1−n))), the seed's step from order j to j + 1
+    starts::ST    # starts[m + lmax + 1, n + 3]
+    coef::Q       # (_wigner_ncoef(T)·lmax, 2lmax+1): the step coefficients at the spin last transformed
     transfer::V   # Ĝ(ℓ) where the loops read it
     lmax::Int
     execution::B
@@ -40,20 +147,14 @@ function DirectSpinTransforms(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
     L = lmax === nothing ? spin_band_limit(grid) : Int(lmax)
     L >= 2 || throw(ArgumentError("the generalized convolution's spin-2 transform needs lmax ≥ 2; got $L"))
+    S = promote_type(T, Float64)
     θ, φ, w = _spin_nodes(grid)
-    q = zeros(T, L + 2, L + 1)
-    for a in 0:L, j in a:(L + 1)
-        q[j + 1, a + 1] = sqrt(T(j^2 - a^2))
-    end
-    r = zeros(T, L + 1, 5)
-    for n in -2:2, j in abs(n):(L - 1)
-        r[j + 1, n + 3] = sqrt(T((2j + 2) * (2j + 1)) / T((j + 1 + n) * (j + 1 - n)))
-    end
+    nd = _wigner_nodes(T, S, θ)
     nrm = [sqrt(T(2ℓ + 1) / (4 * T(π))) for ℓ in 0:L]
     put(a) = FlowGeometries.Execution.on_backend(execution, a)
     return DirectSpinTransforms(
-        put(cos.(θ ./ 2)), put(sin.(θ ./ 2)), put(cos.(θ)), put(φ), put(w), put(nrm), put(q), put(r),
-        put(zeros(T, L + 1)), L, execution,
+        put(nd.x), put(nd.xl), put(nd.u), put(nd.pos), put(nd.lc), put(nd.ls), put(φ), put(w), put(nrm),
+        put(_wigner_starts(S, L)), put(zeros(T, _wigner_ncoef(T) * L, 2L + 1)), put(zeros(T, L + 1)), L, execution,
     )
 end
 
@@ -69,129 +170,82 @@ spin_coefficients(tr::DirectSpinTransforms{T}) where {T} =
 spin_transfer_buffer(tr::DirectSpinTransforms{T}) where {T} = zeros(T, tr.lmax + 1)
 spin_host(tr::DirectSpinTransforms) = _host_memory(tr.execution)
 
-function spin_analyze!(C, F, tr::DirectSpinTransforms, s::Int)
+function spin_analyze!(C, F, tr::DirectSpinTransforms{T,S}, s::Int) where {T,S}
     abs(s) <= 2 || _spin_out_of_range(s)
     L, n = tr.lmax, -s
-    c, sh, x, φ, w, nrm, q, r = tr.c, tr.s, tr.x, tr.φ, tr.w, tr.norm, tr.q, tr.r
+    _wigner_coefficients!(tr.coef, S, L, n, tr.execution)
+    t = _direct_tables(tr)
     FlowGeometries.Execution.run_indices(2L + 1, tr.execution) do col
-        _direct_analysis!(C, F, c, sh, x, φ, w, nrm, q, r, L, n, col)
+        _direct_analysis!(C, F, t, L, n, col)
     end
     return C
 end
 
-function spin_synthesize!(F, C, _W, Ĝ, tr::DirectSpinTransforms, s::Int)
+function spin_synthesize!(F, C, _W, Ĝ, tr::DirectSpinTransforms{T,S}, s::Int) where {T,S}
     abs(s) <= 2 || _spin_out_of_range(s)
     copyto!(tr.transfer, Ĝ)
     L, n = tr.lmax, -s
-    g, c, sh, x, φ, nrm, q, r = tr.transfer, tr.c, tr.s, tr.x, tr.φ, tr.norm, tr.q, tr.r
-    FlowGeometries.Execution.run_indices(length(x), tr.execution) do k
-        @inbounds F[k] = _direct_synthesis(C, g, c[k], sh[k], x[k], φ[k], nrm, q, r, L, n)
+    _wigner_coefficients!(tr.coef, S, L, n, tr.execution)
+    t = _direct_tables(tr)
+    FlowGeometries.Execution.run_indices(length(tr.x), tr.execution) do k
+        @inbounds F[k] = _direct_synthesis(C, t, L, n, k)
     end
     return F
 end
 
 @noinline _spin_out_of_range(s) = throw(ArgumentError("the direct spin transforms carry |s| ≤ 2; got s = $s"))
 
-# The exponent step `B`: a recurrence value is carried as `(d, e)`, worth `d·2^e`, with `e ≤ 0` a multiple
-# of `−B` and `|d| ≥ 2^−B` wherever `e < 0`.
-@inline _exponent_step(::Type{T}) where {T<:AbstractFloat} = exponent(floatmax(T)) ÷ 2
-
-# `d^ℓ₀_{m,n}(θ)` at `ℓ₀ = max(|m|, |n|)` as `(d, e)`, from `c = cos(θ/2)`, `s = sin(θ/2)`: for `|m| ≥ |n|`,
-# `(−1)^{m−n} √C(2m, m+n) c^{m+n} s^{m−n}` at `m ≥ 0` and `√C(2|m|, |m|−n) c^{|m|−n} s^{|m|+n}` at `m < 0`,
-# each built up from order `|n|` by the steps `r`; for `|m| < |n|`, `√C(2|n|, |n|+m) c^{|n|+m} s^{|n|−m}` at
-# `n > 0` and `(−1)^{m+|n|} √C(2|n|, |n|+m) c^{|n|−m} s^{|n|+m}` at `n < 0`.
-@inline function _wigner_seed(m::Int, n::Int, c::T, s::T, r) where {T}
-    if abs(m) >= abs(n)
-        B = _exponent_step(T)
-        lo = ldexp(one(T), -B)
-        j0 = abs(n)
-        v = m >= 0 ? c^(j0 + n) * s^(j0 - n) : c^(j0 - n) * s^(j0 + n)
-        e = 0
-        cs = c * s
-        @inbounds for j in j0:(abs(m) - 1)
-            v *= r[j + 1, n + 3] * cs
-            if zero(T) < abs(v) < lo
-                v = ldexp(v, B)
-                e -= B
-            end
-        end
-        return ((m >= 0 && isodd(m - n)) ? -v : v), e
-    end
-    l0 = abs(n)
-    b = sqrt(T(_small_binomial(2l0, l0 + m)))
-    n > 0 && return b * c^(l0 + m) * s^(l0 - m), 0
-    return (isodd(m + l0) ? -b : b) * c^(l0 - m) * s^(l0 + m), 0
-end
-
-# `(d, dp, e)` with both significands shifted down by `2^B` once `|d|` passes 1 at `e < 0`; the values they
-# carry are unchanged. `|d^ℓ_{mn}| ≤ 1` and the recurrence grows `d` by a bounded factor per degree, so `d`
-# stays within `[2^−B, 1]` up to that factor while `e < 0`, and `e` returns to 0 once the value passes `2^−B`.
-@inline function _wigner_rescale(d::T, dp::T, e::Int) where {T}
-    (e < 0 && abs(d) > one(T)) || return d, dp, e
-    B = _exponent_step(T)
-    return ldexp(d, -B), ldexp(dp, -B), e + B
-end
-
-# The value `d·2^e`.
-@inline _wigner_value(d, e::Int) = iszero(e) ? d : ldexp(d, e)
-
-@inline function _small_binomial(a::Int, b::Int)
-    v = 1
-    for i in 1:b
-        v = v * (a - b + i) ÷ i
-    end
-    return v
-end
-
-# `d^{ℓ+1}_{mn}` from `d = d^ℓ_{mn}` and `dp = d^{ℓ−1}_{mn}` at `x = cos θ`, `ℓ ≥ 1`:
-# `d^{ℓ+1} = [(2ℓ+1)((ℓ+1)x − mn/ℓ) d^ℓ − ((ℓ+1)/ℓ) √((ℓ²−m²)(ℓ²−n²)) d^{ℓ−1}] / √(((ℓ+1)²−m²)((ℓ+1)²−n²))`.
-@inline function _wigner_next(d::T, dp::T, x::T, ℓ::Int, m::Int, n::Int, q) where {T}
-    am, an = abs(m) + 1, abs(n) + 1
-    @inbounds D = q[ℓ + 2, am] * q[ℓ + 2, an]
-    @inbounds P = q[ℓ + 1, am] * q[ℓ + 1, an]
-    return (T(2ℓ + 1) * (T(ℓ + 1) * x - T(m * n) / T(ℓ)) * d - T(ℓ + 1) / T(ℓ) * P * dp) / D
-end
-
 # Column `col`, order `m = col − L − 1`, of the analysis of `F`.
-@inline function _direct_analysis!(C, F, c, s, x, φ, w, nrm, q, r, L::Int, n::Int, col::Int)
-    T = eltype(x)
+# What the loops read, which their device kernels capture in place of the transforms.
+_direct_tables(tr::DirectSpinTransforms) =
+    (; tr.x, tr.xl, tr.u, tr.pos, tr.lc, tr.ls, tr.φ, tr.w, tr.norm, tr.starts, tr.coef, tr.transfer)
+
+@inline function _direct_analysis!(C, F, tr::NamedTuple, L::Int, n::Int, col::Int)
+    T = eltype(tr.x)
     m = col - L - 1
     l0 = max(abs(m), abs(n))
+    up, dn = FlowTransformBindings.wigner_d_bounds(T)
+    st = @inbounds tr.starts[col, n + 3]
+    coef, nrm = tr.coef, tr.norm
     z = zero(eltype(C))
     @inbounds for row in 1:(L + 1)
         C[row, col] = z
     end
-    @inbounds for k in 1:length(x)
-        f = F[k] * w[k]
+    @inbounds for k in eachindex(tr.x)
+        f = F[k] * tr.w[k]
         iszero(f) && continue
-        sn, cn = sincos(T(m) * φ[k])
+        sn, cn = sincos(T(m) * tr.φ[k])
         a = f * complex(cn, -sn)
-        xk = x[k]
-        d, e = _wigner_seed(m, n, c[k], s[k], r)
-        dp = zero(T)
-        C[l0 + 1, col] += a * (nrm[l0 + 1] * _wigner_value(d, e))
+        pos, u, x, xl = tr.pos[k], tr.u[k], tr.x[k], tr.xl[k]
+        y, sk = FlowTransformBindings.wigner_d_start_value(T, st, tr.lc[k], tr.ls[k])
+        e = _wigner_e0(y)
+        C[l0 + 1, col] += a * (nrm[l0 + 1] * y * _wigner_weight(sk, dn))
         for ℓ in l0:(L - 1)
-            dn = ℓ == 0 ? xk * d : _wigner_next(d, dp, xk, ℓ, m, n, q)
-            d, dp, e = _wigner_rescale(dn, d, e)
-            C[ℓ + 2, col] += a * (nrm[ℓ + 2] * _wigner_value(d, e))
+            y, e = _wigner_step(coef, ℓ, col, pos, u, x, xl, y, e)
+            y, e, sk = FlowTransformBindings.wigner_d_rescale(y, e, sk, up, dn)
+            C[ℓ + 2, col] += a * (nrm[ℓ + 2] * y * _wigner_weight(sk, dn))
         end
     end
     return nothing
 end
 
-# The synthesis at one cell, its `cos(θ/2)`, `sin(θ/2)`, `cos θ` and longitude given.
-@inline function _direct_synthesis(C, g, c::T, s::T, x::T, φ::T, nrm, q, r, L::Int, n::Int) where {T}
+# The synthesis at cell `k`.
+@inline function _direct_synthesis(C, tr::NamedTuple, L::Int, n::Int, k::Int)
+    T = eltype(tr.x)
+    up, dn = FlowTransformBindings.wigner_d_bounds(T)
+    coef, nrm, g = tr.coef, tr.norm, tr.transfer
+    @inbounds pos, u, x, xl, lc, ls, φ = tr.pos[k], tr.u[k], tr.x[k], tr.xl[k], tr.lc[k], tr.ls[k], tr.φ[k]
     acc = zero(Complex{T})
     @inbounds for m in -L:L
         l0 = max(abs(m), abs(n))
         col = m + L + 1
-        d, e = _wigner_seed(m, n, c, s, r)
-        dp = zero(T)
-        col_sum = C[l0 + 1, col] * (g[l0 + 1] * nrm[l0 + 1] * _wigner_value(d, e))
+        y, sk = FlowTransformBindings.wigner_d_start_value(T, tr.starts[col, n + 3], lc, ls)
+        e = _wigner_e0(y)
+        col_sum = C[l0 + 1, col] * (g[l0 + 1] * nrm[l0 + 1] * y * _wigner_weight(sk, dn))
         for ℓ in l0:(L - 1)
-            dn = ℓ == 0 ? x * d : _wigner_next(d, dp, x, ℓ, m, n, q)
-            d, dp, e = _wigner_rescale(dn, d, e)
-            col_sum += C[ℓ + 2, col] * (g[ℓ + 2] * nrm[ℓ + 2] * _wigner_value(d, e))
+            y, e = _wigner_step(coef, ℓ, col, pos, u, x, xl, y, e)
+            y, e, sk = FlowTransformBindings.wigner_d_rescale(y, e, sk, up, dn)
+            col_sum += C[ℓ + 2, col] * (g[ℓ + 2] * nrm[ℓ + 2] * y * _wigner_weight(sk, dn))
         end
         sn, cn = sincos(T(m) * φ)
         acc += col_sum * complex(cn, sn)

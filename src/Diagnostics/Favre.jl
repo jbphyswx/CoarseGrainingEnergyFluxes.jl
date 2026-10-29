@@ -34,7 +34,7 @@ function FavreWorkspace(
     z() = _zeros(at, T, gsz)
     return FavreWorkspace(
         z(), z(), z(), z(), z(), z(), z(), z(), z(), z(), z(), z(), z(), z(), z(), z(), z(),
-        z(), z(), ntuple(_ -> z(), 5), z(), z(), z(), at,
+        z(), z(), ntuple(_ -> z(), Val(5)), z(), z(), z(), at,
     )
 end
 
@@ -58,6 +58,7 @@ function compressible_flux!(
     deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _require_tangent_pair(grid, "compressible_flux!")
     plan = filter_plan === nothing ?
@@ -66,9 +67,9 @@ function compressible_flux!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, _resolve_deriv_plan(deriv_plan, output_grid(grid, plan)))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid))
 
-    Filtering.filter_apply_batch!((ws.ρ̄, ws.P̄, ws.ū, ws.v̄), (ρ, P, u, v), plan)
+    Fρ, FP, Fu, Fv = _filtered_with_spectra!((ws.ρ̄, ws.P̄, ws.ū, ws.v̄), (ρ, P, u, v), plan, dplan)
 
     # The filtered products land in `mx`, `my`, `τxx`, `τxy`, `τyy`, each finished in place below.
     p = ws.prods
@@ -77,7 +78,7 @@ function compressible_flux!(
     @. p[3] = ρ * u * u
     @. p[4] = ρ * u * v
     @. p[5] = ρ * v * v
-    Filtering.filter_apply_batch!((ws.mx, ws.my, ws.τxx, ws.τxy, ws.τyy), p, plan)
+    Fm = _filtered_with_spectra!((ws.mx, ws.my, ws.τxx, ws.τxy, ws.τyy), p, plan, dplan)
 
     # Favre velocities ũ_i = (ρu_i)‾/ρ̄, zero where no fluid lies under the kernel.
     @. ws.ũ = _favre(ws.mx, ws.ρ̄)
@@ -85,9 +86,9 @@ function compressible_flux!(
 
     # ρ̄ ∂_j ũ_i = ∂_j (ρu_i)‾ − ũ_i ∂_j ρ̄, differencing only fields defined at every cell. `Px`/`Py`
     # hold ∇ρ̄ until ∇P̄ replaces it.
-    _grad2!(ws.ux, ws.uy, ws.mx, og, dplan, b)
-    _grad2!(ws.vx, ws.vy, ws.my, og, dplan, b)
-    _grad2!(ws.Px, ws.Py, ws.ρ̄, og, dplan, b)
+    _grad2_route!(ws.ux, ws.uy, ws.mx, Fm[1], og, dplan, b, plan)
+    _grad2_route!(ws.vx, ws.vy, ws.my, Fm[2], og, dplan, b, plan)
+    _grad2_route!(ws.Px, ws.Py, ws.ρ̄, Fρ, og, dplan, b, plan)
     @. ws.ux -= ws.ũ * ws.Px
     @. ws.uy -= ws.ũ * ws.Py
     @. ws.vx -= ws.ṽ * ws.Px
@@ -107,11 +108,11 @@ function compressible_flux!(
     @. ws.Π = ifelse(mask,
         -(ws.ux * ws.τxx + (ws.uy + ws.vx) * ws.τxy + ws.vy * ws.τyy), zero(T))
     # Λ = (1/ρ̄) ∂_j P̄ · τ̄(ρ,u_j) — baropycnal work.
-    _grad2!(ws.Px, ws.Py, ws.P̄, og, dplan, b)
+    _grad2_route!(ws.Px, ws.Py, ws.P̄, FP, og, dplan, b, plan)
     @. ws.Λ = ifelse(mask, _favre(ws.Px * ws.mx + ws.Py * ws.my, ws.ρ̄), zero(T))
     # P̄ ∇·ū; the spent `τxx` takes the two gradient components the divergence does not read.
-    _grad2!(ws.prod, ws.τxx, ws.ū, og, dplan, b)
-    _grad2!(ws.τxx, ws.fbuf, ws.v̄, og, dplan, b)
+    _grad2_route!(ws.prod, ws.τxx, ws.ū, Fu, og, dplan, b, plan)
+    _grad2_route!(ws.τxx, ws.fbuf, ws.v̄, Fv, og, dplan, b, plan)
     @. ws.PD = ifelse(mask, ws.P̄ * (ws.prod + ws.fbuf), zero(T))
 
     return (; Π = ws.Π, Λ = ws.Λ, pressure_dilatation = ws.PD,
@@ -177,18 +178,17 @@ function compressible_flux(
     scale::T;
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+    method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     gsz = FlowGeometries.Grids.size_tuple(grid)
     for (nm, a) in (("u", u), ("v", v), ("ρ", ρ), ("P", P))
         size(a) == gsz || throw(DimensionMismatch("$nm has size $(size(a)), grid expects $gsz"))
     end
-    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution)
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy, execution, method)
     ws = FavreWorkspace(grid; execution = Filtering.plan_execution(plan))
     _require_positive_density(ρ, ws.at)
-    return compressible_flux!(
-        ws, u, v, ρ, P, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = Derivatives.derivative_plan(output_grid(grid, plan)),
-    )
+    return compressible_flux!(ws, u, v, ρ, P, grid, kernel, scale; filter_plan = plan, derivative = derivative)
 end
 
 """
@@ -229,7 +229,7 @@ function SphericalFavreWorkspace(
     vector_filter::Union{Nothing,Filtering.AbstractVectorFilter} = nothing,
     transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
     nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
+) where {T<:AbstractFloat, G<:_CurvedSurface{T}}
     at = Placement(grid; execution = execution)
     spin = _workspace_spin(grid, at, vector_filter, transform, nufft)
     gsz = FlowGeometries.Grids.size_tuple(grid)
@@ -275,22 +275,22 @@ function compressible_flux(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     vector_filter::Union{Nothing, Filtering.AbstractVectorFilter} = nothing,
     transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
+) where {T<:AbstractFloat, G<:_CurvedSurface{T}}
     gsz = FlowGeometries.Grids.size_tuple(grid)
     for (nm, a) in (("u", u), ("v", v), ("ρ", ρ), ("P", P))
         size(a) == gsz || throw(DimensionMismatch("$nm has size $(size(a)), grid expects $gsz"))
     end
-    dplan = Derivatives.derivative_plan(output_grid(grid, mask_strategy))
     vf = Filtering.resolve_vector_filter(grid, mask_strategy, vector_filter)
     if vf isa Filtering.GeneralizedConvolution
         ws = SphericalFavreWorkspace(grid; execution = execution, vector_filter = vf, transform = transform)
         _require_positive_density(ρ, ws.at)
-        return compressible_flux!(ws, u, v, ρ, P, grid, kernel, scale; mask_strategy, deriv_plan = dplan)
+        return compressible_flux!(ws, u, v, ρ, P, grid, kernel, scale; mask_strategy, derivative)
     end
     plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy, execution, transform)
     ws = SphericalFavreWorkspace(grid; execution = Filtering.plan_execution(plan), vector_filter = vf)
     _require_positive_density(ρ, ws.at)
-    return compressible_flux!(ws, u, v, ρ, P, grid, kernel, scale; filter_plan = plan, deriv_plan = dplan)
+    return compressible_flux!(ws, u, v, ρ, P, grid, kernel, scale; filter_plan = plan, derivative)
 end
 
 """
@@ -313,64 +313,76 @@ function compressible_flux!(
     deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
+) where {T<:AbstractFloat, G<:_CurvedSurface{T}}
     _require_tangent_pair(grid, "compressible_flux!")
     plan = _plan_for(ws.spin, filter_plan, mask_strategy,
                      () -> Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution))
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, _resolve_deriv_plan(deriv_plan, output_grid(grid, plan)))
-    pr, τ, loc = ws.prod, ws.τ, ws.loc
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid))
+    τ, loc, S = ws.τ, ws.loc, ws.S
     sf = _spin_of(ws.spin, plan)
     if sf === nothing
-        _cartesian_favre_parts!(ws, u, v, ρ, P, plan, og, b)
+        _cartesian_favre_parts!(ws, u, v, ρ, P, grid, plan, _output_frames(ws.at, plan), dplan, b)
+        _favre_derivatives!(ws, og, dplan, b)
     else
-        _spin_favre_parts!(ws, sf, u, v, ρ, P, kernel, scale)
+        _spin_favre_parts!(ws, sf, u, v, ρ, P, kernel, scale, og, dplan, b)
     end
 
+    # The derivatives are held as `S = S(ρ̄ũ)`, `(Px, Py) = ∇ρ̄`, `(Λ, PD) = ∇P̄` and `Π = ∇·ū`, each the
+    # derivative of a field defined at every cell; `∇·ū = tr S(ū)` carries the frame's curvature.
     mask = FlowGeometries.Grids.mask(og)
-    # Π = −ρ̄ S(ũ):τ̃, with ρ̄ S(ũ) = S(ρ̄ũ) − sym(ũ ⊗ ∇ρ̄) differencing only fields defined at every
-    # cell. The product buffers are free once the stress is filtered.
-    @. pr[1] = ws.ρ̄ * loc[1]
-    @. pr[2] = ws.ρ̄ * loc[2]
-    g = (pr[3], pr[4])
-    _strain_into!(ws.S[1], ws.S[2], ws.S[3], pr[1], pr[2], g, og, dplan, b)
-    _grad2!(ws.Px, ws.Py, ws.ρ̄, og, dplan, b)
-    @. ws.S[1] -= loc[1] * ws.Px
-    @. ws.S[2] -= T(0.5) * (loc[1] * ws.Py + loc[2] * ws.Px)
-    @. ws.S[3] -= loc[2] * ws.Py
-    @. ws.Π = ifelse(mask, -_sfs_contraction(
-        ws.S[1], ws.S[2], ws.S[3], τ[1], τ[2], τ[3]), zero(T))
-
-    _grad2!(ws.Px, ws.Py, ws.P̄, og, dplan, b)
-    @. ws.Λ = ifelse(mask, _favre(ws.Px * ws.mloc[1] + ws.Py * ws.mloc[2], ws.ρ̄), zero(T))
-
-    # ∇·ū = tr S(ū), the frame's curvature term included.
-    _strain_into!(ws.S[1], ws.S[2], ws.S[3], loc[3], loc[4], g, og, dplan, b)
-    @. ws.PD = ifelse(mask, ws.P̄ * (ws.S[1] + ws.S[3]), zero(T))
+    @. ws.Λ = ifelse(mask, _favre(ws.Λ * ws.mloc[1] + ws.PD * ws.mloc[2], ws.ρ̄), zero(T))
+    @. ws.PD = ifelse(mask, ws.P̄ * ws.Π, zero(T))
+    # Π = −ρ̄ S(ũ):τ̃, with ρ̄ S(ũ) = S(ρ̄ũ) − sym(ũ ⊗ ∇ρ̄).
+    @. S[1] -= loc[1] * ws.Px
+    @. S[2] -= T(0.5) * (loc[1] * ws.Py + loc[2] * ws.Px)
+    @. S[3] -= loc[2] * ws.Py
+    @. ws.Π = ifelse(mask, -_sfs_contraction(S[1], S[2], S[3], τ[1], τ[2], τ[3]), zero(T))
 
     return (; Π = ws.Π, Λ = ws.Λ, pressure_dilatation = ws.PD,
             ρ̄ = ws.ρ̄, P̄ = ws.P̄, ũ = loc[1], ṽ = loc[2])
 end
 
+# The derivatives `compressible_flux!` contracts, differenced by `dplan` from the filtered fields. The product
+# buffers are free once the stress is filtered.
+function _favre_derivatives!(ws::SphericalFavreWorkspace, og, dplan, b)
+    pr, loc, S = ws.prod, ws.loc, ws.S
+    g = (pr[3], pr[4])
+    _strain_into!(S[1], S[2], S[3], loc[3], loc[4], g, og, dplan, b)
+    @. ws.Π = S[1] + S[3]
+    _grad2!(ws.Λ, ws.PD, ws.P̄, og, dplan, b)
+    _grad2!(ws.Px, ws.Py, ws.ρ̄, og, dplan, b)
+    @. pr[1] = ws.ρ̄ * loc[1]
+    @. pr[2] = ws.ρ̄ * loc[2]
+    _strain_into!(S[1], S[2], S[3], pr[1], pr[2], g, og, dplan, b)
+    return nothing
+end
+
+# Under the series route `_cartesian_favre_parts!` takes them.
+_favre_derivatives!(::SphericalFavreWorkspace, _og, ::SeriesStrain, _b) = nothing
+
 # `ρ̄`, `P̄`, the local Favre and unweighted velocity pairs, the unweighted mass flux and the local Favre
-# stress, by the ambient Cartesian components.
-function _cartesian_favre_parts!(ws::SphericalFavreWorkspace, u, v, ρ, P, plan, og, b)
+# stress, by the ambient Cartesian components; under the series route `route` also the derivatives
+# `_favre_derivatives!` holds.
+function _cartesian_favre_parts!(ws::SphericalFavreWorkspace, u, v, ρ, P, grid, plan, frames, route, b)
     p, bp, m, up, pr, τ, loc = ws.p, ws.bp, ws.m, ws.up, ws.prod, ws.τ, ws.loc
-    _to_ambient!(p, u, v, nothing, ws.at.grid, b)
+    _to_ambient!(p, u, v, nothing, ws.at.frames, b)
     for c in 1:3
         @. pr[c] = ρ * p[c]
     end
-    Filtering.filter_apply_batch!(
+    F = _filtered_with_spectra!(
         (ws.ρ̄, ws.P̄, bp[1], bp[2], bp[3], m[1], m[2], m[3]),
-        (ρ, P, p[1], p[2], p[3], pr[1], pr[2], pr[3]), plan,
+        (ρ, P, p[1], p[2], p[3], pr[1], pr[2], pr[3]), plan, route,
     )
 
     for (k, (i1, i2)) in enumerate(_SYM3)
         @. pr[k] = ρ * p[i1] * p[i2]
     end
     Filtering.filter_apply_batch!(τ, pr, plan)
+    _favre_series_derivatives!(ws, F, grid, frames, route, plan, b)
 
     # Favre velocity ũ_i = (ρu_i)‾/ρ̄, read before `m` becomes the unweighted mass flux τ̄(ρ,u_i).
     for c in 1:3
@@ -381,22 +393,47 @@ function _cartesian_favre_parts!(ws::SphericalFavreWorkspace, u, v, ρ, P, plan,
         @. τ[k] = _favre(τ[k], ws.ρ̄) - up[i1] * up[i2]
     end
 
-    _rotate_moments_to_local!((τ,), og, Val(3), b)
-    _ambient_to_local!((loc[1], loc[2]), up, og, b)
-    _ambient_to_local!((loc[3], loc[4]), bp, og, b)
-    _ambient_to_local!(ws.mloc, m, og, b)
+    _rotate_moments_to_local!((τ,), frames, Val(3), b)
+    _ambient_to_local!((loc[1], loc[2]), up, frames, b)
+    _ambient_to_local!((loc[3], loc[4]), bp, frames, b)
+    _ambient_to_local!(ws.mloc, m, frames, b)
     return nothing
 end
 
-# The same by the generalized convolution: `ρ` and `P` at spin 0, `u` and `ρu` at spin 1, `ρu⊗u` at spins
-# 2 and 0, one `Ĝ(n)` for all.
-function _spin_favre_parts!(ws::SphericalFavreWorkspace, sf::SpinFilter, u, v, ρ, P, kernel, scale)
-    τ, loc, m = ws.τ, ws.loc, ws.mloc
+# The derivatives `_favre_derivatives!` holds, from the filter's series while `bp` and `m` hold `ū` and `(ρu)‾`:
+# `S(ρ̄ũ)` is the strain of `(ρu)‾`. The product and velocity buffers are free once the stress is filtered.
+_favre_series_derivatives!(_ws, _F, _grid, _fr, _route, _plan, _b) = nothing
+
+function _favre_series_derivatives!(ws::SphericalFavreWorkspace{T}, F, grid, fr, route::SeriesStrain, plan, b) where {T}
+    p, pr, S = ws.p, ws.prod, ws.S
+    Ge, Gn = (pr[1], pr[2], pr[3]), (pr[4], pr[5], pr[6])
+    R = _sphere_radius(grid, T)
+    FlowGeometries.Operators.to_local!(p[2], p[3], p[1], ws.bp[1], ws.bp[2], ws.bp[3], fr; execution = b)
+    _ambient_series_strain!((S[1], S[3], S[2]), Ge, Gn, (F[3], F[4], F[5]), ws.bp, p[1], fr, R, route, plan, b)
+    @. ws.Π = S[1] + S[3]
+    FlowGeometries.Operators.to_local!(p[2], p[3], p[1], ws.m[1], ws.m[2], ws.m[3], fr; execution = b)
+    _ambient_series_strain!((S[1], S[3], S[2]), Ge, Gn, (F[6], F[7], F[8]), ws.m, p[1], fr, R, route, plan, b)
+    Filtering.filter_synthesize_gradient!(ws.Px, ws.Py, F[1], ws.ρ̄, plan, route.gradient)
+    Filtering.filter_synthesize_gradient!(ws.Λ, ws.PD, F[2], ws.P̄, plan, route.gradient)
+    return nothing
+end
+
+# The same by the generalized convolution, `ρ` and `P` at spin 0, `u` and `ρu` at spin 1, `ρu⊗u` at spins
+# 2 and 0, one `Ĝ(n)` for all; and the derivatives `_favre_derivatives!` holds, by `dplan`, each taken
+# before the next filter replaces the coefficients it reads. `S(ρ̄ũ)` is the strain of `(ρu)‾`.
+function _spin_favre_parts!(ws::SphericalFavreWorkspace, sf::SpinFilter, u, v, ρ, P, kernel, scale, og, dplan, b)
+    τ, loc, m, S = ws.τ, ws.loc, ws.mloc, ws.S
+    g = (ws.prod[3], ws.prod[4])
     _spin_transfer!(sf, kernel, scale)
     _spin_scalar!(ws.ρ̄, sf, true, k -> @inbounds(ρ[k]))
+    _spin_grad2!(ws.Px, ws.Py, ws.ρ̄, sf, og, dplan, b)
     _spin_scalar!(ws.P̄, sf, true, k -> @inbounds(P[k]))
+    _spin_grad2!(ws.Λ, ws.PD, ws.P̄, sf, og, dplan, b)
     _spin_vector!(loc[3], loc[4], u, v, sf, true)
+    _spin_strain2!((S[1], S[3], S[2]), loc[3], loc[4], sf, og, dplan, g, b)
+    @. ws.Π = S[1] + S[3]
     _spin_filter!(m[1], m[2], sf, 1, true, k -> @inbounds(ρ[k] * complex(u[k], v[k])), 0)
+    _spin_strain2!((S[1], S[3], S[2]), m[1], m[2], sf, og, dplan, g, b)
     _spin_tensor!(τ[1], τ[2], τ[3], sf, true, k -> @inbounds(ρ[k] * complex(u[k], v[k])^2),
                   k -> @inbounds(ρ[k] * (u[k]^2 + v[k]^2)), 0)
     # Favre velocity ũ = (ρu)‾/ρ̄, read before `m` becomes the unweighted mass flux τ̄(ρ,u).
@@ -441,9 +478,10 @@ function Favre3DWorkspace(
     at = Placement(grid; execution = execution)
     gsz = FlowGeometries.Grids.size_tuple(grid)
     z() = _zeros(at, T, gsz)
-    t(n) = ntuple(_ -> z(), n)
+    t3() = (z(), z(), z())
+    t6() = (t3()..., t3()...)
     return Favre3DWorkspace(
-        t(3), t(3), t(3), t(3), t(6), t(6), t(6), t(3), t(3), t(3), z(), z(), z(), z(), z(), at,
+        t3(), t3(), t3(), t3(), t6(), t6(), t6(), t3(), t3(), t3(), z(), z(), z(), z(), z(), at,
     )
 end
 
@@ -474,18 +512,17 @@ function compressible_flux(
     scale::T;
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+    method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     gsz = FlowGeometries.Grids.size_tuple(grid)
     for (nm, a) in (("u", u), ("v", v), ("w", w), ("ρ", ρ), ("P", P))
         size(a) == gsz || throw(DimensionMismatch("$nm has size $(size(a)), grid expects $gsz"))
     end
-    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution)
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy, execution, method)
     ws = Favre3DWorkspace(grid; execution = Filtering.plan_execution(plan))
     _require_positive_density(ρ, ws.at)
-    return compressible_flux!(
-        ws, u, v, w, ρ, P, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = Derivatives.derivative_plan(output_grid(grid, plan)),
-    )
+    return compressible_flux!(ws, u, v, w, ρ, P, grid, kernel, scale; filter_plan = plan, derivative = derivative)
 end
 
 """
@@ -508,23 +545,24 @@ function compressible_flux!(
     deriv_plan::Union{Nothing,FlowGeometries.Operators.StencilPlans} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution) :
         filter_plan
     _check_placement(ws.at, plan)
     b = ws.at.execution
-    og = _output(ws.at, plan)
-    dplan = _placed(ws.at, deriv_plan === nothing ? Derivatives.derivative_plan(output_grid(grid, plan)) : deriv_plan)
+    og, fr = _output(ws.at, plan), _output_frames(ws.at, plan)
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid))
     p, bp, m, up, pr, τ = ws.p, ws.bp, ws.m, ws.up, ws.prod, ws.τ
 
-    _fill_tau3_velocity!(p, u, v, w, ws.at.grid, b)
+    _fill_tau3_velocity!(p, u, v, w, ws.at.grid, ws.at.frames, b)
     for c in 1:3
         @. pr[c] = ρ * p[c]
     end
-    Filtering.filter_apply_batch!(
+    F = _filtered_with_spectra!(
         (ws.ρ̄, ws.P̄, bp[1], bp[2], bp[3], m[1], m[2], m[3]),
-        (ρ, P, p[1], p[2], p[3], pr[1], pr[2], pr[3]), plan,
+        (ρ, P, p[1], p[2], p[3], pr[1], pr[2], pr[3]), plan, dplan,
     )
     for (k, (i1, i2)) in enumerate(_SYM3)
         @. pr[k] = ρ * p[i1] * p[i2]
@@ -540,9 +578,9 @@ function compressible_flux!(
         @. τ[k] = _favre(τ[k], ws.ρ̄) - up[i1] * up[i2]
     end
 
-    _rotate_tau3_to_local!((τ,), og, b)
-    _localize_triple!(ws.loc, up, og, b)
-    _localize_triple!(ws.mloc, m, og, b)
+    _rotate_tau3_to_local!((τ,), og, fr, b)
+    _localize_triple!(ws.loc, up, og, fr, b)
+    _localize_triple!(ws.mloc, m, og, fr, b)
 
     # ρ̄ S(ũ) = S(ρ̄ũ) − sym(ũ ⊗ ∇ρ̄), differencing only fields defined at every cell. The product
     # buffers are free once the stress is filtered; `g` holds ∇ρ̄ until ∇P̄ replaces it.
@@ -552,8 +590,10 @@ function compressible_flux!(
     for c in 1:3
         @. ρũ[c] = ws.ρ̄ * ws.loc[c]
     end
-    _strain_sym3!(ws.S, ρũ, og, dplan, ub, b)
-    _grad3!(ws.g, ws.ρ̄, og, dplan, b)
+    # On a Cartesian volume `ρ̄ũ` is the filtered `(ρu)‾` wherever fluid lies under the kernel, so its series
+    # is that of `(ρu)‾`; a shell's local frame has no series form and takes the physical route.
+    _strain_sym3!(ws.S, ρũ, og, dplan, ub, b, (F[6], F[7], F[8]), plan)
+    _grad3_route!(ws.g, ws.ρ̄, F[1], og, dplan, b, plan)
     for (k, (i1, i2)) in enumerate(_SYM3)
         @. ws.S[k] -= T(0.5) * (ws.loc[i1] * ws.g[i2] + ws.loc[i2] * ws.g[i1])
     end
@@ -561,23 +601,24 @@ function compressible_flux!(
         ws.S[1], ws.S[2], ws.S[3], ws.S[4], ws.S[5], ws.S[6],
         τ[1], τ[2], τ[3], τ[4], τ[5], τ[6]), zero(T))
 
-    _grad3!(ws.g, ws.P̄, og, dplan, b)
+    _grad3_route!(ws.g, ws.P̄, F[2], og, dplan, b, plan)
     @. ws.Λ = ifelse(mask,
         _favre(ws.g[1] * ws.mloc[1] + ws.g[2] * ws.mloc[2] + ws.g[3] * ws.mloc[3], ws.ρ̄), zero(T))
 
     # ∇·ū = tr S(ū), a shell's curvature terms included.
-    _localize_triple!(ub, bp, og, b)
-    _strain_sym3!(ws.S, ub, og, dplan, ρũ, b)
+    _localize_triple!(ub, bp, og, fr, b)
+    _strain_sym3!(ws.S, ub, og, dplan, ρũ, b, (F[3], F[4], F[5]), plan)
     @. ws.PD = ifelse(mask, ws.P̄ * (ws.S[1] + ws.S[4] + ws.S[6]), zero(T))
 
     return (; Π = ws.Π, Λ = ws.Λ, pressure_dilatation = ws.PD,
             ρ̄ = ws.ρ̄, P̄ = ws.P̄, ũ = ws.loc[1], ṽ = ws.loc[2], w̃ = ws.loc[3])
 end
 
-# A volume's filtered triple in its local frame, `grid` held where the backend `be` runs: a Cartesian
-# volume's already is; a shell's ambient Cartesian triple is rotated to (east, north, up).
+# A volume's filtered triple in its local frame, `grid` and its frame plan `frames` held where the backend
+# `be` runs: a Cartesian volume's already is; a shell's ambient Cartesian triple is rotated to (east, north,
+# up).
 function _localize_triple!(
-    dst, src, ::FlowGeometries.Grids.StructuredGrid{T,G,3}, _be,
+    dst, src, ::FlowGeometries.Grids.StructuredGrid{T,G,3}, _frames, _be,
 ) where {T, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     for c in 1:3
         @. dst[c] = src[c]
@@ -586,8 +627,8 @@ function _localize_triple!(
 end
 
 _localize_triple!(
-    dst, src, grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, be,
-) where {T, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}} = _ambient_to_local!(dst, src, grid, be)
+    dst, src, ::FlowGeometries.Grids.StructuredGrid{T,G,3}, frames, be,
+) where {T, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}} = _ambient_to_local!(dst, src, frames, be)
 
 # A density-weighted mean `x/ρ̄`, zero where no fluid lies under the kernel (`ρ̄ = 0` there under
 # `ZeroFill`, and at a masked target under `Deformable`).

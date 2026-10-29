@@ -1,0 +1,11 @@
+module CoarseGrainingEnergyFluxesDelaunayTriangulationExt
+
+using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
+using DelaunayTriangulation: DelaunayTriangulation as DT
+
+
+
+
+
+
+end # module CoarseGrainingEnergyFluxesDelaunayTriangulationExt

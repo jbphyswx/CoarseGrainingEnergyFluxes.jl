@@ -400,8 +400,8 @@ end
 # A uniform axis: one stencil for every position. Its constant cell width cancels in the normalization,
 # so the table is in units of it, as the other kernels' uniform tables are.
 function _separable_axis_weights(
-    x::AbstractRange{T}, lim::Int, ::Bool, ::T, kernel::Kernels.HighOrderKernel, scale::T,
-    ::AbstractVector{T},
+    ::FlowGeometries.Axes.UniformSpacing, x::AbstractVector{T}, lim::Int, ::Bool, ::T,
+    kernel::Kernels.HighOrderKernel, scale::T, ::AbstractVector{T},
 ) where {T<:AbstractFloat}
     Δ = abs(T(step(x)))
     ss = [T(d) * Δ for d in -lim:lim]
@@ -411,7 +411,14 @@ function _separable_axis_weights(
 end
 
 function _separable_axis_weights(
-    x::AbstractVector{T}, lim::Int, periodic::Bool, period::T,
+    x::AbstractRange{T}, lim::Int, periodic::Bool, period::T,
+    kernel::Kernels.HighOrderKernel, scale::T, wfac::AbstractVector{T},
+) where {T<:AbstractFloat}
+    return _separable_axis_weights(FlowGeometries.Axes.UniformSpacing(), x, lim, periodic, period, kernel, scale, wfac)
+end
+
+function _separable_axis_weights(
+    ::FlowGeometries.Axes.NonuniformSpacing, x::AbstractVector{T}, lim::Int, periodic::Bool, period::T,
     kernel::Kernels.HighOrderKernel, scale::T, wfac::AbstractVector{T},
 ) where {T<:AbstractFloat}
     n = length(x)
@@ -428,6 +435,13 @@ function _separable_axis_weights(
         end
     end
     return g
+end
+
+function _separable_axis_weights(
+    x::AbstractVector{T}, lim::Int, periodic::Bool, period::T,
+    kernel::Kernels.HighOrderKernel, scale::T, wfac::AbstractVector{T},
+) where {T<:AbstractFloat}
+    return _separable_axis_weights(FlowGeometries.Axes.NonuniformSpacing(), x, lim, periodic, period, kernel, scale, wfac)
 end
 
 # On a stretched axis a position's weights, continued cells included, come from one correction, so a
@@ -561,10 +575,16 @@ the ring, while no support reaches the seam where the continuation closes.
 function _highorder_shares_rows(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.HighOrderKernel, scale::T,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
-    FlowGeometries.Grids.coordinates(grid, 1) isa AbstractRange || return false
-    FlowGeometries.Grids.isperiodic(grid, 1) && return true
     rad = _query_radius(grid, kernel, scale)
-    lattice = _ho_lattice(grid, rad)
+    return _highorder_shares_rows(grid, rad, _ho_lattice(grid, rad))
+end
+
+_highorder_shares_rows(_, _, _) = false
+
+# The same, given the query radius and the continued lattice ([`_ho_lattice`](@ref)).
+function _highorder_shares_rows(grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, rad::T, lattice) where {T,G}
+    FlowGeometries.Grids.isuniform(grid, 1) || return false
+    FlowGeometries.Grids.isperiodic(grid, 1) && return true
     (lattice !== nothing && lattice[3][1]) || return false
     lat, lo, _, mt = lattice
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
@@ -572,8 +592,6 @@ function _highorder_shares_rows(
     reach = min(lo[1], FlowGeometries.Grids.size_tuple(lat)[1] - lo[1] - Nx) - 1
     return all(j -> FlowGeometries.Connectivity.metric_window(lat, (1 + lo[1], j + lo[2]), rad, mt)[1] <= reach, 1:Ny)
 end
-
-_highorder_shares_rows(_, _, _) = false
 
 """
     _highorder_rows(grid, kernel, scale) -> (di, dj, w, ptr, mass) or nothing
@@ -584,15 +602,23 @@ support's, the continued lattice included. `nothing` where the targets of a row 
 correction ([`_highorder_shares_rows`](@ref)).
 """
 function _highorder_rows(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.HighOrderKernel{P}, scale::T,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}, P}
-    _highorder_shares_rows(grid, kernel, scale) || return nothing
-    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.HighOrderKernel, scale::T,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
     rad = _query_radius(grid, kernel, scale)
     lattice = _ho_lattice(grid, rad)
+    _highorder_shares_rows(grid, rad, lattice) || return nothing
+    lattice === nothing && return _highorder_rows_on(grid, (0, 0), _query_topology(grid, rad), grid, kernel, scale, rad)
+    return _highorder_rows_on(lattice[1], lattice[2], lattice[4], grid, kernel, scale, rad)
+end
+
+# The rows over `lat`, the grid itself or its continued lattice, whose cell `I + lo` is grid cell `I`; `mt`
+# is the topology its folds use.
+function _highorder_rows_on(
+    lat::FlowGeometries.Grids.StructuredGrid, lo::NTuple{2,Int}, mt,
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.HighOrderKernel{P}, scale::T, rad::T,
+) where {T<:AbstractFloat, G, P}
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     periodic = FlowGeometries.Grids.isperiodic(grid, 1)
-    lat, lo, mt = lattice === nothing ? (grid, (0, 0), _query_topology(grid, rad)) :
-                  (lattice[1], lattice[2], lattice[4])
     nλ = FlowGeometries.Grids.size_tuple(lat)[1]
     sup = _ho_support(grid, kernel, scale)
     h = Kernels.kernel_radius(kernel, scale)

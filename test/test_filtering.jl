@@ -3,7 +3,6 @@
 # strategies and on every execution backend, equals the direct sum over the lattice continued past the
 # grid's bounded edges (`_cgef_direct_filter`) or over the grid's own cells (`_cgef_cellset_filter`).
 
-const _CGEF_SERIAL = CGEF.ComputationalBackends.SerialBackend()
 const _CGEF_PARALLEL = (CGEF.ComputationalBackends.ThreadedBackend(), CGEF.ComputationalBackends.GPUBackend(KA.CPU()),
                         CGEF.ComputationalBackends.DistributedBackend(), CGEF.ComputationalBackends.MPIBackend())
 
@@ -27,12 +26,8 @@ const _CGEF_ENGINE_REPORT = Dict(
 _cgef_alloc_apply(out, f, plan) = @allocated CGEF.Filtering.filter_apply!(out, f, plan)
 _cgef_alloc_batch(outs, fs, plan) = @allocated CGEF.Filtering.filter_apply_batch!(outs, fs, plan)
 
-_cgef_field(sz) = [sin(1.3 * I[1] + 0.7 * get(Tuple(I), 2, 0) + 0.4 * get(Tuple(I), 3, 0)) + 0.2
-                   for I in CartesianIndices(sz)]
-
-# `engine` is the footprint type the serial plan must build. A box-truncated separable engine differs
-# from the disk-truncated reference by the kernel's weight past its radius, below 1e-9 of its peak for
-# the Gaussian.
+# `engine` is the footprint type the serial plan must build. `check_setup` reports the engine Auto takes, so a
+# row that names its engine skips that check.
 function _cgef_engine_matches(grid, kernel, ℓ, engine; reference = _cgef_direct_filter, rtol = 1e-11,
                               method = CGEF.Filtering.RealSpace(), kw...)
     f = _cgef_field(size(FG.Grids.mask(grid)))
@@ -43,8 +38,9 @@ function _cgef_engine_matches(grid, kernel, ℓ, engine; reference = _cgef_direc
         p = plan(_CGEF_SERIAL)
         built = nameof(typeof(p.footprint))
         built === engine || error("$(nameof(typeof(grid))), $(nameof(typeof(kernel))), ℓ = $ℓ builds $built, not $engine")
-        Test.@test occursin(_CGEF_ENGINE_REPORT[engine],
-                            CGEF.check_setup(grid, kernel, ℓ; method, mask_strategy = strategy, execution = _CGEF_SERIAL).engine)
+        haskey(kw, :engine) ||
+            Test.@test occursin(_CGEF_ENGINE_REPORT[engine],
+                                CGEF.check_setup(grid, kernel, ℓ; method, mask_strategy = strategy, execution = _CGEF_SERIAL).engine)
         out = CGEF.Filtering.filter_apply!(zero(f), f, p)
         Test.@test _cgef_relerr(out, ref) < rtol
         Test.@test minimum(_ -> _cgef_alloc_apply(out, f, p), 1:2) == 0
@@ -58,224 +54,25 @@ function _cgef_engine_matches(grid, kernel, ℓ, engine; reference = _cgef_direc
     end
 end
 
-const _CGEF_TH = CGEF.TopHatKernel()
-const _CGEF_GA = CGEF.GaussianKernel()
-const _CGEF_SH = CGEF.Kernels.SmoothHatKernel()
-const _CGEF_SS = CGEF.SharpSpectralKernel()
-const _CGEF_CACHES = (CGEF.Filtering.AlwaysCache(), CGEF.Filtering.NeverCache())
-_cgef_hole(sz) = (m = trues(sz); m[5:8, 3:5] .= false; m)
+_cgef_engine_matches(r) =
+    _cgef_engine_matches(r.grid, r.kernel, r.ℓ, r.engine; reference = r.reference, rtol = r.rtol, r.kw...)
 
-# Top-hat radii here sit off every distance between cells, so no cell lies on a support boundary.
+# The device, Distributed and MPI plans of every grid take the kernel's own engine.
 Test.@testset "Real-space engines on Cartesian grids" begin
-    cart = FG.Geometry.CartesianGeometry()
-    xs = cumsum([0.0, 1.1, 0.8, 1.3, 0.9, 1.2, 0.7, 1.0, 1.1, 0.95, 1.05, 1.15, 0.85])
-
-    # Periods 16 and 8.4; the supports reach one, two and five periods, and a periodic Cartesian direction
-    # counts a cell once per image.
-    # Each kernel takes its own engine (prefix sums, separable passes, the banded sum) while that costs
-    # fewer operations than the padded transform, and the transform past it; the device, Distributed and
-    # MPI plans of every grid take the kernel's own engine.
-    gp = FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:7.7; periodic = (true, true))
-    _cgef_engine_matches(gp, _CGEF_TH, 1.5, :PrefixSumTopHatPlan)
-    _cgef_engine_matches(gp, _CGEF_SH, 1.5, :FilterFootprint)
-    _cgef_engine_matches(gp, _CGEF_GA, 1.5, :SeparableFootprint; rtol = 1e-8)
-    for ℓ in (4.8, 19.2, 40.8)
-        _cgef_engine_matches(gp, _CGEF_TH, ℓ, :PaddedFFTFootprint)
-        _cgef_engine_matches(gp, _CGEF_SH, ℓ, :PaddedFFTFootprint)
-    end
-    _cgef_engine_matches(gp, _CGEF_GA, 4.8, :PaddedFFTFootprint; rtol = 1e-8)
-
-    # Three rows along a period of 64: the prefix sums cost less than the transform at any support, here
-    # within one period and past one, two and five.
-    gt = FG.Grids.StructuredGrid(cart, 0.0:1.0:63.0, 0.0:0.7:1.4; periodic = (true, false))
-    for ℓ in (20.3, 70.3, 140.7, 330.1)
-        _cgef_engine_matches(gt, _CGEF_TH, ℓ, :PrefixSumTopHatPlan)
-    end
-
-    # Bounded, with the support past more than half the rows, unmasked and masked.
-    gb = FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:2.8)
-    gbm = FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:4.9, _cgef_hole((16, 8)))
-    for g in (gb, gbm)
-        for ℓ in (4.8, 9.6)
-            _cgef_engine_matches(g, _CGEF_TH, ℓ, :PrefixSumTopHatPlan)
-            _cgef_engine_matches(g, _CGEF_GA, ℓ, :SeparableFootprint; rtol = 1e-8)
-        end
-        _cgef_engine_matches(g, _CGEF_SH, 1.5, :FilterFootprint)
-        _cgef_engine_matches(g, _CGEF_SH, 19.2, :PaddedFFTFootprint)
-    end
-
-    # Stretched axes, bounded and periodic, and the same cells stored in descending order.
-    gs = FG.Grids.StructuredGrid(cart, xs, collect(0.0:0.7:4.9), _cgef_hole((13, 8)))
-    gd = FG.Grids.StructuredGrid(cart, reverse(xs), collect(4.9:-0.7:0.0), reverse(_cgef_hole((13, 8))))
-    for g in (gs, gd), ℓ in (2.9, 6.13)
-        _cgef_engine_matches(g, _CGEF_TH, ℓ, :PrefixSumTopHatPlan)
-        _cgef_engine_matches(g, _CGEF_GA, ℓ, :SeparableFootprint; rtol = 1e-8)
-        for cs in _CGEF_CACHES
-            _cgef_engine_matches(g, _CGEF_SH, ℓ, :ScatteredFilterPlan; cache_strategy = cs)
-        end
-    end
-    gsp = FG.Grids.StructuredGrid(cart, xs, 0.0:0.7:7.7; periodic = (true, true), period = (13.0, 8.4))
-    for ℓ in (5.1462, 29.9226)
-        _cgef_engine_matches(gsp, _CGEF_TH, ℓ, :PrefixSumTopHatPlan)
-    end
-
-    # A uniform axis 1 with a stretched axis 2: one band of offsets per row.
-    ys = cumsum([0.6 + 0.8 * abs(sin(0.3j)) for j in 1:12])
-    for g in (FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, ys),
-              FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, ys; periodic = (true, true), period = (16.0, ys[end] - ys[1] + 1.0)))
-        _cgef_engine_matches(g, _CGEF_SS, 2.0, :FilterFootprint)
-        _cgef_engine_matches(g, _CGEF_SH, 5.0, :FilterFootprint)
-    end
-
-    # One dimension.
-    g1 = FG.Grids.StructuredGrid(cart, 0.0:1.0:23.0)
-    _cgef_engine_matches(g1, _CGEF_TH, 4.8, :FilterFootprintND)
-    _cgef_engine_matches(FG.Grids.StructuredGrid(cart, 0.0:1.0:7.0; periodic = true), _CGEF_TH, 13.0, :FilterFootprintND)
-    _cgef_engine_matches(FG.Grids.StructuredGrid(cart, 0.0:1.0:23.0; periodic = true), _CGEF_TH, 30.5, :PaddedFFTFootprint)
-    _cgef_engine_matches(g1, _CGEF_GA, 4.8, :SeparableFootprintND; rtol = 1e-8)
-    for cs in _CGEF_CACHES
-        _cgef_engine_matches(FG.Grids.StructuredGrid(cart, xs), _CGEF_SH, 2.9, :NDScatteredFilterPlan; cache_strategy = cs)
-    end
-
-    # Three dimensions: whole turns of axis 1 and images along axes 2 and 3; stretched; bounded and masked.
-    g3 = FG.Grids.StructuredGrid(cart, 0.0:1.0:5.0, 0.0:0.7:2.8, 0.0:0.9:2.7; periodic = (true, true, true))
-    _cgef_engine_matches(g3, _CGEF_TH, 1.5, :PrefixSumTopHat3DPlan)
-    _cgef_engine_matches(g3, _CGEF_GA, 1.5, :SeparableFootprintND; rtol = 1e-8)
-    for ℓ in (4.8, 13.3)
-        _cgef_engine_matches(g3, _CGEF_TH, ℓ, :PaddedFFTFootprint)
-        _cgef_engine_matches(g3, _CGEF_SH, ℓ, :PaddedFFTFootprint)
-    end
-    _cgef_engine_matches(g3, _CGEF_GA, 2.9, :PaddedFFTFootprint; rtol = 1e-8)
-    g3s = FG.Grids.StructuredGrid(cart, cumsum([0.0, 1.1, 0.8, 1.3, 0.9, 1.2]), 0.0:0.7:2.8, 0.0:0.9:2.7;
-                                  periodic = (true, true, true), period = (6.2, 3.5, 3.6))
-    for cs in _CGEF_CACHES
-        _cgef_engine_matches(g3s, _CGEF_SH, 4.8, :NDScatteredFilterPlan; cache_strategy = cs)
-    end
-    m3 = trues(6, 5, 4)
-    m3[2:3, 2:3, 2] .= false
-    g3b = FG.Grids.StructuredGrid(cart, 0.0:1.0:5.0, 0.0:0.7:2.8, 0.0:0.9:2.7, m3)
-    for ℓ in (2.9, 5.3)
-        _cgef_engine_matches(g3b, _CGEF_TH, ℓ, :PrefixSumTopHat3DPlan)
-    end
-    _cgef_engine_matches(g3b, _CGEF_SH, 2.9, :FilterFootprintND)
-    _cgef_engine_matches(g3b, _CGEF_SH, 5.3, :PaddedFFTFootprint)
+    foreach(_cgef_engine_matches, _cgef_cartesian_rows())
 end
 
-# A spherical longitude identifies, so each cell counts once however far the support reaches.
 Test.@testset "Real-space engines on spherical grids" begin
-    sph = FG.Geometry.SphericalGeometry(6.371e6)
-    # Global, the support reaching over a pole and round the ring.
-    ring = range(0.0; step = deg2rad(10.0), length = 36)
-    gw = FG.Grids.StructuredGrid(sph, ring, range(deg2rad(-80.0); step = deg2rad(10.0), length = 17); periodic = (true, false))
-    # A uniform longitude takes the kernel's own engine or, where it costs fewer operations, the transform
-    # along longitude; the device, Distributed and MPI plans of every grid take the kernel's own engine.
-    _cgef_engine_matches(gw, _CGEF_TH, 2.0e6, :PrefixSumTopHatPlan)
-    _cgef_engine_matches(gw, _CGEF_TH, 2 * 12_000e3, :ZonalFFTFootprint)
-    _cgef_engine_matches(gw, _CGEF_GA, 0.5e6, :FilterFootprint)
-    _cgef_engine_matches(gw, _CGEF_GA, 3.0e6, :ZonalFFTFootprint)
-
-    # Stretched latitude, with a hole.
-    φs = [deg2rad(-75 + 150 * (s + 0.12 * sin(π * s))) for s in range(0, 1; length = 14)]
-    gls = FG.Grids.StructuredGrid(sph, ring, φs, (m = trues(36, 14); m[10:14, 5:8] .= false; m))
-    _cgef_engine_matches(gls, _CGEF_GA, 1.5e6, :FilterFootprint)
-    _cgef_engine_matches(gls, _CGEF_GA, 4.0e6, :ZonalFFTFootprint)
-
-    # A regional box whose longitude support is wider than half its columns, with and without a hole;
-    # vector axes take the per-point engine.
-    λr = range(0.0, deg2rad(38.0); length = 20)
-    φr = range(deg2rad(60.0), deg2rad(80.0); length = 11)
-    gr = FG.Grids.StructuredGrid(sph, λr, φr)
-    _cgef_engine_matches(gr, _CGEF_SH, 1000e3, :ZonalFFTFootprint)
-    _cgef_engine_matches(gr, _CGEF_TH, 1000e3, :PrefixSumTopHatPlan)
-    for cs in _CGEF_CACHES
-        _cgef_engine_matches(FG.Grids.StructuredGrid(sph, collect(λr), collect(φr)), _CGEF_SH, 1000e3,
-                             :ScatteredFilterPlan; cache_strategy = cs)
-    end
-    grm = FG.Grids.StructuredGrid(sph, λr, φr, (m = trues(20, 11); m[4:6, 3:4] .= false; m))
-    _cgef_engine_matches(grm, _CGEF_SH, 1500e3, :ZonalFFTFootprint)
-    _cgef_engine_matches(grm, _CGEF_TH, 600e3, :PrefixSumTopHatPlan)
-
-    # A box over 320° of longitude, whose 40° gap the support spans: the columns at its two ends are
-    # neighbours across the gap.
-    λw = range(0.0; step = deg2rad(10.0), length = 33)
-    φw = range(deg2rad(50.0), deg2rad(70.0); length = 5)
-    _cgef_engine_matches(FG.Grids.StructuredGrid(sph, λw, φw), _CGEF_TH, 3.1e6, :PrefixSumTopHatPlan)
-    _cgef_engine_matches(FG.Grids.StructuredGrid(sph, λw, φw), _CGEF_TH, 5.0e6, :ZonalFFTFootprint)
-    _cgef_engine_matches(FG.Grids.StructuredGrid(sph, λw, φw), _CGEF_SH, 3.5e6, :ZonalFFTFootprint)
-    for cs in _CGEF_CACHES
-        _cgef_engine_matches(FG.Grids.StructuredGrid(sph, collect(λw), collect(φw)), _CGEF_SH, 2.5e6,
-                             :ScatteredFilterPlan; cache_strategy = cs)
-    end
-
-    # A meridian and a parallel: the measure is an arc length.
-    lat = deg2rad.(collect(-60.0:5.0:60.0))
-    _cgef_engine_matches(FG.Grids.StructuredGrid(sph, [0.0], lat), _CGEF_TH, 2.0e6, :PrefixSumTopHatPlan)
-    _cgef_engine_matches(FG.Grids.StructuredGrid(sph, deg2rad.(collect(0.0:5.0:355.0)), [0.3]), _CGEF_TH, 2.0e6,
-                         :PrefixSumTopHatPlan)
-
-    # Latitude stored north to south, as `π/2 − θ` gives it.
-    gn = FG.Grids.StructuredGrid(sph, range(0.0; step = deg2rad(15.0), length = 24), π / 2 .- range(0.3, π - 0.3; length = 12))
-    _cgef_engine_matches(gn, _CGEF_TH, 1.7e6, :PrefixSumTopHatPlan)
-    _cgef_engine_matches(gn, _CGEF_GA, 1.2e6, :FilterFootprint)
-    _cgef_engine_matches(gn, _CGEF_GA, 4.0e6, :ZonalFFTFootprint)
+    foreach(_cgef_engine_matches, _cgef_spherical_rows())
 end
 
 Test.@testset "Real-space engines on meshes, node sets and sphere pixelizations" begin
-    cart = FG.Geometry.CartesianGeometry()
-    θ = deg2rad(15.0)
-    cx = [i * cos(θ) - 0.3j * sin(θ) for i in 0:11, j in 0:9]
-    cy = [i * sin(θ) + j * (1 + 0.3cos(θ)) for i in 0:11, j in 0:9]
-    gc = FG.Grids.CurvilinearGrid(cart, cx, cy, _cgef_hole((12, 10)))
-    for (k, ℓ) in ((_CGEF_GA, 2.0), (_CGEF_SS, 1.0)), cs in _CGEF_CACHES
-        _cgef_engine_matches(gc, k, ℓ, :ScatteredFilterPlan; reference = _cgef_cellset_filter, cache_strategy = cs)
-    end
-    # A top-hat over points takes bin runs, the support from a few cells to past the whole mesh.
-    for ℓ in (3.1, 8.3, 29.7)
-        _cgef_engine_matches(gc, _CGEF_TH, ℓ, :BinnedTopHatPlan; reference = _cgef_cellset_filter)
-    end
-
-    mn = vec(_cgef_hole((12, 10)))
-    gu = FG.Grids.UnstructuredGrid(cart, vec(cx) .+ 0.1 .* sin.(1:120), vec(cy), fill(1.1, 120), mn)
-    _cgef_engine_matches(gu, _CGEF_GA, 2.0, :NodeFilterPlan; reference = _cgef_cellset_filter, method = CGEF.Filtering.RealSpace())
-    for ℓ in (3.1, 8.3, 29.7)
-        _cgef_engine_matches(gu, _CGEF_TH, ℓ, :BinnedTopHatPlan; reference = _cgef_cellset_filter)
-    end
-    # A periodic node set, whose support reaches across both faces, and a node set in three dimensions.
-    xp, yp = mod.(vec(cx) .+ 0.1 .* sin.(1:120), 12.5), mod.(vec(cy), 13.0)
-    gup = FG.Grids.UnstructuredGrid(cart, (xp, yp), fill(1.35, 120), mn; periodic = (true, true), period = (12.5, 13.0))
-    for ℓ in (3.1, 8.3, 12.1)
-        _cgef_engine_matches(gup, _CGEF_TH, ℓ, :BinnedTopHatPlan; reference = _cgef_cellset_filter)
-    end
-    # Other kernels take the neighbour list; at ℓ = 4 the Gaussian's support passes half of each period.
-    for ℓ in (2.0, 4.0)
-        _cgef_engine_matches(gup, _CGEF_GA, ℓ, :NodeFilterPlan; reference = _cgef_cellset_filter)
-    end
-    zs = [mod(7.3k, 5.0) for k in 1:120]
-    gu3 = FG.Grids.UnstructuredGrid(cart, (vec(cx), vec(cy), zs), fill(6.0, 120), mn)
-    for ℓ in (4.1, 11.3)
-        _cgef_engine_matches(gu3, _CGEF_TH, ℓ, :BinnedTopHatPlan; reference = _cgef_cellset_filter)
-    end
-    _cgef_engine_matches(gu3, _CGEF_GA, 2.0, :NodeFilterPlan; reference = _cgef_cellset_filter)
-
-    # Each pixelization with a hole of half the kernel radius about cell 1, at a width of about 1.3 cells.
-    sgeo = FG.Geometry.SphericalGeometry()
-    builders = (m -> FG.Grids.RingGrid(sgeo, FG.SphericalSampling.ReducedGaussianSampling([16, 24, 32, 32, 24, 16]); mask = m),
-                m -> FG.Grids.CubedSphereGrid(sgeo, 6; mask = m), m -> FG.Grids.HEALPixGrid(sgeo, 4; mask = m),
-                m -> FG.Grids.IcosahedralGrid(sgeo, 4; mask = m), m -> FG.Grids.YinYangGrid(sgeo, 20, 10; mask = m))
-    for build in builders
-        g0 = build(nothing)
-        n = length(FG.Grids.mask(g0))
-        ℓ = 1.3 * FG.Geometry.radius(sgeo) * sqrt(4π / n)
-        p1 = Tuple(FG.Grids.coords(g0, 1))
-        cut = CGEF.Kernels.kernel_radius(_CGEF_GA, ℓ) / 2
-        hole = [FG.Geometry.distance(sgeo, p1, Tuple(FG.Grids.coords(g0, i))) > cut for i in 1:n]
-        _cgef_engine_matches(build(hole), _CGEF_GA, ℓ, :NodeFilterPlan; reference = _cgef_cellset_filter)
-    end
+    foreach(_cgef_engine_matches, _cgef_mesh_rows())
 end
 
 # A Gaussian over points at a scale near the domain's takes the nonuniform-FFT kernel sum. It continues the
-# kernel past its truncation radius, where it is below `GAUSSIAN_TRUNCATION_TOL` (1e-10) of its peak, and
-# runs its transforms at that tolerance, so it agrees with the truncated sum to a few times 1e-10.
+# kernel past its truncation radius, where it is below `Kernels.truncation_tol(Float64)` (1e-10) of its peak,
+# and runs its transforms at that tolerance, so it agrees with the truncated sum to a few times 1e-10.
 Test.@testset "The nonuniform-FFT kernel sum over points" begin
     cart = FG.Geometry.CartesianGeometry()
     M = 1000
@@ -283,7 +80,7 @@ Test.@testset "The nonuniform-FFT kernel sum over points" begin
     m = [mod(k, 13) != 0 for k in 1:M]
     f = sin.(0.3 .* xy[1]) .+ cos.(0.2 .* xy[2]) .+ 0.2
     for g in (FG.Grids.UnstructuredGrid(cart, xy, fill(400 / M, M), m),
-              FG.Grids.UnstructuredGrid(cart, xy, fill(400 / M, M), m; periodic = (true, true), period = (20.0, 20.0))),
+              FG.Grids.UnstructuredGrid(cart, xy, fill(400 / M, M), m; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (20.0, 20.0))),
         ℓ in (6.0, 12.0), s in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
         ref = _cgef_cellset_filter(g, _CGEF_GA, ℓ, f, s)
         plan(b) = CGEF.Filtering.plan_filter(g, _CGEF_GA, ℓ; mask_strategy = s, execution = b)
@@ -295,23 +92,29 @@ Test.@testset "The nonuniform-FFT kernel sum over points" begin
 end
 
 # A window sum read off a running sum is a difference of two numbers `row length / window` times larger
-# than itself, and a periodic row is scanned over three copies of it. The rows are 10 apart and the
-# support radius 3.5, so each target averages its own row; the reference is that mean summed in Float64
-# from the same Float32 values.
+# than itself, and a periodic row is scanned over three copies of it. The rows are 10 apart, their cells 10
+# wide, and the support radius 3.5, so each target averages its own row: the centre test the 7 cells within
+# 3.5, the cell overlap each cell by its part inside the disk or ball. The reference is that mean summed in
+# Float64 from the same Float32 values.
 Test.@testset "Prefix sums in Float32 on long periodic rows" begin
     Nx = 4096
     x = range(0.0f0; step = 1.0f0, length = Nx)
-    window_mean(row, i) = sum(Float64(row[mod1(i + d, Nx)]) for d in -3:3) / 7
+    nodes = CGEF.Filtering._overlap_nodes(Float64)
+    centre(d, _) = abs(d) <= 3 ? 1.0 : 0.0
+    overlap(d, N) = N == 2 ? CGEF.Geometry.disk_fraction(d - 0.5, d + 0.5, -5.0, 5.0, 3.5) :
+                    CGEF.Geometry.ball_box_fraction(d - 0.5, d + 0.5, -5.0, 5.0, -5.0, 5.0, 3.5, nodes)
+    window_mean(row, i, w, N) = sum(w(d, N) * Float64(row[mod1(i + d, Nx)]) for d in -4:4) / sum(d -> w(d, N), -4:4)
     geo = FG.Geometry.CartesianGeometry(Float32)
     y = range(0.0f0; step = 10.0f0, length = 2)
     f2 = Float32[1000 + sin(0.37f0 * i) + 0.5f0 * cos(1.3f0 * i + j) for i in 1:Nx, j in 1:2]
     f3 = Float32[1000 + sin(0.37f0 * i) + 0.5f0 * cos(1.3f0 * i + j - k) for i in 1:Nx, j in 1:2, k in 1:2]
-    for (g, f) in ((FG.Grids.StructuredGrid(geo, x, y; periodic = (true, false)), f2),
-                   (FG.Grids.StructuredGrid(geo, x, y, y; periodic = (true, false, false)), f3))
-        ref = [window_mean(view(f, :, Tuple(I)[2:end]...), I[1]) for I in CartesianIndices(f)]
+    for (g, f) in ((FG.Grids.StructuredGrid(geo, x, y; topology = (FG.Grids.Periodic(), FG.Grids.Bounded())), f2),
+                   (FG.Grids.StructuredGrid(geo, x, y, y; topology = (FG.Grids.Periodic(), FG.Grids.Bounded(), FG.Grids.Bounded())), f3)),
+        (k, w) in ((_CGEF_THC, centre), (_CGEF_TH, overlap))
+        ref = [window_mean(view(f, :, Tuple(I)[2:end]...), I[1], w, ndims(f)) for I in CartesianIndices(f)]
         for b in (_CGEF_SERIAL, CGEF.ComputationalBackends.GPUBackend(KA.CPU()))
-            out = CGEF.Filtering.filter_apply!(similar(f), f, CGEF.Filtering.plan_filter(g, _CGEF_TH, 7.0f0; execution = b))
-            Test.@test maximum(abs, out .- ref) <= 8 * eps(1000.0f0)
+            p = CGEF.Filtering.plan_filter(g, k, 7.0f0; execution = b, engine = CGEF.Filtering.FootprintEngine())
+            Test.@test maximum(abs, CGEF.Filtering.filter_apply!(similar(f), f, p) .- ref) <= 8 * eps(1000.0f0)
         end
     end
 end
@@ -341,12 +144,15 @@ end
 Test.@testset "A filter wider than the sphere" begin
     R = 6.371e6
     sph = FG.Geometry.SphericalGeometry(R)
-    for (lon, lat, periodic) in (
-        (range(0.0; step = deg2rad(10.0), length = 36), range(deg2rad(-80.0); step = deg2rad(5.0), length = 33), true),
-        (range(0.0; step = deg2rad(10.0), length = 36), range(deg2rad(-88.5); step = deg2rad(2.0), length = 89), true),
-        (range(0.0; step = deg2rad(7.0), length = 21), range(deg2rad(-60.0); step = deg2rad(5.0), length = 25), false),
+    for (lon, lat, tλ) in (
+        (range(0.0; step = deg2rad(10.0), length = 36), range(deg2rad(-80.0); step = deg2rad(5.0), length = 33),
+         FG.Grids.Periodic()),
+        (range(0.0; step = deg2rad(10.0), length = 36), range(deg2rad(-88.5); step = deg2rad(2.0), length = 89),
+         FG.Grids.Periodic()),
+        (range(0.0; step = deg2rad(7.0), length = 21), range(deg2rad(-60.0); step = deg2rad(5.0), length = 25),
+         FG.Grids.Bounded()),
     )
-        g = FG.Grids.StructuredGrid(sph, lon, lat; periodic = (periodic, false))
+        g = FG.Grids.StructuredGrid(sph, lon, lat; topology = (tλ, FG.Grids.Bounded()))
         f = [sin(2a) * cos(b) + 2.0 for a in lon, b in lat]
         A = FG.Grids.measure(g)
         for (strategy, want) in ((CGEF.Filtering.Deformable(), sum(f .* A) / sum(A)),
@@ -371,8 +177,8 @@ Test.@testset "ZeroFill commutes with ∂/∂x and conserves the integral; Defor
     grid = FG.Grids.StructuredGrid(cart, xs, xs, mask)
     lattice = FG.Grids.StructuredGrid(cart, xs, xs)
     ddx(a) = _cgef_dd(a, lattice, 1)
-    # A C³ bump, zero from column 30 on, so it and its derivative vanish on land.
-    f = [((r2 = ((i - 24)^2 + (j - 24)^2) / 36) < 1 ? (1 - r2)^4 : 0.0) for i in 1:N, j in 1:N]
+    # A C³ bump, zero from column 29 on, so it and its derivative on the default 5-node stencil vanish on land.
+    f = [((r2 = ((i - 24)^2 + (j - 24)^2) / 25) < 1 ? (1 - r2)^4 : 0.0) for i in 1:N, j in 1:N]
     df = ddx(f)
     Test.@test all(iszero, f[coast:end, :]) && all(iszero, df[coast:end, :])
     gap = Dict{Any,Float64}()
@@ -407,6 +213,8 @@ Test.@testset "The cache budget" begin
     Test.@test bytes(scales[3]) <= budget
     plans = CGEF.Filtering.plan_filter_sweep(g, _CGEF_GA, scales; cache_byte_budget = budget, execution = _CGEF_SERIAL)
     Test.@test [cached(p.footprint) for p in plans] == [true, true, false]
+    # A node set's list has no streaming form: one past the budget is refused before it is allocated.
+    Test.@test_throws ArgumentError CGEF.Filtering._check_list_bytes(10^10, 10^6, Float64)
 end
 
 # A `HighOrderKernel{P}`'s weights on a grid are corrected so their moments of degree 1…P vanish, so the
@@ -456,12 +264,14 @@ Test.@testset "HighOrderKernel on a sphere: one filter whichever engine runs it,
     GPU = CGEF.ComputationalBackends.GPUBackend(KA.CPU())
     # A ring and a regional box, at a scale whose support holds more cells than the correction has
     # conditions, so each target's correction is determined.
-    for (λ, φ, periodic, ℓ) in (
-        (range(0, 2π; length = 73)[1:72], range(deg2rad(-70), deg2rad(70); length = 29), true, 3.0e6),
-        (range(deg2rad(10), deg2rad(70); length = 31), range(deg2rad(-20), deg2rad(20); length = 21), false, 1.5e6),
+    for (λ, φ, tλ, ℓ) in (
+        (FG.Axes.PeriodicUniformAxis(0.0, 2π, 72), range(deg2rad(-70), deg2rad(70); length = 29), FG.Grids.Periodic(),
+         3.0e6),
+        (range(deg2rad(10), deg2rad(70); length = 31), range(deg2rad(-20), deg2rad(20); length = 21), FG.Grids.Bounded(),
+         1.5e6),
     )
-        gr = FG.Grids.StructuredGrid(sph, λ, φ; periodic = (periodic, false))
-        gv = FG.Grids.StructuredGrid(sph, collect(λ), collect(φ); periodic = (periodic, false))
+        gr = FG.Grids.StructuredGrid(sph, λ, φ; topology = (tλ, FG.Grids.Bounded()))
+        gv = FG.Grids.StructuredGrid(sph, collect(λ), collect(φ); topology = (tλ, FG.Grids.Bounded()))
         f = [cos(p) * cos(2l) + 0.3sin(p)^2 for l in λ, p in φ]
         for order in (3, 5)
             k = CGEF.Kernels.HighOrderKernel(; order)
@@ -470,7 +280,8 @@ Test.@testset "HighOrderKernel on a sphere: one filter whichever engine runs it,
             oc = CGEF.Filtering.filter_apply!(similar(f), f,
                                               CGEF.Filtering.plan_filter(gv, k, ℓ; execution = _CGEF_SERIAL,
                                                                          cache_strategy = CGEF.Filtering.AlwaysCache()))
-            # The host plan of the uniform-longitude grid takes the transform, the device plan the banded sum.
+            # The uniform-longitude grid's plans take the transform on the host and, FFTW serving host memory, on
+            # `KA.CPU()`.
             for b in (_CGEF_SERIAL, GPU)
                 o = CGEF.Filtering.filter_apply!(similar(f), f, CGEF.Filtering.plan_filter(gr, k, ℓ; execution = b))
                 Test.@test maximum(abs, o .- oc) < 1e-13 * maximum(abs, f)
@@ -484,7 +295,7 @@ Test.@testset "HighOrderKernel on a sphere: one filter whichever engine runs it,
 
     λ = range(0, 2π; length = 361)[1:360]
     φ = range(deg2rad(-75), deg2rad(75); length = 151)
-    g = FG.Grids.StructuredGrid(sph, λ, φ; periodic = (true, false))
+    g = FG.Grids.StructuredGrid(sph, λ, φ; topology = (FG.Grids.Periodic(), FG.Grids.Bounded()))
     f = [cos(p) * cos(l) + sin(p) for l in λ, p in φ]
     interior = [abs(p) < deg2rad(40) for l in λ, p in φ]
     ℓs = (8.0e5, 1.2e6, 1.8e6)
@@ -505,8 +316,8 @@ Test.@testset "SharpSpectralKernel in real space passes and stops Fourier modes"
     N = 64
     xs = 0.0:1.0:(N - 1)
     geo = FG.Geometry.CartesianGeometry()
-    g1 = FG.Grids.StructuredGrid(geo, xs; periodic = true)
-    g2 = FG.Grids.StructuredGrid(geo, xs, xs; periodic = (true, true))
+    g1 = FG.Grids.StructuredGrid(geo, xs; topology = FG.Grids.Periodic())
+    g2 = FG.Grids.StructuredGrid(geo, xs, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()))
     gain(o, f) = sum(o .* f) / sum(f .* f)
     for (m, target, tol) in ((4, 1.0, 0.05), (16, 0.0, 0.02))
         k = 2π * m / N
@@ -527,7 +338,7 @@ Test.@testset "check_setup on a sphere" begin
     R = 6.371e6
     d = deg2rad(1.0)
     g = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), range(0.0; step = d, length = 360),
-                                range(deg2rad(-60.0), deg2rad(60.0); step = d / 4); periodic = (true, false))
+                                range(deg2rad(-60.0), deg2rad(60.0); step = d / 4); topology = (FG.Grids.Periodic(), FG.Grids.Bounded()))
     r = CGEF.check_setup(g, _CGEF_GA, 500e3)
     Test.@test r.coarsest_spacing[1] ≈ R * d rtol = 1e-12
     Test.@test r.spacing[1] ≈ 2R * asin(cos(deg2rad(60.0)) * sin(d / 2)) rtol = 1e-12
@@ -535,4 +346,74 @@ Test.@testset "check_setup on a sphere" begin
     Test.@test r.cells_per_scale[1] ≈ 500e3 / (R * d) rtol = 1e-12
     Test.@test r.resolvable
     Test.@test !CGEF.check_setup(g, _CGEF_GA, 150e3).resolvable
+end
+
+# Periodic ranges whose cells leave a gap at the wrap (a period other than `n·Δ`, a longitude range short of
+# the circle) and ones they close evenly: every engine, chosen or named, filters as the cell-by-cell plan does,
+# which finds neighbours by the grid's own period.
+Test.@testset "Periodic ranges with and without a gap at the wrap" begin
+    P, B = FG.Grids.Periodic(), FG.Grids.Bounded()
+    cart = FG.Geometry.CartesianGeometry()
+    sph = FG.Geometry.SphericalGeometry(1.0)
+    F = CGEF.Filtering
+    for (g, ℓ) in (
+        (FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:7.7; topology = (P, B), period = (19.0, nothing)), 2.5),
+        (FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:7.7; topology = (P, B)), 2.5),
+        (FG.Grids.StructuredGrid(sph, range(0.0; step = 2π / 70, length = 64), range(-1.2, 1.2; length = 32);
+                                 topology = (P, B)), 0.35),
+        (FG.Grids.StructuredGrid(sph, range(0.0; step = 2π / 64, length = 64), range(-1.2, 1.2; length = 32);
+                                 topology = (P, B)), 0.35),
+    ), k in (_CGEF_GA, _CGEF_TH)
+        sz = size(FG.Grids.mask(g))
+        f = [sin(3i / sz[1]) * cos(2j / sz[2]) + 0.1i for i in 1:sz[1], j in 1:sz[2]]
+        ref = F.apply_footprint!(zeros(sz), f, g, F._build_footprint_scattered(g, k, ℓ), F.ZeroFill(), false, false)
+        for e in (F.AutoEngine(), F.FootprintEngine())
+            p = F.plan_filter(g, k, ℓ; execution = CGEF.ComputationalBackends.SerialBackend(), engine = e)
+            Test.@test maximum(abs, F.filter_apply!(zeros(sz), f, p) .- ref) <= 1e-8 * maximum(abs, ref)
+        end
+    end
+end
+
+# The padded- and zonal-FFT engines planned for `GPUBackend(KA.CPU())`, whose memory FFTW serves, apply by
+# broadcasts: within round-off of the serial plan's row loops, both within round-off of the cell-by-cell
+# footprint. A named FFT engine on a stretched axis raises.
+Test.@testset "FFT engines on a device backend" begin
+    F = CGEF.Filtering
+    CB = CGEF.ComputationalBackends
+    cart = FG.Geometry.CartesianGeometry()
+    sph = FG.Geometry.SphericalGeometry(1.0)
+    P = FG.Grids.Periodic()
+    gpu = CB.GPUBackend(KA.CPU())
+    ringλ = FG.Axes.PeriodicUniformAxis(0.0, 2π, 72)
+    ringφ = collect(range(-1.4, 1.4; length = 36))
+    hole(sz) = (m = trues(sz); m[5:9, 4:8] .= false; m)
+    box = FG.Grids.StructuredGrid(sph, range(0.2, 1.6; length = 40), collect(range(-0.6, 0.6; length = 30)))
+    for (g, k, ℓ, e) in (
+        (FG.Grids.StructuredGrid(cart, 0.0:1.0:23.0, 0.0:0.7:11.9; topology = (P, P)), _CGEF_GA, 4.0, F.PaddedFFTEngine()),
+        (FG.Grids.StructuredGrid(cart, 0.0:1.0:23.0, 0.0:0.7:11.9, hole((24, 18))), CGEF.Kernels.SmoothHatKernel(), 3.5,
+         F.PaddedFFTEngine()),
+        (FG.Grids.StructuredGrid(cart, 0.0:1.0:11.0, 0.0:1.0:9.0, 0.0:1.0:7.0), _CGEF_TH, 2.5, F.PaddedFFTEngine()),
+        (FG.Grids.StructuredGrid(cart, 0.0:1.0:63.0), _CGEF_TH, 5.0, F.PaddedFFTEngine()),
+        (FG.Grids.StructuredGrid(sph, ringλ, ringφ), _CGEF_GA, 0.3, F.ZonalFFTEngine()),
+        (FG.Grids.StructuredGrid(sph, ringλ, ringφ, hole((72, 36))), _CGEF_TH, 0.3, F.ZonalFFTEngine()),
+        (box, _CGEF_GA, 0.15, F.ZonalFFTEngine()),
+        (FG.Grids.StructuredGrid(sph, ringλ, ringφ), CGEF.Kernels.HighOrderKernel(), 0.3, F.ZonalFFTEngine()),
+    ), s in (F.ZeroFill(), F.Deformable())
+        sz = size(FG.Grids.mask(g))
+        f = _cgef_share_field(sz)
+        apply(b, e) = F.filter_apply!(zeros(sz), f, F.plan_filter(g, k, ℓ; execution = b, engine = e, mask_strategy = s))
+        os = apply(CB.SerialBackend(), e)
+        Test.@test maximum(abs, apply(gpu, e) .- os) <= 1e-13 * maximum(abs, os)
+        or = apply(CB.SerialBackend(), F.FootprintEngine())
+        Test.@test maximum(abs, os .- or) <= 1e-13 * maximum(abs, or)
+        # A planner that times its candidates writes the arrays it plans on, kernel samples and zero padding.
+        om = F.filter_apply!(zeros(sz), f, F.plan_filter(g, k, ℓ; execution = CB.SerialBackend(), engine = e, mask_strategy = s,
+                                                         fft_options = (; flags = FFTW.MEASURE)))
+        Test.@test maximum(abs, om .- os) <= 1e-13 * maximum(abs, os)
+    end
+    for (g, e) in ((FG.Grids.StructuredGrid(sph, collect(range(0.2, 1.6; length = 40)), collect(range(-0.6, 0.6; length = 30))),
+                    F.ZonalFFTEngine()),
+                   (FG.Grids.StructuredGrid(cart, cumsum(0.5 .+ (1:20) ./ 20), 0.0:1.0:9.0), F.PaddedFFTEngine()))
+        Test.@test_throws ArgumentError F.plan_filter(g, _CGEF_GA, 0.3; execution = CB.SerialBackend(), engine = e)
+    end
 end

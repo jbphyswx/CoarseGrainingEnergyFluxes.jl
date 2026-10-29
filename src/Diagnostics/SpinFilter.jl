@@ -11,16 +11,18 @@
 """
     SpinFilter
 
-A workspace's [`Filtering.GeneralizedConvolution`](@ref) on its spherical grid: the spin transforms, a
-complex field in the workspace's memory, with a host copy where the transforms run on the host and that
-memory is a device's, five coefficient arrays and one to scale in, the transfer `Ĝ(n)` of the scale last
-set, and the quadrature that computes it.
+A workspace's [`Filtering.GeneralizedConvolution`](@ref) on its spherical grid: the spin transforms and the
+least-squares fit its analysis takes (`nothing` for the quadrature), a complex field in the workspace's memory,
+with a host copy where the transforms run on the host and that memory is a device's, five coefficient arrays and
+one to scale in, the transfer `Ĝ(n)` of the scale last set, the transfer of a derivative of the filtered field,
+and the quadrature that computes `Ĝ(n)`.
 """
 struct SpinFilter{
-    TR<:Filtering.AbstractSpinTransforms, T<:AbstractFloat, MK, IX, FD, FH, CA,
-    V<:AbstractVector{T}, Q<:Kernels.LegendreQuadrature{T}, B,
+    TR<:Filtering.AbstractSpinTransforms, FT<:Union{Nothing,Filtering.SpinFit}, T<:AbstractFloat, MK, IX, FD, FH, CA,
+    V<:AbstractVector{<:AbstractFloat}, Q<:Kernels.LegendreQuadrature{T}, B,
 }
     transforms::TR
+    fit::FT
     mask::MK                # the grid's mask in the workspace's memory
     position::IX            # a cell's position in `field`
     ncells::Int
@@ -29,7 +31,8 @@ struct SpinFilter{
     stage::FH               # the transforms' host field array, or `nothing` where they read `field`
     coeffs::NTuple{5,CA}    # a sweep's analyses, in the order of `_spin_analyze_flux!`
     work::CA
-    transfer::V             # Ĝ(n), in host memory
+    transfer::V             # Ĝ(n), in host memory and the transforms' precision
+    dtransfer::V            # Ĝ(n) times a ladder factor over the radius, for `_spin_eth!`
     quadrature::Q
     execution::B
 end
@@ -54,15 +57,18 @@ function _spin_filter(
 ) where {G, T<:AbstractFloat}
     tr = Filtering.spin_transforms(transform, grid; lmax = vf.lmax, execution = at.execution,
                                    nthreads = Filtering._library_threads(at.execution), nufft = nufft)
+    # Transforms on the host for a workspace on a device: the device field takes the transforms' element
+    # type, so each copy between it and `stage` is one transfer.
     staged = !Filtering._host_memory(at.execution) && Filtering.spin_host(tr)
-    field = staged ? _zeros(at, Complex{T}, Filtering.spin_field_size(tr)) : Filtering.spin_field(tr)
     stage = staged ? Filtering.spin_field(tr) : nothing
+    field = staged ? _zeros(at, eltype(stage), Filtering.spin_field_size(tr)) : Filtering.spin_field(tr)
     coeff() = Filtering.spin_coefficients(tr)
     R = T(FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid)))
     return SpinFilter(
-        tr, FlowGeometries.Grids.mask(at.grid), Filtering.spin_position(tr), length(FlowGeometries.Grids.mask(grid)),
+        tr, Filtering.spin_fit(vf.analysis, grid, tr), FlowGeometries.Grids.mask(at.grid), Filtering.spin_position(tr),
+        length(FlowGeometries.Grids.mask(grid)),
         R, field, stage, ntuple(_ -> coeff(), Val(5)), coeff(), Filtering.spin_transfer_buffer(tr),
-        Kernels.LegendreQuadrature(T), at.execution,
+        Filtering.spin_transfer_buffer(tr), Kernels.LegendreQuadrature(T), at.execution,
     )
 end
 
@@ -111,21 +117,50 @@ given, otherwise `strategy` where `spin` filters every field, which reads no pla
 @inline _host_field!(::Nothing, field) = field
 @inline _host_field!(stage::AbstractArray, field) = copyto!(stage, field)
 
-# The spin-`s` coefficients, into `C`, of the field holding `value(k)` at cell `k`; with `masked` an
-# inactive cell holds zero, whatever `value` reads there.
+# The spin-`s` coefficients, into `C`, of the field holding `value(k)` at cell `k`, by the filter's analysis;
+# with `masked` an inactive cell holds zero, whatever `value` reads there.
 function _spin_analyze!(C, sf::SpinFilter, s::Int, masked::Bool, value::V) where {V}
     F, pos, m = sf.field, sf.position, sf.mask
     z = zero(eltype(F))
     FlowGeometries.Execution.run_indices(sf.ncells, sf.execution) do k
         @inbounds F[pos(k)] = (masked && !m[k]) ? z : value(k)
     end
-    return Filtering.spin_analyze!(C, _host_field!(sf), sf.transforms, s)
+    return Filtering.spin_fit!(C, _host_field!(sf), sf.transforms, sf.fit, s)
 end
 
-# Into the filter's field, the spin-`s` field whose degree-`n` coefficients are `Ĝ(n)` times those of `C`.
-function _spin_synthesize!(sf::SpinFilter, C, s::Int)
+"""
+    analysis_status(sf::SpinFilter) -> (; converged, iterations, residual)
+
+The worst outcome of the least-squares fits the filter has run since it was built, `(true, 0, 0)` for a filter
+whose analysis is the quadrature or an exact transform.
+"""
+Filtering.analysis_status(sf::SpinFilter) = _fit_status(sf.fit, sf.radius)
+_fit_status(fit::Filtering.SpinFit, _) = Filtering.analysis_status(fit)
+_fit_status(::Nothing, ::T) where {T} = Filtering._exact_status(T)
+
+# Into the filter's field, the spin-`s` field whose degree-`n` coefficients are `Ĝ(n)` times those of `C`,
+# `Ĝ` the scale's transfer or another per-degree factor.
+function _spin_synthesize!(sf::SpinFilter, C, s::Int, Ĝ::AbstractVector = sf.transfer)
     host = sf.stage === nothing ? sf.field : sf.stage
-    Filtering.spin_synthesize!(host, C, sf.work, sf.transfer, sf.transforms, s)
+    Filtering.spin_synthesize!(host, C, sf.work, Ĝ, sf.transforms, s)
+    sf.stage === nothing || copyto!(sf.field, sf.stage)
+    return nothing
+end
+
+# Into the filter's field, `ð` (`t = s + 1`) or `ð̄` (`t = s − 1`) on the sphere of radius `R` of the filtered
+# spin-`s` field whose coefficients are `C`: the ladder `√((n − s)(n + s + 1))` or `−√((n + s)(n − s + 1))` over `R`
+# times `Ĝ(n)`, synthesized at spin `t`.
+function _spin_eth!(sf::SpinFilter, C, s::Int, t::Int)
+    d, g = sf.dtransfer, sf.transfer
+    E = eltype(d)
+    R = E(sf.radius)
+    @inbounds for i in eachindex(d)
+        n = i - 1
+        d[i] = n < abs(t) ? zero(E) :
+               t == s + 1 ? g[i] * sqrt(E((n - s) * (n + s + 1))) / R : -g[i] * sqrt(E((n + s) * (n - s + 1))) / R
+    end
+    host = sf.stage === nothing ? sf.field : sf.stage
+    Filtering.spin_ladder_synthesize!(host, C, sf.work, d, sf.transforms, s, t)
     sf.stage === nothing || copyto!(sf.field, sf.stage)
     return nothing
 end
@@ -135,6 +170,34 @@ function _spin_store!(sink::S, sf::SpinFilter) where {S}
     F, pos = sf.field, sf.position
     FlowGeometries.Execution.run_indices(sf.ncells, sf.execution) do k
         @inbounds sink(k, F[pos(k)])
+    end
+    return nothing
+end
+
+# The strain `(S_ee, S_nn, S_en)` at offset `off` of the filtered tangent vector whose spin-1 coefficients
+# are `C`: with `U = u + iv` (east, north), `ð̄U = i∇·u − ζ` and `ðU = 2S_en − i(S_ee − S_nn)`.
+function _spin_strain!(See, Snn, Sen, sf::SpinFilter, C, off::Int)
+    _spin_eth!(sf, C, 1, 0)
+    _spin_store!(sf) do k, z
+        @inbounds See[off + k] = imag(z) / 2
+        @inbounds Snn[off + k] = imag(z) / 2
+    end
+    _spin_eth!(sf, C, 1, 2)
+    _spin_store!(sf) do k, z
+        @inbounds See[off + k] -= imag(z) / 2
+        @inbounds Snn[off + k] += imag(z) / 2
+        @inbounds Sen[off + k] = real(z) / 2
+    end
+    return nothing
+end
+
+# The gradient `(∂_e f̄, ∂_n f̄)`, times `c`, at offset `off` of the filtered scalar whose spin-0 coefficients
+# are `C`: `ðf = ∂_n f − i∂_e f`.
+function _spin_gradient!(ge, gn, sf::SpinFilter, C, off::Int, c::Real = 1)
+    _spin_eth!(sf, C, 0, 1)
+    _spin_store!(sf) do k, z
+        @inbounds ge[off + k] = -c * imag(z)
+        @inbounds gn[off + k] = c * real(z)
     end
     return nothing
 end

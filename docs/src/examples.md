@@ -204,7 +204,7 @@ using FlowGeometries: FlowGeometries as FG
 using NUFSHT: NUFSHT                             # fast spin-weighted transforms for the vector filter
 
 geom = FG.Geometry.SphericalGeometry(6.371e6)
-lon = FG.Axes.PeriodicAxis(0.0, 2π, 1440)        # a 0.25° longitude ring; a plain vector or range is a regional box
+lon = FG.Axes.PeriodicUniformAxis(0.0, 2π, 1440)        # a 0.25° longitude ring; a plain vector or range is a regional box
 lat = deg2rad.(collect(-80.0:0.25:80.0))
 grid = FG.Grids.StructuredGrid(geom, lon, lat)
 # u, v = load_velocity(...)

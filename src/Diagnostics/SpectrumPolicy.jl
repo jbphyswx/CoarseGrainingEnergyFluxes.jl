@@ -72,6 +72,87 @@ resolve_spectrum(::Any, policy::AbstractSpectrumPolicy) = policy
 resolve_spectrum(kernel, ::AutoSpectrum) =
     Kernels.transfer_monotone(kernel) ? StrictSpectrum() : NoSpectrum()
 
+"""
+    AbstractScaleDerivative
+
+How a filtering spectral density differentiates the cumulative energy `Ē(ℓ) = ½⟨|ū_ℓ|²⟩` in the filter width:
+[`AutoScaleDerivative`](@ref), [`ExactScaleDerivative`](@ref) or [`DifferenceScaleDerivative`](@ref).
+"""
+abstract type AbstractScaleDerivative end
+
+"""
+    ExactScaleDerivative()
+
+`dĒ/dℓ = ⟨ū·∂_ℓū⟩` from the filter's own derivative in `ℓ`: the transfer `∂_ℓĜ` of a spectral filter or the
+generalized convolution, and for a real-space filter `∂_ℓū = (M_H/M_G)(ū_H − ū)/ℓ` through
+[`Kernels.ScaleRate`](@ref). Raises where the kernel has none on the filter's route.
+"""
+struct ExactScaleDerivative <: AbstractScaleDerivative end
+
+"""
+    DifferenceScaleDerivative()
+
+The slope at each scale of the quadratic through the cumulative energies of the three nearest scales
+([`spectral_density`](@ref)).
+"""
+struct DifferenceScaleDerivative <: AbstractScaleDerivative end
+
+"""
+    AutoScaleDerivative()
+
+[`ExactScaleDerivative`](@ref) where the kernel has an `ℓ`-derivative on the filter's route
+([`Kernels.has_degree_rate`](@ref), [`Kernels.has_transfer_rate`](@ref), [`Kernels.has_profile_rate`](@ref)),
+[`DifferenceScaleDerivative`](@ref) elsewhere.
+"""
+struct AutoScaleDerivative <: AbstractScaleDerivative end
+
+"""
+    AbstractSlopes
+
+Whether a coarse-graining sweep takes the filtering spectrum's slope: [`Slopes`](@ref) or [`NoSlopes`](@ref).
+"""
+abstract type AbstractSlopes end
+
+"""
+    NoSlopes()
+
+No slope: a result's `spectral_slope` is `nothing`.
+"""
+struct NoSlopes <: AbstractSlopes end
+
+"""
+    Slopes()
+
+The slope `d ln Ẽ/d ln k_ℓ` of the filtering spectrum at each scale. On an exact route of the `scale_derivative` it is
+`−(2⟨ū·a⟩ + ⟨a·a⟩ + ⟨ū·b⟩)/⟨ū·a⟩` with `a = ℓ∂_ℓū` and `b = ℓ²∂²_ℓū`, the filter's second derivative in its width
+taken as its first is; on the difference route the quadratic through the three nearest scales' `ln Ẽ` in `ln k_ℓ`.
+"""
+struct Slopes <: AbstractSlopes end
+
+"""
+    AbstractSpectrumMaps
+
+Whether a coarse-graining sweep keeps the local filtering spectrum per cell: [`SpectrumMaps`](@ref) or
+[`NoSpectrumMaps`](@ref).
+"""
+abstract type AbstractSpectrumMaps end
+
+"""
+    NoSpectrumMaps()
+
+No maps: a result's `spectrum_map` and `slope_map` are `nothing`.
+"""
+struct NoSpectrumMaps <: AbstractSpectrumMaps end
+
+"""
+    SpectrumMaps()
+
+The local filtering spectrum `Ẽ(x, k_ℓ) = −(ℓ/L) ū·ℓ∂_ℓū` at every cell and scale, whose area mean is the filtering
+spectrum, shaped like `Π`; with [`Slopes`](@ref) its slope `d ln Ẽ/d ln k_ℓ` per cell as well. On the difference route
+each cell's `½|ū|²` differenced across the scales as the spectrum is.
+"""
+struct SpectrumMaps <: AbstractSpectrumMaps end
+
 function gate_spectrum(kernel, ::ForceSpectrum)
     Kernels.transfer_monotone(kernel) || @warn(
         "ForceSpectrum with $(nameof(typeof(kernel))): its |Ĝ(k)|² is not monotone decreasing, so " *
@@ -86,31 +167,51 @@ end
     Placement(grid; execution = SerialBackend())
 
 Where a diagnostic workspace lives: the local backend its loops run under, and copies of `grid`, as
-given and with every cell active, held in that backend's memory. Under `MPIBackend` each rank runs its
-inner backend; a `DistributedBackend`'s caller holds host memory, and runs a device inner backend's
-loops serially.
+given and with every cell active, held in that backend's memory. On a sphere or a spheroid it also holds
+the frame plan (`FlowGeometries.Operators.frame_plan`) of each copy, which the rotations between the
+local and the ambient Cartesian frame read; `nothing` on any other geometry. Under `MPIBackend` each rank
+runs its inner backend; a `DistributedBackend`'s caller holds host memory, and runs a device inner
+backend's loops serially.
 """
 struct Placement{
     B<:ComputationalBackends.AbstractLocalBackend, G<:FlowGeometries.Grids.AbstractGrid,
-    U<:FlowGeometries.Grids.AbstractGrid,
+    U<:FlowGeometries.Grids.AbstractGrid, F, FU,
 }
     execution::B
     grid::G
     unmasked::U
+    frames::F
+    unmasked_frames::FU
 end
 
 function Placement(
     grid::FlowGeometries.Grids.AbstractGrid;
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.SerialBackend(),
 )
-    b = _loop_backend(Filtering._resolve_backend(execution, grid))
+    b = _placement_backend(execution, grid)
     g = FlowGeometries.Execution.on_backend(b, grid)
-    return Placement(b, g, _all_active(g))
+    fu = _frame_plan(_all_active(grid), b)
+    return Placement(b, g, _all_active(g), _with_mask(fu, FlowGeometries.Grids.mask(g)), fu)
 end
+
+# The local backend a diagnostic's loops run under for `execution` on `grid`.
+@inline _placement_backend(execution, grid) = _loop_backend(Filtering._resolve_backend(execution, grid))
 
 # `grid` with every cell active: itself when it has no inactive cell.
 @inline _all_active(grid::FlowGeometries.Grids.AbstractGrid) =
     FlowGeometries.Grids.mask(grid) isa FlowGeometries.Grids.AllActive ? grid : _unmasked(grid)
+
+# The frame plan of `grid`, held where `b` runs; a plane has no frame to rotate.
+@inline _frame_plan(grid::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractLonLatGeometry}, b) =
+    FlowGeometries.Operators.frame_plan(grid; execution = b)
+@inline _frame_plan(::FlowGeometries.Grids.AbstractGrid, _) = nothing
+
+# The plan `f` of the all-active grid restricted to the cells of `mask`: a rotation reads a cell's tables
+# only where the mask is set, so the restricted plan shares `f`'s tables.
+@inline _with_mask(::Nothing, _) = nothing
+@inline _with_mask(f::FlowGeometries.Operators.FramePlan, ::FlowGeometries.Grids.AllActive) = f
+@inline _with_mask(f::FlowGeometries.Operators.FramePlan, mask) =
+    FlowGeometries.Operators.FramePlan(f.sinλ, f.cosλ, f.sinφ, f.cosφ, mask, f.layout)
 
 @inline _loop_backend(b::ComputationalBackends.AbstractLocalBackend) = b
 @inline _loop_backend(b::ComputationalBackends.AbstractMPIBackend) = ComputationalBackends.local_backend(b)
@@ -127,6 +228,12 @@ end
 @inline _output(at::Placement, plan::Filtering.AbstractFilterPlan) = _output(at, Filtering.plan_strategy(plan))
 @inline _output(at::Placement, ::Filtering.ZeroFill) = at.unmasked
 @inline _output(at::Placement, ::Filtering.AbstractMaskStrategy) = at.grid
+
+# The frame plan of that grid.
+@inline _output_frames(at::Placement, plan::Filtering.AbstractFilterPlan) =
+    _output_frames(at, Filtering.plan_strategy(plan))
+@inline _output_frames(at::Placement, ::Filtering.ZeroFill) = at.unmasked_frames
+@inline _output_frames(at::Placement, ::Filtering.AbstractMaskStrategy) = at.frames
 
 # `x`, a derivative plan or another value holding arrays, where the placement's loops read it.
 @inline _placed(at::Placement, x) = FlowGeometries.Execution.on_backend(at.execution, x)
@@ -206,20 +313,20 @@ struct ΠWorkspace{
 end
 
 """
-    ΠWorkspace(grid, batch_size = (); has_w = false, execution = SerialBackend(), vector_filter = nothing,
+    ΠWorkspace(grid, batch_size = (), w = nothing; execution = SerialBackend(), vector_filter = nothing,
                transform = AutoSpectralBackend(), nufft = AutoSpectralBackend())
 
 Scratch for a flux computation, in the memory of `execution`, whose loops the flux runs under (see
 [`Placement`](@ref)). `batch_size` sizes every buffer as `(spatial..., batch...)`, holding a whole batch
-of slices at once.
+of slices at once. `w` is the vertical velocity the flux will be given, or `nothing`; only its type is
+read.
 
 On the surface of a sphere the workspace holds the transforms of the vector filter `vector_filter` names
 ([`Filtering.resolve_vector_filter`](@ref) under `ZeroFill`): `GeneralizedConvolution`'s spin transforms,
 chosen by `transform` and `nufft`, by default. A plan filtering under `Deformable` needs
 `vector_filter = Filtering.CartesianComponents()`.
 
-Only the buffers the configuration reaches are allocated, fixed by the grid, the vector filter and
-`has_w`:
+Only the buffers the configuration reaches are allocated, fixed by the grid, the vector filter and `w`:
 
 | configuration | full-size buffers |
 |---|---|
@@ -227,31 +334,22 @@ Only the buffers the configuration reaches are allocated, fixed by the grid, the
 | either with `w` (the 2.5-D path), or true 3-D Cartesian | 28 |
 | `CartesianComponents` on another geometry (a sphere, a spheroid, a shell) | 30 |
 
-`has_w` must be set at construction; a workspace built without the vertical buffers throws when given
-a `w`. The last row and true-3-D grids always carry the vertical set.
+A workspace built for `w = nothing` throws when given a `w`. The last row and true-3-D grids always carry
+the vertical set.
 """
-@inline ΠWorkspace(
-    grid::FlowGeometries.Grids.AbstractGrid, batch_size::Tuple = (); has_w::Bool = false,
-    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.SerialBackend(),
-    vector_filter::Union{Nothing,Filtering.AbstractVectorFilter} = nothing,
-    transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
-    nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
-) = ΠWorkspace(grid, batch_size, Val(has_w); execution, vector_filter, transform, nufft)
-
-# `Val(has_w)` puts the choice in the type, so a caller that knows `w`'s type gets a concrete workspace.
 function ΠWorkspace(
-    grid::FlowGeometries.Grids.AbstractGrid{G,T}, batch_size::Tuple, ::Val{W};
+    grid::FlowGeometries.Grids.AbstractGrid{G,T}, batch_size::Tuple = (), w::Union{Nothing,AbstractArray} = nothing;
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.SerialBackend(),
     vector_filter::Union{Nothing,Filtering.AbstractVectorFilter} = nothing,
     transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
     nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
-) where {G, T<:AbstractFloat, W}
+) where {G, T<:AbstractFloat}
     at = Placement(grid; execution = execution)
     spin = _workspace_spin(grid, at, vector_filter, transform, nufft)
     sz = (FlowGeometries.Grids.size_tuple(grid)..., batch_size...)
     ambient = !(G <: FlowGeometries.Geometry.CartesianGeometry) && spin === nothing
     rank = length(FlowGeometries.Grids.size_tuple(grid))
-    vertical = W || ambient || rank == 3
+    vertical = w !== nothing || ambient || rank == 3
 
     z() = _zeros(at, T, sz)
     zv() = vertical ? z() : nothing
@@ -268,13 +366,13 @@ function ΠWorkspace(
 end
 
 """
-    EnergyWorkspace(grid, batch_size = (); has_w = false, execution = SerialBackend(), vector_filter = nothing,
+    EnergyWorkspace(grid, batch_size = (), w = nothing; execution = SerialBackend(), vector_filter = nothing,
                     transform = AutoSpectralBackend(), nufft = AutoSpectralBackend())
 
 Scratch for the diagnostics that read only the filtered velocity, `cumulative_energy!` and through it
-`filtering_spectrum`, in the memory of `execution` (see [`Placement`](@ref)): two buffers, three with
-a vertical component. Interchangeable with [`ΠWorkspace`](@ref) wherever only the velocity buffers are
-used.
+`filtering_spectrum`, in the memory of `execution` (see [`Placement`](@ref)): two buffers, three when `w`,
+the vertical velocity or `nothing`, is an array. Interchangeable with [`ΠWorkspace`](@ref) wherever only
+the velocity buffers are used.
 
 On the surface of a sphere it holds the vector filter's transforms as [`ΠWorkspace`](@ref) does. Under
 `CartesianComponents` on a grid of non-Cartesian geometry it also holds the ambient Cartesian
@@ -295,8 +393,7 @@ struct EnergyWorkspace{
 end
 
 function EnergyWorkspace(
-    grid::FlowGeometries.Grids.AbstractGrid{G,T}, batch_size::Tuple = ();
-    has_w::Bool = false,
+    grid::FlowGeometries.Grids.AbstractGrid{G,T}, batch_size::Tuple = (), w::Union{Nothing,AbstractArray} = nothing;
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.SerialBackend(),
     vector_filter::Union{Nothing,Filtering.AbstractVectorFilter} = nothing,
     transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
@@ -308,7 +405,7 @@ function EnergyWorkspace(
     ambient = !(G <: FlowGeometries.Geometry.CartesianGeometry) && spin === nothing
     z() = _zeros(at, T, sz)
     za() = ambient ? z() : nothing
-    return EnergyWorkspace(z(), z(), (has_w || ambient) ? z() : nothing, za(), za(), za(), spin, at)
+    return EnergyWorkspace(z(), z(), (w !== nothing || ambient) ? z() : nothing, za(), za(), za(), spin, at)
 end
 
 # The ambient Cartesian input buffers and the three filtered ones they are filtered into.
@@ -322,8 +419,8 @@ end
 @noinline function _workspace_missing_vertical()
     throw(ArgumentError(
         "this ΠWorkspace was built without vertical-component buffers, but a vertical velocity `w` was " *
-        "supplied. Which buffers exist is fixed when the workspace is built, so rebuild it as " *
-        "`ΠWorkspace(grid; has_w = true)` (or `ΠWorkspace(grid, batch_size; has_w = true)`).",
+        "supplied. Which buffers exist is fixed when the workspace is built, so rebuild it with `w`: " *
+        "`ΠWorkspace(grid, batch_size, w)`.",
     ))
 end
 

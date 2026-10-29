@@ -3,6 +3,8 @@ module CoarseGrainingEnergyFluxesOhMyThreadsExt
 using OhMyThreads: OhMyThreads
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries
+
+CGEF.Filtering._available(::CGEF.Filtering._Threads) = true
 using FlowTransformBindings: FlowTransformBindings as FTB
 using LinearAlgebra: LinearAlgebra
 
@@ -17,6 +19,10 @@ const _SLICE_SCHED = OhMyThreads.DynamicScheduler(; chunking = false)
 # `CGEF.Filtering._sep_serial`.
 @inline _omt_driver(f::F, indices) where {F} =
     OhMyThreads.tforeach(f, indices; scheduler = _sched())
+
+# A process's share of a real-space apply on a threaded inner backend: its units in one chunk per thread.
+CGEF.Filtering._share_run(f::F, ::CGEF.ComputationalBackends.AbstractThreadedBackend, units) where {F} =
+    OhMyThreads.tforeach(f, OhMyThreads.chunks(units; n = Threads.nthreads()); scheduler = _sched())
 
 # Row `j` writes only `out[:, j]`, so the parallel row loop is race-free and bit-identical to serial.
 function CGEF.Filtering.threaded_filter_field!(
@@ -42,8 +48,12 @@ function CGEF.Filtering.threaded_filter_field!(
     _, Ny = FlowGeometries.Grids.size_tuple(grid)
     fill!(out, zero(T))
     CGEF.Filtering.prepare_row_apply!(fp, field, grid)
-    OhMyThreads.tforeach(1:Ny; scheduler = _sched()) do j
-        CGEF.Filtering.apply_footprint_row!(out, field, grid, fp, mask_strategy, periodic_x, periodic_y, j)
+    # One query buffer per task, over that task's block of rows.
+    OhMyThreads.tforeach(OhMyThreads.chunks(1:Ny; n = Threads.nthreads()); scheduler = _sched()) do rows
+        sc = CGEF.Filtering.row_scratch(fp)
+        for j in rows
+            CGEF.Filtering.apply_footprint_row!(out, field, grid, fp, mask_strategy, periodic_x, periodic_y, j, sc)
+        end
     end
     return out
 end
@@ -145,8 +155,11 @@ function CGEF.Filtering.threaded_filter_fields!(
         fill!(out, zero(T))
     end
     CGEF.Filtering.prepare_row_apply_batch!(fp, fields, grid)
-    OhMyThreads.tforeach(1:Ny; scheduler = _sched()) do j
-        CGEF.Filtering.apply_footprint_row_batch!(outs, fields, grid, fp, mask_strategy, periodic_x, periodic_y, j)
+    OhMyThreads.tforeach(OhMyThreads.chunks(1:Ny; n = Threads.nthreads()); scheduler = _sched()) do rows
+        sc = CGEF.Filtering.row_scratch(fp)
+        for j in rows
+            CGEF.Filtering.apply_footprint_row_batch!(outs, fields, grid, fp, mask_strategy, periodic_x, periodic_y, j, sc)
+        end
     end
     return outs
 end
@@ -158,10 +171,10 @@ function _threaded_apply_prefixsum_tophat_3d!(
     fp::CGEF.Filtering.PrefixSumTopHat3DPlan{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
 ) where {T<:AbstractFloat}
     _, Ny, Nz = FlowGeometries.Grids.size_tuple(grid)
-    P = fp.scratch.prefix
+    sc = fp.scratch
     planes = CartesianIndices((Ny, Nz))
     OhMyThreads.tforeach(planes; scheduler = _sched()) do JK
-        CGEF.Filtering._prefixsum3d_fill_plane!(P, field, grid, fp.masked, JK[1], JK[2])
+        CGEF.Filtering._prefixsum3d_fill_plane!(sc, field, grid, fp.masked, JK[1], JK[2])
     end
     OhMyThreads.tforeach(planes; scheduler = _sched()) do JK
         CGEF.Filtering._prefixsum3d_out_plane!(out, fp, JK[1], JK[2])

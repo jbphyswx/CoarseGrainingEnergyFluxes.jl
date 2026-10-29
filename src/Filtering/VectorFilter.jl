@@ -12,27 +12,75 @@ How a filter acts on a vector or a rank-2 tensor on the surface of a sphere:
 abstract type AbstractVectorFilter end
 
 """
-    GeneralizedConvolution(; lmax = nothing) <: AbstractVectorFilter
+    AbstractAnalysis
+
+How [`GeneralizedConvolution`](@ref) takes a field's spin-weighted coefficients: [`AutoAnalysis`](@ref),
+[`Quadrature`](@ref) or [`LeastSquares`](@ref).
+"""
+abstract type AbstractAnalysis end
+
+"""
+    Quadrature() <: AbstractAnalysis
+
+The coefficients by the quadrature over the grid's cells, `C_ℓm = Σ_k w_k F_k conj(ₛY_ℓm(x_k))`, `w_k` the cell's
+measure over `R²`. It is exact for a field of degree at most `lmax` where the measure integrates degree `2lmax`
+exactly, as Gauss–Legendre rows do to `lmax = nrings − 1`, and over a regional grid it is the integral of the
+field extended by zero over the sphere.
+"""
+struct Quadrature <: AbstractAnalysis end
+
+"""
+    LeastSquares(; rtol = nothing, maxiter = 100) <: AbstractAnalysis
+
+The coefficients minimizing `Σ_k w_k |F_k − Σ_ℓm C_ℓm ₛY_ℓm(x_k)|²` over the grid's cells, by FlowTransformBindings'
+`lsmr!` in the inner product of the cells' measures, whose first iterate is the [`Quadrature`](@ref). It
+recovers a field of degree at most `lmax` wherever the cells determine its coefficients, whatever the
+quadrature's accuracy. `rtol` bounds `‖Aᴴ W r‖ / ‖Aᴴ W F‖`, `nothing` taking `max(1e-12, 100 eps(T))`; a fit
+that stops at `maxiter` keeps its last iterate and reports through [`analysis_status`](@ref).
+"""
+struct LeastSquares{R<:Union{Nothing,Real}} <: AbstractAnalysis
+    rtol::R
+    maxiter::Int
+end
+
+LeastSquares(; rtol::Union{Nothing,Real} = nothing, maxiter::Integer = 100) = LeastSquares(rtol, Int(maxiter))
+
+"""
+    AutoAnalysis() <: AbstractAnalysis
+
+[`Quadrature`](@ref) on Gauss–Legendre and reduced Gaussian samplings, where it is exact, and on grids whose
+sampling may be regional (none, latitude–longitude or scattered), where it is the zero-extended field's
+integral; [`LeastSquares`](@ref) on every other spherical sampling, whose quadrature is not exact at its band
+limit (Fejér, Driscoll–Healy, McEwen–Wiaux, HEALPix, cubed-sphere, icosahedral, Yin–Yang). A latitude–longitude
+grid over the whole sphere takes `LeastSquares()` by name.
+"""
+struct AutoAnalysis <: AbstractAnalysis end
+
+"""
+    GeneralizedConvolution(; lmax = nothing, analysis = AutoAnalysis()) <: AbstractVectorFilter
 
 The convolution of vectors and rank-2 tensors on a sphere of Aluie (2019, eqs. 58 and 121): every
 degree-`n` vector or tensor spherical harmonic is multiplied by the kernel's `Ĝ(n)`
 ([`Kernels.spectral_transfer_degrees!`](@ref)), so filtering commutes with the surface gradient,
 divergence and curl (Propositions 1–3). It runs as spin-weighted transforms of the field extended by zero
 over the sphere ([`spin_transforms`](@ref)): FastSphericalHarmonics' on a `Float64`
-`ClenshawCurtisSampling` grid of `2N − 1` by `N`, NUFSHT's on every other spherical grid when a NUFFT
+`Fejer1Sampling` grid of `2N − 1` by `N`, NUFSHT's on every other spherical grid when a NUFFT
 library is loaded to run it, and otherwise the direct sums, [`RingSpinTransforms`](@ref) on a latitude–longitude `StructuredGrid` and
 [`DirectSpinTransforms`](@ref) elsewhere. The theory page derives the spin-weighted form.
 
 `lmax` is the highest degree the NUFSHT and direct transforms carry, `nothing` the grid's
 [`spin_band_limit`](@ref). FastSphericalHarmonics transforms at its grid's own band limit, so a given
-`lmax` selects another transform under `transform = AutoSpectralBackend()`.
+`lmax` selects another transform under `transform = AutoSpectralBackend()`. `analysis` is how the NUFSHT and
+direct transforms take coefficients ([`AbstractAnalysis`](@ref)); FastSphericalHarmonics' transform is exact on
+its grid.
 """
-struct GeneralizedConvolution{L<:Union{Nothing,Int}} <: AbstractVectorFilter
+struct GeneralizedConvolution{L<:Union{Nothing,Int}, A<:AbstractAnalysis} <: AbstractVectorFilter
     lmax::L
+    analysis::A
 end
 
-GeneralizedConvolution(; lmax::Union{Nothing,Integer} = nothing) =
-    GeneralizedConvolution(lmax === nothing ? nothing : Int(lmax))
+GeneralizedConvolution(; lmax::Union{Nothing,Integer} = nothing, analysis::AbstractAnalysis = AutoAnalysis()) =
+    GeneralizedConvolution(lmax === nothing ? nothing : Int(lmax), analysis)
 
 """
     CartesianComponents <: AbstractVectorFilter
@@ -109,10 +157,14 @@ Spin-weighted spherical harmonic transforms of spin 0, 1 and 2 over every cell o
   from 0, for the transfer `Ĝ`;
 - `spin_analyze!(C, F, tr, s)`: the coefficients of the spin-`s` field `F` into `C`;
 - `spin_synthesize!(F, C, W, Ĝ, tr, s)`: into `F`, the spin-`s` field whose degree-`n` coefficients are
-  `Ĝ[n+1]` times those of `C`, with `W` a coefficient array to scale in. `C` is left as it is.
+  `Ĝ[n+1]` times those of `C`, with `W` a coefficient array to scale in. `C` is left as it is;
+- `spin_ladder_synthesize!(F, C, W, d, tr, s, t)`: into `F`, the spin-`t` field `ð` (`t = s + 1`) or `ð̄`
+  (`t = s − 1`) of the spin-`s` field whose coefficients are `C`, its degree-`n` coefficients scaled by
+  `d[n+1]`.
 
 and may define `spin_host(tr)`, whether its arrays are host memory, `true` unless it says otherwise; a
-device workspace stages its fields through host copies for transforms that run there.
+device workspace stages its fields through host copies for transforms that run there. Transforms whose
+analysis is the quadrature `Aᴴ W` define [`spin_weights`](@ref), which a [`LeastSquares`](@ref) analysis reads.
 """
 abstract type AbstractSpinTransforms end
 
@@ -123,6 +175,16 @@ function spin_coefficients end
 function spin_transfer_buffer end
 function spin_analyze! end
 function spin_synthesize! end
+
+"""
+    spin_ladder_synthesize!(F, C, W, d, tr, s, t) -> F
+
+Into `F`, the spin-`t` field `ð` (`t = s + 1`) or `ð̄` (`t = s − 1`) of the spin-`s` field whose coefficients are
+`C`, `ð` and `ð̄` the Newman–Penrose operators on the unit sphere, with its degree-`n` coefficients scaled by
+`d[n + 1]`. The caller folds the ladder factor `√((n − s)(n + s + 1))` or `−√((n + s)(n − s + 1))` into `d`; each
+transform applies the phases of its own harmonics. `W` is a coefficient array to scale in.
+"""
+function spin_ladder_synthesize! end
 
 spin_host(::AbstractSpinTransforms) = true
 
@@ -154,7 +216,7 @@ _direct_spin_transforms(grid; lmax = nothing, execution = ComputationalBackends.
 @noinline _spin_library_missing(transform, grid) = throw(ArgumentError(
     "transform = $(nameof(typeof(transform)))() names a library whose spin-weighted transforms no loaded " *
     "extension provides for $(nameof(typeof(grid))): load it (`using NUFSHT`, or `using " *
-    "FastSphericalHarmonics, FFTW` on a Float64 ClenshawCurtisSampling grid of 2N − 1 longitudes by N " *
+    "FastSphericalHarmonics, FFTW` on a Float64 Fejer1Sampling grid of 2N − 1 longitudes by N " *
     "latitudes), or pass transform = AutoSpectralBackend() or DirectSumSpectralBackend().",
 ))
 
@@ -205,17 +267,23 @@ end
 """
     spin_band_limit(grid) -> Int
 
-The highest spherical-harmonic degree `grid`'s cells resolve, at least 2: a spectral-quadrature
-sampling's own band limit, and otherwise `⌈πR/√A⌉ − 1`, the degree whose half wavelength is the side
-`√A` of the grid's largest cell.
+The highest spherical-harmonic degree `grid`'s cells resolve, at least 2: the band limit of a sampling
+that ties its ring count to one (`SphericalSampling.has_bandlimit`), and otherwise `⌈πR/√A⌉ − 1`, the
+degree whose half wavelength is the side `√A` of the grid's largest cell.
 """
 spin_band_limit(grid::FlowGeometries.Grids.AbstractGrid) =
     max(2, _band_limit(FlowGeometries.Grids.sampling(grid), grid))
 
-_band_limit(s::FlowGeometries.SphericalSampling.AbstractSpectralQuadratureSampling, grid::FlowGeometries.Grids.AbstractGrid) =
-    FlowGeometries.SphericalSampling.bandlimit(s, size(FlowGeometries.Grids.mask(grid), 2))
+_band_limit(s::FlowGeometries.SphericalSampling.AbstractSphericalSampling, grid::FlowGeometries.Grids.AbstractGrid) =
+    FlowGeometries.SphericalSampling.has_bandlimit(s) ?
+        FlowGeometries.SphericalSampling.bandlimit(s, _ring_count(grid)) : _cell_band_limit(grid)
+_band_limit(_, grid::FlowGeometries.Grids.AbstractGrid) = _cell_band_limit(grid)
 
-function _band_limit(_, grid::FlowGeometries.Grids.AbstractGrid{G,T}) where {G,T}
+# The latitude rings of the grids whose samplings have a band limit.
+_ring_count(grid::FlowGeometries.Grids.StructuredGrid) = size(FlowGeometries.Grids.mask(grid), 2)
+_ring_count(grid::FlowGeometries.Grids.RingGrid) = FlowGeometries.Grids.nrings(grid)
+
+function _cell_band_limit(grid::FlowGeometries.Grids.AbstractGrid{G,T}) where {G,T}
     R = FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(grid))
     return ceil(Int, T(π) * R / sqrt(maximum(FlowGeometries.Grids.measure(grid)))) - 1
 end

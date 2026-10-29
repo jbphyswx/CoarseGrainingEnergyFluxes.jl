@@ -65,11 +65,12 @@ end
 The scale-independent part of the prefix-sum top-hat engine: everything fixed by the grid, its mask
 and the mask strategy. One instance serves every scale of a sweep.
 
-Holds the separable measure factors (`wx`,`wy`), the extended axis-1 coordinate array the two-pointer
-sweep walks (tripled when axis 1 is periodic, so a wrapped support interval is still one contiguous
-run), and the two measure scans the window mass is formed from: `prefix_wx` of `wx` along the extended
-axis (`ZeroFill`), and `prefix_den` of `mask·wx` per row (`Deformable` on a masked grid, `nothing`
-otherwise).
+Holds the separable measure factors (`wx`,`wy`), the axis-1 coordinates in ascending order, and the two
+measure scans the window mass is formed from: `prefix_wx` of `wx` along axis 1 (`ZeroFill`), and
+`prefix_den` of `mask·wx` per row (`Deformable` on a masked grid, `nothing` otherwise). Every scan holds one
+copy of the axis. Where axis 1 wraps (`tiles_x || rings_x`), the two-pointer sweep walks an extended axis of
+three copies shifted by `−P, 0, +P`, so a wrapped support interval is one contiguous run: entry `c·Nx + t`
+is `xe[t] + (c − 1)·P`, and its scan entry `c` row totals plus the scan's entry `t` ([`_walk_band`](@ref)).
 """
 struct PrefixSumGridPlan{
     T<:AbstractFloat,
@@ -92,56 +93,98 @@ struct PrefixSumGridPlan{
     strategy::MS        # the strategy `prefix_den` and every scale's `invden` are built for
     wx::WX              # axis-1 cell width;  measure[i,j] == wx[i]*wy[j]
     wy::WY              # axis-2 measure factor
-    xe::VT              # extended axis-1 coordinates (nrep*Nx), strictly increasing
-    src::BT             # xe[k] belongs to real axis-1 index src[k]
-    prefix_wx::PW       # scan of wx along the extended axis (nrep*Nx+1) — ZeroFill denominator
-    prefix_den::DT      # per-row scan of mask·wx (nrep*Nx+1 × Ny), or nothing (Deformable only)
+    xe::VT              # axis-1 coordinates (Nx), strictly increasing
+    src::BT             # xe[t] belongs to axis-1 index src[t]
+    prefix_wx::PW       # scan of wx in xe's order (Nx+1) — ZeroFill denominator
+    prefix_den::DT      # per-row scan of mask·wx (Nx+1 × Ny), or nothing (Deformable only)
 end
 
 """
-    PrefixSumScratch{T,S,VS} <: AbstractFilterScratch
+    PrefixSumScratch{T,S,VS,VV} <: AbstractFilterScratch
 
 The prefix-sum engine's per-apply buffers: one [`CompensatedScan`](@ref) of `mask·field·wx` per field
-in flight. Every apply refills them, so one set serves every scale of a sweep, one apply at a time.
-Each row of a scan is written independently, so the numerator fill may run concurrently by row.
+in flight, and under [`Kernels.CellOverlap`](@ref) the cells' values `mask·field·wx` themselves in the scan's
+order (`cell_values`, `nothing` under `CellCentre`), which the cells the disk's edge cuts read. Every apply
+refills them, so one set serves every scale of a sweep, one apply at a time. Each row is written
+independently, so the numerator fill may run concurrently by row.
 
 A single-field apply uses slot 1, a batched apply of `K` fields slots `1:K`; `_prefixsum_numerators!`
 adds missing slots.
 """
 struct PrefixSumScratch{
-    T<:AbstractFloat, S<:CompensatedScan{T}, VS<:AbstractVector{S},
+    T<:AbstractFloat, S<:CompensatedScan{T}, VS<:AbstractVector{S}, VV<:Union{Nothing,AbstractVector},
 } <: AbstractFilterScratch
     prefix_nums::VS     # slot k: per-row scan of mask·fieldₖ·wx (nrep*Nx+1 × Ny)
+    cell_values::VV     # slot k: mask·fieldₖ·wx by cell in the scan's order (Nx × Ny), or nothing
 end
+
+PrefixSumScratch(prefix_nums::AbstractVector) = PrefixSumScratch(prefix_nums, nothing)
 
 # Slot 1 always exists, so the single-field path never checks.
 @inline _prefixsum_num(sc::PrefixSumScratch) = @inbounds sc.prefix_nums[1]
 
+# Slot `k`'s cell values, or `nothing`.
+@inline _prefixsum_values(sc::PrefixSumScratch, k::Int) = _slot(sc.cell_values, k)
+@inline _slot(::Nothing, ::Int) = nothing
+@inline _slot(v::AbstractVector, k::Int) = @inbounds v[k]
+
 """
     _prefixsum_numerators!(sc, K) -> sc.prefix_nums
 
-Grow `sc` to at least `K` numerator slots and return them. A new slot is a zeroed `similar` of slot
-1, since the fill never writes row 1, the empty prefix. Call it before any parallel region that uses
-the slots: growing `push!`es.
+Grow `sc` to at least `K` numerator slots (and cell-value slots, where held) and return them. A new slot is
+a zeroed `similar` of slot 1, since the fill never writes row 1, the empty prefix. Call it before any parallel
+region that uses the slots: growing `push!`es.
 """
 function _prefixsum_numerators!(sc::PrefixSumScratch{T}, K::Integer) where {T<:AbstractFloat}
     while length(sc.prefix_nums) < K
         P1 = @inbounds sc.prefix_nums[1]
         push!(sc.prefix_nums, CompensatedScan(fill!(similar(P1.hi), zero(T)), fill!(similar(P1.lo), zero(T))))
     end
+    _grow_values!(sc.cell_values, K)
     return sc.prefix_nums
 end
 
+_grow_values!(::Nothing, ::Integer) = nothing
+function _grow_values!(v::AbstractVector, K::Integer)
+    while length(v) < K
+        push!(v, similar(@inbounds v[1]))
+    end
+    return v
+end
+
 """
-    PrefixSumTopHatPlan{T,GP,SC,MT,WT}
+    PrefixEdgeCells{VI,VT,MI}
+
+The cells the support of a [`Kernels.CellOverlap`](@ref) top-hat cuts, for a plan whose axis 1 is uniform. Row
+`j`'s taps `ptr[j]:ptr[j+1]-1` hold an axis-1 offset `di`, a raw axis-2 offset `dj` and `w = f·wy`, `f` the
+cell's fraction inside the support, which multiplies the cell's scanned value `mask·field·wx`. `far[b, j]` is
+the least axis-1 offset from which every cell across a regional longitude box's seam lies wholly inside, `0`
+where none does. Axis-1 offsets count along the scan's ascending order (`rev`: the coordinates descend), and
+modulo the axis's length where it closes on itself (`wrap`).
+"""
+struct PrefixEdgeCells{VI<:AbstractVector{Int}, VT<:AbstractVector, MI<:AbstractMatrix{Int}}
+    wrap::Bool
+    rev::Bool
+    far::MI
+    ptr::VI
+    di::VI
+    dj::VI
+    w::VT
+end
+
+"""
+    PrefixSumTopHatPlan{T,GP,SC,MT,WT,RM}
 
 Exact `O(N·dj_lim)` top-hat footprint for a rectilinear 2D `StructuredGrid`, holding the state that
 depends on the filter scale ℓ. `grid_plan` and `scratch` may be shared with the other scales of a
 sweep.
 
 - `invden`: the reciprocal window mass per point, a function of the grid, the mask, the strategy and ℓ.
-- `hw`/`wcell`: the support half-width per `(band, row)` and, on a uniform ascending axis, the
-  constant cell half-width it implies.
+- `hw`/`wcell`: under [`Kernels.CellCentre`](@ref), the support half-width per `(band, row)` and, on a
+  uniform ascending axis, the constant cell half-width it implies; under [`Kernels.CellOverlap`](@ref),
+  `hw ≥ 0` marks a band holding cells wholly inside the support and `wcell` the half-width, in cells, of
+  those about the target.
+- `edge`: `nothing` under `CellCentre`, the [`PrefixEdgeCells`](@ref) under `CellOverlap`.
 
 `invden` is built for one mask strategy: where the two strategies normalize differently (`bound`), the
 apply throws unless its `strategy` has the type of `grid_plan.strategy`.
@@ -152,6 +195,7 @@ struct PrefixSumTopHatPlan{
     SC<:PrefixSumScratch{T},
     MT<:AbstractMatrix{T},
     WT<:AbstractMatrix{Int},
+    RM<:Union{Nothing,PrefixEdgeCells},
 }
     grid_plan::GP
     scratch::SC
@@ -162,6 +206,7 @@ struct PrefixSumTopHatPlan{
     invden::MT          # 1/(window mass) per point (Nx × Ny); zero where empty or, under Deformable, inactive
     hw::MT              # support half-width per (band, row); negative ⇒ band empty
     wcell::WT           # uniform-axis constant cell half-width per (band, row), else -1
+    edge::RM
 end
 
 """
@@ -205,38 +250,28 @@ function _build_prefixsum_grid_plan(
 
     wx, wy = _rectilinear_measure_factors(grid)
 
-    # Extended axis-1 coordinates, ascending: one copy, or three shifted by −P, 0, +P on a periodic axis
-    # or a longitude (P exceeds the axis extent), so a wrapped support interval is one contiguous run.
-    # `src` maps each entry to its real axis index, which a descending axis permutes.
-    nrep = ((periodic_x && Nx > 1) || rings) ? 3 : 1
-    ne = nrep * Nx
-    ord = issorted(FlowGeometries.Grids.coordinates(grid, 1)) ? collect(1:Nx) : sortperm(FlowGeometries.Grids.coordinates(grid, 1))
-    xe = Vector{T}(undef, ne)
-    src = Vector{Int}(undef, ne)
-    @inbounds for r in 0:(nrep - 1), t in 1:Nx
-        k = r * Nx + t
-        i = ord[t]
-        xe[k] = FlowGeometries.Grids.coordinates(grid, 1)[i] + (nrep == 3 ? (r - 1) * x_period : zero(T))
-        src[k] = i
-    end
+    # Axis-1 coordinates, ascending; `src` maps each entry to its axis index, which a descending axis permutes.
+    x = FlowGeometries.Grids.coordinates(grid, 1)
+    src = issorted(x) ? collect(1:Nx) : sortperm(x)
+    xe = T[x[i] for i in src]
 
-    prefix_wx = CompensatedScan(T, ne + 1)
+    prefix_wx = CompensatedScan(T, Nx + 1)
     let h = zero(T), l = zero(T)
-        @inbounds for k in 1:ne
+        @inbounds for k in 1:Nx
             h, l = _scan_step(h, l, T(wx[src[k]]))
             prefix_wx.hi[k + 1] = h
             prefix_wx.lo[k + 1] = l
         end
     end
 
-    masked = !all(FlowGeometries.Grids.mask(grid))
+    mask = FlowGeometries.Grids.mask(grid)
+    masked = !all(mask)
 
-    prefix_den = if mask_strategy isa Deformable && masked
-        P = CompensatedScan(T, ne + 1, Ny)
-        mask = FlowGeometries.Grids.mask(grid)
+    prefix_den = if !_mask_free_mass(mask_strategy, mask)
+        P = CompensatedScan(T, Nx + 1, Ny)
         @inbounds for j in 1:Ny
             h = l = zero(T)
-            for k in 1:ne
+            for k in 1:Nx
                 i = src[k]
                 h, l = _scan_step(h, l, mask[i, j] ? T(wx[i]) : zero(T))
                 P.hi[k + 1, j] = h
@@ -248,7 +283,8 @@ function _build_prefixsum_grid_plan(
         nothing
     end
 
-    tiles_x = nrep == 3 && is_cartesian
+    # A support interval wraps on a periodic axis or a longitude (P exceeds the axis extent).
+    tiles_x = periodic_x && Nx > 1 && is_cartesian
     rings_x = rings
     tiles_y = periodic_y && Ny > 1 && is_cartesian && y_period > zero(T)
     return PrefixSumGridPlan(
@@ -258,25 +294,84 @@ function _build_prefixsum_grid_plan(
 end
 
 """
-    _prefixsum_scratch(gp::PrefixSumGridPlan, grid) -> PrefixSumScratch
+    _prefixsum_scratch(gp::PrefixSumGridPlan, grid, kernel) -> PrefixSumScratch
 
-Allocate the engine's per-apply numerator scan. Sized by the grid alone, so one scratch serves every
-scale — but only one apply at a time; see [`AbstractFilterScratch`](@ref).
+Allocate the engine's per-apply numerator scan, and under [`Kernels.CellOverlap`](@ref) the cell values. Sized
+by the grid alone, so one scratch serves every scale — but only one apply at a time; see
+[`AbstractFilterScratch`](@ref).
 """
 function _prefixsum_scratch(
-    gp::PrefixSumGridPlan{T}, grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
+    gp::PrefixSumGridPlan{T}, grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, ::Kernels.TopHatKernel{Kernels.CellCentre},
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     _, Ny = FlowGeometries.Grids.size_tuple(grid)
     return PrefixSumScratch([CompensatedScan(T, length(gp.xe) + 1, Ny)])
 end
 
-# An ascending `Range` axis 1, where a band shorter than a period is a constant ±w cells.
-@inline _prefixsum_uniform_axis(::PrefixSumGridPlan, x) = x isa AbstractRange && step(x) > zero(eltype(x))
+function _prefixsum_scratch(
+    gp::PrefixSumGridPlan{T}, grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, ::Kernels.TopHatKernel{Kernels.CellOverlap},
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
+    return PrefixSumScratch([CompensatedScan(T, length(gp.xe) + 1, Ny)], [zeros(T, Nx, Ny)])
+end
 
-# The extended-axis entries `lo:hi` of a constant-width band at target `i`: `i ± w` clamped to the axis,
-# or, where axis 1 tiles, `±w` about the target's entry in the middle copy.
-@inline _prefixsum_wcell_range(tiles_x::Bool, i::Int, w::Int, Nx::Int) =
-    tiles_x ? (Nx + i - w, Nx + i + w) : (max(1, i - w), min(Nx, i + w))
+# An ascending axis 1 uniform around its wrap where it wraps, on which a band shorter than a period is a
+# constant ±w cells.
+@inline _prefixsum_uniform_axis(grid, x) = FlowGeometries.Grids.isuniform(grid, 1) && step(x) > zero(eltype(x))
+
+# Whether a constant-width band wraps modulo the axis length: axis 1 tiles or is a closed longitude ring.
+@inline _prefixsum_band_wraps(gp::PrefixSumGridPlan) = gp.tiles_x || (gp.rings_x && gp.periodic_x)
+
+# The scanned sum over cells `i − w : i + w`: clamped to the axis, or modulo its length where it wraps, for
+# `2w + 1 ≤ Nx`. A run across the wrap is one row total less the scan before its start, plus the scan to its end.
+@inline function _band_diff(Ph, Pl, wrap::Bool, i::Int, w::Int, Nx::Int, J::Integer...)
+    wrap || return _scan_diff(Ph, Pl, min(Nx, i + w) + 1, max(1, i - w), J...)
+    i - w < 1 && return _wrap_sum(Ph, Pl, 1, i + w + 1, Nx + i - w, Nx, J...)
+    i + w > Nx && return _wrap_sum(Ph, Pl, 1, i + w - Nx + 1, i - w, Nx, J...)
+    return _scan_diff(Ph, Pl, i + w + 1, i - w, J...)
+end
+
+# The shift of copy `c` of the extended axis: `(c − 1)·P` where axis 1 wraps, none otherwise.
+@inline _copy_shift(wraps::Bool, c::Int, P::T) where {T} = wraps ? T(c - 1) * P : zero(T)
+
+# The extended-axis sum from scan entry `a` of copy `cl` to entry `b` of copy `cl + n`: `n` row totals and the
+# difference of the two entries, the totals less the lower entry first.
+@inline function _wrap_sum(Ph, Pl, n::Int, b::Int, a::Int, Nx::Int, J::Integer...)
+    iszero(n) && return _scan_diff(Ph, Pl, b, a, J...)
+    @inbounds return ((n * Ph[Nx + 1, J...] - Ph[a, J...]) + Ph[b, J...]) +
+                     ((n * Pl[Nx + 1, J...] - Pl[a, J...]) + Pl[b, J...])
+end
+
+"""
+    _walk_band(f, xe, src, x, wraps, P, a, c, Nx)
+
+The two-pointer sweep of one band: for each target `i = src[t]` in ascending coordinate order whose interval
+`[x[i] − a, x[i] + c]` holds an entry of the extended axis, `f(i, n, hi, lo)` with the run's sum
+`_wrap_sum(Ph, Pl, n, hi, lo, Nx, …)`. Each pointer holds its copy and entry, so the extended axis is never
+stored; entry `t` of copy `k` lies at `xe[t] + _copy_shift(wraps, k, P)`.
+"""
+@inline function _walk_band(f::F, xe, src, x, wraps::Bool, P::T, a::T, c::T, Nx::Int) where {F, T}
+    nc = wraps ? 3 : 1
+    lc, lt = 0, 1   # first entry at or past the interval's start
+    hc, ht = 0, 0   # last entry at or before its end (none yet)
+    @inbounds for t in 1:Nx
+        i = src[t]
+        xc = x[i]
+        xlo = xc - a
+        xhi = xc + c
+        while lc < nc && xe[lt] + _copy_shift(wraps, lc, P) < xlo
+            lt += 1
+            lt > Nx && (lt = 1; lc += 1)
+        end
+        while true
+            nt, ncp = ht + 1, hc
+            nt > Nx && (nt = 1; ncp += 1)
+            (ncp < nc && xe[nt] + _copy_shift(wraps, ncp, P) <= xhi) || break
+            ht, hc = nt, ncp
+        end
+        hc * Nx + ht >= lc * Nx + lt && f(i, hc - lc, ht + 1, lt)
+    end
+    return nothing
+end
 
 # The source row of band 0 for target row `j`. On a tiling axis 2 every raw offset `-dj_lim:dj_lim` is
 # one row image; on a bounded one the bands start at the first row in reach, so at most `Ny` of them.
@@ -306,7 +401,7 @@ and `mask_strategy` is then unused. `kwargs...` absorbs and ignores `cache_strat
 """
 function _build_prefixsum_tophat(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
-    kernel::Kernels.TopHatKernel,
+    kernel::Kernels.TopHatKernel{Kernels.CellCentre},
     scale::T;
     mask_strategy::AbstractMaskStrategy = ZeroFill(),
     grid_plan::Union{Nothing,PrefixSumGridPlan} = nothing,
@@ -315,7 +410,7 @@ function _build_prefixsum_tophat(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     gp = grid_plan === nothing ?
         _build_prefixsum_grid_plan(grid; mask_strategy = mask_strategy) : grid_plan
-    sc = scratch === nothing ? _prefixsum_scratch(gp, grid) : scratch
+    sc = scratch === nothing ? _prefixsum_scratch(gp, grid, kernel) : scratch
 
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     rad = Kernels.kernel_radius(kernel, scale)
@@ -331,9 +426,11 @@ function _build_prefixsum_tophat(
     x = FlowGeometries.Grids.coordinates(grid, 1)
     y = FlowGeometries.Grids.coordinates(grid, 2)
     nb = _prefixsum_nbands(gp.tiles_y, dj_lim, Ny)
-    uniform = _prefixsum_uniform_axis(gp, x)
-    # A longitude band shorter than the gap across the grid's seam, and than half the ring, keeps to the
-    # grid's own columns.
+    uniform = _prefixsum_uniform_axis(grid, x)
+    # A band shorter than half a period is constant-width where it wraps modulo the axis; on a regional
+    # longitude box, where it is also shorter than the gap across the box's seam, which keeps it to the grid's
+    # own columns.
+    wrap = _prefixsum_band_wraps(gp)
     seam = gp.rings_x ? gp.x_period - abs(T(x[Nx]) - T(x[1])) : T(Inf)
     sy = (Ny > 1 && y[Ny] < y[1]) ? -one(T) : one(T)   # coordinate direction of increasing index
 
@@ -350,7 +447,7 @@ function _build_prefixsum_tophat(
             h = FlowGeometries.Connectivity.metric_band(grid, 1, y_t, y_t + dy, rad)
             h < zero(T) && continue
             hw[b + 1, j] = h
-            if uniform && h < seam && !((gp.rings_x || gp.tiles_x) && 2h >= gp.x_period)
+            if uniform && (wrap || h < seam) && !((gp.rings_x || gp.tiles_x) && 2h >= gp.x_period)
                 # Same `≤` the pointer loop uses, so it makes the same boundary decision.
                 w = 0
                 while (w + 1) * step(x) <= h
@@ -368,7 +465,235 @@ function _build_prefixsum_tophat(
     # Every band constant-width: nothing for a batch to share.
     every_band = uniform && all(k -> hw[k] < zero(T) || wcell[k] >= 0, eachindex(hw))
 
-    return PrefixSumTopHatPlan(gp, sc, rad, dj_lim, every_band, bound, invden, hw, wcell)
+    return PrefixSumTopHatPlan(gp, sc, rad, dj_lim, every_band, bound, invden, hw, wcell, nothing)
+end
+
+# `(near, far)`: a band's cells about the target are scanned at offsets `0:near`, and a regional longitude box's
+# cells across its seam at offsets `far:(Nx − 1)` (none where `far > Nx − 1`). A tiling axis has every image
+# (the scan stops at the first cell outside the support), a closed ring each cell once, a bounded axis its
+# own cells; a regional longitude box keeps the near offsets within half a turn.
+function _overlap_offsets(gp::PrefixSumGridPlan, Nx::Int, Δ::F) where {F}
+    gp.tiles_x && return typemax(Int) - 1, typemax(Int)
+    gp.rings_x && gp.periodic_x && return Nx ÷ 2, typemax(Int)
+    gp.rings_x || return Nx - 1, typemax(Int)
+    half = floor(Int, F(π) / Δ)
+    return min(Nx - 1, half), half + 1
+end
+
+# A band's fractions on a uniform axis 1 of step `Δ`: at offsets `0, 1, …, near_max` into `near`, stopping at
+# the first cell wholly outside (one cell where axis 1 is a single column), and across a regional box's seam
+# at offsets `Nx − 1, Nx − 2, …, far_min` into `far` (entry `k` at offset `Nx − k`), stopping likewise. Both
+# offsets' signs give one fraction.
+function _band_fractions!(near, far, ov, band, Δ::F, near_max::Int, far_min::Int, Nx::Int, line_x::Bool) where {F}
+    empty!(near)
+    empty!(far)
+    for d in 0:near_max
+        f = _cell_fraction(ov, band, (d - F(1) / 2) * Δ, (d + F(1) / 2) * Δ, line_x)
+        iszero(f) && break
+        push!(near, f)
+        line_x && break
+    end
+    for d in (Nx - 1):-1:far_min
+        f = _cell_fraction(ov, band, (d - F(1) / 2) * Δ, (d + F(1) / 2) * Δ, line_x)
+        iszero(f) && break
+        push!(far, f)
+    end
+    return near, far
+end
+
+"""
+    _overlap_band_rows(grid, kernel::TopHatKernel{CellOverlap}, scale) -> (di, dj, w, ptr)
+
+Every tap of a `CellOverlap` top-hat on a 2-D grid of uniform axis 1, by target row: row `j`'s entries
+`ptr[j]:ptr[j+1]-1` hold the axis-1 and axis-2 offsets of each cell the support about a target in row `j`
+reaches and its weight `measure · f`. The same for every target of a row, as [`_sphere_band_rows`](@ref)'s.
+"""
+function _overlap_band_rows(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    gp = _build_prefixsum_grid_plan(grid)
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
+    F = _overlap_float(T)
+    rad = Kernels.kernel_radius(kernel, scale)
+    ov = _overlap_rule(FlowGeometries.Grids.grid_geometry(grid), rad)
+    line_x, line_y = Nx == 1, Ny == 1
+    y = FlowGeometries.Grids.coordinates(grid, 2)
+    Δ = line_x ? zero(F) : abs(F(step(FlowGeometries.Grids.coordinates(grid, 1))))
+    fy = line_y ? F[] : _cell_faces(grid, 2, F)
+    near_max, far_min = _overlap_offsets(gp, Nx, Δ)
+    closed_ring = gp.rings_x && gp.periodic_x
+    sy = (Ny > 1 && y[Ny] < y[1]) ? -one(F) : one(F)
+    di, dj, w = Int[], Int[], T[]
+    ptr = Int[1]
+    fr, ff = F[], F[]
+    for j in 1:Ny
+        tgt = _overlap_target(ov, F(y[j]))
+        # The target's row, then rows outward each way until one lies wholly outside.
+        for dir in (0, 1, -1)
+            (line_y && dir != 0) && continue
+            k = abs(dir)
+            while true
+                jr = j + dir * k
+                (gp.tiles_y || 1 <= jr <= Ny) || break
+                m = fld(jr - 1, Ny)
+                jj = jr - m * Ny
+                band = _overlap_band(ov, fy, jj, sy * F(m) * F(gp.y_period), tgt, line_y)
+                band === nothing && break
+                A = T(gp.wx[1]) * T(gp.wy[jj])
+                _band_fractions!(fr, ff, ov, band, Δ, near_max, far_min, Nx, line_x)
+                for d in 0:(length(fr) - 1)
+                    _push_edge!(di, dj, w, d, jr - j, A * T(fr[d + 1]), d > 0 && !(closed_ring && 2d == Nx))
+                end
+                for q in eachindex(ff)
+                    _push_edge!(di, dj, w, Nx - q, jr - j, A * T(ff[q]), true)
+                end
+                dir == 0 && break
+                k += 1
+            end
+        end
+        push!(ptr, length(di) + 1)
+    end
+    return di, dj, w, ptr
+end
+
+# Appends the tap of offset `d` and, unless `d` names one cell on both sides, of `-d`.
+function _push_edge!(di, dj, w, d::Int, djr::Int, wt, both::Bool)
+    push!(di, d); push!(dj, djr); push!(w, wt)
+    if both
+        push!(di, -d); push!(dj, djr); push!(w, wt)
+    end
+    return nothing
+end
+
+"""
+    _build_prefixsum_tophat(grid, kernel::TopHatKernel{CellOverlap}, scale; ...) -> PrefixSumTopHatPlan
+
+The prefix-sum top-hat with each cell weighted by its fraction inside the support, on a grid whose axis 1 is
+uniform: per `(band, row)` the integer half-width of the cells wholly inside about the target (by its scan
+interval) and, across a regional longitude box's seam, the offset from which they are; per target row, the
+cells the support's boundary cuts as [`PrefixEdgeCells`](@ref) taps. A band's fractions are symmetric in the axis-1
+offset, and fall from one to zero as it grows. `ZeroFill` divides by the support's measure
+([`_support_mass`](@ref)) where a window leaves the grid, and by the summed weights elsewhere.
+"""
+function _build_prefixsum_tophat(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
+    kernel::Kernels.TopHatKernel{Kernels.CellOverlap},
+    scale::T;
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
+    grid_plan::Union{Nothing,PrefixSumGridPlan} = nothing,
+    scratch::Union{Nothing,PrefixSumScratch} = nothing,
+    kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    gp = grid_plan === nothing ?
+        _build_prefixsum_grid_plan(grid; mask_strategy = mask_strategy) : grid_plan
+    sc = scratch === nothing ? _prefixsum_scratch(gp, grid, kernel) : scratch
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
+    F = _overlap_float(T)
+    rad = Kernels.kernel_radius(kernel, scale)
+    geo = FlowGeometries.Grids.grid_geometry(grid)
+    ov = _overlap_rule(geo, rad)
+    line_x, line_y = Nx == 1, Ny == 1
+    x = FlowGeometries.Grids.coordinates(grid, 1)
+    y = FlowGeometries.Grids.coordinates(grid, 2)
+    Δ = line_x ? zero(F) : abs(F(step(x)))
+    fy = line_y ? F[] : _cell_faces(grid, 2, F)
+    wrap = gp.tiles_x || (gp.rings_x && gp.periodic_x)
+    rev = !line_x && step(x) < zero(eltype(x))
+
+    # Rows whose band can reach the support, from the axis's least gap; a tiling axis 2 reaches rows through
+    # their images.
+    min_dy = FlowGeometries.Grids.minimum_spacing(grid, 2)
+    dy_phys = G <: FlowGeometries.Geometry.CartesianGeometry{T} ? min_dy :
+        _least_meridian_radius(geo) * min_dy
+    dj_lim = !(isfinite(dy_phys) && dy_phys > 0) ? 0 :
+             gp.tiles_y ? ceil(Int, rad / dy_phys) + 1 : min(Ny - 1, ceil(Int, rad / dy_phys) + 1)
+    nb = _prefixsum_nbands(gp.tiles_y, dj_lim, Ny)
+    sy = (Ny > 1 && y[Ny] < y[1]) ? -one(F) : one(F)
+    near_max, far_min = _overlap_offsets(gp, Nx, Δ)
+    closed_ring = gp.rings_x && gp.periodic_x
+
+    hw = fill(-one(T), nb, Ny)
+    wcell = fill(-1, nb, Ny)
+    far = zeros(Int, nb, Ny)
+    ptr = Vector{Int}(undef, Ny + 1)
+    ptr[1] = 1
+    rdi, rdj, rw = Int[], Int[], T[]
+    fr, ff = F[], F[]
+    tgts = map(t -> _overlap_target(ov, F(t)), y)
+    for j in 1:Ny
+        tgt = tgts[j]
+        row0 = _prefixsum_row0(gp.tiles_y, j, dj_lim)
+        for b in 0:(nb - 1)
+            jr = row0 + b
+            (gp.tiles_y || jr <= Ny) || continue
+            m = fld(jr - 1, Ny)
+            jj = jr - m * Ny
+            band = _overlap_band(ov, fy, jj, sy * F(m) * F(gp.y_period), tgt, line_y)
+            band === nothing && continue
+            wy = T(gp.wy[jj])
+            _band_fractions!(fr, ff, ov, band, Δ, near_max, far_min, Nx, line_x)
+            wf = 0
+            while wf < length(fr) && isone(fr[wf + 1])
+                wf += 1
+            end
+            wf -= 1
+            closed_ring && (wf = min(wf, (Nx - 1) ÷ 2))
+            for d in (wf + 1):(length(fr) - 1)
+                _push_edge!(rdi, rdj, rw, d, jr - j, T(fr[d + 1]) * wy, d > 0 && !(closed_ring && 2d == Nx))
+            end
+            fa = 0
+            whole = true
+            for k in eachindex(ff)
+                d = Nx - k
+                if whole && isone(ff[k])
+                    fa = d
+                else
+                    whole = false
+                    _push_edge!(rdi, rdj, rw, d, jr - j, T(ff[k]) * wy, true)
+                end
+            end
+            if wf >= 0 || fa > 0
+                hw[b + 1, j] = zero(T)
+                wcell[b + 1, j] = wf
+                far[b + 1, j] = fa
+            end
+        end
+        ptr[j + 1] = length(rdi) + 1
+    end
+
+    edge = PrefixEdgeCells(wrap, rev, far, ptr, rdi, rdj, rw)
+    bound = gp.masked || _reaches_exterior(grid, kernel, scale)
+    invden = zeros(T, Nx, Ny)
+    fp = PrefixSumTopHatPlan(gp, sc, rad, dj_lim, true, bound, invden, hw, wcell, edge)
+    # The window mass: the row body over the scan of the mass field, `wx` everywhere (`ZeroFill`, or every
+    # cell active) or `mask·wx`.
+    Pm = gp.prefix_den === nothing ? _replicated_scan(gp.prefix_wx, Ny) : gp.prefix_den
+    mask = FlowGeometries.Grids.mask(grid)
+    Vm = [(gp.prefix_den === nothing || mask[gp.src[k], j]) ? T(gp.wx[gp.src[k]]) : zero(T) for k in 1:Nx, j in 1:Ny]
+    for j in 1:Ny
+        _overlap_row_sum!(_entry_row(invden, j, rev, Nx), Pm, Vm, fp, edge, j, Nx, Ny)
+    end
+    zerofill = gp.strategy isa ZeroFill
+    if zerofill && _reaches_exterior(grid, kernel, scale)
+        for j in 1:Ny
+            fill!(view(invden, :, j), T(_support_mass(ov, line_x, line_y, tgts[j])))
+        end
+    end
+    @inbounds for j in 1:Ny, i in 1:Nx
+        keep = zerofill || FlowGeometries.Grids.isactive(grid, i, j)
+        invden[i, j] = keep ? _inv_mass(invden[i, j]) : zero(T)
+    end
+    return fp
+end
+
+# The scan `P` of one row, held for each of `Ny` rows.
+function _replicated_scan(P::CompensatedScan{T}, Ny::Int) where {T}
+    R = CompensatedScan(T, length(P.hi), Ny)
+    for j in 1:Ny
+        copyto!(view(R.hi, :, j), P.hi)
+        copyto!(view(R.lo, :, j), P.lo)
+    end
+    return R
 end
 
 """
@@ -388,10 +713,11 @@ function _prefixsum_build_invden(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     x = FlowGeometries.Grids.coordinates(grid, 1)
-    Pd, Pwx, src, xe = gp.prefix_den, gp.prefix_wx, gp.src, gp.xe
-    ne = length(xe)
+    Pd, Pwx = gp.prefix_den, gp.prefix_wx
     use_mask_den = !(gp.strategy isa ZeroFill) && Pd !== nothing
     nb = size(hw, 1)
+    wrap = _prefixsum_band_wraps(gp)
+    wraps = gp.tiles_x || gp.rings_x
 
     den = zeros(T, Nx, Ny)
     @inbounds for j in 1:Ny
@@ -412,26 +738,13 @@ function _prefixsum_build_invden(
             if wcell[b + 1, j] >= 0
                 w = wcell[b + 1, j]
                 for i in 1:Nx
-                    lo, hi = _prefixsum_wcell_range(gp.tiles_x, i, w, Nx)
-                    den[i, j] += wyj * (use_mask_den ? _scan_diff(Pd, hi + 1, lo, jj) : _scan_diff(Pwx, hi + 1, lo))
+                    den[i, j] += wyj * (use_mask_den ? _band_diff(Pd.hi, Pd.lo, wrap, i, w, Nx, jj) :
+                        _band_diff(Pwx.hi, Pwx.lo, wrap, i, w, Nx))
                 end
             elseif -a <= c
-                lo = 1
-                hi = 0
-                for t in 1:Nx
-                    i = src[t]
-                    xc = x[i]
-                    xlo = xc - a
-                    xhi = xc + c
-                    while lo <= ne && xe[lo] < xlo
-                        lo += 1
-                    end
-                    while hi < ne && xe[hi + 1] <= xhi
-                        hi += 1
-                    end
-                    if hi >= lo
-                        den[i, j] += wyj * (use_mask_den ? _scan_diff(Pd, hi + 1, lo, jj) : _scan_diff(Pwx, hi + 1, lo))
-                    end
+                _walk_band(gp.xe, gp.src, x, wraps, gp.x_period, a, c, Nx) do i, n, hi, lo
+                    den[i, j] += wyj * (use_mask_den ? _wrap_sum(Pd.hi, Pd.lo, n, hi, lo, Nx, jj) :
+                        _wrap_sum(Pwx.hi, Pwx.lo, n, hi, lo, Nx))
                 end
             end
         end
@@ -471,14 +784,15 @@ concurrently across `j`.
 function prefixsum_fill_numerator_row!(
     fp::PrefixSumTopHatPlan{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid, j::Integer,
 ) where {T<:AbstractFloat}
-    _prefixsum_scan_row!(_prefixsum_num(fp.scratch), fp.grid_plan, field, grid, j)
+    _prefixsum_scan_row!(_prefixsum_num(fp.scratch), _prefixsum_values(fp.scratch, 1), fp.grid_plan, field, grid, j)
     return nothing
 end
 
-# The scan itself, over one destination table, shared by the single-field and batched fills. Row 1 is
-# the empty prefix, zero from construction, and is not written here.
+# The scan itself, over one destination table, shared by the single-field and batched fills, and the cells'
+# values in the scan's order where `V` holds them. Row 1 is the empty prefix, zero from construction, and is
+# not written here.
 @inline function _prefixsum_scan_row!(
-    P::CompensatedScan{T}, gp::PrefixSumGridPlan{T}, field::AbstractMatrix,
+    P::CompensatedScan{T}, V, gp::PrefixSumGridPlan{T}, field::AbstractMatrix,
     grid::FlowGeometries.Grids.StructuredGrid, j::Integer,
 ) where {T<:AbstractFloat}
     ne = length(gp.xe)
@@ -490,6 +804,17 @@ end
         h, l = _scan_step(h, l, mask[i, j] ? T(field[i, j]) * wx[i] : zero(T))
         Ph[k + 1, j] = h
         Pl[k + 1, j] = l
+    end
+    _store_cell_values!(V, gp, field, mask, j)
+    return nothing
+end
+
+@inline _store_cell_values!(::Nothing, gp, field, mask, j) = nothing
+@inline function _store_cell_values!(V::AbstractMatrix{T}, gp::PrefixSumGridPlan, field, mask, j) where {T}
+    src, wx = gp.src, gp.wx
+    @inbounds for k in axes(V, 1)
+        i = src[k]
+        V[k, j] = mask[i, j] ? T(field[i, j]) * wx[i] : zero(T)
     end
     return nothing
 end
@@ -506,7 +831,7 @@ function prefixsum_fill_numerator_batch_row!(
     Ps = _prefixsum_numerators!(fp.scratch, length(fields))
     gp = fp.grid_plan
     for m in eachindex(fields)
-        _prefixsum_scan_row!(@inbounds(Ps[m]), gp, @inbounds(fields[m]), grid, j)
+        _prefixsum_scan_row!(@inbounds(Ps[m]), _prefixsum_values(fp.scratch, m), gp, @inbounds(fields[m]), grid, j)
     end
     return nothing
 end
@@ -554,19 +879,27 @@ apply_prefixsum_tophat_row!(
     out::AbstractMatrix{T}, grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, fp::PrefixSumTopHatPlan{T},
     strategy::AbstractMaskStrategy, j::Integer,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
-    _prefixsum_row!(out, _prefixsum_num(fp.scratch), grid, fp, j)
+    _prefixsum_row!(out, _prefixsum_num(fp.scratch), _prefixsum_values(fp.scratch, 1), grid, fp, j)
 
-# The row body, taking its numerator table explicitly so a batched apply can drive it once per field.
-function _prefixsum_row!(
-    out::AbstractMatrix{T}, Pn::CompensatedScan{T},
+# The row body, taking its numerator table and cell values explicitly so a batched apply can drive it once per
+# field.
+@inline _prefixsum_row!(
+    out::AbstractMatrix{T}, Pn::CompensatedScan{T}, V,
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, fp::PrefixSumTopHatPlan{T}, j::Integer,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
+    _prefixsum_row!(out, Pn, V, grid, fp, fp.edge, j)
+
+function _prefixsum_row!(
+    out::AbstractMatrix{T}, Pn::CompensatedScan{T}, _,
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, fp::PrefixSumTopHatPlan{T}, ::Nothing, j::Integer,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     gp = fp.grid_plan
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    ne = length(gp.xe)
-    x, xe, src = FlowGeometries.Grids.coordinates(grid, 1), gp.xe, gp.src
+    x = FlowGeometries.Grids.coordinates(grid, 1)
     invden, hwj, wcellj = fp.invden, fp.hw, fp.wcell
     Ph, Pl = Pn.hi, Pn.lo
+    wrap = _prefixsum_band_wraps(gp)
+    wraps = gp.tiles_x || gp.rings_x
 
     @inbounds for i in 1:Nx
         out[i, j] = zero(T)
@@ -583,33 +916,17 @@ function _prefixsum_row!(
 
         q, a, c = _prefixsum_window(gp.tiles_x, gp.rings_x, gp.x_period, hw)
         if q > 0
-            # Whole periods in support: `q` totals of one replica.
+            # Whole periods in support: `q` row totals.
             num_all = q * _scan_diff(Ph, Pl, Nx + 1, 1, jj)
             for i in 1:Nx
                 out[i, j] += wyj * num_all
             end
         end
         if wcellj[b + 1, j] >= 0
-            _prefixsum_band!(out, Ph, Pl, gp.tiles_x, wcellj[b + 1, j], wyj, Nx, jj, j)
+            _band_sum!(view(out, :, j), Ph, Pl, wrap, wcellj[b + 1, j], wyj, Nx, jj)
         elseif -a <= c
-            lo = 1
-            hi = 0
-            # Targets in ascending coordinate order, `src[1:Nx]`: the pointers only advance, so the target
-            # coordinate must increase.
-            for t in 1:Nx
-                i = src[t]
-                xc = x[i]
-                xlo = xc - a
-                xhi = xc + c
-                while lo <= ne && xe[lo] < xlo
-                    lo += 1
-                end
-                while hi < ne && xe[hi + 1] <= xhi
-                    hi += 1
-                end
-                if hi >= lo
-                    out[i, j] += wyj * _scan_diff(Ph, Pl, hi + 1, lo, jj)
-                end
+            _walk_band(gp.xe, gp.src, x, wraps, gp.x_period, a, c, Nx) do i, n, hi, lo
+                out[i, j] += wyj * _wrap_sum(Ph, Pl, n, hi, lo, Nx, jj)
             end
         end
     end
@@ -621,38 +938,129 @@ function _prefixsum_row!(
     return out
 end
 
-@inline _prefixsum_band!(out, Ph, Pl, tiles_x::Bool, w::Int, wyj, Nx::Int, jj::Int, j::Integer) =
-    tiles_x ? _prefixsum_tiled_band!(out, Ph, Pl, w, wyj, Nx, jj, j) :
-              _prefixsum_wcell_band!(out, Ph, Pl, w, wyj, Nx, jj, j)
-
-# A constant-width band on a tiling axis: target `i` sums the extended entries `Nx+i-w:Nx+i+w`.
-@inline function _prefixsum_tiled_band!(
-    out::AbstractMatrix{T}, Ph, Pl, w::Int, wyj::T, Nx::Int, jj::Int, j::Integer,
-) where {T<:AbstractFloat}
-    @inbounds @simd for i in 1:Nx
-        out[i, j] += wyj * _scan_diff(Ph, Pl, Nx + i + w + 1, Nx + i - w, jj)
+function _prefixsum_row!(
+    out::AbstractMatrix{T}, Pn::CompensatedScan{T}, V::AbstractMatrix,
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, fp::PrefixSumTopHatPlan{T}, edge::PrefixEdgeCells, j::Integer,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
+    @inbounds for i in 1:Nx
+        out[i, j] = zero(T)
     end
-    return nothing
+    _overlap_row_sum!(_entry_row(out, j, edge.rev, Nx), Pn, V, fp, edge, j, Nx, Ny)
+    invden = fp.invden
+    @inbounds @simd for i in 1:Nx
+        out[i, j] *= invden[i, j]
+    end
+    return out
 end
 
-# A constant-width band on a uniform ascending axis: target `i` sums cells `i-w:i+w`, clamped to the axis.
-@inline function _prefixsum_wcell_band!(
-    out::AbstractMatrix{T}, Ph, Pl, w::Int, wyj::T, Nx::Int, jj::Int, j::Integer,
-) where {T<:AbstractFloat}
-    ilo = min(w + 1, Nx + 1)
-    ihi = max(Nx - w, 0)
-    @inbounds for i in 1:min(w, Nx)                     # left edge: lo clamps to 1
-        hi = min(Nx, i + w)
-        out[i, j] += wyj * _scan_diff(Ph, Pl, hi + 1, 1, jj)
+# Row `j` of `A` in the scan's ascending axis-1 order.
+@inline _entry_row(A::AbstractMatrix, j::Integer, rev::Bool, Nx::Int) = rev ? view(A, Nx:-1:1, j) : view(A, :, j)
+
+"""
+    _overlap_row_sum!(oc, Pn, V, fp, edge, j, Nx, Ny) -> oc
+
+Add target row `j`'s weighted sums under a [`PrefixEdgeCells`](@ref) plan into `oc`, the row in the scan's ascending
+order: per band, the cells wholly inside about the target and across a regional seam from the scan `Pn`, then the
+cells the disk's edge cuts from their values `V`. The device sweep adds in this order.
+"""
+function _overlap_row_sum!(
+    oc::AbstractVector{T}, Pn::CompensatedScan, V::AbstractMatrix, fp::PrefixSumTopHatPlan, edge::PrefixEdgeCells,
+    j::Integer, Nx::Int, Ny::Int,
+) where {T}
+    gp = fp.grid_plan
+    Ph, Pl = Pn.hi, Pn.lo
+    hwj, wcellj = fp.hw, fp.wcell
+    nb = size(hwj, 1)
+    row0 = _prefixsum_row0(gp.tiles_y, j, fp.dj_lim)
+    @inbounds for b in 0:(nb - 1)
+        hwj[b + 1, j] < zero(eltype(hwj)) && continue
+        jj = mod1(row0 + b, Ny)
+        wyj = T(gp.wy[jj])
+        w = wcellj[b + 1, j]
+        w >= 0 && _band_sum!(oc, Ph, Pl, edge.wrap, w, wyj, Nx, jj)
+        fa = edge.far[b + 1, j]
+        fa > 0 && _overlap_far!(oc, Ph, Pl, fa, wyj, Nx, jj)
     end
-    @inbounds @simd for i in ilo:ihi                    # interior: no clamping at all
-        out[i, j] += wyj * _scan_diff(Ph, Pl, i + w + 1, i - w, jj)
+    @inbounds for s in edge.ptr[j]:(edge.ptr[j + 1] - 1)
+        jr = j + edge.dj[s]
+        if jr < 1 || jr > Ny
+            gp.tiles_y || continue
+            jr = mod1(jr, Ny)
+        end
+        _edge_cell!(oc, V, T(edge.w[s]), edge.di[s], edge.wrap, Nx, jr)
     end
-    @inbounds for i in max(ihi + 1, w + 1):Nx           # right edge: hi clamps to Nx
-        lo = max(1, i - w)
-        out[i, j] += wyj * _scan_diff(Ph, Pl, Nx + 1, lo, jj)
+    return oc
+end
+
+# Target `e` sums the cells `e − w : e + w`: clamped to the axis, or modulo its length where it closes, as `q`
+# whole turns and a remainder where the span exceeds one. The targets whose run stays inside the axis take one
+# scan difference.
+@inline function _band_sum!(oc::AbstractVector{T}, Ph, Pl, wrap::Bool, w::Int, wyj::T, Nx::Int, jj::Int) where {T}
+    if !wrap
+        ilo = min(w + 1, Nx + 1)
+        ihi = max(Nx - w, 0)
+        @inbounds for e in 1:min(w, Nx)
+            oc[e] += wyj * _scan_diff(Ph, Pl, min(Nx, e + w) + 1, 1, jj)
+        end
+        @inbounds @simd for e in ilo:ihi
+            oc[e] += wyj * _scan_diff(Ph, Pl, e + w + 1, e - w, jj)
+        end
+        @inbounds for e in max(ihi + 1, w + 1):Nx
+            oc[e] += wyj * _scan_diff(Ph, Pl, Nx + 1, max(1, e - w), jj)
+        end
+    elseif 2w + 1 <= Nx
+        @inbounds @simd for e in 1:w
+            oc[e] += wyj * _wrap_sum(Ph, Pl, 1, e + w + 1, Nx + e - w, Nx, jj)
+        end
+        @inbounds @simd for e in (w + 1):(Nx - w)
+            oc[e] += wyj * _scan_diff(Ph, Pl, e + w + 1, e - w, jj)
+        end
+        @inbounds @simd for e in (Nx - w + 1):Nx
+            oc[e] += wyj * _wrap_sum(Ph, Pl, 1, e + w - Nx + 1, e - w, Nx, jj)
+        end
+    else
+        q, rc = divrem(2w + 1, Nx)
+        tot = q * _scan_diff(Ph, Pl, Nx + 1, 1, jj)
+        @inbounds for e in 1:Nx
+            lo = mod1(e - w, Nx)
+            hi = lo + rc - 1
+            part = rc == 0 ? zero(T) : hi <= Nx ? _scan_diff(Ph, Pl, hi + 1, lo, jj) :
+                _scan_diff(Ph, Pl, Nx + 1, lo, jj) + _scan_diff(Ph, Pl, hi - Nx + 1, 1, jj)
+            oc[e] += wyj * (tot + part)
+        end
     end
-    return nothing
+    return oc
+end
+
+# Target `e` sums the cells at offsets `fa` and more away along a regional box, across its seam.
+@inline function _overlap_far!(oc::AbstractVector{T}, Ph, Pl, fa::Int, wyj::T, Nx::Int, jj::Int) where {T}
+    @inbounds for e in 1:Nx
+        s = zero(T)
+        e + fa <= Nx && (s += _scan_diff(Ph, Pl, Nx + 1, e + fa, jj))
+        e - fa >= 1 && (s += _scan_diff(Ph, Pl, e - fa + 1, 1, jj))
+        oc[e] += wyj * s
+    end
+    return oc
+end
+
+# Target `e` takes `w` times the value of the cell at offset `d` in row `jj` of `V`, absent off a bounded axis and
+# modulo the length of one that closes.
+@inline function _edge_cell!(oc::AbstractVector{T}, V::AbstractMatrix, w::T, d::Int, wrap::Bool, Nx::Int, jj::Int) where {T}
+    if !wrap
+        @inbounds @simd for e in max(1, 1 - d):min(Nx, Nx - d)
+            oc[e] += w * V[e + d, jj]
+        end
+    else
+        r = mod(d, Nx)
+        @inbounds @simd for e in 1:(Nx - r)
+            oc[e] += w * V[e + r, jj]
+        end
+        @inbounds @simd for e in (Nx - r + 1):Nx
+            oc[e] += w * V[e + r - Nx, jj]
+        end
+    end
+    return oc
 end
 
 """
@@ -689,16 +1097,17 @@ function apply_prefixsum_tophat_batch_row!(
     Ps = fp.scratch.prefix_nums
     if fp.uniform_axis
         for m in eachindex(outs)
-            _prefixsum_row!(@inbounds(outs[m]), @inbounds(Ps[m]), grid, fp, j)
+            _prefixsum_row!(@inbounds(outs[m]), @inbounds(Ps[m]), _prefixsum_values(fp.scratch, m), grid, fp, j)
         end
         return outs
     end
 
     gp = fp.grid_plan
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    ne = length(gp.xe)
-    x, xe, src = FlowGeometries.Grids.coordinates(grid, 1), gp.xe, gp.src
+    x = FlowGeometries.Grids.coordinates(grid, 1)
     invden, hwj, wcellj = fp.invden, fp.hw, fp.wcell
+    wrap = _prefixsum_band_wraps(gp)
+    wraps = gp.tiles_x || gp.rings_x
 
     for m in eachindex(outs)
         o = @inbounds outs[m]
@@ -728,26 +1137,12 @@ function apply_prefixsum_tophat_batch_row!(
         if wcellj[b + 1, j] >= 0
             # The bands the single-field row takes at constant width, taken the same way.
             for m in eachindex(outs)
-                _prefixsum_band!(outs[m], Ps[m].hi, Ps[m].lo, gp.tiles_x, wcellj[b + 1, j], wyj, Nx, jj, j)
+                _band_sum!(view(outs[m], :, j), Ps[m].hi, Ps[m].lo, wrap, wcellj[b + 1, j], wyj, Nx, jj)
             end
         elseif -a <= c
-            lo = 1
-            hi = 0
-            for t in 1:Nx
-                i = src[t]
-                xc = x[i]
-                xlo = xc - a
-                xhi = xc + c
-                while lo <= ne && xe[lo] < xlo
-                    lo += 1
-                end
-                while hi < ne && xe[hi + 1] <= xhi
-                    hi += 1
-                end
-                if hi >= lo
-                    for m in eachindex(outs)
-                        outs[m][i, j] += wyj * _scan_diff(Ps[m], hi + 1, lo, jj)
-                    end
+            _walk_band(gp.xe, gp.src, x, wraps, gp.x_period, a, c, Nx) do i, n, hi, lo
+                for m in eachindex(outs)
+                    outs[m][i, j] += wyj * _wrap_sum(Ps[m].hi, Ps[m].lo, n, hi, lo, Nx, jj)
                 end
             end
         end
@@ -810,28 +1205,62 @@ apply_footprint!(
     apply_prefixsum_tophat!(out, field, grid, fp, strategy)
 
 """
-    build_footprint(grid::StructuredGrid{T,<:AbstractGeometry,2}, kernel::TopHatKernel, scale; kwargs...) -> PrefixSumTopHatPlan
+    _structured_footprint(::Tuple, grid::StructuredGrid{T,<:AbstractGeometry,2}, kernel::TopHatKernel, scale; kwargs...)
 
-The exact prefix-sum top-hat engine on any rectilinear 2D `StructuredGrid`; keywords as for
-`_build_prefixsum_tophat`. More specific in the kernel than the generic 2D methods, so every
-`TopHatKernel` on such a grid dispatches here.
+The top-hat on a rectilinear 2D `StructuredGrid`; keywords as for `_build_prefixsum_tophat`. Under
+[`Kernels.CellCentre`](@ref), the prefix-sum engine at any spacing. Under [`Kernels.CellOverlap`](@ref), the
+prefix-sum engine with its edge where axis 1 is uniform, so a row's cut cells are the same about every target,
+and the cell-by-cell plan with the overlap rule otherwise.
 """
-function build_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
-    kernel::Kernels.TopHatKernel,
-    scale::T;
-    kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    return _build_prefixsum_tophat(grid, kernel, scale; kwargs...)
-end
+_structured_footprint(
+    ::Tuple, grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.TopHatKernel{Kernels.CellCentre},
+    scale::T; kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
+    _build_prefixsum_tophat(grid, kernel, scale; kwargs...)
 
-# A `Range` axis 1 is also what the banded method takes for any kernel, so a top-hat there matches both;
-# this method is more specific than either and keeps it on the prefix-sum path.
-function build_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2,S,TP,<:Tuple{AbstractRange{T},AbstractVector{T}}},
-    kernel::Kernels.TopHatKernel,
-    scale::T;
+_structured_footprint(
+    ::Tuple, grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap},
+    scale::T; kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
+    _build_footprint_scattered(grid, kernel, scale; kwargs...)
+
+# A spheroid: the centre test by the cell-by-cell plan at the geodesic distance, since the geodesic disk has no
+# closed band along a row; the cell overlap by the prefix sums where longitude is uniform, each row's fractions shared
+# round it, and cell by cell otherwise.
+_structured_footprint(
+    ::Tuple, grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.TopHatKernel{Kernels.CellCentre}, scale::T;
     kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, S, TP<:NTuple{2,FlowGeometries.Grids.AbstractTopology}}
-    return _build_prefixsum_tophat(grid, kernel, scale; kwargs...)
-end
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractEllipsoidalGeometry{T}} =
+    _build_footprint_scattered(grid, kernel, scale; kwargs...)
+
+_structured_footprint(
+    ::Tuple{FlowGeometries.Axes.UniformSpacing,Any}, grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
+    kernel::Kernels.TopHatKernel{Kernels.CellCentre}, scale::T; kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractEllipsoidalGeometry{T}} =
+    _build_footprint_scattered(grid, kernel, scale; kwargs...)
+
+_structured_footprint(
+    ::Tuple, grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T;
+    kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractEllipsoidalGeometry{T}} =
+    _build_footprint_scattered(grid, kernel, scale; kwargs...)
+
+_structured_footprint(
+    ::Tuple{FlowGeometries.Axes.UniformSpacing,Any}, grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
+    kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T; kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractEllipsoidalGeometry{T}} =
+    _build_prefixsum_tophat(grid, kernel, scale; kwargs...)
+
+# A uniform axis 1 is also what the banded engine takes for any kernel, so a top-hat there matches both;
+# these methods are more specific than either and keep it on the prefix-sum path.
+_structured_footprint(
+    ::Tuple{FlowGeometries.Axes.UniformSpacing,Any}, grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
+    kernel::Kernels.TopHatKernel{Kernels.CellCentre}, scale::T; kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
+    _build_prefixsum_tophat(grid, kernel, scale; kwargs...)
+
+_structured_footprint(
+    ::Tuple{FlowGeometries.Axes.UniformSpacing,Any}, grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
+    kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T; kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
+    _build_prefixsum_tophat(grid, kernel, scale; kwargs...)

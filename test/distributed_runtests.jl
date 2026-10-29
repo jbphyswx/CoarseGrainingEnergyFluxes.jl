@@ -10,9 +10,11 @@
 # result exactly.
 
 using Distributed: Distributed
-Distributed.addprocs(2; exeflags = "--project=$(Base.active_project())")
+Distributed.addprocs(2; exeflags = ["--project=$(Base.active_project())", "--threads=2"])
 Distributed.@everywhere begin
     using SharedArrays: SharedArrays
+    using OhMyThreads: OhMyThreads
+    using KernelAbstractions: KernelAbstractions as KA
     using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
     using FlowGeometries: FlowGeometries as FG
     using FlowTransformBindings: FlowTransformBindings as FTB
@@ -55,9 +57,9 @@ Test.@testset "Distributed FFT spectral filtering on $(Distributed.nworkers()) w
     hole = trues(32, 24); hole[12:16, 9:12] .= false
     f = [sin(0.4xi) * cos(0.3yj) + 0.02xi for xi in x, yj in y]
     F = cat(f, f .^ 2; dims = 3)
-    for (periodic, mask) in (((true, true), trues(32, 24)), ((false, false), hole), ((true, false), hole)),
-        st in STRATEGIES
-        grid = FG.Grids.StructuredGrid(geom, x, y, mask; periodic = periodic)
+    P, B = FG.Grids.Periodic(), FG.Grids.Bounded()
+    for (topology, mask) in (((P, P), trues(32, 24)), ((B, B), hole), ((P, B), hole)), st in STRATEGIES
+        grid = FG.Grids.StructuredGrid(geom, x, y, mask; topology)
         pd = distributed_matches_serial(grid, f, F, [4.0, 6.0], 1e-12; mask_strategy = st)
         Test.@test pd.grid_plan.workers == Distributed.workers()
     end
@@ -100,6 +102,22 @@ Test.@testset "Distributed coarse_grain_batch! on $(Distributed.nworkers()) work
     end
 end
 
+# One field's sweep on the workers: the exact filtering spectrum reads each scale's window masses from the footprint
+# the caller holds and applies its rate plans across the workers, each output cell written in the serial order.
+Test.@testset "Distributed coarse_grain's exact filtering spectrum on $(Distributed.nworkers()) workers" begin
+    xs = 0.0:1000.0:23e3
+    mask = trues(24, 24); mask[8:12, 6:9] .= false
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs, mask)
+    Random.seed!(7)
+    u = randn(24, 24); v = randn(24, 24)
+    for kern in (CGEF.GaussianKernel(), CGEF.Kernels.SmoothHatKernel()), st in STRATEGIES
+        kw = (; scales = [3e3, 6e3], kernel = kern, mask_strategy = st, spectrum = CGEF.Diagnostics.ForceSpectrum(),
+              scale_derivative = CGEF.Diagnostics.ExactScaleDerivative())
+        Test.@test CGEF.coarse_grain(u, v, grid; kw..., execution = CB.DistributedBackend()).filtering_spectrum ==
+                   CGEF.coarse_grain(u, v, grid; kw..., execution = CB.SerialBackend()).filtering_spectrum
+    end
+end
+
 # The real-space engines divide their rows, `(j, k)` planes or pass lines among the workers. Each is the
 # direct sum to the engine's accuracy: round-off for a top-hat, and for the Gaussian's separable passes
 # the square window's truncation, below 1e-9 of the kernel's peak.
@@ -124,6 +142,22 @@ Test.@testset "Distributed real-space engines on $(Distributed.nworkers()) worke
         out = apply(plan(CB.DistributedBackend()), f)
         Test.@test out == apply(ps, f)
         Test.@test _cgef_relerr(out, _cgef_direct_filter(grid, kern, ℓ, f, st)) < rtol
+    end
+end
+
+# Every real-space engine divided among the workers on a serial, a threaded and a device inner backend, the
+# plan applied twice: equal to the serial plan, and on the device to the whole-grid device plan.
+Test.@testset "Distributed shares on every engine and inner backend" begin
+    dev = CB.GPUBackend(KA.CPU())
+    for (grid, kern, ℓ, kw) in _cgef_share_cases(), st in STRATEGIES
+        f = _cgef_share_field(size(FG.Grids.mask(grid)))
+        plan(b) = CGEF.Filtering.plan_filter(grid, kern, ℓ; execution = b, mask_strategy = st, kw...)
+        ref, devref = apply(plan(CB.SerialBackend()), f), apply(plan(dev), f)
+        for (inner, want) in ((CB.SerialBackend(), ref), (CB.ThreadedBackend(), ref), (dev, devref))
+            p = plan(CB.DistributedBackend(inner))
+            Test.@test apply(p, f) == want
+            Test.@test apply(p, f) == want
+        end
     end
 end
 

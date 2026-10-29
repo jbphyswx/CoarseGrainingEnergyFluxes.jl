@@ -40,6 +40,7 @@ _cgef_same(d::NamedTuple, h::NamedTuple) = keys(d) == keys(h) && all(k -> _cgef_
 # A device result whose host counterpart evaluates the same sums in another order, `n` terms per value.
 _cgef_close(d::AbstractArray, h::AbstractArray, n) =
     d isa JLArrays.JLArray && isapprox(Array(d), h; rtol = 2n * eps()) && any(!iszero, h)
+_cgef_close(d::NamedTuple, h::NamedTuple, n) = keys(d) == keys(h) && all(k -> _cgef_close(d[k], h[k], n), keys(d))
 
 # The bound on two orders of the area mean `Σ xᵢ Aᵢ / area` over the active cells of `og`.
 _cgef_mean_atol(x, og, area) = 2 * length(x) * eps() * FG.Grids.integrate(abs.(x), og) / area
@@ -70,7 +71,7 @@ function _cgef_dev_sphere()
     m = trues(36, 13)
     m[10:14, 5:8] .= false
     return FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(_CGEF_R), range(0.0; step = 2π / 36, length = 36),
-                                   range(deg2rad(-60.0), deg2rad(60.0); length = 13), m; periodic = (true, false))
+                                   range(deg2rad(-60.0), deg2rad(60.0); length = 13), m; topology = (FG.Grids.Periodic(), FG.Grids.Bounded()))
 end
 
 function _cgef_dev_shell()
@@ -112,34 +113,42 @@ Test.@testset "compute_Π! on the device" begin
     vb = cat(v, u, v .^ 2; dims = 3)
     same(gc, ga, 4e3, ub, vb, nothing)
 
-    # Spheres: a regular latitude range, and a Clenshaw–Curtis sampling's latitudes, which are a vector.
-    # NUFSHT's spin transforms run their NUFFT on the device workspace's threads, and the host plan of the
-    # ring takes the transform along longitude where the device plan takes the banded sum: each pair is
-    # one sum in two orders, a term per cell.
+    # Spheres: a regular latitude range, and a Fejér sampling's latitudes, which are a vector. JLArrays have
+    # no FFT or nonuniform FFT, so the vector filter's spin transforms are the in-core sums and the device
+    # plan names the real-space footprint where the host plan may take the transform along longitude: each
+    # pair is one sum in two orders, a term per cell.
     gs = _cgef_dev_sphere()
     us, vs, _ = _cgef_dev_fields(gs, 1.0)
+    insums = (; transform = CGEF.SpectralBackends.DirectSumSpectralBackend())
+    devplan(g, k, ℓ; kw...) =
+        CGEF.Filtering.plan_filter(g, k, ℓ; execution = _CGEF_DEV, engine = CGEF.Filtering.FootprintEngine(), kw...)
     near(g, k, ℓ, u, v, w; kw...) =
+        Test.@test _cgef_close(flux(g, k, ℓ, u, v, w, _CGEF_DEV; filter_plan = devplan(g, k, ℓ; kw...), kw...),
+                               flux(g, k, ℓ, u, v, w, _CGEF_HOST; kw...), length(FG.Grids.mask(g)))
+    sums(g, k, ℓ, u, v, w; kw...) =
         Test.@test _cgef_close(flux(g, k, ℓ, u, v, w, _CGEF_DEV; kw...), flux(g, k, ℓ, u, v, w, _CGEF_HOST; kw...),
                                length(FG.Grids.mask(g)))
     for k in (ga, th)
-        near(gs, k, deg2rad(30.0) * _CGEF_R, us, vs, nothing)
+        near(gs, k, deg2rad(30.0) * _CGEF_R, us, vs, nothing; insums...)
     end
-    near(gs, ga, deg2rad(30.0) * _CGEF_R, us, vs, nothing; mask_strategy = CGEF.Filtering.Deformable())
-    # The in-core spin transforms run in the device's memory under its loops.
-    same(gs, ga, deg2rad(30.0) * _CGEF_R, us, vs, nothing; transform = CGEF.SpectralBackends.DirectSumSpectralBackend())
-    gq = FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), 9;
+    near(gs, ga, deg2rad(30.0) * _CGEF_R, us, vs, nothing; mask_strategy = CGEF.Filtering.Deformable(), insums...)
+    # The in-core spin transforms run in the device's memory under its loops; their longitude sums are a
+    # matrix product, which the device sums in its own order.
+    sums(gs, ga, deg2rad(30.0) * _CGEF_R, us, vs, nothing; transform = CGEF.SpectralBackends.DirectSumSpectralBackend())
+    gq = FG.Connectivity.structured_grid(FG.SphericalSampling.Fejer1Sampling(), 9;
                                          geometry = FG.Geometry.SphericalGeometry(_CGEF_R))
     uq, vq, _ = _cgef_dev_fields(gq, 1.0)
     same(gq, ga, deg2rad(60.0) * _CGEF_R, uq, vq, nothing)
 
-    # A curvilinear mesh and a node set, differenced by least squares.
+    # A curvilinear mesh and a node set, differenced by least squares; the mesh's filter sums each window
+    # in the device's order.
     n = 16
     θr = deg2rad(15.0)
     X = [1000.0 * (i * cos(θr) - 0.3j * sin(θr)) for i in 0:(n - 1), j in 0:(n - 1)]
     Y = [1000.0 * (i * sin(θr) + j * (1 + 0.3cos(θr))) for i in 0:(n - 1), j in 0:(n - 1)]
     gcv = FG.Grids.CurvilinearGrid(_CGEF_CART, X, Y, trues(n, n))
     ucv, vcv, _ = _cgef_dev_fields(gcv, 5000.0)
-    same(gcv, th, 4e3, ucv, vcv, nothing)
+    sums(gcv, th, 4e3, ucv, vcv, nothing)
     gn = FG.Grids.UnstructuredGrid(_CGEF_CART, vec(X), vec(Y), trues(n * n); k = 8)
     same(gn, ga, 3e3, vec(ucv), vec(vcv), nothing)
 
@@ -172,10 +181,13 @@ Test.@testset "Flux decompositions and budgets on the device" begin
     D = CGEF.Diagnostics
     k = CGEF.GaussianKernel()
     gc, gs = _cgef_dev_cartesian(), _cgef_dev_sphere()
-    # On the sphere both sides run the in-core spin transforms and, at this scale, the banded sum the
-    # device takes for a scalar.
+    # On the sphere both sides run the in-core spin transforms, whose longitude sums the device takes as its own
+    # matrix product, and at this scale the banded sum the device takes for a scalar: one sum in two orders, a
+    # term per cell.
     sph = (; transform = CGEF.SpectralBackends.DirectSumSpectralBackend())
     for (g, s, ℓ, kw) in ((gc, 5000.0, 4e3, (;)), (gs, 1.0, deg2rad(15.0) * _CGEF_R, sph))
+        n = length(FG.Grids.mask(g))
+        agree(d, h) = g === gs ? _cgef_close(d, h, n) : _cgef_same(d, h)
         u, v, _, θ, ρ = _cgef_dev_fields(g, s)
         P = 1.0e5 .+ 100 .* θ
         ur, vr = 0.6 .* u, 0.4 .* v
@@ -190,7 +202,7 @@ Test.@testset "Flux decompositions and budgets on the device" begin
             both((u, v, θ, ρ, P, ur, vr, b) -> (; ω = D.vorticity(u, v, g; execution = b))),
             both((u, v, θ, ρ, P, ur, vr, b) -> D.compressible_flux(u, v, ρ, P, g, k, ℓ; execution = b, kw...)),
         )
-            Test.@test _cgef_same(d, h)
+            Test.@test agree(d, h)
         end
     end
 
@@ -229,13 +241,16 @@ Test.@testset "Energies and sweeps on the device" begin
     x3 = range(0.0, 7000.0; length = 8)
     g3 = FG.Grids.StructuredGrid(_CGEF_CART, x3, x3, x3)
     g1 = FG.Grids.StructuredGrid(_CGEF_CART, range(0.0, 31000.0; length = 32))
-    # The sphere at scales where the host takes the banded sum, as in the testset above.
+    # The sphere at scales where the host takes the banded sum, as in the testset above. Its vector filter's
+    # in-core spin sums run in the device's memory, the longitude products by the device's matrix product
+    # where the host's are BLAS's: one sum in two orders, so its maps agree to that bound.
     sph = (; transform = CGEF.SpectralBackends.DirectSumSpectralBackend())
-    for (g, s, scales, kw) in ((_cgef_dev_cartesian(), 5000.0, [3e3, 6e3], (;)),
-                               (_cgef_dev_sphere(), 1.0, deg2rad.([10.0, 15.0]) .* _CGEF_R, sph),
-                               (g3, 3000.0, [2e3, 4e3], (;)), (g1, 3000.0, [3e3, 6e3], (;)))
+    for (g, s, scales, kw, exact) in ((_cgef_dev_cartesian(), 5000.0, [3e3, 6e3], (;), true),
+                                      (_cgef_dev_sphere(), 1.0, deg2rad.([10.0, 15.0]) .* _CGEF_R, sph, false),
+                                      (g3, 3000.0, [2e3, 4e3], (;), true), (g1, 3000.0, [3e3, 6e3], (;), true))
         u, v, w = _cgef_dev_fields(g, s)
         n = length(u)
+        agree(a, b) = exact ? _cgef_same(a, b) : _cgef_close(a, b, n)
         line = ndims(u) == 1
         ww = ndims(u) == 3 ? w : nothing
         if !line
@@ -243,11 +258,11 @@ Test.@testset "Energies and sweeps on the device" begin
             Eh = D.cumulative_energy(u, v, ww, g, k, scales; execution = _CGEF_HOST, kw...)
             Test.@test isapprox(Ed, Eh; rtol = 2n * eps())
 
-            bd = D.band_energies(_cgef_d(u), _cgef_d(v), _cgef_d(ww), g, k, scales; maps = true,
+            bd = D.band_energies(_cgef_d(u), _cgef_d(v), _cgef_d(ww), g, k, scales; maps = CGEF.Diagnostics.BandMaps(),
                                  execution = _CGEF_DEV, kw...)
-            bh = D.band_energies(u, v, ww, g, k, scales; maps = true, execution = _CGEF_HOST, kw...)
-            Test.@test all(i -> _cgef_same(bd.band_maps[i], bh.band_maps[i]), eachindex(scales))
-            Test.@test _cgef_same(bd.resolved_map, bh.resolved_map)
+            bh = D.band_energies(u, v, ww, g, k, scales; maps = CGEF.Diagnostics.BandMaps(), execution = _CGEF_HOST, kw...)
+            Test.@test all(i -> agree(bd.band_maps[i], bh.band_maps[i]), eachindex(scales))
+            Test.@test agree(bd.resolved_map, bh.resolved_map)
             og, area = D.output_grid(g, zf), D.active_area(g)
             Test.@test all(i -> abs(bd.bands[i] - bh.bands[i]) <= _cgef_mean_atol(bh.band_maps[i], og, area),
                            eachindex(scales))
@@ -259,7 +274,7 @@ Test.@testset "Energies and sweeps on the device" begin
                                       execution = _CGEF_DEV, kw...)
         rh = line ? CGEF.coarse_grain(u, g; scales, kernel = k, execution = _CGEF_HOST) :
                     CGEF.coarse_grain(u, v, ww, g; scales, kernel = k, execution = _CGEF_HOST, kw...)
-        Test.@test _cgef_same(rd.Π, rh.Π)
+        Test.@test agree(rd.Π, rh.Π)
         Test.@test _cgef_device_energies(rd, rh, n)
     end
 

@@ -32,14 +32,18 @@ using Quickhull: Quickhull
 using FlowGeometries: FlowGeometries as FG
 
 include("reference_filters.jl")
+include("engine_rows.jl")
 
 include("test_quality.jl")
 include("test_kernels.jl")
 include("test_filtering.jl")
 include("test_spectral.jl")
 include("test_diagnostics.jl")
+include("test_scale_derivative.jl")
+include("test_geometry.jl")
 include("test_batch.jl")
 include("test_device_genericity.jl")
 include("test_allocs.jl")
+include("test_jet.jl")
 
 end # module

@@ -3,6 +3,7 @@ module Kernels
 using FlowGeometries: FlowGeometries
 
 export AbstractFilterKernel, TopHatKernel, GaussianKernel, SharpSpectralKernel
+export AbstractCellWeight, CellOverlap, CellCentre
 export SmoothHatKernel, HyperGaussianKernel, HighOrderKernel
 export kernel_profile, is_separable, is_radial, limb_amplitudes, radial_limb_amplitudes
 export spherical_limb_amplitudes
@@ -24,11 +25,37 @@ Abstract supertype for all filter kernels (TopHat, Gaussian, SharpSpectral, …)
 abstract type AbstractFilterKernel end
 
 """
-    TopHatKernel <: AbstractFilterKernel
+    AbstractCellWeight
 
-Real-space top-hat (box) filter of full width `ℓ`: unit weight for `d ≤ ℓ/2`, zero otherwise.
+How [`TopHatKernel`](@ref) weighs a grid cell: [`CellOverlap`](@ref) or [`CellCentre`](@ref).
 """
-struct TopHatKernel <: AbstractFilterKernel end
+abstract type AbstractCellWeight end
+
+"""
+    CellOverlap()
+
+A cell weighs its measure inside the disk (in three dimensions the ball) of radius `ℓ/2` about the target: the
+continuous top-hat integrated over each cell. On a node set, whose points carry no cells, the centre test.
+"""
+struct CellOverlap <: AbstractCellWeight end
+
+"""
+    CellCentre()
+
+A cell weighs its whole measure where its centre lies within `ℓ/2` of the target, nothing otherwise.
+"""
+struct CellCentre <: AbstractCellWeight end
+
+"""
+    TopHatKernel(; cells = CellOverlap()) <: AbstractFilterKernel
+
+Real-space top-hat (box) filter of full width `ℓ`: unit weight within distance `ℓ/2`, zero beyond, each grid cell
+weighed as `cells` says ([`AbstractCellWeight`](@ref)).
+"""
+struct TopHatKernel{C<:AbstractCellWeight} <: AbstractFilterKernel
+    cells::C
+end
+TopHatKernel(; cells::AbstractCellWeight = CellOverlap()) = TopHatKernel(cells)
 
 """
     GaussianKernel(; α = 6.0) <: AbstractFilterKernel
@@ -109,10 +136,12 @@ HyperGaussianKernel(; α::Real = 1.0) = HyperGaussianKernel(α)
 
 """
     HighOrderKernel(; order = 3, b_over_ℓ = 1/8) <: AbstractFilterKernel
+    HighOrderKernel{P}(; b_over_ℓ = 1/8)
 
 Piecewise-constant kernel with `P = order` vanishing moments (Sadek & Aluie 2018 §V): a positive body of
 half-width `ℓ/2` flanked by alternating-sign limbs of width `b = b_over_ℓ · ℓ`, whose amplitudes are
-solved so that `∫xⁿG dx = 0` for `n = 1 … P`.
+solved so that `∫xⁿG dx = 0` for `n = 1 … P`. The order is the type parameter `P`, which the second form
+names directly.
 
 - `P = 3` is the paper's `M^I`: one negative limb, support `|x| < ℓ/2 + b`.
 - `P = 5` is `M^II`: a negative limb then a positive one, support `|x| < ℓ/2 + 2b`.
@@ -161,15 +190,17 @@ struct HighOrderKernel{P, T<:Real} <: AbstractFilterKernel
     b_over_ℓ::T
 end
 
-function HighOrderKernel(; order::Integer = 3, b_over_ℓ::Real = 1 / 8)
-    order in (3, 5) || throw(ArgumentError(
-        "HighOrderKernel is defined for order 3 (the paper's M^I) and order 5 (M^II); got $order. " *
+function HighOrderKernel{P}(; b_over_ℓ::Real = 1 / 8) where {P}
+    P in (3, 5) || throw(ArgumentError(
+        "HighOrderKernel is defined for order 3 (the paper's M^I) and order 5 (M^II); got $P. " *
         "M^I cannot be promoted to order 5 by tuning `b_over_ℓ` — the two moment conditions " *
         "coincide only at the degenerate b = 0.",
     ))
     b_over_ℓ > 0 || throw(ArgumentError("HighOrderKernel needs b_over_ℓ > 0, got $b_over_ℓ"))
-    return HighOrderKernel{Int(order), typeof(b_over_ℓ)}(b_over_ℓ)
+    return HighOrderKernel{P, typeof(b_over_ℓ)}(b_over_ℓ)
 end
+
+HighOrderKernel(; order::Integer = 3, b_over_ℓ::Real = 1 / 8) = HighOrderKernel{Int(order)}(; b_over_ℓ = b_over_ℓ)
 
 """
     limb_amplitudes(k::HighOrderKernel{P}, ::Type{T}) -> NTuple{P == 3 ? 1 : 2, T}
@@ -355,8 +386,14 @@ is_radial(::HighOrderKernel) = false
     ))
 end
 
-# Relative weight below which the Gaussian, hyper-Gaussian and smooth-hat footprints are truncated.
-const GAUSSIAN_TRUNCATION_TOL = 1e-10
+"""
+    truncation_tol(T) -> T
+
+The relative weight below which the Gaussian, hyper-Gaussian and smooth-hat footprints are truncated in
+element type `T`, and the tolerance of the nonuniform-FFT kernel sum: `1e-10`, or `8 eps(T)` where `T`
+resolves less (`Float32`: `9.5e-7`).
+"""
+truncation_tol(::Type{T}) where {T<:AbstractFloat} = max(T(1e-10), 8 * eps(T))
 
 # ---------------------------------------------------------------------------
 # Kernel evaluation
@@ -373,9 +410,20 @@ the inverse transform of its transfer function, which depends on `D`.
 @inline kernel_weight(k::AbstractFilterKernel, d::T, ℓ::T, ::Val) where {T<:AbstractFloat} =
     kernel_weight(k, d, ℓ)
 
-@inline function kernel_weight(::TopHatKernel, d::T, ℓ::T) where {T<:AbstractFloat}
+# The centre test, `CellCentre`'s weight. A `CellOverlap` top-hat's weight depends on the cell's shape, which
+# its engines evaluate from the grid's cells.
+@inline function kernel_weight(::TopHatKernel{CellCentre}, d::T, ℓ::T) where {T<:AbstractFloat}
     return d <= ℓ / T(2) ? one(T) : zero(T)
 end
+
+"""
+    point_kernel(kernel) -> AbstractFilterKernel
+
+The kernel a node set's points are weighted by: `kernel` itself, and for [`TopHatKernel`](@ref) the centre test,
+points carrying no cells to overlap.
+"""
+point_kernel(k::AbstractFilterKernel) = k
+point_kernel(::TopHatKernel) = TopHatKernel(CellCentre())
 
 @inline function kernel_weight(k::GaussianKernel, d::T, ℓ::T) where {T<:AbstractFloat}
     return exp(-T(k.α) * (d / ℓ)^2)
@@ -418,11 +466,54 @@ top-hat of radius `R` at `x = |k|R`, and the inverse transform of the brick wall
     return T(3) * (s - x * c) / x^3
 end
 
-# `D = 2` is `2J₁(x)/x`, defined by the SpecialFunctions extension as the more specific `Val{2}` method.
+# Below `x = 1` the series `Σₖ (−x²/4)ᵏ / (k! ∏ⱼ₌₁ᵏ (5/2 + j))` to `k = 9` is exact to round-off, where the closed
+# form loses `log₁₀(1/x⁴)` digits to cancellation.
+@inline function _ball_transform(x::T, ::Val{5}) where {T<:AbstractFloat}
+    if abs(x) < one(T)
+        q = -x * x / T(4)
+        s, t = one(T), one(T)
+        for k in 1:9
+            t *= q / (T(k) * (T(5) / 2 + T(k)))
+            s += t
+        end
+        return s
+    end
+    s, c = sincos(x)
+    return T(15) * ((T(3) - x^2) * s - T(3) * x * c) / x^5
+end
+
+# Below `x = 2` the series `Σₖ (−x²/4)ᵏ / (k! ∏ⱼ₌₁ᵏ (7/2 + j))` to `k = 12` is exact to round-off, where the closed
+# form `105((15 − 6x²) sin x − (15x − x³) cos x)/x⁷` loses `log₁₀(1575/x⁶)` digits to cancellation.
+@inline function _ball_transform(x::T, ::Val{7}) where {T<:AbstractFloat}
+    if abs(x) < T(2)
+        q = -x * x / T(4)
+        s, t = one(T), one(T)
+        for k in 1:12
+            t *= q / (T(k) * (T(7) / 2 + T(k)))
+            s += t
+        end
+        return s
+    end
+    s, c = sincos(x)
+    x2 = x * x
+    return T(105) * ((T(15) - T(6) * x2) * s - (T(15) - x2) * x * c) / x^7
+end
+
+# `d/dx` of the `D`-dimensional ball transform, `−x/(D+2)` times the `(D+2)`-dimensional one, from
+# `d/dx[x^{−ν}J_ν(x)] = −x^{−ν}J_{ν+1}(x)`.
+@inline _ball_rate(x::T, ::Val{D}) where {T<:AbstractFloat, D} = -x / T(D + 2) * _ball_transform(x, Val(D + 2))
+
+# `d²/dx²` of the `D`-dimensional ball transform, by the same identity twice.
+@inline _ball_rate2(x::T, ::Val{D}) where {T<:AbstractFloat, D} =
+    -_ball_transform(x, Val(D + 2)) / T(D + 2) + x^2 / T((D + 2) * (D + 4)) * _ball_transform(x, Val(D + 4))
+
+# `D = 2`, `4` and `6` are `2J₁(x)/x`, `8J₂(x)/x²` and `48J₃(x)/x³`, defined by the SpecialFunctions extension as
+# the more specific `Val{2}`, `Val{4}` and `Val{6}` methods.
 @noinline function _ball_transform(::T, ::Val{D}) where {T<:AbstractFloat, D}
-    throw(ArgumentError(D == 2 ?
-        "the two-dimensional top-hat transfer and sharp-spectral weight are the jinc `2J₁(x)/x`, provided " *
-        "by the SpecialFunctions weak dependency. Run `using SpecialFunctions`." :
+    throw(ArgumentError(D in (2, 4, 6) ?
+        "the two-dimensional top-hat transfer, its derivatives in the filter width and the sharp-spectral " *
+        "weight are the Bessel quotients `2J₁(x)/x`, `8J₂(x)/x²` and `48J₃(x)/x³`, provided by the SpecialFunctions " *
+        "weak dependency. Run `using SpecialFunctions`." :
         "the top-hat transfer and sharp-spectral weight are defined in 1, 2 and 3 dimensions; got $D."))
 end
 
@@ -440,21 +531,21 @@ mass.
 """
 @inline kernel_radius(::TopHatKernel, ℓ::T) where {T<:AbstractFloat} = ℓ / T(2)
 
-@inline function kernel_radius(k::GaussianKernel, ℓ::T) where {T<:AbstractFloat}
-    # Truncate where exp(-α (r/ℓ)²) < GAUSSIAN_TRUNCATION_TOL  ⇒  r = ℓ √(-ln(tol)/α); ≈ 1.96 ℓ at α = 6.
-    return ℓ * sqrt(-log(T(GAUSSIAN_TRUNCATION_TOL)) / T(k.α))
+@inline function kernel_radius(k::GaussianKernel, ℓ::T, tol::T = truncation_tol(T)) where {T<:AbstractFloat}
+    # Truncate where exp(-α (r/ℓ)²) < tol  ⇒  r = ℓ √(-ln(tol)/α); ≈ 1.96 ℓ at α = 6 in Float64.
+    return ℓ * sqrt(-log(tol) / T(k.α))
 end
 
 # ½(1 - tanh z) < tol ⟺ z > atanh(1 - 2 tol); the rim sits at 2d/ℓ = 1, so the truncation radius is
 # (ℓ/2)(1 + atanh(1 - 2 tol)/s) — ≈ 1.08 ℓ at the default steepness.
-@inline function kernel_radius(k::SmoothHatKernel, ℓ::T) where {T<:AbstractFloat}
-    z = atanh(one(T) - T(2) * T(GAUSSIAN_TRUNCATION_TOL))
+@inline function kernel_radius(k::SmoothHatKernel, ℓ::T, tol::T = truncation_tol(T)) where {T<:AbstractFloat}
+    z = atanh(one(T) - T(2) * tol)
     return ℓ / T(2) * (one(T) + z / T(k.steepness))
 end
 
 # exp(-α D⁴) < tol  ⇒  D = (-ln(tol)/α)^(1/4); ≈ 1.09 ℓ at α = 1.
-@inline function kernel_radius(k::HyperGaussianKernel, ℓ::T) where {T<:AbstractFloat}
-    return ℓ / T(2) * (-log(T(GAUSSIAN_TRUNCATION_TOL)) / T(k.α))^(one(T) / T(4))
+@inline function kernel_radius(k::HyperGaussianKernel, ℓ::T, tol::T = truncation_tol(T)) where {T<:AbstractFloat}
+    return ℓ / T(2) * (-log(tol) / T(k.α))^(one(T) / T(4))
 end
 
 @inline kernel_radius(k::AbstractFilterKernel, ℓ::T, ::Val) where {T<:AbstractFloat} = kernel_radius(k, ℓ)
@@ -535,13 +626,13 @@ transform over its mass.
 """
     transfer_cutoff(kernel, ℓ::T) -> T or nothing
 
-The wavenumber past which `|Ĝ(k, ℓ)| ≤ GAUSSIAN_TRUNCATION_TOL` in every dimension, the relative weight the
+The wavenumber past which `|Ĝ(k, ℓ)| ≤ truncation_tol(T)` in every dimension, the relative weight the
 real-space footprints truncate at, or `nothing` for a kernel without such a bound in closed form.
 `GaussianKernel(α)`: `exp(−k²ℓ²/(4α))` falls below `tol` past `k = √(4α ln(1/tol))/ℓ`.
 """
 transfer_cutoff(::AbstractFilterKernel, ::AbstractFloat) = nothing
-transfer_cutoff(k::GaussianKernel, ℓ::T) where {T<:AbstractFloat} =
-    sqrt(-T(4) * T(k.α) * log(T(GAUSSIAN_TRUNCATION_TOL))) / ℓ
+transfer_cutoff(k::GaussianKernel, ℓ::T, tol::T = truncation_tol(T)) where {T<:AbstractFloat} =
+    sqrt(-T(4) * T(k.α) * log(tol)) / ℓ
 
 @noinline spectral_transfer(k::HighOrderKernel, ::AbstractFloat, ::AbstractFloat) =
     throw(ArgumentError(
@@ -583,15 +674,17 @@ buffers are growable host vectors that keep the largest size asked of them, so a
 scale allocates nothing once that size is reached.
 """
 mutable struct LegendreQuadrature{T<:AbstractFloat, V<:AbstractVector{T}}
-    λ::V     # the longitudes `spherical_quadrature!` writes with its nodes, unread here
-    φ::V     # the nodes `x` on `[-1, 1]` as latitudes, `asin x`
-    w::V
-    acc::V   # one sum per degree
-    n::Int   # the order the nodes are for, 0 before the first
+    const λ::V     # the longitudes `spherical_quadrature!` writes with its nodes, unread here
+    const φ::V     # the nodes `x` on `[-1, 1]` as latitudes, `asin x`
+    const w::V
+    const acc::V   # one sum per degree
+    const acch::V  # one sum per degree of `ScaleRate`'s weight, for `spectral_rate_degrees!`
+    const accj::V  # one sum per degree of `ScaleRate(ScaleRate)`'s weight, for the second derivative
+    n::Int         # the order the nodes are for, 0 before the first
 end
 
 LegendreQuadrature(::Type{T} = Float64) where {T<:AbstractFloat} =
-    LegendreQuadrature(Vector{T}(), Vector{T}(), Vector{T}(), Vector{T}(), 0)
+    LegendreQuadrature(Vector{T}(), Vector{T}(), Vector{T}(), Vector{T}(), Vector{T}(), Vector{T}(), 0)
 
 # The `n`-point rule, solved only when the order changes.
 function _legendre_nodes!(q::LegendreQuadrature, n::Int)
@@ -731,6 +824,364 @@ _profile_degree(k::SmoothHatKernel, γt::T, ℓ::T, R::T) where {T<:AbstractFloa
     ceil(Int, 160 * T(k.steepness) * R * γt / (T(π) * ℓ))
 
 # ---------------------------------------------------------------------------
+# The derivative in the filter width
+# ---------------------------------------------------------------------------
+
+"""
+    ScaleRate(kernel) <: AbstractFilterKernel
+
+The weight `H(s) = −s G′(s)`, `s = d/ℓ`, of a kernel whose weight is `G(d/ℓ)`: `∂_ℓ G(d/ℓ) = H(d/ℓ)/ℓ`, so a
+real-space filter `ū = N_G/M_G` has `∂_ℓū = (M_H/M_G)(ū_H − ū)/ℓ`, `ū_H` the filter with `H` and `M` each filter's
+window mass. `H ≥ 0` for a profile decreasing in `d`. Its footprint is `kernel`'s, so `N_H` and `M_H` sum the cells
+`N_G` and `M_G` do. [`has_profile_rate`](@ref) names the kernels it has a weight for.
+"""
+struct ScaleRate{K<:AbstractFilterKernel} <: AbstractFilterKernel
+    kernel::K
+end
+
+@inline function kernel_weight(h::ScaleRate{<:GaussianKernel}, d::T, ℓ::T) where {T<:AbstractFloat}
+    a = T(h.kernel.α) * (d / ℓ)^2
+    return T(2) * a * exp(-a)
+end
+
+# `c s sech²(c(2s − 1))`, with `sech² z = 4e^{−2|z|}/(1 + e^{−2|z|})²`.
+@inline function kernel_weight(h::ScaleRate{<:SmoothHatKernel}, d::T, ℓ::T) where {T<:AbstractFloat}
+    c = T(h.kernel.steepness)
+    s = d / ℓ
+    e = exp(-T(2) * abs(c * (T(2) * s - one(T))))
+    return c * s * T(4) * e / (one(T) + e)^2
+end
+
+@inline function kernel_weight(h::ScaleRate{<:HyperGaussianKernel}, d::T, ℓ::T) where {T<:AbstractFloat}
+    u = T(h.kernel.α) * (T(2) * d / ℓ)^4
+    return T(4) * u * exp(-u)
+end
+
+# `ScaleRate(ScaleRate(kernel))` weighs by `J(s) = −s H′(s) = s G′(s) + s² G″(s)`, so `(ℓ∂_ℓ)² G(d/ℓ) = J(d/ℓ)`.
+@inline function kernel_weight(h::ScaleRate{<:ScaleRate{<:GaussianKernel}}, d::T, ℓ::T) where {T<:AbstractFloat}
+    a = T(h.kernel.kernel.α) * (d / ℓ)^2
+    return T(4) * a * (a - one(T)) * exp(-a)
+end
+
+# `c s sech²z (4cs tanh z − 1)`, `z = c(2s − 1)`.
+@inline function kernel_weight(h::ScaleRate{<:ScaleRate{<:SmoothHatKernel}}, d::T, ℓ::T) where {T<:AbstractFloat}
+    c = T(h.kernel.kernel.steepness)
+    s = d / ℓ
+    z = c * (T(2) * s - one(T))
+    e = exp(-T(2) * abs(z))
+    return c * s * T(4) * e / (one(T) + e)^2 * (T(4) * c * s * tanh(z) - one(T))
+end
+
+@inline function kernel_weight(h::ScaleRate{<:ScaleRate{<:HyperGaussianKernel}}, d::T, ℓ::T) where {T<:AbstractFloat}
+    u = T(h.kernel.kernel.α) * (T(2) * d / ℓ)^4
+    return T(16) * u * (u - one(T)) * exp(-u)
+end
+
+# The Gaussian's one-dimensional profile has its radial form, so its rate profiles do too.
+@inline kernel_profile(h::ScaleRate{<:GaussianKernel}, δ::T, ℓ::T) where {T<:AbstractFloat} = kernel_weight(h, abs(δ), ℓ)
+@inline kernel_profile(h::ScaleRate{<:ScaleRate{<:GaussianKernel}}, δ::T, ℓ::T) where {T<:AbstractFloat} =
+    kernel_weight(h, abs(δ), ℓ)
+
+@inline kernel_radius(h::ScaleRate, ℓ::T) where {T<:AbstractFloat} = kernel_radius(h.kernel, ℓ)
+@inline kernel_radius(h::ScaleRate, ℓ::T, dim::Val) where {T<:AbstractFloat} = kernel_radius(h.kernel, ℓ, dim)
+
+is_nonnegative(::ScaleRate) = true
+is_nonnegative(::ScaleRate{<:ScaleRate}) = false
+transfer_monotone(::ScaleRate) = false
+
+"""
+    AxisRate(kernel, Val(d)) <: AbstractFilterKernel
+
+A separable `kernel`'s product with its profile along axis `d` replaced by the profile of [`ScaleRate`](@ref):
+`ℓ ∂_ℓ ∏_e g(δ_e/ℓ) = Σ_d H₁(δ_d/ℓ) ∏_{e≠d} g(δ_e/ℓ)`, `H₁(s) = −s g′(s)`, so a separable filter's derivative in its
+width is a sum of filters of these, one per axis. Nested, `AxisRate(AxisRate(kernel, Val(d)), Val(e))` replaces the
+profile along `d` and then along `e`: `J₁` along `d = e`, `H₁` along both otherwise, the terms of
+`(ℓ∂_ℓ)² ∏ g = Σ_d J₁ ∏_{e≠d} g + Σ_{d≠e} H₁H₁ ∏ g`. Its footprint is `kernel`'s.
+"""
+struct AxisRate{D, K<:AbstractFilterKernel} <: AbstractFilterKernel
+    kernel::K
+end
+
+AxisRate(kernel::K, ::Val{D}) where {D, K<:AbstractFilterKernel} = AxisRate{D,K}(kernel)
+
+# The kernel whose profile a separable kernel takes along axis `d`.
+@inline _axis_kernel(kernel::AbstractFilterKernel, ::Val) = kernel
+@inline _axis_kernel(r::AxisRate{D}, v::Val{D}) where {D} = ScaleRate(_axis_kernel(r.kernel, v))
+@inline _axis_kernel(r::AxisRate, v::Val) = _axis_kernel(r.kernel, v)
+
+@inline kernel_radius(r::AxisRate, ℓ::T) where {T<:AbstractFloat} = kernel_radius(r.kernel, ℓ)
+@inline kernel_radius(r::AxisRate, ℓ::T, dim::Val) where {T<:AbstractFloat} = kernel_radius(r.kernel, ℓ, dim)
+is_separable(::AxisRate) = true
+is_radial(::AxisRate) = false
+is_nonnegative(r::AxisRate) = is_nonnegative(r.kernel)
+is_nonnegative(::AxisRate{D,<:AxisRate{D}}) where {D} = false
+transfer_monotone(::AxisRate) = false
+
+const _ProfileRateKernel = Union{GaussianKernel, SmoothHatKernel, HyperGaussianKernel}
+
+"""
+    has_profile_rate(kernel) -> Bool
+
+Whether [`ScaleRate`](@ref) has a weight for `kernel`, a profile differentiable in distance, so a real-space
+filter's derivative in the filter width is exact; `has_profile_rate(ScaleRate(kernel))` whether the second
+derivative is. The top-hat's `H` is a ring at its rim, the high-order kernel's sits at its edges, and the sharp
+cut's footprint ends where its weight is not small.
+"""
+has_profile_rate(::AbstractFilterKernel) = false
+has_profile_rate(::_ProfileRateKernel) = true
+has_profile_rate(::ScaleRate{<:_ProfileRateKernel}) = true
+
+const _TransferRateKernel = Union{GaussianKernel, TopHatKernel, HighOrderKernel}
+
+"""
+    has_transfer_rate(kernel) -> Bool
+
+Whether [`scale_rate_transfer`](@ref) has a method for `kernel`: a planar transfer function differentiable in
+the filter width; `has_transfer_rate(TransferRate(kernel))` whether it is twice.
+"""
+has_transfer_rate(::AbstractFilterKernel) = false
+has_transfer_rate(::_TransferRateKernel) = true
+
+const _DegreeRateKernel = Union{GaussianKernel, SmoothHatKernel, HyperGaussianKernel, TopHatKernel}
+
+"""
+    has_degree_rate(kernel) -> Bool
+
+Whether [`spectral_rate_degrees!`](@ref) has a method for `kernel`, and for `TransferRate(kernel)` whether it
+has the second derivative. The high-order kernel's isotropic limb amplitudes, and the sharp cut's truncation,
+move with `ℓ`.
+"""
+has_degree_rate(::AbstractFilterKernel) = false
+has_degree_rate(::_DegreeRateKernel) = true
+
+"""
+    scale_rate_transfer(kernel, kmag::T, ℓ::T, ::Val{D}) -> T
+    scale_rate_transfer(kernel, k::NTuple{D,T}, ℓ::T) -> T
+
+`∂Ĝ/∂ℓ` of [`spectral_transfer`](@ref) at the wavenumber magnitude `kmag` or the wavevector `k`. The top-hat's
+is `(k/2) d/dx` of the ball's transform at `x = kℓ/2`, `−x/(D+2)` times the `(D+2)`-dimensional ball's.
+"""
+@inline scale_rate_transfer(k::GaussianKernel, kmag::T, ℓ::T, ::Val) where {T<:AbstractFloat} =
+    -kmag^2 * ℓ / (T(2) * T(k.α)) * exp(-kmag^2 * ℓ^2 / (T(4) * T(k.α)))
+@inline scale_rate_transfer(::TopHatKernel, kmag::T, ℓ::T, dim::Val) where {T<:AbstractFloat} =
+    kmag / T(2) * _ball_rate(kmag * ℓ / T(2), dim)
+@inline scale_rate_transfer(kernel::AbstractFilterKernel, k::NTuple{D,T}, ℓ::T) where {D,T<:AbstractFloat} =
+    scale_rate_transfer(kernel, sqrt(sum(abs2, k)), ℓ, Val(D))
+@inline function scale_rate_transfer(kernel::HighOrderKernel, k::NTuple{D,T}, ℓ::T) where {D,T<:AbstractFloat}
+    t = map(kd -> _profile_transfer(kernel, kd, ℓ), k)
+    r = map(kd -> _profile_rate(kernel, kd, ℓ), k)
+    return sum(ntuple(d -> r[d] * prod(ntuple(e -> e == d ? one(T) : t[e], Val(D))), Val(D)))
+end
+
+# One axis of the product: the shells' radii are proportional to `ℓ`, so their measures' ratios hold and each
+# shell's `sin(kρ)/(kρ)` changes by `(kρ/ℓ)` times its derivative.
+@inline _profile_rate(k::HighOrderKernel, kd::T, ℓ::T) where {T<:AbstractFloat} =
+    _shell_sum(ρ -> (T(2) * ρ, kd * ρ / ℓ * _ball_rate(kd * ρ, Val(1))), limb_amplitudes(k, T), k, ℓ)
+
+"""
+    TransferRate(kernel) <: AbstractFilterKernel
+
+`kernel`'s transfer differentiated in the filter width, as a transfer: [`spectral_transfer`](@ref) is
+[`scale_rate_transfer`](@ref) and [`spectral_transfer_degrees!`](@ref) is [`spectral_rate_degrees!`](@ref), so a
+spectral plan built with it synthesizes `∂_ℓū` from the analysis `kernel`'s plan holds. Its footprint is
+`kernel`'s; it has no real-space weight.
+"""
+struct TransferRate{K<:AbstractFilterKernel} <: AbstractFilterKernel
+    kernel::K
+end
+
+@inline spectral_transfer(r::TransferRate, kmag::T, ℓ::T, dim::Val) where {T<:AbstractFloat} =
+    scale_rate_transfer(r.kernel, kmag, ℓ, dim)
+@inline spectral_transfer(r::TransferRate, k::NTuple{D,T}, ℓ::T) where {D,T<:AbstractFloat} =
+    scale_rate_transfer(r.kernel, k, ℓ)
+spectral_transfer_degrees!(dĜ::AbstractVector{<:AbstractFloat}, r::TransferRate, ℓ::Real, R::Real,
+                           quadrature::LegendreQuadrature = LegendreQuadrature(eltype(dĜ))) =
+    spectral_rate_degrees!(dĜ, r.kernel, ℓ, R, quadrature)
+@inline kernel_radius(r::TransferRate, ℓ::T) where {T<:AbstractFloat} = kernel_radius(r.kernel, ℓ)
+@inline kernel_radius(r::TransferRate, ℓ::T, dim::Val) where {T<:AbstractFloat} = kernel_radius(r.kernel, ℓ, dim)
+transfer_cutoff(r::TransferRate, ℓ::AbstractFloat) = transfer_cutoff(r.kernel, ℓ)
+is_radial(r::TransferRate) = is_radial(r.kernel)
+is_nonnegative(::TransferRate) = false
+transfer_monotone(::TransferRate) = false
+has_transfer_rate(::TransferRate{<:_TransferRateKernel}) = true
+has_degree_rate(::TransferRate{<:_DegreeRateKernel}) = true
+
+# `∂²_ℓĜ`, the transfer of `TransferRate(TransferRate(kernel))`: the Gaussian's `(4q² − 2q)e^{−q}/ℓ²`,
+# `q = k²ℓ²/4α`; the top-hat's `(k/2)²` times the ball transform's second derivative at `x = kℓ/2`; the high-order
+# product's by the product rule over its axes.
+@inline function scale_rate_transfer(r::TransferRate{<:GaussianKernel}, kmag::T, ℓ::T, ::Val) where {T<:AbstractFloat}
+    q = kmag^2 * ℓ^2 / (T(4) * T(r.kernel.α))
+    return (T(4) * q^2 - T(2) * q) / ℓ^2 * exp(-q)
+end
+@inline scale_rate_transfer(::TransferRate{<:TopHatKernel}, kmag::T, ℓ::T, dim::Val) where {T<:AbstractFloat} =
+    (kmag / T(2))^2 * _ball_rate2(kmag * ℓ / T(2), dim)
+@inline function scale_rate_transfer(r::TransferRate{<:HighOrderKernel}, k::NTuple{D,T}, ℓ::T) where {D,T<:AbstractFloat}
+    kernel = r.kernel
+    t = map(kd -> _profile_transfer(kernel, kd, ℓ), k)
+    d1 = map(kd -> _profile_rate(kernel, kd, ℓ), k)
+    d2 = map(kd -> _profile_rate2(kernel, kd, ℓ), k)
+    rest(d, e) = prod(ntuple(f -> f == d || f == e ? one(T) : t[f], Val(D)))
+    diagonal = sum(ntuple(d -> d2[d] * rest(d, d), Val(D)))
+    mixed = sum(ntuple(d -> sum(ntuple(e -> e == d ? zero(T) : d1[d] * d1[e] * rest(d, e), Val(D))), Val(D)))
+    return diagonal + mixed
+end
+
+# One axis's `∂²_ℓ` of the high-order profile's transfer: each shell's `sin(kρ)/(kρ)` has `ρ ∝ ℓ`, so it changes by
+# `(kρ/ℓ)²` times its second derivative.
+@inline _profile_rate2(k::HighOrderKernel, kd::T, ℓ::T) where {T<:AbstractFloat} =
+    _shell_sum(ρ -> (T(2) * ρ, (kd * ρ / ℓ)^2 * _ball_rate2(kd * ρ, Val(1))), limb_amplitudes(k, T), k, ℓ)
+
+@noinline kernel_weight(r::TransferRate, ::AbstractFloat, ::AbstractFloat) = throw(ArgumentError(
+    "TransferRate($(nameof(typeof(r.kernel)))) is a transfer function for spectral plans and has no real-space weight; " *
+    "a real-space filter's derivative in its width reads `ScaleRate`.",
+))
+
+"""
+    spectral_rate_degrees!(dĜ, kernel, ℓ, R[, quadrature]) -> dĜ
+
+`∂Ĝ(n)/∂ℓ` of [`spectral_transfer_degrees!`](@ref) for every degree `n = 0 … length(dĜ) − 1`. With `A_n` and `B_n`
+the degree sums of `G` and of [`ScaleRate`](@ref)'s `H` over the same nodes, `∂_ℓĜ(n) = (B_n − Ĝ(n)B_0)/(ℓA_0)`, the
+truncation radius, where `G` is below the truncation tolerance, held. A cap of angular radius `θ₀ = ℓ/2R` has
+`(P_n(cos θ₀) − Ĝ(n)) cot(θ₀/2)/(2R)`.
+"""
+function spectral_rate_degrees!(
+    dĜ::AbstractVector{<:AbstractFloat}, kernel::AbstractFilterKernel, ℓ::Real, R::Real,
+    quadrature::LegendreQuadrature = LegendreQuadrature(eltype(dĜ)),
+)
+    isempty(dĜ) && return dĜ
+    A = resize!(quadrature.acc, length(dĜ))
+    B = resize!(quadrature.acch, length(dĜ))
+    TW = eltype(A)
+    fill!(A, zero(TW))
+    fill!(B, zero(TW))
+    _rate_sums!(A, B, nothing, kernel, ℓ, R, quadrature)
+    a0, b0 = A[1], B[1]
+    ℓw = TW(ℓ)
+    @. dĜ = (B - (A / a0) * b0) / (ℓw * a0)
+    return dĜ
+end
+
+# `∂²Ĝ(n)/∂ℓ²`, the degree transfer of `TransferRate(TransferRate(kernel))`. With the degree sums `A`, `B`, `C` of `G`,
+# `H` and `J` over the same nodes, `ℓ∂_ℓ` takes each to the next, so `(ℓ∂_ℓ)Ĝ = (B_n − Ĝ B_0)/A_0` and
+# `(ℓ∂_ℓ)²Ĝ = (C_n − Ĝ C_0)/A_0 − 2(ℓ∂_ℓĜ)B_0/A_0`, and `ℓ²∂²_ℓ = (ℓ∂_ℓ)² − ℓ∂_ℓ`.
+function spectral_rate_degrees!(
+    d2Ĝ::AbstractVector{<:AbstractFloat}, r::TransferRate, ℓ::Real, R::Real,
+    quadrature::LegendreQuadrature = LegendreQuadrature(eltype(d2Ĝ)),
+)
+    isempty(d2Ĝ) && return d2Ĝ
+    A = resize!(quadrature.acc, length(d2Ĝ))
+    B = resize!(quadrature.acch, length(d2Ĝ))
+    C = resize!(quadrature.accj, length(d2Ĝ))
+    TW = eltype(A)
+    fill!(A, zero(TW))
+    fill!(B, zero(TW))
+    fill!(C, zero(TW))
+    _rate_sums!(A, B, C, r.kernel, ℓ, R, quadrature)
+    a0, b0, c0 = A[1], B[1], C[1]
+    ℓw = TW(ℓ)
+    @inbounds for i in eachindex(d2Ĝ, A, B, C)
+        g = A[i] / a0
+        d1 = (B[i] - g * b0) / a0
+        d2 = (C[i] - g * c0) / a0 - 2 * d1 * b0 / a0
+        d2Ĝ[i] = (d2 - d1) / ℓw^2
+    end
+    return d2Ĝ
+end
+
+# The cap of angular radius `θ₀ = ℓ/2R`: `dĜ/dθ₀ = (P_n(cos θ₀) − Ĝ(n)) cot(θ₀/2)`, so
+# `d²Ĝ/dθ₀² = (−sin θ₀ P′_n(cos θ₀) − dĜ/dθ₀) cot(θ₀/2) − (P_n − Ĝ(n))/(2sin²(θ₀/2))`, over `(2R)²` in `ℓ`.
+function spectral_rate_degrees!(
+    d2Ĝ::AbstractVector{<:AbstractFloat}, ::TransferRate{<:TopHatKernel}, ℓ::Real, R::Real,
+    quadrature::LegendreQuadrature = LegendreQuadrature(eltype(d2Ĝ)),
+)
+    isempty(d2Ĝ) && return d2Ĝ
+    A = resize!(quadrature.acc, length(d2Ĝ))
+    TW = eltype(A)
+    fill!(A, zero(TW))
+    θ0 = TW(ℓ) / (2 * TW(R))
+    θ0 >= TW(π) && return fill!(d2Ĝ, zero(eltype(d2Ĝ)))
+    _add_cap!(A, one(TW), θ0)
+    sh, ch = sincos(θ0 / 2)
+    x = one(TW) - TW(2) * sh^2
+    sθ = TW(2) * sh * ch
+    cot = ch / sh
+    c2 = inv(2 * TW(R))^2
+    P0, P1 = one(TW), x
+    D0, D1 = zero(TW), one(TW)
+    @inbounds d2Ĝ[1] = zero(eltype(d2Ĝ))
+    @inbounds for n in 1:(length(d2Ĝ) - 1)
+        δ = P1 - A[n + 1]
+        g1 = δ * cot
+        d2Ĝ[n + 1] = ((-sθ * D1 - g1) * cot - δ / (2 * sh^2)) * c2
+        P0, P1 = P1, (TW(2n + 1) * x * P1 - TW(n) * P0) / TW(n + 1)
+        D0, D1 = D1, TW(2n + 1) * P0 + D0
+    end
+    return d2Ĝ
+end
+
+function spectral_rate_degrees!(
+    dĜ::AbstractVector{<:AbstractFloat}, ::TopHatKernel, ℓ::Real, R::Real,
+    quadrature::LegendreQuadrature = LegendreQuadrature(eltype(dĜ)),
+)
+    isempty(dĜ) && return dĜ
+    A = resize!(quadrature.acc, length(dĜ))
+    TW = eltype(A)
+    fill!(A, zero(TW))
+    θ0 = TW(ℓ) / (2 * TW(R))
+    θ0 >= TW(π) && return fill!(dĜ, zero(eltype(dĜ)))
+    _add_cap!(A, one(TW), θ0)
+    x = one(TW) - TW(2) * sin(θ0 / 2)^2
+    c = cos(θ0 / 2) / sin(θ0 / 2) / (2 * TW(R))
+    P0, P1 = one(TW), x
+    @inbounds dĜ[1] = zero(eltype(dĜ))
+    @inbounds for n in 1:(length(dĜ) - 1)
+        dĜ[n + 1] = (P1 - A[n + 1]) * c
+        P0, P1 = P1, (TW(2n + 1) * x * P1 - TW(n) * P0) / TW(n + 1)
+    end
+    return dĜ
+end
+
+# `A_n`, `B_n` and, where `C` is given, `C_n` by the Gauss–Legendre rule `_degree_sums!` reads, with room for `H`'s
+# and `J`'s faster variation.
+function _rate_sums!(A::AbstractVector{TW}, B::AbstractVector{TW}, C::Union{Nothing,AbstractVector{TW}},
+                     kernel::_QuadratureKernel, ℓ::Real, R::Real, q::LegendreQuadrature{TW}) where {TW<:AbstractFloat}
+    ℓw, Rw = TW(ℓ), TW(R)
+    h = ScaleRate(kernel)
+    γt = min(kernel_radius(kernel, ℓw, Val(2)) / Rw, TW(π))
+    L = length(A) - 1
+    n = _legendre_order(kernel, L, γt, ℓw, Rw) + (C === nothing ? 16 : 32)
+    _legendre_nodes!(q, n)
+    @inbounds for i in 1:n
+        γ = γt * sin(TW(π) / 4 + q.φ[i] / 2)^2
+        sγ = q.w[i] * sin(γ)
+        g = sγ * kernel_weight(kernel, Rw * γ, ℓw, Val(2))
+        f = sγ * kernel_weight(h, Rw * γ, ℓw)
+        j = _second_weight(C, h, sγ, Rw * γ, ℓw)
+        x = cos(γ)
+        A[1] += g
+        B[1] += f
+        _add_sum!(C, 1, j)
+        L == 0 && continue
+        A[2] += g * x
+        B[2] += f * x
+        _add_sum!(C, 2, j * x)
+        P0, P1 = one(TW), x
+        for l in 1:(L - 1)
+            P0, P1 = P1, (TW(2l + 1) * x * P1 - TW(l) * P0) / TW(l + 1)
+            A[l + 2] += g * P1
+            B[l + 2] += f * P1
+            _add_sum!(C, l + 2, j * P1)
+        end
+    end
+    return nothing
+end
+
+@inline _second_weight(::Nothing, _h, sγ::T, _d, _ℓ) where {T} = zero(T)
+@inline _second_weight(::AbstractVector, h, sγ, d, ℓ) = sγ * kernel_weight(ScaleRate(h), d, ℓ)
+@inline _add_sum!(::Nothing, _i, _v) = nothing
+@inline _add_sum!(C::AbstractVector, i::Int, v) = (@inbounds C[i] += v; nothing)
+
+# ---------------------------------------------------------------------------
 # Spectrum admissibility
 # ---------------------------------------------------------------------------
 
@@ -764,6 +1215,22 @@ transfer_monotone(::TopHatKernel) = false
 transfer_monotone(::SmoothHatKernel) = false
 transfer_monotone(::HyperGaussianKernel) = false
 transfer_monotone(::HighOrderKernel) = false
+
+"""
+    is_nonnegative(kernel::AbstractFilterKernel) -> Bool
+
+Whether the kernel's real-space weight is non-negative everywhere, so the filter is a positive operator
+and the subfilter stress `τ` is realizable (Vreman, Geurts & Kuerten 1994). `SharpSpectralKernel`'s
+`J_{D/2}` profile and `HighOrderKernel`'s limbs change sign. Every kernel defines its own method.
+"""
+function is_nonnegative end
+
+is_nonnegative(::TopHatKernel) = true
+is_nonnegative(::GaussianKernel) = true
+is_nonnegative(::SmoothHatKernel) = true
+is_nonnegative(::HyperGaussianKernel) = true
+is_nonnegative(::SharpSpectralKernel) = false
+is_nonnegative(::HighOrderKernel) = false
 
 """
     check_spectrum_kernel(kernel::AbstractFilterKernel)

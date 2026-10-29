@@ -31,7 +31,7 @@ end
 @inline function _resolve_slice_backend(backend::ComputationalBackends.AbstractExecutionBackend)
     backend isa ComputationalBackends.AbstractAutoBackend ||
         return ComputationalBackends.resolve_backend(backend)
-    return (Threads.nthreads() > 1 && _threading_available()) ?
+    return (Threads.nthreads() > 1 && _available(_Threads())) ?
         ComputationalBackends.ThreadedBackend() : ComputationalBackends.SerialBackend()
 end
 

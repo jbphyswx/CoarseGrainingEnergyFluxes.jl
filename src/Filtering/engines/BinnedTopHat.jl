@@ -28,7 +28,26 @@ struct BinnedPoints{D, T<:AbstractFloat, VI<:AbstractVector{Int}, VT<:AbstractVe
     ptr::VI
     x::NTuple{D,VT}
     measure::VT
-    mask::MK       # `Vector{Bool}` in bin order, or `nothing` when every point is active
+    mask::MK       # `Vector{Bool}` in bin order, or `nothing` on a grid whose mask is `AllActive`
+end
+
+"""
+    BinnedEdgeCells{T,VV,C}
+
+A curvilinear mesh's cells under a [`Kernels.CellOverlap`](@ref) top-hat of radius `R`, for the binned engine:
+each point's four cell vertices in bin order (`vx`, `vy`, at the point's own image), and the squared radii
+`rin2 = (R − ρ)²` within which a cell lies wholly inside the disk and `rout2 = (R + ρ)²` beyond which it lies wholly
+outside, `ρ` the farthest any vertex lies from its cell's centre. A cell between weighs its fraction inside;
+`cache` holds those fractions per target in bin order, `(ptr, src, frac)` with `src` a point in bin order, or
+is `nothing` where an apply computes them.
+"""
+struct BinnedEdgeCells{T<:AbstractFloat, VV<:AbstractVector{NTuple{4,T}}, C}
+    vx::VV
+    vy::VV
+    R::T
+    rin2::T
+    rout2::T
+    cache::C
 end
 
 """
@@ -42,11 +61,12 @@ of the bin totals along axis 1, and each target's window sum in bin order), adde
 apply; and `invden`, the reciprocal window mass under
 `strategy` per point in the grid's order, zero where the window is empty or, under `Deformable`, the
 target inactive. `bound` is whether the two strategies' denominators differ, which they do on a masked
-grid.
+grid. `edge` is `nothing` where each point counts by the centre test (a node set, or a mesh under
+[`Kernels.CellCentre`](@ref)), the [`BinnedEdgeCells`](@ref) of a mesh under `CellOverlap`.
 """
 struct BinnedTopHatPlan{
     D, T<:AbstractFloat, BP<:BinnedPoints{D,T}, VL<:AbstractVector, VI<:AbstractVector{Int},
-    VB<:AbstractVector, VT<:AbstractVector{T}, MS<:AbstractMaskStrategy,
+    VB<:AbstractVector, VT<:AbstractVector{T}, MS<:AbstractMaskStrategy, E<:Union{Nothing,BinnedEdgeCells{T}},
 }
     points::BP
     rad::T
@@ -57,6 +77,7 @@ struct BinnedTopHatPlan{
     invden::VT
     strategy::MS
     bound::Bool
+    edge::E
 end
 
 Base.show(io::IO, fp::BinnedTopHatPlan) =
@@ -64,57 +85,12 @@ Base.show(io::IO, fp::BinnedTopHatPlan) =
 
 _driven_footprint(::BinnedTopHatPlan) = true
 
-"""
-    _binned_lattice(grid, Val(D)) -> (lo, h, nb, periodic, period)
-
-The lattice a point set is binned on: origin `lo`, widths `h` and counts `nb`, the width the mean cell
-measure, about one point per bin, along a bounded direction, and the period divided into a whole number
-of bins along a periodic one.
-"""
-function _binned_lattice(grid::FlowGeometries.Grids.AbstractGrid{G,T}, ::Val{D}) where {G, T<:AbstractFloat, D}
-    n = length(FlowGeometries.Grids.mask(grid))
-    periodic = ntuple(d -> FlowGeometries.Grids.isperiodic(grid, d), Val(D))
-    period = ntuple(d -> periodic[d] ? T(FlowGeometries.Grids.period(grid, d)) : zero(T), Val(D))
-    lo = ntuple(d -> T(FlowGeometries.Grids.bounds(grid, d)[1]), Val(D))
-    extent = ntuple(d -> T(FlowGeometries.Grids.bounds(grid, d)[2]) - lo[d], Val(D))
-    h0 = (T(sum(FlowGeometries.Grids.measure(grid))) / n)^(one(T) / D)
-    nb = ntuple(d -> periodic[d] ? max(1, floor(Int, period[d] / h0)) : floor(Int, extent[d] / h0) + 1, Val(D))
-    h = ntuple(d -> periodic[d] ? period[d] / nb[d] : h0, Val(D))
-    return lo, h, nb, periodic, period
-end
-
-function BinnedPoints(grid::FlowGeometries.Grids.AbstractGrid{G,T}, ::Val{D}) where {G, T<:AbstractFloat, D}
-    xs = ntuple(d -> vec(FlowGeometries.Grids.coordinates(grid, d)), Val(D))
-    n = length(first(xs))
-    measure = T.(vec(FlowGeometries.Grids.measure(grid)))
-    mask = FlowGeometries.Grids.mask(grid)
-    lo, h, nb, periodic, period = _binned_lattice(grid, Val(D))
-    # Each point's coordinates reduced into the lattice's period, and its bin.
-    xr = ntuple(Val(D)) do d
-        periodic[d] ? [lo[d] + mod(x - lo[d], period[d]) for x in xs[d]] : collect(T, xs[d])
-    end
-    cart = ntuple(d -> [clamp(floor(Int, (v - lo[d]) / h[d]), 0, nb[d] - 1) for v in xr[d]], Val(D))
-    strides = accumulate(*, (1, Base.front(nb)...))
-    bin = [1 + sum(ntuple(d -> cart[d][j] * strides[d], Val(D))) for j in 1:n]
-    # Counting sort by bin.
-    nbins = prod(nb)
-    ptr = zeros(Int, nbins + 1)
-    for b in bin
-        ptr[b + 1] += 1
-    end
-    ptr[1] = 1
-    for b in 1:nbins
-        ptr[b + 1] += ptr[b]
-    end
-    order = Vector{Int}(undef, n)
-    next = ptr[1:nbins]
-    for j in 1:n
-        order[next[bin[j]]] = j
-        next[bin[j]] += 1
-    end
-    active = all(mask) ? nothing : collect(Bool, vec(mask))[order]
-    return BinnedPoints(lo, h, nb, periodic, period, order, ptr, ntuple(d -> xr[d][order], Val(D)),
-                        measure[order], active)
+# The points binned by FlowGeometries' dense-layout index on bins of side `width` (`nothing` for the mean
+# spacing), with each point's measure in bin order.
+function BinnedPoints(grid::FlowGeometries.Grids.AbstractGrid{G,T}, ::Val{D}; width = nothing) where {G, T<:AbstractFloat, D}
+    ix = FlowGeometries.Grids.binned_index(grid; layout = FlowGeometries.Grids.DenseBins(), width = width)
+    measure = T.(vec(FlowGeometries.Grids.measure(grid)))[ix.order]
+    return BinnedPoints(ix.lo, ix.h, ix.nb, ix.wrap, ix.period, ix.order, ix.ptr, ix.x, measure, ix.active)
 end
 
 """
@@ -152,20 +128,63 @@ curvilinear mesh: the same sum as its neighbour-list engine, over the cells whos
 """
 function binned_tophat_plan(
     grid::FlowGeometries.Grids.AbstractGrid{G,T}, kernel::Kernels.TopHatKernel, scale::T;
-    mask_strategy::AbstractMaskStrategy = ZeroFill(),
+    mask_strategy::AbstractMaskStrategy = ZeroFill(), kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}}
     D = FlowGeometries.Grids.ncoordinates(grid)
-    return _binned_tophat_plan(grid, kernel, scale, mask_strategy, Val(D))
+    bp = BinnedPoints(grid, Val(D))
+    return _binned_tophat_plan(bp, T(Kernels.kernel_radius(kernel, scale, Val(D))), mask_strategy, nothing, nothing)
 end
 
-function _binned_tophat_plan(grid, kernel, scale::T, mask_strategy, ::Val{D}) where {T, D}
-    bp = BinnedPoints(grid, Val(D))
-    rad = T(Kernels.kernel_radius(kernel, scale, Val(D)))
+"""
+    binned_tophat_plan(grid::CurvilinearGrid, kernel::TopHatKernel{CellOverlap}, scale; mask_strategy, cache_strategy, cache_byte_budget)
+
+The binned top-hat over a Cartesian curvilinear mesh, each cell weighted by its area inside the disk: bins
+wholly within `R − ρ` of every target in a bin add as runs, points within `R − ρ` count whole, and the cells
+whose centres lie within `ρ` of the disk's edge take their polygon's fraction inside
+([`BinnedEdgeCells`](@ref)), held per target where `cache_strategy` keeps them. `ZeroFill` divides by the disk's
+area, the mesh having no lattice past its edge.
+"""
+function binned_tophat_plan(
+    grid::FlowGeometries.Grids.CurvilinearGrid{T,G,2}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T;
+    mask_strategy::AbstractMaskStrategy = ZeroFill(), cache_strategy::AbstractCacheStrategy = AutoCache(),
+    cache_byte_budget::Integer = default_cache_byte_budget(), kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}}
+    bp = BinnedPoints(grid, Val(2))
+    poly = OverlapPolygons(grid, Kernels.kernel_radius(kernel, scale))
+    R = T(poly.ov.R)
+    ρ = T(poly.reach) - R
+    # Each point's vertices at the image its binned position names.
+    Nx = FlowGeometries.Grids.size_tuple(grid)[1]
+    C = FlowGeometries.Grids.coordinates(grid)
+    n = length(bp.order)
+    vx, vy = Vector{NTuple{4,T}}(undef, n), Vector{NTuple{4,T}}(undef, n)
+    @inbounds for s in 1:n
+        t = bp.order[s]
+        i, j = mod1(t, Nx), fld1(t, Nx)
+        dx, dy = bp.x[1][s] - T(C[1][i, j]), bp.x[2][s] - T(C[2][i, j])
+        cs = ((i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1))
+        vx[s] = map(c -> T(poly.xc[c...]) + dx, cs)
+        vy[s] = map(c -> T(poly.yc[c...]) + dy, cs)
+    end
+    inner = max(R - ρ, zero(T))
+    open = BinnedEdgeCells(vx, vy, R, inner^2, (R + ρ)^2, nothing)
+    fp = _binned_tophat_plan(bp, R + ρ, mask_strategy, open, inner)
+    edge = BinnedEdgeCells(vx, vy, R, inner^2, (R + ρ)^2,
+                           _binned_edge_cache(fp, open, cache_strategy, cache_byte_budget))
+    # `ZeroFill` divides by the disk's area; `Deformable` by the active cells' weights, found above.
+    mask_strategy isa ZeroFill && fill!(fp.invden, _inv_mass(T(π) * R^2))
+    return BinnedTopHatPlan(fp.points, fp.rad, fp.lines, fp.win, fp.wout, fp.buffers, fp.invden, fp.strategy,
+                            fp.bound, edge)
+end
+
+# The plan over `bp` reaching `rad`, with its window masses. Bins wholly within `rin` of every target in a bin
+# add as runs (`rin = rad` under the centre test).
+function _binned_tophat_plan(bp::BinnedPoints{D,T}, rad::T, mask_strategy, edge, rin) where {D, T}
     # An offset formed from coordinates of magnitude up to `xmax` is off by a few ulps of `xmax`, so a bin's
     # points lie in its box to that much; the run and the reach are widened and narrowed by it.
     xmax = maximum(d -> maximum(abs, bp.x[d]) + abs(bp.period[d]), 1:D)
     δ = 16 * eps(T) * (xmax + rad)
-    lines, win, wout = _binned_lines(bp.h, rad - δ, rad + δ)
+    lines, win, wout = _binned_lines(bp.h, (rin === nothing ? rad : rin) - δ, rad + δ)
     n = length(bp.order)
     buf = _binned_buffer(bp)
     values, prefix, sums = buf
@@ -177,13 +196,68 @@ function _binned_tophat_plan(grid, kernel, scale::T, mask_strategy, ::Val{D}) wh
     _binned_scan!(prefix, values, bp)
     den = Vector{T}(undef, n)
     _binned_sweep!((den,), Returns(true), bp, (values,), (prefix,), (sums,), rad, lines, win, wout,
-                   1:prod(Base.tail(bp.nb)))
+                   1:prod(Base.tail(bp.nb)), edge)
     invden = similar(den)
     @inbounds for s in 1:n
         t = bp.order[s]
         invden[t] = (deformable && !bp.mask[s]) ? zero(T) : _inv_mass(den[t])
     end
-    return BinnedTopHatPlan(bp, rad, lines, win, wout, [buf], invden, mask_strategy, bp.mask !== nothing)
+    return BinnedTopHatPlan(bp, rad, lines, win, wout, [buf], invden, mask_strategy, bp.mask !== nothing, edge)
+end
+
+# The fraction of point `s`'s cell, at the image `shift`, inside the disk about `p`.
+@inline function _edge_fraction(e::BinnedEdgeCells{T}, s::Int, p::NTuple{2,T}, shift::NTuple{2,T}) where {T}
+    vx, vy = e.vx[s], e.vy[s]
+    poly = SA.SVector{4,NTuple{2,T}}(ntuple(k -> (vx[k] + shift[1] - p[1], vy[k] + shift[2] - p[2]), Val(4)))
+    return T(Geometry.disk_fraction(poly, e.R))
+end
+
+# Every target's cells in the band between `rin2` and `rout2`, their fractions held in bin order, or `nothing`
+# where `strategy` does not keep them within `budget`.
+function _binned_edge_cache(fp::BinnedTopHatPlan{D,T}, e::BinnedEdgeCells{T}, strategy, budget) where {D,T}
+    n = length(fp.points.order)
+    count = _cache_entries(strategy, budget, sizeof(Int) + sizeof(T)) do limit
+        _binned_edge_pass((m, _, _, _) -> m + 1, 0, fp, e, limit)
+    end
+    count === nothing && return nothing
+    ptr = zeros(Int, n + 1)
+    src = Vector{Int}(undef, count)
+    frac = Vector{T}(undef, count)
+    ptr[1] = 1
+    _binned_edge_pass(0, fp, e, typemax(Int)) do m, s, s1, fr
+        m += 1
+        src[m] = s1
+        frac[m] = fr
+        ptr[s + 1] = m + 1
+        m
+    end
+    # A target with no cell in the band holds an empty run.
+    @inbounds for s in 1:n
+        ptr[s + 1] = max(ptr[s + 1], ptr[s])
+    end
+    return (ptr, src, frac)
+end
+
+# Fold `acc = f(acc, s, s₁, fr)` over every target `s` (bin order) and each cell `s₁` in its band with fraction
+# `fr`, stopping once `acc` passes `limit`.
+function _binned_edge_pass(f::F, acc, fp::BinnedTopHatPlan{D,T}, e::BinnedEdgeCells{T}, limit::Int) where {F,D,T}
+    bp = fp.points
+    strides = accumulate(*, (1, Base.front(bp.nb)...))
+    cart = CartesianIndices(bp.nb)
+    @inbounds for b in 1:prod(bp.nb)
+        I0 = Tuple(cart[b])
+        J0 = map(j -> j - 1, Base.tail(I0))
+        for s in bp.ptr[b]:(bp.ptr[b + 1] - 1)
+            p = ntuple(d -> bp.x[d][s], Val(D))
+            acc = _binned_within(acc, bp, p, I0[1] - 1, J0, e.rout2, fp.lines, fp.wout, strides) do a, s1, d2, shift
+                d2 > e.rin2 || return a
+                fr = _edge_fraction(e, s1, p, shift)
+                iszero(fr) ? a : f(a, s, s1, fr)
+            end
+            acc > limit && return acc
+        end
+    end
+    return acc
 end
 
 # One field's `(values, scan, sums)` buffers.
@@ -224,15 +298,6 @@ function _binned_scan!(P::CompensatedScan{T}, values::AbstractVector{T}, bp::Bin
     return P
 end
 
-# Bin `i` of a direction as its bin on the lattice and the shift of its image, `(-1, 0)` past a bounded
-# edge. A bin one period out wraps by a comparison; farther ones by a division.
-@inline function _binned_wrap(i::Int, nb::Int, periodic::Bool, period::T) where {T}
-    0 <= i < nb && return i, zero(T)
-    periodic || return -1, zero(T)
-    -nb <= i < 0 && return i + nb, -period
-    nb <= i < 2nb && return i - nb, period
-    return mod(i, nb), T(fld(i, nb)) * period
-end
 
 # Sum of the bins `a…b` of the line at 1-based tail index `J` (raw indices along axis 1, any integers on a
 # periodic axis, where each run of `nb₁` is one image of the line), one per field's scan.
@@ -259,7 +324,7 @@ end
 # The line `J₀ + o` of bins across axes `2…D` (0-based bin indices): its bin indices `J`, the linear offset
 # `lin` of its first bin, and the shift `tshift` of the image it is; `nothing` past a bounded edge.
 @inline function _binned_line(bp::BinnedPoints{D}, J0, o, strides) where {D}
-    wrapped = map((j, oo, n, pd, len) -> _binned_wrap(j + oo, n, pd, len), J0, o, Base.tail(bp.nb),
+    wrapped = map((j, oo, n, pd, len) -> FlowGeometries.Grids._binned_wrap(j + oo, n, pd, len), J0, o, Base.tail(bp.nb),
                   Base.tail(bp.periodic), Base.tail(bp.period))
     any(w -> first(w) < 0, wrapped) && return nothing
     J = map(first, wrapped)
@@ -280,7 +345,7 @@ end
     end
     i = a
     @inbounds while i <= b
-        iw, sx = _binned_wrap(i, nb1, true, bp.period[1])
+        iw, sx = FlowGeometries.Grids._binned_wrap(i, nb1, true, bp.period[1])
         e = min(b, i + nb1 - 1 - iw)
         acc = g(acc, bp.ptr[1 + lin + iw], bp.ptr[2 + lin + iw + e - i] - 1, (sx, tshift...))
         i = e + 1
@@ -291,14 +356,14 @@ end
 # The values of the points within `rad` of `p` in bins `a…b` of the line at linear offset `lin`, one sum per
 # field.
 @inline _binned_partial(bp::BinnedPoints{D,T}, values::NTuple{K}, a::Int, b::Int, lin::Int, p::NTuple{D,T},
-                        tshift::NTuple{M,T}, r2::T) where {D,T,K,M} =
+                        tshift::NTuple{M,T}, r2::T, edge) where {D,T,K,M} =
     _binned_runs(ntuple(_ -> zero(T), Val(K)), bp, a, b, lin, tshift) do acc, s0, s1, shift
-        map(+, acc, _binned_points(bp, values, s0, s1, p, shift, r2))
+        map(+, acc, _binned_points(bp, values, s0, s1, p, shift, r2, edge))
     end
 
 # A point inside the ball adds its value and one outside adds zero, with no branch on which.
 @inline function _binned_points(bp::BinnedPoints{D,T}, values::NTuple{K}, s0::Int, s1::Int, p::NTuple{D,T},
-                                shift::NTuple{D,T}, r2::T) where {D,T,K}
+                                shift::NTuple{D,T}, r2::T, ::Nothing) where {D,T,K}
     acc = ntuple(_ -> zero(T), Val(K))
     @inbounds for s in s0:s1
         d2 = zero(T)
@@ -312,11 +377,43 @@ end
     return acc
 end
 
+# A mesh's cell within `R − ρ` adds its value, and one in the band out to `R + ρ` its fraction of it, here unless
+# the plan holds the band's fractions.
+@inline function _binned_points(bp::BinnedPoints{D,T}, values::NTuple{K}, s0::Int, s1::Int, p::NTuple{D,T},
+                                shift::NTuple{D,T}, _, e::BinnedEdgeCells{T}) where {D,T,K}
+    acc = ntuple(_ -> zero(T), Val(K))
+    @inbounds for s in s0:s1
+        d2 = zero(T)
+        for d in 1:D
+            δ = bp.x[d][s] + shift[d] - p[d]
+            d2 += δ * δ
+        end
+        if d2 <= e.rin2
+            acc = map((a, v) -> a + v[s], acc, values)
+        elseif e.cache === nothing && d2 <= e.rout2
+            fr = _edge_fraction(e, s, p, shift)
+            acc = map((a, v) -> a + fr * v[s], acc, values)
+        end
+    end
+    return acc
+end
+
+# The band cells the plan holds, added to each target's sums.
+@inline _binned_held_edges!(sums, values, ::Nothing, s0, s1) = nothing
+@inline _binned_held_edges!(sums, values, e::BinnedEdgeCells, s0, s1) = _binned_held_edges!(sums, values, e.cache, s0, s1)
+@inline function _binned_held_edges!(sums::NTuple{K}, values::NTuple{K}, cache::Tuple, s0, s1) where {K}
+    ptr, src, frac = cache
+    @inbounds for s in s0:s1, k in ptr[s]:(ptr[s + 1] - 1)
+        foreach((acc, v) -> (acc[s] += frac[k] * v[src[k]]), sums, values)
+    end
+    return nothing
+end
+
 # `outs[k][t] = scale(t) · window sum of field k` for the points of the rows of bins `rows`, linear indices
 # over axes `2…D`; each writes its own entries of every output, indexed in the grid's order, and of `sums`,
 # indexed in bin order. Each line of bins within reach of a row is found once for the row.
 function _binned_sweep!(outs::NTuple{K}, scale::F, bp::BinnedPoints{D,T}, values::NTuple{K}, P::NTuple{K},
-                        sums::NTuple{K}, rad::T, lines, win, wout, rows) where {K, F, D, T}
+                        sums::NTuple{K}, rad::T, lines, win, wout, rows, edge) where {K, F, D, T}
     r2 = rad * rad
     nb1 = bp.nb[1]
     strides = accumulate(*, (1, Base.front(bp.nb)...))
@@ -333,8 +430,9 @@ function _binned_sweep!(outs::NTuple{K}, scale::F, bp::BinnedPoints{D,T}, values
             line = _binned_line(bp, J0, lines[q], strides)
             line === nothing && continue
             J, lin, tshift = line
-            _binned_line_sums!(sums, bp, values, P, r2, win[q], wout[q], map(j -> j + 1, J), lin, tshift, base)
+            _binned_line_sums!(sums, bp, values, P, r2, win[q], wout[q], map(j -> j + 1, J), lin, tshift, base, edge)
         end
+        _binned_held_edges!(sums, values, edge, s0, s1)
         for s in s0:s1
             t = bp.order[s]
             c = scale(t)
@@ -349,7 +447,8 @@ end
 # scan, once per bin, and the bins out to `i₀ ± wo` point by point. A bin whose reach stays on the lattice
 # along axis 1 reads its runs of points directly.
 @inline function _binned_line_sums!(sums::NTuple{K}, bp::BinnedPoints{D,T}, values::NTuple{K}, P::NTuple{K}, r2::T,
-                                    wi::Int, wo::Int, Jp, lin::Int, tshift::NTuple{M,T}, base::Int) where {K, D, T, M}
+                                    wi::Int, wo::Int, Jp, lin::Int, tshift::NTuple{M,T}, base::Int,
+                                    edge) where {K, D, T, M}
     nb1, ptr = bp.nb[1], bp.ptr
     shift = (zero(T), tshift...)
     @inbounds for i0 in 0:(nb1 - 1)
@@ -365,7 +464,8 @@ end
             r1 = wi >= 0 ? ptr[2 + lin + i0 + wo] - 1 : 0
             for s in t0:t1
                 p = ntuple(d -> bp.x[d][s], Val(D))
-                a = map(+, run, _binned_points(bp, values, l0, l1, p, shift, r2), _binned_points(bp, values, r0, r1, p, shift, r2))
+                a = map(+, run, _binned_points(bp, values, l0, l1, p, shift, r2, edge),
+                        _binned_points(bp, values, r0, r1, p, shift, r2, edge))
                 foreach((acc, ak) -> (acc[s] += ak), sums, a)
             end
         else
@@ -373,10 +473,10 @@ end
                 p = ntuple(d -> bp.x[d][s], Val(D))
                 a = if wi >= 0
                     map(+, _binned_run(P, i0 - wi, i0 + wi, nb1, bp.periodic[1], Jp),
-                        _binned_partial(bp, values, i0 - wo, i0 - wi - 1, lin, p, tshift, r2),
-                        _binned_partial(bp, values, i0 + wi + 1, i0 + wo, lin, p, tshift, r2))
+                        _binned_partial(bp, values, i0 - wo, i0 - wi - 1, lin, p, tshift, r2, edge),
+                        _binned_partial(bp, values, i0 + wi + 1, i0 + wo, lin, p, tshift, r2, edge))
                 else
-                    _binned_partial(bp, values, i0 - wo, i0 + wo, lin, p, tshift, r2)
+                    _binned_partial(bp, values, i0 - wo, i0 + wo, lin, p, tshift, r2, edge)
                 end
                 foreach((acc, ak) -> (acc[s] += ak), sums, a)
             end
@@ -434,7 +534,7 @@ function _binned_apply!(outs::NTuple{K}, fields::NTuple{K}, fp::BinnedTopHatPlan
     per = max(1, _BINNED_BLOCK ÷ bp.nb[1])
     driver(1:cld(nrows, per)) do k
         rows = ((k - 1) * per + 1):min(k * per, nrows)
-        _binned_sweep!(outs, t -> @inbounds(invden[t]), bp, values, P, sums, rad, lines, win, wout, rows)
+        _binned_sweep!(outs, t -> @inbounds(invden[t]), bp, values, P, sums, rad, lines, win, wout, rows, fp.edge)
     end
     return outs
 end
@@ -460,9 +560,9 @@ _apply_serial_batch!(outs, fields, grid, fp::BinnedTopHatPlan, strategy) = _driv
     return nothing
 end
 
-# Fold `acc = f(acc, s, d²)` over the points `s` (in bin order) within `√r2` of `p`, a point of bin
-# `(i₀, J₀)`, `d²` the squared distance from `p` to the image of `s` a run names: per line `lines[q]`, the
-# bins `i₀ ± wout[q]`, each image of a point once.
+# Fold `acc = f(acc, s, d², shift)` over the points `s` (in bin order) within `√r2` of `p`, a point of bin
+# `(i₀, J₀)`, `d²` the squared distance from `p` to the image of `s` a run names, `shift` that image's: per line
+# `lines[q]`, the bins `i₀ ± wout[q]`, each image of a point once.
 @inline function _binned_within(f::F, acc, bp::BinnedPoints{D,T}, p::NTuple{D,T}, i0::Int, J0, r2::T,
                                 lines, wout, strides) where {F, D, T}
     @inbounds for q in eachindex(lines)
@@ -476,7 +576,7 @@ end
                     δ = bp.x[d][s] + shift[d] - p[d]
                     d2 += δ * δ
                 end
-                d2 <= r2 && (a = f(a, s, d2))
+                d2 <= r2 && (a = f(a, s, d2, shift))
             end
             a
         end
@@ -499,7 +599,12 @@ _binned_csr(grid::FlowGeometries.Grids.AbstractGrid{G,T}, kernel::Kernels.Abstra
 
 function _binned_csr(grid, kernel, scale::T, backend, dim::Val{D}) where {T, D}
     bp = BinnedPoints(grid, dim)
-    rad = T(Kernels.kernel_radius(kernel, scale, dim))
+    return _binned_csr(bp, kernel, scale, dim, T(Kernels.kernel_radius(kernel, scale, dim)), identity, backend)
+end
+
+# The list over the binned points `bp`: every point within `rad` of a target in the bins' coordinates, weighted by
+# the kernel (in `dim` dimensions) at `distance(c)`, `c` the distance in those coordinates.
+function _binned_csr(bp::BinnedPoints{D,T}, kernel, scale::T, dim::Val, rad::T, distance::F, backend) where {D, T, F}
     xmax = maximum(d -> maximum(abs, bp.x[d]) + abs(bp.period[d]), 1:D)
     lines, _, wout = _binned_lines(bp.h, rad, rad + 16 * eps(T) * (xmax + rad))
     r2 = rad * rad
@@ -512,21 +617,23 @@ function _binned_csr(grid, kernel, scale::T, backend, dim::Val{D}) where {T, D}
     FlowGeometries.Execution.run_chunks(cld(nbins, _BINNED_BLOCK), backend) do ks
         for k in ks
             _binned_rows(bp, block(k)) do t, p, i0, J0
-                @inbounds ptr[t + 1] = _binned_within((m, _, _) -> m + 1, 0, bp, p, i0, J0, r2, lines, wout, strides)
+                @inbounds ptr[t + 1] = _binned_within((m, _, _, _) -> m + 1, 0, bp, p, i0, J0, r2, lines, wout, strides)
             end
         end
     end
     @inbounds for t in 1:n
         ptr[t + 1] += ptr[t]
     end
+    _check_list_bytes(ptr[n + 1] - 1, n, T)
     nbrs = Vector{Int}(undef, ptr[n + 1] - 1)
     w = Vector{T}(undef, ptr[n + 1] - 1)
     FlowGeometries.Execution.run_chunks(cld(nbins, _BINNED_BLOCK), backend) do ks
         for k in ks
             _binned_rows(bp, block(k)) do t, p, i0, J0
-                _binned_within(@inbounds(ptr[t]), bp, p, i0, J0, r2, lines, wout, strides) do m, s, d2
+                _binned_within(@inbounds(ptr[t]), bp, p, i0, J0, r2, lines, wout, strides) do m, s, d2, _
                     @inbounds nbrs[m] = bp.order[s]
-                    @inbounds w[m] = Kernels.kernel_weight(kernel, sqrt(d2), scale, dim) * bp.measure[s]
+                    @inbounds w[m] = Kernels.kernel_weight(Kernels.point_kernel(kernel), distance(sqrt(d2)), scale, dim) *
+                                     bp.measure[s]
                     m + 1
                 end
             end

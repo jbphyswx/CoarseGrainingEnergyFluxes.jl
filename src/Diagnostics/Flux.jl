@@ -2,6 +2,21 @@
 # Energy Flux (Π) Calculation
 # ---------------------------------------------------------------------------
 
+"""
+    SeriesStrain(gradient = nothing)
+
+The derivative route of a diagnostic whose filtered fields are differentiated from their filter's own series
+([`Derivatives.SpectralDerivative`](@ref)), in the place of a derivative plan; a sweep passes it as
+`deriv_plan` once resolved. `gradient` is the plan's [`Filtering.series_gradient`](@ref).
+"""
+struct SeriesStrain{G}
+    gradient::G
+end
+SeriesStrain() = SeriesStrain(nothing)
+
+# A `deriv_plan` keyword: a derivative plan, a sweep's resolved series route, or `nothing`.
+const _DerivRoute{P} = Union{Nothing, P, SeriesStrain}
+
 # Fields may carry trailing batch axes past the grid's rank: each field's leading axes are the grid's
 # and every field has the same batch shape.
 @inline function _validate_field_sizes(grid, Π::AbstractArray, u::AbstractArray, v = nothing, w = nothing)
@@ -76,12 +91,12 @@ path does not write those three buffers, so one rotation serves the whole sweep.
 struct SphericalAnalysis end
 
 # The ambient Cartesian components of the local (east, north, up) velocity into the three arrays of
-# `p`, or into `ws.ux/uy/uz`; zero on inactive cells, the value the filter reads there. `grid` is held
-# where the backend `b` runs.
-@inline _to_ambient!(p::NTuple{3,AbstractArray}, u, v, w, grid::FlowGeometries.Grids.AbstractGrid, b) =
-    FlowGeometries.Operators.to_planetary!(p[1], p[2], p[3], u, v, w, grid; execution = b)
+# `p`, or into `ws.ux/uy/uz`; zero on inactive cells, the value the filter reads there. `frames` is the
+# placement's frame plan of the cells the components are read on, held where the backend `b` runs.
+@inline _to_ambient!(p::NTuple{3,AbstractArray}, u, v, w, frames::FlowGeometries.Operators.FramePlan, b) =
+    FlowGeometries.Operators.to_planetary!(p[1], p[2], p[3], u, v, w, frames; execution = b)
 @inline _to_ambient!(ws::ΠWorkspace, u, v, w) =
-    _to_ambient!((ws.ux, ws.uy, ws.uz), u, v, w, ws.at.grid, ws.at.execution)
+    _to_ambient!((ws.ux, ws.uy, ws.uz), u, v, w, ws.at.frames, ws.at.execution)
 
 # On a sphere or a spheroid a sweep shares, across its scales, the spin analysis of the generalized
 # convolution, or the rotation into ambient Cartesian components; a single `compute_Π!` call does either
@@ -127,15 +142,7 @@ products, and `plan` may be the mask strategy alone.
 function analyze_sweep(u, v, w, grid, ws::ΠWorkspace, plan::Filtering.AbstractFilterPlan)
     Filtering.analyze_buffer(plan, u) === nothing && return nothing
     has_w = w !== nothing
-    # The products borrow the per-scale path's scratch, which is free again once analyzed.
-    @. ws.ux = u * u
-    @. ws.uy = u * v
-    @. ws.uz = v * v
-    if has_w
-        @. ws.ux_filt = u * w
-        @. ws.uy_filt = v * w
-        @. ws.uz_filt = w * w
-    end
+    _sweep_products!(ws, u, v, w, has_w)
     vel = map(f -> Filtering.filter_analyze!(Filtering.analyze_buffer(plan, f), f, plan),
               _velocity_ins(u, v, w, has_w))
     prod = map(f -> Filtering.filter_analyze!(Filtering.analyze_buffer(plan, f), f, plan),
@@ -144,13 +151,43 @@ function analyze_sweep(u, v, w, grid, ws::ΠWorkspace, plan::Filtering.AbstractF
 end
 
 """
-    compute_Π!(Π, u, v, w, grid, kernel, scale; workspace=nothing, filter_plan=nothing, execution=AutoBackend(), mask_strategy=ZeroFill(), method=RealSpace(), vector_filter=nothing, transform=AutoSpectralBackend(), deriv_plan=nothing, analyzed=nothing)
+    analyze_sweep!(a, u, v, w, grid, ws, plan) -> a
+
+[`analyze_sweep`](@ref) into the spectra of `a`, an earlier result for fields of the same shape on a plan
+sharing `plan`'s transforms.
+"""
+function analyze_sweep!(a::NamedTuple{(:velocity, :product)}, u, v, w, grid, ws::ΠWorkspace,
+                        plan::Filtering.AbstractFilterPlan)
+    has_w = w !== nothing
+    _sweep_products!(ws, u, v, w, has_w)
+    map((F̂, f) -> Filtering.filter_analyze!(F̂, f, plan), a.velocity, _velocity_ins(u, v, w, has_w))
+    map((F̂, f) -> Filtering.filter_analyze!(F̂, f, plan), a.product, _product_ins(ws, has_w))
+    return a
+end
+
+# The products borrow the per-scale path's scratch, which is free again once analyzed.
+function _sweep_products!(ws::ΠWorkspace, u, v, w, has_w::Bool)
+    @. ws.ux = u * u
+    @. ws.uy = u * v
+    @. ws.uz = v * v
+    if has_w
+        @. ws.ux_filt = u * w
+        @. ws.uy_filt = v * w
+        @. ws.uz_filt = w * w
+    end
+    return ws
+end
+
+"""
+    compute_Π!(Π, u, v, w, grid, kernel, scale; workspace=nothing, filter_plan=nothing, execution=AutoBackend(), mask_strategy=ZeroFill(), method=RealSpace(), vector_filter=nothing, transform=AutoSpectralBackend(), deriv_plan=nothing, derivative=AutoDerivative(), analyzed=nothing)
 
 The cross-scale kinetic energy flux `Π = −S̄_ij τ_ij` at filter scale `scale` (Aluie, Hecht & Vallis
 2018): positive where energy passes from scales larger than `scale` to smaller ones.
 
 `S̄_ij = ½(∂ū_i/∂x_j + ∂ū_j/∂x_i)` is the strain rate of the filtered velocity and
-`τ_ij = (u_i u_j)‾ − ū_i ū_j` the subfilter stress. On a sphere the velocity `ū` and the stress
+`τ_ij = (u_i u_j)‾ − ū_i ū_j` the subfilter stress. `derivative` ([`Derivatives.AbstractDerivative`](@ref))
+takes the strain: by default the derivative of the filter's own series under `method = Spectral()` and
+differences of the filtered field otherwise, by `deriv_plan` when given. On a sphere the velocity `ū` and the stress
 `(u_i u_j)‾` are filtered by `vector_filter` ([`Filtering.resolve_vector_filter`](@ref)): by default the
 generalized convolution of Aluie (2019) under `ZeroFill`, which commutes with the surface derivatives,
 its spin transforms chosen by `transform`; `Filtering.CartesianComponents()` filters the ambient
@@ -205,7 +242,8 @@ function compute_Π!(
     method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
     vector_filter::Union{Nothing, Filtering.AbstractVectorFilter} = nothing,
     transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
-    deriv_plan::Union{Nothing, FlowGeometries.Operators.StencilPlans} = nothing,
+    deriv_plan::_DerivRoute{<:FlowGeometries.Operators.StencilPlans} = nothing,
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
     # A sweep's `analyze_sweep` result, or `nothing`.
     analyzed = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
@@ -217,6 +255,6 @@ function compute_Π!(
     )
     _check_workspace_w(ws, w)
     # The stencil weights depend only on the output grid, so one plan serves every scale.
-    dplan = deriv_plan === nothing ? Derivatives.derivative_plan(output_grid(grid, plan)) : deriv_plan
-    return _compute_Π!(Π, u, v, w, grid, ws, plan, dplan, kernel, scale, analyzed)
+    route = _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid)
+    return _compute_Π!(Π, u, v, w, grid, ws, plan, route, kernel, scale, analyzed)
 end

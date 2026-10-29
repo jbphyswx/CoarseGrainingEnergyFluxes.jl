@@ -396,7 +396,7 @@ let geom = FG.Geometry.CartesianGeometry(), ker = CGEF.GaussianKernel(), ℓ = 4
     pl = CGEF.Filtering.plan_filter(grid, ker, ℓ; execution = SER)
     dp = CGEF.Derivatives.derivative_plan(grid)
     Π = zeros(n, n, n)
-    wsΠ = CGEF.Diagnostics.ΠWorkspace(grid; has_w = true)
+    wsΠ = CGEF.Diagnostics.ΠWorkspace(grid, (), w)
     wt = CGEF.Diagnostics.Sym3TauWorkspace(grid)
     wf = CGEF.Diagnostics.Favre3DWorkspace(grid)
     wd = CGEF.Diagnostics.PiDecomposed3DWorkspace(grid)
@@ -448,7 +448,7 @@ if Base.get_extension(CGEF, :CoarseGrainingEnergyFluxesOhMyThreadsExt) !== nothi
             Base.UUID("67456a42-1dca-4109-a031-0a68de7e3ad5"), "OhMyThreads"))
         for N in (512, 1024)
             ax = range(0.0, 1.0e6; length = N + 1)[1:N]
-            grid = FG.Grids.StructuredGrid(geom, ax, ax; periodic = (true, true))
+            grid = FG.Grids.StructuredGrid(geom, ax, ax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()))
             plan = direct_plan(grid, CGEF.GaussianKernel(), 6.0e4;
                                execution = CGEF.ComputationalBackends.ThreadedBackend())
             fields = ntuple(_ -> rand(N, N), K)
@@ -481,9 +481,9 @@ let cart = FG.Geometry.CartesianGeometry{Float64}(), R = 6.371e6
     xn, yn = L .* rand(M), L .* rand(M)
     cases = (
         ("cartesian-$(N)x$(N)-periodic", CGEF.TopHatKernel(), [16e3, 64e3, 256e3],
-         FG.Grids.StructuredGrid(cart, xs, xs; periodic = (true, true), period = (N * 1e3, N * 1e3))),
+         FG.Grids.StructuredGrid(cart, xs, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()))),
         ("sphere-720x360", CGEF.TopHatKernel(), [200e3, 500e3, 1000e3],
-         FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), FG.Axes.PeriodicAxis(0.0, 2π, 720),
+         FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), FG.Axes.PeriodicUniformAxis(0.0, 2π, 720),
                                  range(-π / 2 + π / 720, π / 2 - π / 720; length = 360))),
         ("node-set-$M", CGEF.TopHatKernel(), [20e3, 50e3, 100e3], FG.Grids.UnstructuredGrid(cart, xn, yn; k = 8)),
         ("node-set-$M", CGEF.GaussianKernel(), [20e3, 50e3, 100e3], FG.Grids.UnstructuredGrid(cart, xn, yn; k = 8)),

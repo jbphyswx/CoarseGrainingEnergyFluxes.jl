@@ -18,18 +18,20 @@ function threaded_filter_slices!(args...; kwargs...)
     throw(ArgumentError("ThreadedBackend is unavailable — run `using OhMyThreads` (or use SerialBackend())."))
 end
 
-# Padded-FFT real-space engine (FFTW extension). Zero-padding makes the transform the linear
+# Padded-FFT real-space engine (AbstractFFTs extension). Zero-padding makes the transform the linear
 # convolution, valid on bounded and masked domains.
 function padded_fft_footprint(args...; kwargs...)
-    throw(ArgumentError("The padded-FFT real-space engine needs FFTW — run `using FFTW`."))
+    throw(ArgumentError("The padded-FFT real-space engine runs on a uniform Cartesian StructuredGrid with an " *
+                        "FFT library loaded (`using FFTW`)."))
 end
 
-# Zonal-FFT real-space engine (FFTW extension). On a sphere of uniform longitude, for a fixed pair of
+# Zonal-FFT real-space engine (AbstractFFTs extension). On a sphere of uniform longitude, for a fixed pair of
 # latitudes a great-circle kernel depends on the longitude difference alone, so each latitude band is a
 # convolution along longitude, circular on a ring and zero-padded on a regional box, with the direct
 # sum's weights.
 function zonal_fft_footprint(args...; kwargs...)
-    throw(ArgumentError("The zonal-FFT spherical engine needs FFTW — run `using FFTW`."))
+    throw(ArgumentError("The zonal-FFT spherical engine runs on a two-direction spherical StructuredGrid with " *
+                        "an FFT library loaded (`using FFTW`)."))
 end
 
 # Whether `fp` is a host engine applied through `apply_footprint!(out, field, grid, fp, strategy, driver)`,
@@ -45,6 +47,15 @@ function _driven_batch!(outs, fields, grid, fp, strategy, driver = _sep_serial)
     end
     return outs
 end
+
+"""
+    _resident_apply!(out, field, grid, fp, strategy) -> out
+
+The apply of a footprint whose arrays live in its plan's execution memory, by broadcasts and library
+transforms: the padded and zonal FFTs. A GPU backend's extension calls it for a footprint it has no
+kernel for; `out` and `field` are in the same memory as `fp`.
+"""
+function _resident_apply! end
 
 const _DistributedBackends =
     Union{ComputationalBackends.AbstractDistributedBackend, ComputationalBackends.AbstractMPIBackend}
@@ -108,9 +119,9 @@ end
 
 # Build a spectral filter plan: forward transform → multiply by `spectral_transfer` → inverse
 # transform, one method per grid type:
-#   FFTW extension        StructuredGrid{…,Cartesian}   (uniform Cartesian)
+#   AbstractFFTs ext.     StructuredGrid{…,Cartesian}   (uniform Cartesian)
 #   engines/NUFFTSpectral UnstructuredGrid{Cartesian}   (scattered Cartesian, through FlowTransformBindings)
-#   SHT extension         StructuredGrid{…,Spherical}   (ClenshawCurtisSampling at nlon = 2·nlat − 1)
+#   SHT extension         StructuredGrid{…,Spherical}   (Fejer1Sampling at nlon = 2·nlat − 1)
 #   NUFSHT extension      UnstructuredGrid{Spherical}   (scattered spherical)
 # Every other grid is filtered over its cells as a node set (engines/NodeSpectral).
 function spectral_filter_plan(spectral_backend, grid, kernel, scale; kwargs...)
@@ -123,12 +134,15 @@ function spectral_filter_plan(spectral_backend, grid, kernel, scale; kwargs...)
 end
 
 """
-    spectral_grid_plan(spectral_backend, grid, kernel; mask_strategy, execution, batch) -> AbstractGridPlan or nothing
+    spectral_grid_plan(spectral_backend, grid, kernel; mask_strategy, execution, batch, max_scale = 0)
+        -> AbstractGridPlan or nothing
 
-The scale-independent half of a spectral plan: the transform objects themselves, the wavenumber grids,
-and the mask. Only the transfer function `Ĝ(|k|, ℓ)` and the `Deformable` renormalization depend on
-the filter scale, so a sweep builds this once and each scale keeps only those two. The transforms run on
-`_library_threads(execution)` threads.
+The half of a spectral plan a sweep shares: the transform objects themselves, the wavenumber grids, and
+the mask. The transfer function `Ĝ(|k|, ℓ)` and the `Deformable` renormalization depend on the filter
+scale, so a sweep builds this once and each scale keeps only those two. A bounded Cartesian direction is
+zero-padded so that `kernel` at every scale up to `max_scale` stays clear of the domain's periodic copies;
+a filter plan at a larger scale raises. `max_scale = 0` pads to twice the direction's length. The
+transforms run on `_library_threads(execution)` threads.
 
 Returns `nothing` for a backend with no grid plan; a sweep then builds a full plan per scale.
 """
