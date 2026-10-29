@@ -16,10 +16,12 @@ export compute_Π_strain_convergence, compute_Π_strain_convergence!, PiStrainWo
 export vorticity, vorticity!, enstrophy_flux, enstrophy_flux!, EnstrophyFluxWorkspace
 export TracerFluxWorkspace, SphericalTracerFluxWorkspace, TracerFlux3DWorkspace
 export tracer_variance_flux!
-export band_energies
+export band_energies, band_energies!, BandWorkspace, BandMaps
 export compressible_flux, compressible_flux!, favre_filter!
 export FavreWorkspace, SphericalFavreWorkspace, Favre3DWorkspace
 export AbstractSpectrumPolicy, AutoSpectrum, StrictSpectrum, ForceSpectrum, NoSpectrum
+export AbstractScaleDerivative, AutoScaleDerivative, ExactScaleDerivative, DifferenceScaleDerivative
+export AbstractSlopes, NoSlopes, Slopes, AbstractSpectrumMaps, NoSpectrumMaps, SpectrumMaps
 
 include("Diagnostics/SpectrumPolicy.jl")
 include("Diagnostics/SpinFilter.jl")
@@ -33,5 +35,12 @@ include("Diagnostics/Tracer.jl")
 include("Diagnostics/Favre.jl")
 include("Diagnostics/Bands.jl")
 include("Diagnostics/Enstrophy.jl")
+
+# A workspace holding a generalized convolution reports its fits; one without, `(true, 0, 0)`.
+Filtering.analysis_status(ws::Union{ΠWorkspace, EnergyWorkspace, BandWorkspace, SphericalFavreWorkspace,
+                                    SphericalPiDecomposedWorkspace, Sym3TauWorkspace, SphericalTracerFluxWorkspace}) =
+    _spin_status(ws.spin)
+_spin_status(sf::SpinFilter) = Filtering.analysis_status(sf)
+_spin_status(::Nothing) = Filtering._exact_status(Float64)
 
 end # module

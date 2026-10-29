@@ -151,7 +151,7 @@ function tau_decomposition(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     vector_filter::Union{Nothing, Filtering.AbstractVectorFilter} = nothing,
     transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
+) where {T<:AbstractFloat, G<:_CurvedSurface{T}}
     vf = Filtering.resolve_vector_filter(grid, mask_strategy, vector_filter)
     if vf isa Filtering.GeneralizedConvolution
         ws = Sym3TauWorkspace(grid; execution = execution, vector_filter = vf, transform = transform)
@@ -168,19 +168,19 @@ end
 const _SYM3 = ((1, 1), (1, 2), (1, 3), (2, 2), (2, 3), (3, 3))
 
 """
-    _sph_pair_moments!(Maa, Mab, Mbb, a, b, ā, b̄, pr, plan, grid, be)
+    _sph_pair_moments!(Maa, Mab, Mbb, a, b, ā, b̄, pr, plan, frames, be)
 
 The three generalized second moments of an ambient Cartesian velocity pair,
 
     M(a,a) ,   M(a,b) + M(b,a) ,   M(b,b) ,   M(x,y)_ij = (x_i y_j)‾ − x̄_i ȳ_j ,
 
 each rotated from the ambient 3×3 into the local (east, north) frame, over slots 1–3 of its own tensor.
-`ā`, `b̄` are the filtered triples and `pr` six scratch buffers; `grid` is held where the backend `be`
-runs.
+`ā`, `b̄` are the filtered triples and `pr` six scratch buffers; `frames` is the frame plan of the cells
+the moments are read on, held where the backend `be` runs.
 """
-function _sph_pair_moments!(Maa, Mab, Mbb, a, b, ā, b̄, pr, plan, grid, be)
+function _sph_pair_moments!(Maa, Mab, Mbb, a, b, ā, b̄, pr, plan, frames, be)
     _pair_moments!(Maa, Mab, Mbb, a, b, ā, b̄, pr, plan)
-    _rotate_moments_to_local!((Maa, Mab, Mbb), grid, Val(3), be)
+    _rotate_moments_to_local!((Maa, Mab, Mbb), frames, Val(3), be)
     return nothing
 end
 
@@ -215,25 +215,25 @@ function _pair_moments!(Maa, Mab, Mbb, a, b, ā, b̄, pr, plan)
 end
 
 """
-    _rotate_moments_to_local!(tensors, grid, ::Val{NC}, be)
+    _rotate_moments_to_local!(tensors, frames, ::Val{NC}, be)
 
 Rotate each symmetric ambient Cartesian tensor, its six components in `_SYM3` order, into the local
 frame over its own leading slots: `(λλ, λφ, φφ)` for `NC = 3`, a tangent split, and
 `(λλ, λφ, λr, φφ, φr, rr)` for `NC = 6`, a volume. Zero on inactive cells. Each cell reads all six
-ambient components before it writes; `grid` is held where the backend `be` runs.
+ambient components before it writes; `frames` is a frame plan held where the backend `be` runs.
 """
-function _rotate_moments_to_local!(tensors, grid, ::Val{3}, be)
+function _rotate_moments_to_local!(tensors, frames, ::Val{3}, be)
     for t in tensors
         FlowGeometries.Operators.tensor_to_local!(t[1], t[3], nothing, t[2], nothing, nothing,
-                                                  t[1], t[4], t[6], t[2], t[3], t[5], grid; execution = be)
+                                                  t[1], t[4], t[6], t[2], t[3], t[5], frames; execution = be)
     end
     return nothing
 end
 
-function _rotate_moments_to_local!(tensors, grid, ::Val{6}, be)
+function _rotate_moments_to_local!(tensors, frames, ::Val{6}, be)
     for t in tensors
         FlowGeometries.Operators.tensor_to_local!(t[1], t[4], t[6], t[2], t[3], t[5],
-                                                  t[1], t[4], t[6], t[2], t[3], t[5], grid; execution = be)
+                                                  t[1], t[4], t[6], t[2], t[3], t[5], frames; execution = be)
     end
     return nothing
 end
@@ -307,7 +307,7 @@ function tau_decomposition!(
     derived_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
+) where {T<:AbstractFloat, G<:_CurvedSurface{T}}
     _require_tangent_pair(grid, "tau_decomposition!")
     plan = _plan_for(ws.spin, filter_plan, mask_strategy,
                      () -> Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution))
@@ -317,17 +317,16 @@ function tau_decomposition!(
     dplan = derived_plan === nothing ? _derived_plan(plan, grid, output_grid(grid, plan), kernel, scale) :
                                        derived_plan
     b = ws.at.execution
-    og = _output(ws.at, plan)
     up, ub, ubb, upb, pr = ws.up, ws.ub, ws.ubb, ws.upb, ws.prod
 
-    _to_ambient!(up, u, v, nothing, ws.at.grid, b)
+    _to_ambient!(up, u, v, nothing, ws.at.frames, b)
     Filtering.filter_apply_batch!(ub, up, plan)                       # ū
     for c in 1:3
         @. up[c] = up[c] - ub[c]                                      # residual u', in place
     end
     Filtering.filter_apply_batch!((ubb..., upb...), (ub..., up...), dplan)  # ū̄ and ū'
 
-    _sph_pair_moments!(ws.L, ws.C, ws.R, ub, up, ubb, upb, pr, dplan, og, b)
+    _sph_pair_moments!(ws.L, ws.C, ws.R, ub, up, ubb, upb, pr, dplan, _output_frames(ws.at, plan), b)
     return _tangent_split(ws)
 end
 
@@ -418,22 +417,23 @@ function tau_decomposition!(
     b = ws.at.execution
     up, ub, ubb, upb, pr = ws.up, ws.ub, ws.ubb, ws.upb, ws.prod
 
-    _fill_tau3_velocity!(up, u, v, w, ws.at.grid, b)
+    _fill_tau3_velocity!(up, u, v, w, ws.at.grid, ws.at.frames, b)
     Filtering.filter_apply_batch!(ub, up, plan)                             # ū
     for c in 1:3
         @. up[c] = up[c] - ub[c]                                            # residual u', in place
     end
     Filtering.filter_apply_batch!((ubb..., upb...), (ub..., up...), dplan)  # ū̄ and ū'
     _pair_moments!(ws.L, ws.C, ws.R, ub, up, ubb, upb, pr, dplan)
-    _rotate_tau3_to_local!((ws.L, ws.C, ws.R), _output(ws.at, plan), b)
+    _rotate_tau3_to_local!((ws.L, ws.C, ws.R), _output(ws.at, plan), _output_frames(ws.at, plan), b)
 
     return (; L = _sym3_named(ws.L), C = _sym3_named(ws.C), R = _sym3_named(ws.R))
 end
 
-# The velocity triple a volume filters, `grid` held where the backend `be` runs: the supplied components
-# on a Cartesian volume, zero on an inactive cell; the ambient Cartesian components on a spherical shell.
+# The velocity triple a volume filters, `grid` and its frame plan `frames` held where the backend `be`
+# runs: the supplied components on a Cartesian volume, zero on an inactive cell; the ambient Cartesian
+# components on a spherical shell.
 function _fill_tau3_velocity!(
-    up, u, v, w, grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, _be,
+    up, u, v, w, grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, _frames, _be,
 ) where {T, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     mask = FlowGeometries.Grids.mask(grid)
     @. up[1] = mask * u
@@ -443,15 +443,15 @@ function _fill_tau3_velocity!(
 end
 
 _fill_tau3_velocity!(
-    up, u, v, w, grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, be,
-) where {T, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}} = _to_ambient!(up, u, v, w, grid, be)
+    up, u, v, w, ::FlowGeometries.Grids.StructuredGrid{T,G,3}, frames, be,
+) where {T, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}} = _to_ambient!(up, u, v, w, frames, be)
 
 # The volume's tensors in its local frame, `_SYM3`-ordered: a Cartesian volume's already are.
 _rotate_tau3_to_local!(
-    _tensors, ::FlowGeometries.Grids.StructuredGrid{T,G,3}, _be,
+    _tensors, ::FlowGeometries.Grids.StructuredGrid{T,G,3}, _frames, _be,
 ) where {T, G<:FlowGeometries.Geometry.CartesianGeometry{T}} = nothing
 
 _rotate_tau3_to_local!(
-    tensors, grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, be,
+    tensors, ::FlowGeometries.Grids.StructuredGrid{T,G,3}, frames, be,
 ) where {T, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}} =
-    _rotate_moments_to_local!(tensors, grid, Val(6), be)
+    _rotate_moments_to_local!(tensors, frames, Val(6), be)

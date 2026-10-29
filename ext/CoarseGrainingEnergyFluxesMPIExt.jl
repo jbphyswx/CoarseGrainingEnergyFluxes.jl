@@ -16,210 +16,64 @@ end
 CGEF.Filtering._sum_across!(b::CGEF.ComputationalBackends.AbstractMPIBackend, A::AbstractArray) =
     MPI.Allreduce!(A, +, _comm(b))
 
-# Each rank fills a round-robin stride of rows, and an in-place `Allreduce!` sums the disjoint partials
-# into the full field on every rank. The caller replicates `field` on every rank and calls `MPI.Init()`.
+# A real-space apply divided among the ranks, each holding the whole field: every pass runs the rank's
+# block of its units on the rank's inner backend into the zeroed arrays the pass writes, and an
+# `Allreduce!` sums the disjoint blocks into the whole pass on every rank, through a host buffer where the
+# share holds one. A pass that costs less to run whole than to assemble runs whole on every rank. The
+# caller replicates `field` on every rank and calls `MPI.Init()`.
+CGEF.Filtering.prepare_workspace(
+    b::CGEF.ComputationalBackends.MPIBackend, grid::FlowGeometries.Grids.AbstractGrid, fp::CGEF.Filtering._SharedFootprint,
+) = CGEF.Filtering._share_workspace(CGEF.ComputationalBackends.local_backend(b), grid, fp)
+
 function CGEF.Filtering.mpi_filter_field!(
-    b::CGEF.ComputationalBackends.AbstractMPIBackend,
-    out::AbstractMatrix{T},
-    field::AbstractMatrix,
-    grid::Union{FlowGeometries.Grids.StructuredGrid{T,G,2}, FlowGeometries.Grids.CurvilinearGrid{T,G}},
-    kernel::CGEF.Kernels.AbstractFilterKernel,
-    scale::T,
-    mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
-    workspace,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    comm = _comm(b)
-    rank = MPI.Comm_rank(comm)
-    nproc = MPI.Comm_size(comm)
-
-    # A `workspace` from a `PhysicalFilterPlan` is its built footprint.
-    fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
+    b::CGEF.ComputationalBackends.AbstractMPIBackend, out::AbstractArray, field::AbstractArray,
+    grid::FlowGeometries.Grids.AbstractGrid, kernel::CGEF.Kernels.AbstractFilterKernel, scale::AbstractFloat,
+    mask_strategy::CGEF.Filtering.AbstractMaskStrategy, workspace,
+)
+    fp = _footprint(workspace, grid, kernel, scale, mask_strategy)
     CGEF.Filtering._check_strategy(fp, mask_strategy)
-    if fp isa CGEF.Filtering.SeparableFootprint
-        return _mpi_apply_separable!(out, field, grid, fp, rank, nproc, comm)
-    elseif fp isa CGEF.Filtering.PrefixSumTopHatPlan
-        return _mpi_apply_prefixsum_tophat!(out, field, grid, fp, mask_strategy, rank, nproc, comm)
-    end
-    periodic_x = FlowGeometries.Grids.isperiodic(grid, 1)
-    periodic_y = FlowGeometries.Grids.isperiodic(grid, 2)
-    _, Ny = FlowGeometries.Grids.size_tuple(grid)
-
-    fill!(out, zero(T))
-    CGEF.Filtering.prepare_row_apply!(fp, field, grid)
-    # Round-robin rows balance the per-row masking cost across ranks.
-    for j in (rank + 1):nproc:Ny
-        CGEF.Filtering.apply_footprint_row!(out, field, grid, fp, mask_strategy, periodic_x, periodic_y, j)
-    end
-    MPI.Allreduce!(out, +, comm)   # disjoint rows ⇒ sum == full assembled field on every rank
+    comm = _comm(b)
+    k, nk = MPI.Comm_rank(comm) + 1, MPI.Comm_size(comm)
+    inner = CGEF.ComputationalBackends.local_backend(b)
+    _passes!(out, field, grid, fp, mask_strategy, Val(1), CGEF.Filtering._share_passes(fp), k, nk, inner, comm)
     return out
 end
 
-# Separable Gaussian. Each rank runs both passes over its own stride of rows, and an `Allreduce!` after
-# each assembles the pass on every rank: the column pass reads every row of `row_pass`. Normalization is
-# pointwise, so it runs whole on each rank after the second.
-function _mpi_apply_separable!(
-    out::AbstractMatrix{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid, fp::CGEF.Filtering.SeparableFootprint{T},
-    rank::Integer, nproc::Integer, comm,
-) where {T<:AbstractFloat}
-    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    mask = FlowGeometries.Grids.mask(grid)
-    gx, gy = fp.gx, fp.gy
-    di_lim, dj_lim = fp.di_lim, fp.dj_lim
-    periodic_x, periodic_y = fp.periodic_x, fp.periodic_y
+_footprint(::Nothing, grid, kernel, scale, strategy) =
+    CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = strategy)
+_footprint(fp::Union{CGEF.Filtering._SharedFootprint, CGEF.Filtering.AbstractProcessShare}, _, _, _, _) = fp
+_footprint(fp, _, _, _, _) = throw(ArgumentError(
+    "MPIBackend divides the real-space footprints among ranks; the $(nameof(typeof(fp))) engine runs in " *
+    "one process. Name a footprint engine (`engine = FootprintEngine()`) or plan with a local backend."))
 
-    masked_input = fp.masked_input
-    row_pass = fp.row_pass
-    @. masked_input = mask * field
-    fill!(row_pass, zero(T))
-    for j in (rank + 1):nproc:Ny
-        CGEF.Filtering._separable_row_pass_at!(row_pass, masked_input, gx, di_lim, periodic_x, Nx, j)
-    end
-    MPI.Allreduce!(row_pass, +, comm)
+_passes!(out, field, grid, fp, strategy, ::Val{n}, ::Val{n}, k, nk, inner, comm) where {n} =
+    _pass!(out, field, grid, fp, strategy, Val(n), k, nk, inner, comm)
 
-    fill!(out, zero(T))
-    for j in (rank + 1):nproc:Ny
-        CGEF.Filtering._separable_column_pass_at!(out, row_pass, gy, dj_lim, periodic_y, Nx, Ny, j)
-    end
-    MPI.Allreduce!(out, +, comm)   # disjoint rows ⇒ sum == full assembled raw convolution on every rank
-    CGEF.Filtering._separable_normalize_and_mask!(out, fp, mask, Nx, Ny)
-    return out
+function _passes!(out, field, grid, fp, strategy, ::Val{p}, ::Val{n}, k, nk, inner, comm) where {p,n}
+    _pass!(out, field, grid, fp, strategy, Val(p), k, nk, inner, comm)
+    return _passes!(out, field, grid, fp, strategy, Val(p + 1), Val(n), k, nk, inner, comm)
 end
 
-# The N-pass separable engine's driver under MPI: each rank runs its stride of a pass's lines into the
-# zeroed destination, and an `Allreduce!` assembles the pass on every rank before the next reads it. The
-# pointwise normalization runs whole on each rank.
-struct _RankPasses{C}
-    comm::C
-    rank::Int
-    nproc::Int
-end
-
-function CGEF.Filtering._drive_pass!(f::F, d::_RankPasses, indices, dst) where {F}
-    fill!(dst, zero(eltype(dst)))
-    for q in (d.rank + 1):d.nproc:length(indices)
-        f(@inbounds indices[q])
+function _pass!(out, field, grid, fp, strategy, pass::Val, k::Int, nk::Int, inner, comm)
+    if CGEF.Filtering._share_local(fp, pass)
+        CGEF.Filtering._share_pass!(out, field, grid, fp, strategy, pass, 1, 1, inner)
+        return nothing
     end
-    MPI.Allreduce!(dst, +, d.comm)
+    dst = CGEF.Filtering._share_dst(out, fp, pass)
+    foreach(a -> fill!(a, zero(eltype(a))), dst)
+    CGEF.Filtering._share_pass!(out, field, grid, fp, strategy, pass, k, nk, inner)
+    staging = CGEF.Filtering._share_staging(fp)
+    foreach(a -> _sum_ranks!(a, staging, comm), dst)
     return nothing
 end
 
-CGEF.Filtering._drive_pointwise!(f::F, ::_RankPasses, indices) where {F} = CGEF.Filtering._sep_serial(f, indices)
-
-# 3-D prefix-sum top-hat: each rank scans the whole field, which it holds, and sweeps its stride of
-# `(j, k)` planes; each plane is written by one rank, so the `Allreduce!` sum is final.
-function _mpi_apply_prefixsum_tophat_3d!(
-    out::AbstractArray{T,3}, field::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid,
-    fp::CGEF.Filtering.PrefixSumTopHat3DPlan{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
-    rank::Integer, nproc::Integer, comm,
-) where {T<:AbstractFloat}
-    CGEF.Filtering._prefixsum3d_check_strategy(fp, strategy)
-    _, Ny, Nz = FlowGeometries.Grids.size_tuple(grid)
-    CGEF.Filtering._prefixsum3d_fill!(fp.scratch.prefix, field, grid, fp.masked)
-    fill!(out, zero(T))
-    planes = CartesianIndices((Ny, Nz))
-    for q in (rank + 1):nproc:length(planes)
-        JK = planes[q]
-        CGEF.Filtering._prefixsum3d_out_plane!(out, fp, JK[1], JK[2])
-    end
-    MPI.Allreduce!(out, +, comm)
-    return out
-end
-
-# Prefix-sum top-hat. Every rank builds the whole prefix table and sweeps its own stride of rows; the
-# row kernel normalizes each point, so the `Allreduce!` sum is final.
-function _mpi_apply_prefixsum_tophat!(
-    out::AbstractMatrix{T}, field::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid,
-    fp::CGEF.Filtering.PrefixSumTopHatPlan{T}, strategy::CGEF.Filtering.AbstractMaskStrategy,
-    rank::Integer, nproc::Integer, comm,
-) where {T<:AbstractFloat}
-    _, Ny = FlowGeometries.Grids.size_tuple(grid)
-    CGEF.Filtering._prefixsum_check_strategy(fp, strategy)
-    CGEF.Filtering.prefixsum_fill_numerator!(fp, field, grid)
-    fill!(out, zero(T))
-    for j in (rank + 1):nproc:Ny
-        CGEF.Filtering.apply_prefixsum_tophat_row!(out, grid, fp, strategy, j)
-    end
-    MPI.Allreduce!(out, +, comm)   # disjoint rows ⇒ sum == full assembled field on every rank
-    return out
-end
-
-
-# 1-D and 3-D grids; the 2-D method above takes `N == 2`. Ranks take disjoint round-robin strides of
-# linear indices, of each separable pass's lines, or of the 3-D prefix sum's planes, summed by
-# `Allreduce!`.
-function CGEF.Filtering.mpi_filter_field!(
-    b::CGEF.ComputationalBackends.AbstractMPIBackend,
-    out::AbstractArray{T,N},
-    field::AbstractArray,
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
-    kernel::CGEF.Kernels.AbstractFilterKernel,
-    scale::T,
-    mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
-    workspace,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, N}
-    comm = _comm(b)
-    rank = MPI.Comm_rank(comm)
-    nproc = MPI.Comm_size(comm)
-    fp = workspace === nothing ? CGEF.Filtering.build_footprint(grid, kernel, scale; mask_strategy = mask_strategy) : workspace
-    CGEF.Filtering._check_strategy(fp, mask_strategy)
-    dims = FlowGeometries.Grids.size_tuple(grid)
-    mask = FlowGeometries.Grids.mask(grid)
-
-    if fp isa CGEF.Filtering.PrefixSumTopHat3DPlan
-        return _mpi_apply_prefixsum_tophat_3d!(out, field, grid, fp, mask_strategy, rank, nproc, comm)
-    end
-
-    if fp isa CGEF.Filtering.SeparableFootprintND
-        return CGEF.Filtering.apply_separable_nd!(out, field, grid, fp, mask_strategy, _RankPasses(comm, rank, nproc))
-    end
-
-    fill!(out, zero(T))
-    cart = CartesianIndices(dims)
-    if fp isa CGEF.Filtering.FilterFootprintND
-        # Ranks take a round-robin stride of the lines along axis 1.
-        src = CGEF.Filtering._nd_source!(fp, field, grid)
-        lines = CartesianIndices(Base.tail(dims))
-        for q in (rank + 1):nproc:length(lines)
-            CGEF.Filtering._nd_out_line!(out, src, fp, Tuple(lines[q]))
-        end
-    elseif fp.cache !== nothing
-        # The point functions decide which targets the strategy filters.
-        lin_idx = LinearIndices(dims)
-        for lin in (rank + 1):nproc:length(out)
-            I = cart[lin]
-            out[I] = CGEF.Filtering._footprint_nd_point_cached(field, fp.cache, fp.exterior, mask_strategy, mask, lin_idx, I)
-        end
-    else
-        for lin in (rank + 1):nproc:length(out)
-            I = cart[lin]
-            out[I] = CGEF.Filtering._footprint_nd_point_streaming(field, grid, fp, mask_strategy, mask, I)
-        end
-    end
-    MPI.Allreduce!(out, +, comm)
-    return out
-end
-
-# Node sets: ranks own disjoint round-robin strides of nodes, summed by `Allreduce!`.
-function CGEF.Filtering.mpi_filter_field!(
-    b::CGEF.ComputationalBackends.AbstractMPIBackend,
-    out::AbstractVector{T},
-    field::AbstractVector,
-    grid::FlowGeometries.Grids.AbstractGrid{G,T},
-    kernel::CGEF.Kernels.AbstractFilterKernel,
-    scale::T,
-    mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
-    fp::CGEF.Filtering.NodeFilterPlan,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    comm = _comm(b)
-    rank = MPI.Comm_rank(comm)
-    nproc = MPI.Comm_size(comm)
-
-    fill!(out, zero(T))
-    for t in (rank + 1):nproc:length(out)
-        out[t] = CGEF.Filtering._footprint_node_point(field, grid, fp, mask_strategy, t)
-    end
-    MPI.Allreduce!(out, +, comm)
-    return out
+_sum_ranks!(a, ::Nothing, comm) = MPI.Allreduce!(a, +, comm)
+_sum_ranks!(a::Array, ::Array, comm) = MPI.Allreduce!(a, +, comm)
+function _sum_ranks!(a, host::Array, comm)
+    copyto!(host, a)
+    MPI.Allreduce!(host, +, comm)
+    copyto!(a, host)
+    return a
 end
 
 # Each rank sweeps a round-robin stride of slices into the zeroed batch arrays. A slice's columns are

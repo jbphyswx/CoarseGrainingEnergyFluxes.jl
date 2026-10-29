@@ -1,309 +1,6 @@
 # ---------------------------------------------------------------------------
-# Real-space convolution footprints: the banded engine and the cell-by-cell plan
+# The cell-by-cell real-space plan, and the weight and normalization rules the real-space engines share
 # ---------------------------------------------------------------------------
-
-"""
-    BandedScratch{T,MT,VM} <: AbstractFilterScratch
-
-Per-apply buffers for the banded engine: the masked input `mask · field`, one per field in flight.
-
-Empty on an unmasked grid, where the engine convolves the caller's array directly. Slots are added on
-demand for a batched apply and reused by later applies.
-"""
-struct BandedScratch{
-    T<:AbstractFloat, MT<:AbstractMatrix{T}, VM<:AbstractVector{MT},
-} <: AbstractFilterScratch
-    masked_inputs::VM
-end
-
-# Grows to `K` slots, each `similar` to slot 1, which must exist: callers hold a masked footprint.
-function _banded_inputs!(sc::BandedScratch, K::Integer)
-    while length(sc.masked_inputs) < K
-        push!(sc.masked_inputs, similar(@inbounds sc.masked_inputs[1]))
-    end
-    return sc.masked_inputs
-end
-
-"""
-    BandTable{VI,VT}
-
-The banded engine's taps by band. Band `b` holds runs `ptr[b]:ptr[b+1]-1`, and run `s` covers the
-consecutive axis-1 offsets `di0[s] + t − 1` at axis-2 offset `dj[s]`, with weights `w[start[s] + t − 1]`
-for `t = 1:(start[s+1] − start[s])`.
-"""
-struct BandTable{VI<:AbstractVector{Int}, VT<:AbstractVector}
-    dj::VI
-    di0::VI
-    start::VI
-    w::VT
-    ptr::VI
-end
-
-"""
-    _band_table(di, dj, w, ptr) -> BandTable
-
-The flat per-tap lists a builder produces (band `b`'s taps `ptr[b]:ptr[b+1]-1`) grouped into runs: each
-band's taps ordered by axis-2 then axis-1 offset, a run broken wherever the axis-2 offset changes or the
-axis-1 offset skips.
-"""
-function _band_table(
-    di::AbstractVector{Int}, dj::AbstractVector{Int}, w::AbstractVector{T}, ptr::AbstractVector{Int},
-) where {T}
-    nb = length(ptr) - 1
-    rdj, rdi, rstart = Int[], Int[], Int[]
-    rw = sizehint!(T[], length(w))
-    rptr = Vector{Int}(undef, nb + 1)
-    rptr[1] = 1
-    for b in 1:nb
-        prev = 0
-        for k in sort(ptr[b]:(ptr[b + 1] - 1); by = k -> (dj[k], di[k]))
-            if prev == 0 || dj[k] != dj[prev] || di[k] != di[prev] + 1
-                push!(rdj, dj[k])
-                push!(rdi, di[k])
-                push!(rstart, length(rw) + 1)
-            end
-            push!(rw, w[k])
-            prev = k
-        end
-        rptr[b + 1] = length(rdj) + 1
-    end
-    push!(rstart, length(rw) + 1)
-    return BandTable(rdj, rdi, rstart, rw, rptr)
-end
-
-"""
-    FilterFootprint{T,BT,MT,SC,MS}
-
-Precomputed convolution footprint for a structured grid + kernel + scale whose axis 1 is uniform. The
-in-support neighbour offsets and their geometric weights `w = kernel_weight(distance) * cell_area` are
-held in a [`BandTable`](@ref), grouped into axis-2 (`y`) bands. A Cartesian grid uniform in both
-directions is translation-invariant, a single band; otherwise the footprint is invariant along axis 1
-only, one band per row.
-
-The offsets and weights depend on the geometry alone. `invden`, the reciprocal window mass, also depends
-on the mask, the mask strategy and where a domain edge cuts the window; [`_banded_build_invden`](@ref)
-accumulates it at plan build.
-"""
-struct FilterFootprint{
-    T<:AbstractFloat, BT<:BandTable, MT<:AbstractMatrix{T}, SC<:BandedScratch{T}, MS<:AbstractMaskStrategy,
-}
-    taps::BT           # offsets and weights by band
-    nbands::Int        # 1 (uniform Cartesian) or Ny
-    strategy::MS       # the strategy `invden` was accumulated under
-    masked::Bool       # grid has inactive cells, so the numerator needs `mask · field`
-    bound::Bool        # the strategies' denominators differ: a cell is inactive or a window leaves the grid
-    # The grid's wrap at build, which `invden` was accumulated under. The apply uses these and ignores
-    # the periodic flags it is passed.
-    periodic_x::Bool
-    periodic_y::Bool
-    invden::MT         # 1/(window mass) per point; zero where the window is empty or, under Deformable, the target inactive
-    scratch::SC        # per-apply `mask · field` buffers
-end
-
-"""
-    _banded_row_accumulate!(oc, src, taps::BandTable, b, periodic_x, periodic_y, Nx, Ny, j) -> oc
-
-Add output row `j`'s weighted tap sum over band `b` into `oc`, the taps of each run by
-[`_run_accumulate!`](@ref). `src` is `mask · field` for the numerator at apply time and the mass field for
-`invden` at plan build. On a bounded axis 1 a tap covers the columns whose source index stays in range.
-"""
-@inline function _banded_row_accumulate!(
-    oc::AbstractVector{T}, src::AbstractMatrix, taps::BandTable, b::Integer,
-    periodic_x::Bool, periodic_y::Bool, Nx::Int, Ny::Int, j::Integer,
-) where {T<:AbstractFloat}
-    w = taps.w
-    @inbounds for s in taps.ptr[b]:(taps.ptr[b + 1] - 1)
-        jj = j + taps.dj[s]
-        if jj < 1 || jj > Ny
-            periodic_y || continue
-            jj = mod1(jj, Ny)
-        end
-        fc = view(src, :, jj)
-        k0 = taps.start[s]
-        _run_accumulate!(oc, fc, w, k0, taps.start[s + 1] - 1, taps.di0[s] - k0, periodic_x, Nx)
-    end
-    return oc
-end
-
-const _TAP_BLOCK = 16
-
-"""
-    _run_accumulate!(oc, fc, w, k0, k1, d0, periodic, n) -> oc
-
-`oc[i] += w[k] · fc[i + d0 + k]` for the taps `k0:k1` of one run, in that order for every output `i`.
-Where every tap's source lies on the line, blocks of `_TAP_BLOCK` outputs stay in registers across the
-run's taps, so each tap reads its sources once and the line is loaded and stored once per run; the
-outputs at either end take each tap on its own, wrapped where the line is periodic.
-"""
-@inline function _run_accumulate!(oc::AbstractVector{T}, fc::AbstractVector, w, k0::Int, k1::Int, d0::Int,
-                                  periodic::Bool, n::Int) where {T}
-    ilo = max(1, 1 - (d0 + k0))
-    ihi = min(n, n - (d0 + k1))
-    nblock = max(0, ihi - ilo + 1) ÷ _TAP_BLOCK
-    lo_end, hi_start = nblock == 0 ? (n, n + 1) : (ilo - 1, ilo + nblock * _TAP_BLOCK)
-    @inbounds for k in k0:k1
-        wk = T(w[k])
-        _tap_add_range!(oc, fc, wk, d0 + k, periodic, n, 1, lo_end)
-        _tap_add_range!(oc, fc, wk, d0 + k, periodic, n, hi_start, n)
-    end
-    @inbounds for b in 0:(nblock - 1)
-        i0 = ilo + b * _TAP_BLOCK - 1
-        acc = ntuple(q -> oc[i0 + q], Val(_TAP_BLOCK))
-        for k in k0:k1
-            wk = T(w[k])
-            o = i0 + d0 + k
-            acc = ntuple(q -> acc[q] + wk * fc[o + q], Val(_TAP_BLOCK))
-        end
-        for q in 1:_TAP_BLOCK
-            oc[i0 + q] = acc[q]
-        end
-    end
-    return oc
-end
-
-# `oc[i] += wk · fc[i + d]` for `i ∈ lo:hi` whose source is on the line, or is brought back onto it where
-# the line is periodic. With `|d| < n` the sources below, on and above the line are each a contiguous range
-# of `i` at a constant offset.
-@inline function _tap_add_range!(oc, fc, wk, d::Int, periodic::Bool, n::Int, lo::Int, hi::Int)
-    @inbounds if !periodic
-        @simd for i in max(lo, 1 - d):min(hi, n - d)
-            oc[i] += wk * fc[i + d]
-        end
-    elseif abs(d) < n
-        @simd for i in lo:min(hi, -d)
-            oc[i] += wk * fc[i + d + n]
-        end
-        @simd for i in max(lo, 1 - d):min(hi, n - d)
-            oc[i] += wk * fc[i + d]
-        end
-        @simd for i in max(lo, n - d + 1):hi
-            oc[i] += wk * fc[i + d - n]
-        end
-    else
-        @simd for i in lo:hi
-            oc[i] += wk * fc[mod1(i + d, n)]
-        end
-    end
-    return oc
-end
-
-@inline _banded_band(nbands::Int, j::Integer) = nbands == 1 ? 1 : Int(j)
-
-"""
-    _banded_unit_mass!(den, taps::BandTable, nbands, periodic_x, periodic_y) -> den
-
-[`_banded_row_accumulate!`](@ref) over a mass field of ones, into a zeroed `den`, from the runs' weights
-alone. On a periodic axis 1 every target of a row takes every tap, so the row is one sum, added in the
-order the accumulation adds it. On a bounded axis 1 a target takes the part of each run whose sources stay
-on the row, a difference of the run's prefix sums. Cost `O(taps)` per row on a periodic axis 1 and
-`O(runs·Nx)` on a bounded one.
-"""
-function _banded_unit_mass!(
-    den::AbstractMatrix{T}, taps::BandTable, nbands::Int, periodic_x::Bool, periodic_y::Bool,
-) where {T<:AbstractFloat}
-    Nx, Ny = size(den)
-    w = taps.w
-    cum = T[]
-    @inbounds for j in 1:Ny
-        b = _banded_band(nbands, j)
-        acc = zero(T)
-        for s in taps.ptr[b]:(taps.ptr[b + 1] - 1)
-            jj = j + taps.dj[s]
-            (1 <= jj <= Ny || periodic_y) || continue
-            k0, k1 = taps.start[s], taps.start[s + 1] - 1
-            if periodic_x
-                for k in k0:k1
-                    acc += T(w[k])
-                end
-            else
-                L = k1 - k0 + 1
-                resize!(cum, L + 1)
-                cum[1] = zero(T)
-                for t in 1:L
-                    cum[t + 1] = cum[t] + T(w[k0 + t - 1])
-                end
-                # Tap `t` has offset `di0 + t − 1`, so target `i` takes `t` with `1 ≤ i + di0 + t − 1 ≤ Nx`.
-                di0 = taps.di0[s]
-                for i in 1:Nx
-                    lo = max(1, 2 - i - di0)
-                    hi = min(L, Nx - i - di0 + 1)
-                    hi >= lo && (den[i, j] += cum[hi + 1] - cum[lo])
-                end
-            end
-        end
-        periodic_x && fill!(view(den, :, j), acc)
-    end
-    return den
-end
-
-"""
-    _banded_build_invden(grid, taps, nbands, strategy, periodic_x, periodic_y, exterior) -> invden
-
-The reciprocal window mass, accumulated once per plan by running [`_banded_row_accumulate!`](@ref)
-over a mass field:
-
-- `ZeroFill` counts every in-support tap whether or not its source cell is active, so its mass field
-  is `1` everywhere, and adds `exterior`, the mass past a bounded edge: the kernel's full mass. An
-  `exterior` vector is that full mass per row, and is the denominator itself.
-- `Deformable` drops inactive cells from both sums, so its mass field is the mask, and an inactive
-  target gets zero.
-"""
-function _banded_build_invden(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, taps::BandTable, nbands::Int,
-    strategy::AbstractMaskStrategy, periodic_x::Bool, periodic_y::Bool,
-    exterior::Union{Nothing,AbstractArray{T}},
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    zerofill = strategy isa ZeroFill
-    den = zeros(T, Nx, Ny)
-    if zerofill && exterior isa AbstractVector
-        @inbounds for j in 1:Ny, i in 1:Nx
-            den[i, j] = exterior[j]
-        end
-    elseif zerofill || all(FlowGeometries.Grids.mask(grid))
-        _banded_unit_mass!(den, taps, nbands, periodic_x, periodic_y)
-        zerofill && exterior !== nothing && (den .+= exterior)
-    else
-        mass = Matrix{T}(undef, Nx, Ny)
-        @inbounds for j in 1:Ny, i in 1:Nx
-            mass[i, j] = FlowGeometries.Grids.isactive(grid, i, j) ? one(T) : zero(T)
-        end
-        for j in 1:Ny
-            _banded_row_accumulate!(
-                view(den, :, j), mass, taps, _banded_band(nbands, j), periodic_x, periodic_y, Nx, Ny, j,
-            )
-        end
-    end
-    @inbounds for j in 1:Ny, i in 1:Nx
-        keep = zerofill || FlowGeometries.Grids.isactive(grid, i, j)
-        den[i, j] = keep ? _inv_mass(den[i, j]) : zero(T)
-    end
-    return den
-end
-
-# The `FilterFootprint` of a builder's per-tap lists `di, dj, w, ptr`. `exterior` is
-# [`_banded_build_invden`](@ref)'s.
-function _banded_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
-    di::AbstractVector{Int}, dj::AbstractVector{Int}, w::AbstractVector{T},
-    ptr::AbstractVector{Int}, nbands::Int, strategy::AbstractMaskStrategy,
-    kernel::Kernels.AbstractFilterKernel, scale::T;
-    exterior::Union{Nothing,AbstractArray{T}} =
-        strategy isa ZeroFill ? _exterior_mass(grid, kernel, scale) : nothing,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    periodic_x = FlowGeometries.Grids.isperiodic(grid, 1)
-    periodic_y = FlowGeometries.Grids.isperiodic(grid, 2)
-    masked = !all(FlowGeometries.Grids.mask(grid))
-    taps = _band_table(di, dj, w, ptr)
-    invden = _banded_build_invden(grid, taps, nbands, strategy, periodic_x, periodic_y, exterior)
-    scratch = BandedScratch(masked ? [zeros(T, Nx, Ny)] : Matrix{T}[])
-    return FilterFootprint(
-        taps, nbands, strategy, masked, masked || _reaches_exterior(grid, kernel, scale),
-        periodic_x, periodic_y, invden, scratch,
-    )
-end
-
 
 # The cell measure, under whichever index the grid names a cell by.
 @inline _cell_measure(grid, J::Tuple) = FlowGeometries.Grids.area(grid, J...)
@@ -382,7 +79,6 @@ struct ScatteredFilterPlan{
     periodic_y::Bool
     x_period::T
     y_period::T
-    is_cartesian::Bool
     cache::C
     topology::MT   # ball-query topology for both the cache build and the streaming apply
     exterior::EX   # mass past a bounded edge, added to `ZeroFill`'s denominator, or nothing
@@ -413,19 +109,59 @@ function _cache_entries(
     return n > limit ? nothing : n
 end
 
+"""
+    _rule_fold(f, acc, rule, grid, t, I, rad, mt, sc) -> acc
+
+Fold `acc = f(acc, J, w)` over the cells the plan's weight `rule` reaches about target `I` (linear index `t`),
+`w` cell `J`'s weight: through the grid's ball query of radius `rad` for a [`RadialWeights`](@ref) or
+[`HighOrderWeights`](@ref) rule, by the support's own walk for an [`OverlapWeights`](@ref) one.
+"""
+@inline _rule_fold(f::F, acc, rule, grid, t, I, rad, mt, sc) where {F} =
+    _ball_fold(acc, grid, I[1], I[2], rad, mt, sc) do a, J, d
+        f(a, J, last(_cell_weight(rule, grid, t, I, J, d)))
+    end
+
+@inline _rule_fold(f::F, acc, rule::OverlapWeights, grid, _, I, _, _, _) where {F} =
+    _overlap_fold(f, acc, rule, grid, I[1], I[2])
+
+# A curvilinear cell's weight: its measure times its polygon's fraction inside the support, over the cells a
+# query of the rule's reach returns.
+@inline function _rule_fold(f::F, acc, rule::OverlapPolygons, grid, _, I, rad, mt, sc) where {F}
+    p = FlowGeometries.Grids.coords(SA.SVector, grid, I[1], I[2])
+    return _ball_fold(acc, grid, I[1], I[2], rad, mt, sc) do a, J, _
+        fr = _polygon_fraction(rule, J, p, FlowGeometries.Grids.coords(SA.SVector, grid, J[1], J[2]))
+        iszero(fr) && return a
+        A = _cell_measure(grid, J)
+        f(a, J, A * oftype(A, fr))
+    end
+end
+
+# A `CellOverlap` top-hat's query on a curvilinear grid or a sphere with a radius reaches every cell its support
+# touches.
+_query_radius(grid::FlowGeometries.Grids.CurvilinearGrid{T}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale) where {T} =
+    T(OverlapPolygons(grid, Kernels.kernel_radius(kernel, scale)).reach)
+function _query_radius(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale,
+) where {T, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
+    F = _overlap_float(T)
+    faces = ntuple(d -> _cell_faces(grid, d, F), Val(3))
+    x = ntuple(d -> F.(collect(FlowGeometries.Grids.coordinates(grid, d))), Val(3))
+    return T(F(Kernels.kernel_radius(kernel, scale)) + _shell_extent(grid, faces, x))
+end
+
 # Entries of a 2-D cache, counted in target order, stopping once past `limit`.
-function _count_scattered(grid, rad, is_cartesian::Bool, mt, sc, limit::Int)
+function _count_scattered(grid, rule, rad, mt, sc, limit::Int)
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     n = 0
     for j in 1:Ny, i in 1:Nx
-        n = _ball_fold((m, _, _) -> m + 1, n, grid, i, j, rad, is_cartesian, mt, sc)
+        n = _rule_fold((m, _, _) -> m + 1, n, rule, grid, i + (j - 1) * Nx, (i, j), rad, mt, sc)
         n > limit && break
     end
     return n
 end
 
 # The 2-D cache, `n` entries from `_count_scattered`, filled in target order `t = i + (j-1)·Nx`.
-function _fill_scattered(grid, rule::RadialWeights{D,K,T}, rad, is_cartesian::Bool, mt, sc, n::Int) where {D,K,T}
+function _fill_scattered(grid::FlowGeometries.Grids.AbstractGrid{G,T}, rule, rad, mt, sc, n::Int) where {G,T}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     ii = Vector{Int}(undef, n)
     jj = Vector{Int}(undef, n)
@@ -435,11 +171,11 @@ function _fill_scattered(grid, rule::RadialWeights{D,K,T}, rad, is_cartesian::Bo
     k = 0
     for j in 1:Ny, i in 1:Nx
         t = i + (j - 1) * Nx
-        k = _ball_fold(k, grid, i, j, rad, is_cartesian, mt, sc) do m, J, d
+        k = _rule_fold(k, rule, grid, t, (i, j), rad, mt, sc) do m, J, wt
             m += 1
             ii[m] = J[1]
             jj[m] = J[2]
-            w[m] = last(_cell_weight(rule, grid, t, (i, j), J, d))
+            w[m] = wt
             m
         end
         ptr[t + 1] = k + 1
@@ -450,22 +186,57 @@ end
 # A 2-D cell-by-cell plan's neighbour cache (or `nothing`), its mass past a bounded edge (or `nothing`)
 # and its weight rule.
 function _scattered_parts(
-    grid, kernel::Kernels.AbstractFilterKernel, scale::T, rad, is_cartesian::Bool, mt, strategy, budget,
+    grid, kernel::Kernels.AbstractFilterKernel, scale::T, rad, mt, strategy, budget,
 ) where {T}
     rule = RadialWeights(kernel, scale, _kernel_dim(grid))
-    sc = FlowGeometries.Connectivity.ball_scratch()
-    n = _cache_entries(strategy, budget, _cache_entry_bytes(Val(2), T)) do limit
-        _count_scattered(grid, rad, is_cartesian, mt, sc, limit)
-    end
-    cache = n === nothing ? nothing : _fill_scattered(grid, rule, rad, is_cartesian, mt, sc, n)
+    cache = _scattered_cache(grid, rule, rad, mt, strategy, budget)
     return cache, _plan_exterior(grid, kernel, scale), rule
 end
 
 function _scattered_parts(
-    grid, kernel::Kernels.HighOrderKernel, scale::T, rad, is_cartesian::Bool, mt, strategy, budget,
+    grid::FlowGeometries.Grids.StructuredGrid, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T,
+    rad, mt, strategy, budget,
+) where {T}
+    rule = OverlapWeights(grid, rad)
+    cache = _scattered_cache(grid, rule, rad, mt, strategy, budget)
+    return cache, _overlap_exterior(grid, rule, kernel, scale), rule
+end
+
+function _scattered_parts(
+    grid::FlowGeometries.Grids.CurvilinearGrid{T,G,2}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T,
+    rad, mt, strategy, budget,
+) where {T, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    rule = OverlapPolygons(grid, Kernels.kernel_radius(kernel, scale))
+    cache = _scattered_cache(grid, rule, rad, mt, strategy, budget)
+    return cache, _polygon_exterior(grid, rule, rad, mt), rule
+end
+
+# `ZeroFill`'s mass past the edges of a curvilinear grid: the support's measure less the weights a target's
+# window sums over the grid's own cells.
+function _polygon_exterior(grid::FlowGeometries.Grids.CurvilinearGrid{T}, rule::OverlapPolygons, rad, mt) where {T}
+    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
+    M = T(_support_mass(rule.ov, 2))
+    sc = FlowGeometries.Connectivity.ball_scratch()
+    E = Matrix{T}(undef, Nx, Ny)
+    for j in 1:Ny, i in 1:Nx
+        E[i, j] = M - _rule_fold((a, _, w) -> a + w, zero(T), rule, grid, 0, (i, j), rad, mt, sc)
+    end
+    return E
+end
+
+function _scattered_cache(grid::FlowGeometries.Grids.AbstractGrid{G,T}, rule, rad, mt, strategy, budget) where {G,T}
+    sc = FlowGeometries.Connectivity.ball_scratch()
+    n = _cache_entries(strategy, budget, _cache_entry_bytes(Val(2), T)) do limit
+        _count_scattered(grid, rule, rad, mt, sc, limit)
+    end
+    return n === nothing ? nothing : _fill_scattered(grid, rule, rad, mt, sc, n)
+end
+
+function _scattered_parts(
+    grid, kernel::Kernels.HighOrderKernel, scale::T, rad, mt, strategy, budget,
 ) where {T}
     sc = FlowGeometries.Connectivity.ball_scratch()
-    fold = (f, acc, I) -> _ball_fold(f, acc, grid, I[1], I[2], rad, is_cartesian, mt, sc)
+    fold = (f, acc, I) -> _ball_fold(f, acc, grid, I[1], I[2], rad, mt, sc)
     keep = _cache_keep(strategy, budget, _cache_entry_bytes(Val(2), T))
     weights, exterior, kept = _highorder_targets(grid, kernel, scale, rad, fold, _ho_lattice(grid, rad), keep)
     cache = kept === nothing ? nothing :
@@ -478,11 +249,11 @@ _plan_exterior(grid::FlowGeometries.Grids.StructuredGrid, kernel, scale) = _exte
 _plan_exterior(_, _, _) = nothing
 
 """
-    _scattered_window_bounds(grid::StructuredGrid{...,2}, rad) -> (di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period, is_cartesian)
+    _scattered_window_bounds(grid::StructuredGrid{...,2}, rad) -> (di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period)
 
 The widest index window the grid's ball query scans, from `Connectivity.metric_window`, with the
-periodic flags, the Cartesian wrap lengths and whether the geometry is Cartesian. On a rectilinear grid
-the window depends on the row alone, so one evaluation per row covers the grid.
+periodic flags and the Cartesian wrap lengths. On a rectilinear grid the window depends on the row alone,
+so one evaluation per row covers the grid.
 """
 function _scattered_window_bounds(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, rad::T,
@@ -505,27 +276,33 @@ function _scattered_window_bounds(
     # when stretched); zero on a sphere, whose great-circle distance is 2π-periodic in longitude.
     x_period = (periodic_x && is_cartesian) ? T(FlowGeometries.Grids.period(grid, 1)) : zero(T)
     y_period = (periodic_y && is_cartesian) ? T(FlowGeometries.Grids.period(grid, 2)) : zero(T)
-    return di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period, is_cartesian
+    return di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period
 end
 
-# Folds `acc = f(acc, J, d)` over every cell within `rad` of `(i, j)`, the centre included. On a
-# Cartesian grid a cell within `rad` through several periodic images contributes once per image.
-# `scratch` is an indexed query's candidate buffer, one per task; the structured form ignores it.
+# Folds `acc = f(acc, J, d)` over every cell within `rad` of `(i, j)`, the centre included, under the
+# grid's image convention. `scratch` is an indexed query's candidate buffer, one per task; the structured
+# form ignores it.
 @inline _ball_fold(
-    f::F, acc, grid::FlowGeometries.Grids.StructuredGrid, i::Int, j::Int, rad, is_cartesian::Bool, mt,
-    scratch = nothing,
+    f::F, acc, grid::FlowGeometries.Grids.StructuredGrid, i::Int, j::Int, rad, mt, scratch = nothing,
 ) where {F} = FlowGeometries.Connectivity.fold_within(
     f, acc, grid, i, j;
-    ball = rad, self = true, active_only = false, topology = mt,
-    images = is_cartesian ? FlowGeometries.Connectivity.AllImages() :
-                            FlowGeometries.Connectivity.NearestImage(),
+    ball = rad, self = true, active_only = false, topology = mt, images = _image_convention(grid),
 )
 
-@inline _ball_fold(f::F, acc, grid, i::Int, j::Int, rad, ::Bool, mt, scratch = nothing) where {F} =
+@inline _ball_fold(f::F, acc, grid, i::Int, j::Int, rad, mt, scratch = nothing) where {F} =
     FlowGeometries.Connectivity.fold_within(
         f, acc, grid, i, j;
         ball = rad, self = true, active_only = false, topology = mt, scratch = scratch,
     )
+
+# A periodic Cartesian direction tiles, so each image of a cell inside the support comes at its own
+# displacement; a periodic angle identifies, so its cells come once.
+@inline _image_convention(grid::FlowGeometries.Grids.StructuredGrid) =
+    _image_convention(FlowGeometries.Grids.grid_geometry(grid))
+@inline _image_convention(::FlowGeometries.Geometry.AbstractCartesianGeometry) =
+    FlowGeometries.Connectivity.AllImages()
+@inline _image_convention(::FlowGeometries.Geometry.AbstractGeometry) =
+    FlowGeometries.Connectivity.NearestImage()
 
 """
     _build_footprint_scattered(grid, kernel, scale; cache_strategy=AutoCache(), cache_byte_budget=default_cache_byte_budget()) -> ScatteredFilterPlan
@@ -543,24 +320,21 @@ function _build_footprint_scattered(
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     rad = _query_radius(grid, kernel, scale)
-    di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period, is_cartesian =
-        _scattered_window_bounds(grid, rad)
+    di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period = _scattered_window_bounds(grid, rad)
     mt = _query_topology(grid, rad)
-    cache, exterior, weights =
-        _scattered_parts(grid, kernel, scale, rad, is_cartesian, mt, cache_strategy, cache_byte_budget)
+    cache, exterior, weights = _scattered_parts(grid, kernel, scale, rad, mt, cache_strategy, cache_byte_budget)
     return _scattered_plan(kernel, scale, rad, di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period,
-                           is_cartesian, cache, mt, exterior, weights)
+                           cache, mt, exterior, weights)
 end
 
 # The plan with its cache and its exterior mass each held as `nothing` or an array under one field type,
 # so the plan's type is fixed by the grid and the kernel.
 @inline _scattered_plan(
-    kernel::K, scale::T, rad::T, di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period, is_cartesian,
+    kernel::K, scale::T, rad::T, di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period,
     cache, mt::MT, exterior, weights::W,
 ) where {K,T,MT,W} = ScatteredFilterPlan{
     T, K, Union{Nothing,ScatteredCache{T,Vector{Int},Vector{T}}}, MT, Union{Nothing,Matrix{T}}, W,
-}(kernel, scale, rad, di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period, is_cartesian,
-  cache, mt, exterior, weights)
+}(kernel, scale, rad, di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period, cache, mt, exterior, weights)
 
 """
     _build_footprint_curvilinear(grid, kernel, scale; cache_strategy=AutoCache(), cache_byte_budget=default_cache_byte_budget()) -> ScatteredFilterPlan
@@ -599,9 +373,8 @@ function _build_footprint_curvilinear(
     di_lim = isfinite(min_di) && min_di > 0 ? ceil(Int, rad / min_di) : 0
     dj_lim = isfinite(min_dj) && min_dj > 0 ? ceil(Int, rad / min_dj) : 0
     mt = _query_topology(grid, rad)
-    cache, exterior, weights =
-        _scattered_parts(grid, kernel, scale, rad, false, mt, cache_strategy, cache_byte_budget)
-    return _scattered_plan(kernel, scale, rad, di_lim, dj_lim, false, false, zero(T), zero(T), false,
+    cache, exterior, weights = _scattered_parts(grid, kernel, scale, rad, mt, cache_strategy, cache_byte_budget)
+    return _scattered_plan(kernel, scale, rad, di_lim, dj_lim, false, false, zero(T), zero(T),
                            cache, mt, exterior, weights)
 end
 
@@ -617,6 +390,56 @@ build_footprint(
     kwargs...,
 ) where {T<:AbstractFloat} = _build_footprint_curvilinear(grid, kernel, scale; kwargs...)
 
+"""
+    build_footprint(grid::StructuredGrid, kernel, scale; kwargs...)
+
+The real-space footprint of a structured grid, chosen by the spacing of its directions
+(`FlowGeometries.Grids.spacing_trait`, a periodic direction's wrap included), its geometry and the kernel:
+a uniform direction 1 takes the engines shared along it, and the cell-by-cell plan takes what no more
+specific engine covers.
+"""
+build_footprint(
+    grid::FlowGeometries.Grids.StructuredGrid{T}, kernel::Kernels.AbstractFilterKernel, scale::T; kwargs...,
+) where {T<:AbstractFloat} = _with_spacings(sp -> _structured_footprint(sp, grid, kernel, scale; kwargs...), grid)
+
+# `f(sp)`, `sp` each direction's `UniformSpacing()` or `NonuniformSpacing()` with a periodic direction's
+# wrap included, the tuple the engines dispatch on; `f(nothing)` on a grid without structured directions. A
+# periodic range other than a `PeriodicUniformAxis` shares its type with ranges of other periods, so
+# `Grids.isuniform` compares its period with its `n·|Δ|`, and each answer calls `f` from its own branch;
+# every other direction's types answer.
+@inline _with_spacings(f::F, ::FlowGeometries.Grids.AbstractGrid) where {F} = f(nothing)
+@inline _with_spacings(f::F, grid::FlowGeometries.Grids.StructuredGrid) where {F} =
+    _spaced(f, map(_spacing, FlowGeometries.Grids.topology(grid), FlowGeometries.Grids.coordinates(grid)), grid)
+
+# A direction's spacing where its types answer, `_WrapCheck()` where the period decides.
+struct _WrapCheck end
+@inline _spacing(::FlowGeometries.Grids.Bounded, x) = FlowGeometries.Axes.spacing_trait(x)
+@inline _spacing(::FlowGeometries.Grids.Periodic, ::FlowGeometries.Axes.PeriodicUniformAxis) =
+    FlowGeometries.Axes.UniformSpacing()
+@inline _spacing(::FlowGeometries.Grids.Periodic, ::AbstractRange) = _WrapCheck()
+@inline _spacing(::FlowGeometries.Grids.Periodic, ::AbstractArray) = FlowGeometries.Axes.NonuniformSpacing()
+
+# `g` of direction `d`'s spacing: the answer itself, or each answer of the wrap check from its own branch.
+@inline _pick(g::F, s, _, ::Int) where {F} = g(s)
+@inline _pick(g::F, ::_WrapCheck, grid, d::Int) where {F} =
+    FlowGeometries.Grids.isuniform(grid, d) ? g(FlowGeometries.Axes.UniformSpacing()) :
+                                              g(FlowGeometries.Axes.NonuniformSpacing())
+
+@inline _spaced(f::F, k::Tuple{Any}, grid) where {F} = _pick(a -> f((a,)), k[1], grid, 1)
+@inline _spaced(f::F, k::Tuple{Any,Any}, grid) where {F} =
+    _pick(a -> _pick(b -> f((a, b)), k[2], grid, 2), k[1], grid, 1)
+@inline _spaced(f::F, k::Tuple{Any,Any,Any}, grid) where {F} =
+    _pick(a -> _pick(b -> _pick(c -> f((a, b, c)), k[3], grid, 3), k[2], grid, 2), k[1], grid, 1)
+
+
+# The cell-by-cell plan ([`_build_footprint_scattered`](@ref)) of a 2-D grid no more specific engine
+# covers, such as one whose axis 1 is not uniform.
+_structured_footprint(
+    ::Tuple, grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.AbstractFilterKernel, scale::T;
+    kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
+    _build_footprint_scattered(grid, kernel, scale; kwargs...)
+
 # `wn` plus the exterior mass at a point, for `ZeroFill`'s full-mass denominator.
 @inline _add_exterior(wn, ::Nothing, I...) = wn
 @inline _add_exterior(wn, E::AbstractArray, I...) = wn + @inbounds(E[I...])
@@ -629,216 +452,134 @@ build_footprint(
 @inline _normalized(ws, wn) = iszero(wn) ? zero(ws) : ws / wn
 @inline _inv_mass(m) = iszero(m) ? zero(m) : inv(m)
 
+"""
+    _MassOnly{T}(dims)
+
+The field a cell-by-cell engine applies over to write each target's window mass: its loops pass their sums to
+`_emit`, which returns the summed weight for it and the weighted mean for any other field. Its values are
+never read into the output.
+"""
+struct _MassOnly{T,N} <: AbstractArray{T,N}
+    dims::NTuple{N,Int}
+end
+_MassOnly{T}(dims::NTuple{N,Int}) where {T,N} = _MassOnly{T,N}(dims)
+Base.size(m::_MassOnly) = m.dims
+Base.@propagate_inbounds Base.getindex(::_MassOnly{T,N}, ::Vararg{Int,N}) where {T,N} = zero(T)
+
+@inline _emit(::AbstractArray, ws, wn) = _normalized(ws, wn)
+@inline _emit(::_MassOnly, _, wn) = wn
+
 # Whether a target is filtered: every one under `ZeroFill`, the active ones under `Deformable`.
 @inline _filters_target(::ZeroFill, ::Bool) = true
 @inline _filters_target(::AbstractMaskStrategy, active::Bool) = active
 
-"""
-    _banded_cartesian_rows!(di, dj, w, ptr, grid, kernel, scale, rad) -> nothing
+# Whether `strategy`'s window mass is the kernel's mass over every in-domain offset whatever the mask holds:
+# `ZeroFill` counts every in-support cell, and `Deformable` counts the active ones, which a mask of type
+# `AllActive` alone fixes. Answered from the types.
+@inline _mask_free_mass(::ZeroFill, ::AbstractArray{Bool}) = true
+@inline _mask_free_mass(::AbstractMaskStrategy, mask::AbstractArray{Bool}) = mask isa FlowGeometries.Grids.AllActive
 
-One offset/weight band per row of a Cartesian grid uniform along `x` and stretched along `y`, appended to
-`di, dj, w, ptr`. A periodic `y` tiles: a band reaches every row image inside the support, each at its
-own displacement, and the apply maps a raw row offset back onto the grid with `mod1`.
 """
-function _banded_cartesian_rows!(
-    di::AbstractVector{Int}, dj::AbstractVector{Int}, w::AbstractVector{T}, ptr::AbstractVector{Int},
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.AbstractFilterKernel, scale::T, rad::T,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    apply_footprint!(out, field, grid, fp::ScatteredFilterPlan, strategy, periodic_x, periodic_y)
+
+Whole-grid convolve using a [`ScatteredFilterPlan`](@ref), the engine for nonuniform-axis and
+curvilinear grids. Periodicity comes from `fp`; `periodic_x`/`periodic_y` are unused.
+"""
+function apply_footprint!(
+    out::AbstractMatrix{T},
+    field::AbstractMatrix,
+    grid::FlowGeometries.Grids.AbstractGrid,
+    fp::ScatteredFilterPlan{T},
+    strategy::AbstractMaskStrategy,
+    periodic_x::Bool,
+    periodic_y::Bool,
+) where {T<:AbstractFloat}
     _, Ny = FlowGeometries.Grids.size_tuple(grid)
-    dx = step(FlowGeometries.Grids.coordinates(grid, 1))
-    y = FlowGeometries.Grids.coordinates(grid, 2)
-    periodic_y = FlowGeometries.Grids.isperiodic(grid, 2) && Ny > 1
-    Py = periodic_y ? T(FlowGeometries.Grids.period(grid, 2)) : zero(T)
-    sy = (Ny > 1 && y[Ny] < y[1]) ? -one(T) : one(T)   # coordinate direction of increasing index
-    min_dy = T(FlowGeometries.Grids.minimum_spacing(grid, 2))
-    di_lim = dx > 0 ? ceil(Int, rad / dx) : 0
-    dj_lim = min_dy > 0 ? ceil(Int, rad / min_dy) : 0
+    fill!(out, zero(T))
+    sc = row_scratch(fp)
     for j in 1:Ny
-        for ddj in -dj_lim:dj_lim
-            jraw = j + ddj
-            (periodic_y || 1 <= jraw <= Ny) || continue
-            m = fld(jraw - 1, Ny)
-            jj = jraw - m * Ny
-            Δy = T(y[jj]) + sy * T(m) * Py - T(y[j])
-            abs(Δy) <= rad || continue
-            A = FlowGeometries.Grids.area(grid, 1, jj)
-            for ddi in -di_lim:di_lim
-                d = sqrt((ddi * dx)^2 + Δy^2)
-                d <= rad || continue
-                push!(di, ddi)
-                push!(dj, ddj)
-                push!(w, Kernels.kernel_weight(kernel, T(d), scale, Val(2)) * A)
-            end
-        end
-        push!(ptr, length(di) + 1)
+        apply_footprint_row!(out, field, grid, fp, strategy, periodic_x, periodic_y, j, sc)
     end
-    return nothing
+    return out
 end
 
 """
-    build_footprint(grid, kernel, scale; mask_strategy = ZeroFill()) -> FilterFootprint
+    row_scratch(fp) -> scratch or nothing
 
-The banded engine, for a 2-D grid whose axis 1 is a `Range`: constant spacing along axis 1 makes the
-footprint invariant under a shift along it, so each row of targets shares one offset/weight list. A
-Cartesian grid uniform in both directions has one list for every row; otherwise each row has its own
-(`nbands = Ny`), on a stretched Cartesian `y` and on any latitude axis of a sphere.
+The candidate buffer a row apply's ball queries reuse, the last argument of `apply_footprint_row!` and
+`apply_footprint_row_batch!`: one per concurrent worker. `nothing` for an engine whose rows query nothing.
 """
-function build_footprint(
-    # `StructuredGrid{T,G,N,S,TP,C,…}`: `C`, the axes' types, is the sixth parameter.
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2,S,TP,<:Tuple{AbstractRange{T},AbstractVector{T}}},
-    kernel::Kernels.AbstractFilterKernel,
-    scale::T;
-    mask_strategy::AbstractMaskStrategy = ZeroFill(),
-    kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}, S, TP<:NTuple{2,FlowGeometries.Grids.AbstractTopology}}
-    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    rad = Kernels.kernel_radius(kernel, scale, Val(2))
-    if !(G <: FlowGeometries.Geometry.CartesianGeometry{T})
-        di, dj, w, ptr = _sphere_band_rows(grid, kernel, scale, rad)
-        return _banded_footprint(grid, di, dj, w, ptr, Ny, mask_strategy, kernel, scale)
-    end
-
-    di = Int[]
-    dj = Int[]
-    w = T[]
-    ptr = Int[1]
-
-    if FlowGeometries.Grids.coordinates(grid, 2) isa AbstractRange
-        dx = step(FlowGeometries.Grids.coordinates(grid, 1))
-        dy = step(FlowGeometries.Grids.coordinates(grid, 2))
-        A = FlowGeometries.Grids.area(grid, 1, 1)   # uniform Cartesian cell area
-        di_lim = dx > 0 ? ceil(Int, rad / dx) : 0
-        dj_lim = dy > 0 ? ceil(Int, rad / dy) : 0
-        sizehint!(di, (2*di_lim + 1) * (2*dj_lim + 1))
-        sizehint!(dj, (2*di_lim + 1) * (2*dj_lim + 1))
-        sizehint!(w, (2*di_lim + 1) * (2*dj_lim + 1))
-        for ddj in -dj_lim:dj_lim, ddi in -di_lim:di_lim
-            d = sqrt((ddi * dx)^2 + (ddj * dy)^2)
-            if d <= rad
-                push!(di, ddi)
-                push!(dj, ddj)
-                push!(w, Kernels.kernel_weight(kernel, T(d), scale, Val(2)) * A)
-            end
-        end
-        push!(ptr, length(di) + 1)
-        return _banded_footprint(grid, di, dj, w, ptr, 1, mask_strategy, kernel, scale)
-    else
-        _banded_cartesian_rows!(di, dj, w, ptr, grid, kernel, scale, rad)
-        return _banded_footprint(grid, di, dj, w, ptr, Ny, mask_strategy, kernel, scale)
-    end
-end
+row_scratch(_) = nothing
+row_scratch(fp::ScatteredFilterPlan) = FlowGeometries.Connectivity.ball_scratch(fp.topology)
 
 """
-    _sphere_band_rows(grid, kernel, scale, rad) -> (di, dj, w, ptr)
+    apply_footprint_row!(out, field, grid, fp::ScatteredFilterPlan, strategy, periodic_x, periodic_y, j, sc = row_scratch(fp))
 
-The taps of a sphere of uniform longitude by latitude row: row `j`'s entries `ptr[j]:ptr[j+1]-1` hold
-the longitude and latitude offsets of the cells within great-circle distance `rad` of a target in row `j`
-and their weights `kernel_weight(d)·area`. Uniform longitude makes them the same for every target of a
-row.
+Fill output row `j` from a [`ScatteredFilterPlan`](@ref): if `fp.cache !== nothing`, read the
+precomputed per-point neighbour list (absolute `(ii,jj)` indices, periodic wrap resolved at build
+time); otherwise recompute each point's neighbours and weights through the grid's ball query, the
+enumeration the cache was built from, reusing `sc`. A target the strategy skips is left unwritten.
 """
-function _sphere_band_rows(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.AbstractFilterKernel, scale::T, rad::T,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    geo = FlowGeometries.Grids.grid_geometry(grid)
-    lat = FlowGeometries.Grids.coordinates(grid, 2)
-    # Band `j`'s window, from `metric_window`, holds for every row its ball reaches: a row nearer a pole
-    # spans more longitude at the same radius. `_banded_lon_offsets` turns it into offsets.
-    dλ = step(FlowGeometries.Grids.coordinates(grid, 1))
-    periodic_λ = FlowGeometries.Grids.isperiodic(grid, 1)
-    offsets = Vector{NTuple{3,UnitRange{Int}}}(undef, Ny)
-    dj_lims = Vector{Int}(undef, Ny)
-    total_entries = 0
-    for j in 1:Ny
-        dl, djl = FlowGeometries.Connectivity.metric_window(grid, (1, j), rad)
-        offsets[j] = _banded_lon_offsets(dl, Nx, dλ, periodic_λ)
-        dj_lims[j] = djl
-        for ddj in -djl:djl
-            (1 <= j + ddj <= Ny) && (total_entries += sum(length, offsets[j]))
-        end
-    end
-    di = sizehint!(Int[], total_entries)
-    dj = sizehint!(Int[], total_entries)
-    w = sizehint!(T[], total_entries)
-    ptr = Int[1]
-    for j in 1:Ny
-        for ddj in -dj_lims[j]:dj_lims[j]
-            jj = j + ddj
-            (1 <= jj <= Ny) || continue
-            A = FlowGeometries.Grids.area(grid, 1, jj)   # spherical cell area depends only on latitude
-            for range in offsets[j], ddi in range
-                d = FlowGeometries.Geometry.distance(
-                    geo, SA.SVector{2,T}(zero(T), lat[j]), SA.SVector{2,T}(T(ddi) * dλ, lat[jj]),
-                )
-                if d <= rad
-                    push!(di, ddi)
-                    push!(dj, ddj)
-                    push!(w, Kernels.kernel_weight(kernel, d, scale, Val(2)) * A)
+function apply_footprint_row!(
+    out::AbstractMatrix{T},
+    field::AbstractMatrix,
+    grid::FlowGeometries.Grids.AbstractGrid,
+    fp::ScatteredFilterPlan{T},
+    strategy::AbstractMaskStrategy,
+    periodic_x::Bool,
+    periodic_y::Bool,
+    j::Integer,
+    sc = row_scratch(fp),
+) where {T<:AbstractFloat}
+    Nx = FlowGeometries.Grids.size_tuple(grid)[1]
+    cache = fp.cache
+    zerofill = strategy isa ZeroFill
+    if cache !== nothing
+        for i in 1:Nx
+            _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
+            t = i + (j - 1) * Nx
+            lo = cache.ptr[t]
+            hi = cache.ptr[t+1] - 1
+            weighted_sum = zero(T)
+            weight_norm = zero(T)
+            @inbounds for k in lo:hi
+                ii = cache.ii[k]
+                jj = cache.jj[k]
+                active = FlowGeometries.Grids.isactive(grid, ii, jj)
+                w = cache.w[k]
+                if zerofill
+                    weight_norm += w
+                    active && (weighted_sum += w * field[ii, jj])
+                else
+                    active || continue
+                    weight_norm += w
+                    weighted_sum += w * field[ii, jj]
                 end
             end
+            zerofill && (weight_norm = _add_exterior(weight_norm, fp.exterior, i, j))
+            out[i, j] = _emit(field, weighted_sum, weight_norm)
         end
-        push!(ptr, length(di) + 1)
+    else
+        rule = fp.weights
+        for i in 1:Nx
+            _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
+            t = i + (j - 1) * Nx
+            I = (Int(i), Int(j))
+            weighted_sum, weight_norm = _rule_fold(
+                (zero(T), zero(T)), rule, grid, t, I, fp.rad, fp.topology, sc,
+            ) do acc, J, w
+                ws, wn = acc
+                active = FlowGeometries.Grids.isactive(grid, J[1], J[2])
+                if zerofill
+                    return (active ? ws + w * field[J[1], J[2]] : ws, wn + w)
+                else
+                    active || return acc
+                    return (ws + w * field[J[1], J[2]], wn + w)
+                end
+            end
+            zerofill && (weight_norm = _add_exterior(weight_norm, fp.exterior, i, j))
+            out[i, j] = _emit(field, weighted_sum, weight_norm)
+        end
     end
-    return di, dj, w, ptr
-end
-
-"""
-    _banded_lon_offsets(dl, Nx, dλ, periodic) -> NTuple{3,UnitRange{Int}}
-
-The longitude offsets a latitude row's taps are drawn from, for a window of `dl` steps of `dλ`. A ring
-contributes each column once: `-dl:dl` capped at one turn, the antipodal column of an even ring taken from
-one side. A regional box takes the near offsets `|Δi| ≤ dl` and the far ones that come back within the
-window across its seam, `|Δi|·|dλ| ≥ 2π − dl·|dλ|`, up to `Nx − 1`; longitude identifies, so the
-distance between two columns is taken the short way round.
-"""
-@inline function _banded_lon_offsets(dl::Int, Nx::Int, dλ::T, periodic::Bool) where {T<:AbstractFloat}
-    if periodic
-        lim = min(dl, Nx ÷ 2)
-        return (1:0, -lim:(2lim + 1 > Nx ? lim - 1 : lim), 1:0)
-    end
-    near = min(dl, Nx - 1)
-    s = abs(dλ)
-    far = dl * s >= T(2π) ? near + 1 : max(near + 1, floor(Int, (T(2π) - dl * s) / s))
-    return (-(Nx - 1):-far, -near:near, far:(Nx - 1))
-end
-
-"""
-    build_footprint(grid::StructuredGrid{T,<:AbstractSphericalGeometry,2}, kernel::HighOrderKernel, scale; kwargs...)
-
-A `HighOrderKernel` on a latitude–longitude grid of uniform longitude, any latitude axis: the banded
-engine with one correction per row ([`_highorder_rows`](@ref)), or the per-cell plan where the targets of
-a row do not share one.
-"""
-function build_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2,S,TP,<:Tuple{AbstractRange{T},AbstractVector{T}}},
-    kernel::Kernels.HighOrderKernel, scale::T; kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}, S, TP<:NTuple{2,FlowGeometries.Grids.AbstractTopology}}
-    return _highorder_spherical_footprint(grid, kernel, scale; kwargs...)
-end
-
-function _highorder_spherical_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.HighOrderKernel, scale::T;
-    mask_strategy::AbstractMaskStrategy = ZeroFill(), kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
-    rows = _highorder_rows(grid, kernel, scale)
-    rows === nothing && return _build_footprint_scattered(grid, kernel, scale; kwargs...)
-    di, dj, w, ptr, mass = rows
-    _, Ny = FlowGeometries.Grids.size_tuple(grid)
-    return _banded_footprint(grid, di, dj, w, ptr, Ny, mask_strategy, kernel, scale; exterior = mass)
-end
-
-"""
-    build_footprint(grid, kernel, scale; kwargs...) -> ScatteredFilterPlan
-
-The cell-by-cell plan ([`_build_footprint_scattered`](@ref)) of a 2-D `StructuredGrid` no more specific
-method covers, such as one whose axis 1 is a plain `AbstractVector`, which carries no guarantee of
-uniform spacing.
-"""
-function build_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
-    kernel::Kernels.AbstractFilterKernel,
-    scale::T;
-    kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    return _build_footprint_scattered(grid, kernel, scale; kwargs...)
+    return out
 end

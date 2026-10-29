@@ -103,9 +103,9 @@ Test.@testset "Allocations" begin
                                                          dplan(gs, fp))) == 0
         end
         for g in (g3, g3m)
-            ws = CGEF.Diagnostics.ΠWorkspace(g; has_w = true)
-            fp = CGEF.Filtering.plan_filter(g, th, 2.5dx; execution = SER)
             f = field((16, 16, 16))
+            ws = CGEF.Diagnostics.ΠWorkspace(g, (), f)
+            fp = CGEF.Filtering.plan_filter(g, th, 2.5dx; execution = SER)
             Test.@test _cgef_second(() -> _cgef_a_flux3(zeros(16, 16, 16), f, f .^ 2, f .^ 3, g, th, 2.5dx, ws, fp,
                                                          dplan(g, fp))) == 0
         end
@@ -123,29 +123,32 @@ Test.@testset "Allocations" begin
         end
     end
 
+    # A family of one engine type, as the centre-test top-hat's prefix sums are at every scale here: a sweep over
+    # plans of several types dispatches per scale.
     Test.@testset "sweeps and batches" begin
         scales = [5dx, 10dx]
+        k = CGEF.TopHatKernel(; cells = CGEF.Kernels.CellCentre())
         ws = CGEF.Diagnostics.ΠWorkspace(g2)
         dp = CGEF.Derivatives.derivative_plan(g2)
-        plans = [CGEF.Filtering.plan_filter(g2, th, s; execution = SER) for s in scales]
+        plans = [CGEF.Filtering.plan_filter(g2, k, s; execution = SER) for s in scales]
         u, v = field((N, N)), field((N, N)) .^ 2
-        r = CGEF.coarse_grain(u, v, g2; scales, kernel = th, execution = SER, spectrum = CGEF.Diagnostics.NoSpectrum())
-        kw = (; scales, kernel = th, workspace = ws, filter_plans = plans, deriv_plan = dp, execution = SER,
+        r = CGEF.coarse_grain(u, v, g2; scales, kernel = k, execution = SER, spectrum = CGEF.Diagnostics.NoSpectrum())
+        kw = (; scales, kernel = k, workspace = ws, filter_plans = plans, deriv_plan = dp, execution = SER,
               spectrum = CGEF.Diagnostics.NoSpectrum())
         Test.@test _cgef_second(() -> _cgef_a_sweep(r, u, v, g2, kw)) == 0
         u3, v3 = field((N, N, 3)), field((N, N, 3)) .^ 2
-        pkw = (; scales, kernel = th, workspaces = [ws], filter_plans = [plans], deriv_plans = [dp], execution = SER,
+        pkw = (; scales, kernel = k, workspaces = [ws], filter_plans = [plans], deriv_plans = [dp], execution = SER,
                spectrum = CGEF.Diagnostics.NoSpectrum())
         b = CGEF.Pipeline.CoarseGrainBatchResult(g2, 2, (3,))
         Test.@test _cgef_second(() -> _cgef_a_profile(b, u3, v3, g2, pkw)) == 0
         Test.@test _cgef_second(() -> _cgef_a_batch(b, u3, v3, g2, pkw)) == 0
         # Scratch the caller leaves out is built once per worker, so a batch twice as long costs the same.
-        bkw = (; scales, kernel = th, execution = SER, spectrum = CGEF.Diagnostics.NoSpectrum())
+        bkw = (; scales, kernel = k, execution = SER, spectrum = CGEF.Diagnostics.NoSpectrum())
         b6 = CGEF.Pipeline.CoarseGrainBatchResult(g2, 2, (6,))
         u6, v6 = cat(u3, u3; dims = 3), cat(v3, v3; dims = 3)
         Test.@test _cgef_second(() -> _cgef_a_batch(b6, u6, v6, g2, bkw)) == _cgef_second(() -> _cgef_a_batch(b, u3, v3, g2, bkw))
         E = zeros(2)
-        Test.@test _cgef_second(() -> _cgef_a_cumulative(E, u, v, g2, th, scales, ws, plans)) == 0
+        Test.@test _cgef_second(() -> _cgef_a_cumulative(E, u, v, g2, k, scales, ws, plans)) == 0
         Test.@test _cgef_second(() -> _cgef_a_density(zeros(2), E, 1.0 ./ scales)) == 0
 
         # On a sphere the generalized convolution reads no filter plan, and a sweep builds none.
@@ -161,9 +164,9 @@ Test.@testset "Allocations" begin
         ews = CGEF.Diagnostics.EnergyWorkspace(gs; FIN...)
         Test.@test _cgef_second(() -> _cgef_a_cumulative(zeros(2), us, vs, gs, ga, sscales, ews, nothing)) == 0
         wsb = CGEF.Diagnostics.ΠWorkspace(g2, (3,))
-        CGEF.Diagnostics.compute_Π!(zeros(N, N, 3), u3, v3, nothing, g2, th, 5dx; workspace = wsb, filter_plan = plans[1], execution = SER)
+        CGEF.Diagnostics.compute_Π!(zeros(N, N, 3), u3, v3, nothing, g2, k, 5dx; workspace = wsb, filter_plan = plans[1], execution = SER)
         Test.@test _cgef_second(() -> _cgef_a_energy(zeros(3), wsb, plans[1], CGEF.Diagnostics.active_area(g2))) == 0
-        Test.@test _cgef_second(() -> _cgef_a_field(zeros(N, N), u, g2, th, 5dx, plans[1])) == 0
+        Test.@test _cgef_second(() -> _cgef_a_field(zeros(N, N), u, g2, k, 5dx, plans[1])) == 0
     end
 
     # The returned NamedTuple and nothing field-sized: one field here is well over the bound.
@@ -215,7 +218,7 @@ Test.@testset "Allocations" begin
 
     Test.@testset "spectral applies add nothing to their library's transforms" begin
         u = field((N, N))
-        gp = FG.Grids.StructuredGrid(cart, xs, xs; periodic = (true, true))
+        gp = FG.Grids.StructuredGrid(cart, xs, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()))
         p = CGEF.Filtering.plan_filter(gp, ga, 5dx; execution = SER, method = CGEF.Filtering.Spectral())
         Test.@test _cgef_second(() -> _cgef_a_apply(zeros(N, N), u, p)) <= TASK_SLACK
         n = 400
@@ -228,7 +231,7 @@ Test.@testset "Allocations" begin
             Test.@test minimum(_ -> _cgef_a_apply(zeros(n), un, pu), 1:3) <= pair + TASK_SLACK
             lib isa FTB.FINUFFTBackend && Test.@test pair <= TASK_SLACK
         end
-        sg = FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), 17; geometry = FG.Geometry.SphericalGeometry(R))
+        sg = FG.Connectivity.structured_grid(FG.SphericalSampling.Fejer1Sampling(), 17; geometry = FG.Geometry.SphericalGeometry(R))
         ps = CGEF.Filtering.plan_filter(sg, ga, π * R / 8; execution = SER, method = CGEF.Filtering.Spectral())
         Test.@test _cgef_second(() -> _cgef_a_apply(zeros(33, 17), field((33, 17)), ps)) <= TASK_SLACK
         # NUFSHT allocates inside its own fit; the extension adds nothing over the same upstream calls.
@@ -246,13 +249,14 @@ Test.@testset "Allocations" begin
         Test.@test _cgef_second(() -> _cgef_a_apply(zeros(M), f, pq)) <= upstream + TASK_SLACK
     end
 
-    # Plan memory: the prefix-sum engine keeps no neighbour list, so a sixteen-fold wider filter barely
-    # grows its plan; a streaming scattered plan derives each neighbourhood per apply, so its build does
-    # not grow with the window.
+    # Plan memory: the centre-test top-hat's prefix-sum engine keeps no neighbour list at any spacing, so a
+    # sixteen-fold wider filter barely grows its plan; a streaming scattered plan derives each neighbourhood per
+    # apply, so its build does not grow with the window.
     Test.@testset "plan memory against the filter width" begin
         xv = collect(0.0:dx:63dx) .+ [0.3dx * sin(2.7i) for i in 1:64]
         g = FG.Grids.StructuredGrid(cart, xv, xv)
-        Test.@test Base.summarysize(CGEF.Filtering.build_footprint(g, th, 64dx)) < 3 * Base.summarysize(CGEF.Filtering.build_footprint(g, th, 4dx))
+        thc = CGEF.TopHatKernel(; cells = CGEF.Kernels.CellCentre())
+        Test.@test Base.summarysize(CGEF.Filtering.build_footprint(g, thc, 64dx)) < 3 * Base.summarysize(CGEF.Filtering.build_footprint(g, thc, 4dx))
         build(ℓ) = @allocated CGEF.Filtering.build_footprint(g, CGEF.SharpSpectralKernel(), ℓ; cache_strategy = CGEF.Filtering.NeverCache())
         build(2dx)
         build(4dx)

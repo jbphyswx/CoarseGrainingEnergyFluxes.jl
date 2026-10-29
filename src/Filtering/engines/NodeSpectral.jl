@@ -64,6 +64,7 @@ end
 
 plan_strategy(plan::NodeSetPlan) = plan_strategy(plan.inner)
 plan_execution(plan::NodeSetPlan) = plan.grid_plan.execution
+analysis_status(plan::NodeSetPlan) = analysis_status(plan.inner)
 
 Base.show(io::IO, plan::NodeSetPlan) =
     print(io, "NodeSetPlan(", plan.grid_plan.ncells, " cells, ", length(plan.scratch.field), " nodes, ",
@@ -79,20 +80,27 @@ function _node_set(grid::FlowGeometries.Grids.AbstractGrid{G,T}) where {G,T}
     geo = FlowGeometries.Grids.grid_geometry(grid)
     x = FlowGeometries.Grids.materialize(grid)
     A = collect(T, vec(FlowGeometries.Grids.measure(grid)))
-    m = BitVector(vec(FlowGeometries.Grids.mask(grid)))
+    m = _node_mask(geo, FlowGeometries.Grids.mask(grid))
     xc, Ac, mc = _complete_sphere(geo, grid, x, A, m)
     return FlowGeometries.Grids.UnstructuredGrid(geo, xc, Ac, mc; _node_closure(geo, grid)...)
 end
 
 _node_set(grid::FlowGeometries.Grids.UnstructuredGrid) = grid
 
+# The node set's mask in linear order. A Cartesian set adds no node, so an `AllActive` grid stays
+# `AllActive`; a sphere's completion appends inactive nodes, so its mask is always an array.
+_node_mask(::FlowGeometries.Geometry.AbstractCartesianGeometry, m::FlowGeometries.Grids.AllActive) =
+    FlowGeometries.Grids.AllActive((length(m),))
+_node_mask(::FlowGeometries.Geometry.AbstractGeometry, m::AbstractArray{Bool}) = BitVector(vec(m))
+
 # A Cartesian node set carries the grid's own wrap, which fixes the transform's box. The sphere closes
 # by itself.
 _node_closure(::FlowGeometries.Geometry.AbstractSphericalGeometry, _) = (;)
 function _node_closure(::FlowGeometries.Geometry.AbstractCartesianGeometry{T}, grid) where {T}
-    per = FlowGeometries.Grids.periodic_flags(grid)
-    prd = ntuple(d -> per[d] ? T(FlowGeometries.Grids.period(grid, d)) : zero(T), length(per))
-    return (periodic = per, period = prd)
+    tp = FlowGeometries.Grids.topology(grid)
+    prd = ntuple(d -> FlowGeometries.Grids.isperiodic(grid, d) ? T(FlowGeometries.Grids.period(grid, d)) : zero(T),
+                 Val(length(tp)))
+    return (topology = tp, period = prd)
 end
 
 _complete_sphere(::FlowGeometries.Geometry.AbstractGeometry, _, x, A, m) = (x, A, m)
@@ -107,13 +115,12 @@ function _complete_sphere(
     return _complete_from(ext, lo, FlowGeometries.Grids.size_tuple(grid), x, A, m)
 end
 
-# The lattice's cells outside the grid, appended inactive. Behind a barrier: `ext`'s axis types are
-# known only past the call.
+# The lattice's cells outside the grid, appended inactive.
 function _complete_from(ext, lo::NTuple{N,Int}, dims::NTuple{N,Int}, x, A, m) where {N}
     outside = vec([!_inside(Tuple(J), lo, dims) for J in CartesianIndices(FlowGeometries.Grids.size_tuple(ext))])
     xe = FlowGeometries.Grids.materialize(ext)
     Ae = vec(collect(FlowGeometries.Grids.measure(ext)))
-    return (ntuple(d -> vcat(x[d], xe[d][outside]), length(x)), vcat(A, Ae[outside]),
+    return (map((xd, xed) -> vcat(xd, xed[outside]), x, xe), vcat(A, Ae[outside]),
             vcat(m, falses(count(outside))))
 end
 
@@ -129,16 +136,24 @@ function _node_set_grid_plan(
     spectral_backend::SpectralBackends.AbstractSpectralBackend, grid::FlowGeometries.Grids.AbstractGrid,
     kernel::Kernels.AbstractFilterKernel;
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-    batch::Union{Nothing,Integer} = nothing, kwargs...,
+    batch::Union{Nothing,Integer} = nothing, analysis::AbstractAnalysis = AutoAnalysis(), kwargs...,
 )
     _node_route(spectral_backend) || return nothing
     nodes = _node_set(grid)
-    inner = spectral_grid_plan(spectral_backend, nodes, kernel; execution = execution, batch = batch, kwargs...)
+    inner = spectral_grid_plan(spectral_backend, nodes, kernel; execution = execution, batch = batch,
+                               _node_analysis(FlowGeometries.Grids.grid_geometry(grid), analysis, grid)..., kwargs...)
     inner === nothing && return nothing
     return NodeSetGridPlan(nodes, inner, length(FlowGeometries.Grids.mask(grid)),
                            FlowGeometries.Grids.size_tuple(grid), batch === nothing ? nothing : Int(batch),
                            execution)
 end
+
+# How a spherical node set's harmonic coefficients are taken, resolved from the grid it was made from, whose sampling
+# the node set does not keep ([`AutoAnalysis`](@ref)). A Cartesian set's transform takes no analysis.
+_node_analysis(::FlowGeometries.Geometry.AbstractSphericalGeometry, a::AbstractAnalysis, grid) =
+    (; analysis = resolved_analysis(a, grid))
+_node_analysis(::FlowGeometries.Geometry.AbstractCartesianGeometry, ::AutoAnalysis, _) = (;)
+_node_analysis(::FlowGeometries.Geometry.AbstractCartesianGeometry, a::AbstractAnalysis, _) = (; analysis = a)
 
 function _node_set_scratch(gp::NodeSetGridPlan, inner_scratch)
     T = eltype(FlowGeometries.Grids.measure(gp.nodes))
@@ -165,6 +180,7 @@ function _node_set_filter_plan(
     grid_plan::Union{Nothing,NodeSetGridPlan} = nothing,
     scratch::Union{Nothing,NodeSetScratch} = nothing,
     batch::Union{Nothing,Integer} = nothing,
+    analysis::AbstractAnalysis = AutoAnalysis(),
     kwargs...,
 )
     _node_route(spectral_backend) || _no_spectral_backend(spectral_backend, grid)
@@ -173,7 +189,8 @@ function _node_set_filter_plan(
     inner = spectral_filter_plan(
         spectral_backend, nodes, kernel, scale;
         execution = execution, grid_plan = grid_plan === nothing ? nothing : grid_plan.inner,
-        scratch = scratch === nothing ? nothing : scratch.inner, batch = nb, kwargs...,
+        scratch = scratch === nothing ? nothing : scratch.inner, batch = nb,
+        _node_analysis(FlowGeometries.Grids.grid_geometry(grid), analysis, grid)..., kwargs...,
     )
     gp = grid_plan === nothing ?
         NodeSetGridPlan(nodes, inner.grid_plan, length(FlowGeometries.Grids.mask(grid)),
@@ -206,7 +223,7 @@ spectral_grid_plan(
 
 @noinline _no_spectral_backend(::SpectralBackends.AbstractFFTSpectralBackend, grid) = throw(ArgumentError(
     "FFT spectral filtering samples each direction at equal steps, which a grid states in its axis " *
-    "types (`FlowGeometries.Axes.spacing_trait`); this $(nameof(typeof(grid))) is not two uniform " *
+    "types (`FlowGeometries.Grids.spacing_trait`); this $(nameof(typeof(grid))) is not two uniform " *
     "directions. Filter it over its cells with `transform = AutoSpectralBackend()` and a " *
     "nonuniform FFT: $(_NUFFT_LIBRARIES_HINT).",
 ))
@@ -273,8 +290,8 @@ end
 
 analyze_buffer(plan::NodeSetPlan, field::AbstractArray) =
     _single(plan, field) ? analyze_buffer(plan.inner, plan.scratch.field) :
-    (plan.grid_plan.batch == size(field, ndims(field)) ?
-        analyze_buffer(plan.inner, plan.scratch.batched.field) : nothing)
+    _batch_analysis(plan.scratch.batched, size(field, ndims(field)), _ -> plan.grid_plan.batch,
+                    () -> analyze_buffer(plan.inner, plan.scratch.batched.field))
 
 function filter_analyze!(F̂, field::AbstractArray, plan::NodeSetPlan)
     buf = _single(plan, field) ? plan.scratch.field : _batch_buffers(plan, field).field
@@ -286,4 +303,59 @@ function filter_synthesize!(out::AbstractArray, F̂, plan::NodeSetPlan)
     buf = _single(plan, out) ? plan.scratch.out : _batch_buffers(plan, out).out
     filter_synthesize!(buf, F̂, plan.inner)
     return _store_cells!(out, buf, plan.grid_plan.ncells)
+end
+
+series_form(plan::NodeSetPlan) = series_form(plan.inner)
+
+rate_available(plan::NodeSetPlan, kernel::Kernels.AbstractFilterKernel) = rate_available(plan.inner, kernel)
+rate_plan(plan::NodeSetPlan, kernel::Kernels.AbstractFilterKernel, scale::AbstractFloat) =
+    NodeSetPlan(rate_plan(plan.inner, kernel, scale), plan.grid_plan, plan.scratch)
+
+# The node set's field buffer is free once analyzed, so it holds `ū` for the inner plan's quotient rule.
+function filter_synthesize_derivative!(out::AbstractArray, F̂, ū::AbstractArray, plan::NodeSetPlan, d::Int)
+    bufs = _single(plan, out) ? plan.scratch : _batch_buffers(plan, out)
+    n = plan.grid_plan.ncells
+    _load_nodes!(bufs.field, ū, n)
+    filter_synthesize_derivative!(bufs.out, F̂, bufs.field, plan.inner, d)
+    return _store_cells!(out, bufs.out, n)
+end
+
+"""
+    NodeSetGradient
+
+The inner plan's [`series_gradient`](@ref) and the node-set pair a gradient lands in before its cells are
+copied out, with the same pair over the batch for a batched plan.
+"""
+struct NodeSetGradient{G, V<:AbstractArray, BT}
+    inner::G
+    out::NTuple{2,V}
+    batched::BT   # a pair of nnodes × batch arrays, or nothing
+end
+
+# An inner plan needing no gradient state takes `filter_synthesize_derivative!` per direction.
+series_gradient(plan::NodeSetPlan) = _node_gradient_state(series_gradient(plan.inner), plan)
+_node_gradient_state(::Nothing, ::NodeSetPlan) = nothing
+function _node_gradient_state(inner, plan::NodeSetPlan)
+    sc = plan.scratch
+    pair(a) = (similar(a), similar(a))
+    return NodeSetGradient(inner, pair(sc.out), sc.batched === nothing ? nothing : pair(sc.batched.out))
+end
+
+function filter_synthesize_gradient!(g1::AbstractArray, g2::AbstractArray, F̂, ū::AbstractArray, plan::NodeSetPlan,
+                                     g::NodeSetGradient)
+    if _single(plan, g1)
+        _node_gradient!(g1, g2, F̂, ū, plan, plan.scratch.field, g.out, g.inner)
+    else
+        _node_gradient!(g1, g2, F̂, ū, plan, _batch_buffers(plan, g1).field, g.batched, g.inner)
+    end
+    return g1, g2
+end
+
+function _node_gradient!(g1, g2, F̂, ū, plan::NodeSetPlan, field, out::NTuple{2,Any}, inner)
+    n = plan.grid_plan.ncells
+    _load_nodes!(field, ū, n)
+    filter_synthesize_gradient!(out[1], out[2], F̂, field, plan.inner, inner)
+    _store_cells!(g1, out[1], n)
+    _store_cells!(g2, out[2], n)
+    return nothing
 end

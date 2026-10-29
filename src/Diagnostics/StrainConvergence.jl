@@ -26,7 +26,7 @@ function PiStrainWorkspace(
 ) where {T<:AbstractFloat, G}
     at = Placement(grid; execution = execution)
     gsz = FlowGeometries.Grids.size_tuple(grid)
-    return PiStrainWorkspace(ntuple(_ -> _zeros(at, T, gsz), 16)..., at)
+    return PiStrainWorkspace(ntuple(_ -> _zeros(at, T, gsz), Val(16))..., at)
 end
 
 """
@@ -47,6 +47,7 @@ function compute_Π_strain_convergence!(
     deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _require_tangent_pair(grid, "compute_Π_strain_convergence!")
     plan = filter_plan === nothing ?
@@ -55,15 +56,15 @@ function compute_Π_strain_convergence!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, _resolve_deriv_plan(deriv_plan, output_grid(grid, plan)))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid))
 
-    Filtering.filter_apply_batch!((ws.ū, ws.v̄), (u, v), plan)
+    Fu, Fv = _filtered_with_spectra!((ws.ū, ws.v̄), (u, v), plan, dplan)
     _second_moment!(ws.τuu, u, u, ws.ū, ws.ū, ws.prod, ws.fbuf, plan)
     _second_moment!(ws.τuv, u, v, ws.ū, ws.v̄, ws.prod, ws.fbuf, plan)
     _second_moment!(ws.τvv, v, v, ws.v̄, ws.v̄, ws.prod, ws.fbuf, plan)
 
-    _grad2!(ws.ux, ws.uy, ws.ū, og, dplan, b)
-    _grad2!(ws.vx, ws.vy, ws.v̄, og, dplan, b)
+    _grad2_route!(ws.ux, ws.uy, ws.ū, Fu, og, dplan, b, plan)
+    _grad2_route!(ws.vx, ws.vy, ws.v̄, Fv, og, dplan, b, plan)
 
     mask = FlowGeometries.Grids.mask(og)
     @. ws.δ = ifelse(mask, ws.ux + ws.vy, zero(T))
@@ -119,14 +120,16 @@ function compute_Π_strain_convergence(
     scale::T;
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+    method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
     size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
-    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution)
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy, execution, method)
     return compute_Π_strain_convergence!(
         PiStrainWorkspace(grid; execution = Filtering.plan_execution(plan)), u, v, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = Derivatives.derivative_plan(output_grid(grid, plan)),
+        filter_plan = plan, derivative = derivative,
     )
 end
 
@@ -157,7 +160,8 @@ function compute_Π_strain_convergence(
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     vector_filter::Union{Nothing, Filtering.AbstractVectorFilter} = nothing,
     transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
+) where {T<:AbstractFloat, G<:_CurvedSurface{T}}
     gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
     size(v) == gsz || throw(DimensionMismatch("v has size $(size(v)), grid expects $gsz"))
@@ -169,7 +173,7 @@ function compute_Π_strain_convergence(
     return compute_Π_strain_convergence!(
         ws, u, v, grid, kernel, scale;
         filter_plan = plan isa Filtering.AbstractFilterPlan ? plan : nothing, mask_strategy = mask_strategy,
-        deriv_plan = Derivatives.derivative_plan(output_grid(grid, plan)),
+        derivative = derivative,
     )
 end
 
@@ -192,12 +196,13 @@ function compute_Π_strain_convergence!(
     deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
+) where {T<:AbstractFloat, G<:_CurvedSurface{T}}
     _require_tangent_pair(grid, "compute_Π_strain_convergence!")
     plan = _plan_for(ws.spin, filter_plan, mask_strategy,
                      () -> Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution))
     _check_placement(ws.at, plan)
-    dplan = _placed(ws.at, _resolve_deriv_plan(deriv_plan, output_grid(grid, plan)))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid))
 
     _fill_stress_strain!(u, v, nothing, grid, ws, plan, dplan, kernel, scale, nothing)
 
@@ -235,6 +240,8 @@ function compute_Π_decomposed(
     scale::T;
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+    method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     gsz = FlowGeometries.Grids.size_tuple(grid)
     size(u) == gsz || throw(DimensionMismatch("u has size $(size(u)), grid expects $gsz"))
@@ -243,11 +250,11 @@ function compute_Π_decomposed(
     size(u_rot) == gsz || throw(DimensionMismatch("u_rot has size $(size(u_rot)), grid expects $gsz"))
     size(v_rot) == gsz || throw(DimensionMismatch("v_rot has size $(size(v_rot)), grid expects $gsz"))
     size(w_rot) == gsz || throw(DimensionMismatch("w_rot has size $(size(w_rot)), grid expects $gsz"))
-    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy=mask_strategy, execution=execution)
+    plan = Filtering.plan_filter(grid, kernel, scale; mask_strategy, execution, method)
     return compute_Π_decomposed!(
         PiDecomposed3DWorkspace(grid; execution = Filtering.plan_execution(plan)), u, v, w, u_rot, v_rot,
         w_rot, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = Derivatives.derivative_plan(output_grid(grid, plan)),
+        filter_plan = plan, derivative = derivative,
     )
 end
 
@@ -280,16 +287,30 @@ function PiDecomposed3DWorkspace(
     at = Placement(grid; execution = execution)
     gsz = FlowGeometries.Grids.size_tuple(grid)
     z() = _zeros(at, T, gsz)
-    t(n) = ntuple(_ -> z(), n)
+    t3() = (z(), z(), z())
+    t6() = (t3()..., t3()...)
     return PiDecomposed3DWorkspace(
-        t(3), t(3), t(3), t(6), t(6), t(6), t(6), t(6), t(6), z(), z(), z(), z(), at,
+        t3(), t3(), t3(), t6(), t6(), t6(), t6(), t6(), t6(), z(), z(), z(), z(), at,
     )
 end
 
 # The six components of S̄ of a filtered velocity triple `b3` into `S`, in `_SYM3` order, the frame's
-# turning included; `g` is three scratch arrays, and `grid` is held where the backend `be` runs.
+# turning included; `g` is three scratch arrays, and `grid` is held where the backend `be` runs. Under the
+# series route the triple's spectra `F` give it from the filter's own output.
 @inline _strain_sym3!(S::NTuple{6}, b3::NTuple{3}, grid, dplan, g::NTuple{3}, be) =
     _strain!((S[1], S[4], S[6], S[2], S[3], S[5]), b3, grid, dplan, g, be)
+@inline _strain_sym3!(S::NTuple{6}, b3::NTuple{3}, grid, dplan, g::NTuple{3}, be, _F, _plan) =
+    _strain_sym3!(S, b3, grid, dplan, g, be)
+
+function _strain_sym3!(S::NTuple{6}, b3::NTuple{3}, _grid, ::SeriesStrain, g::NTuple{3}, _be, F::NTuple{3}, plan)
+    _series_derivative!(S[1], F[1], b3[1], plan, 1)
+    _series_derivative!(S[4], F[2], b3[2], plan, 2)
+    _series_derivative!(S[6], F[3], b3[3], plan, 3)
+    _series_shear!(S[2], (F[1], b3[1]), (F[2], b3[2]), 1, 2, plan, g[1], g[2])
+    _series_shear!(S[3], (F[1], b3[1]), (F[3], b3[3]), 1, 3, plan, g[1], g[2])
+    _series_shear!(S[5], (F[2], b3[2]), (F[3], b3[3]), 2, 3, plan, g[1], g[2])
+    return nothing
+end
 
 # Nine-term symmetric contraction S_ij τ_ij at one point, over the `_SYM3` component order.
 @inline _sym3_dot(S1, S2, S3, S4, S5, S6, t1, t2, t3, t4, t5, t6) =
@@ -334,6 +355,7 @@ function compute_Π_decomposed!(
     deriv_plan::Union{Nothing,FlowGeometries.Operators.StencilPlans} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution) :
@@ -341,7 +363,7 @@ function compute_Π_decomposed!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, deriv_plan === nothing ? Derivatives.derivative_plan(output_grid(grid, plan)) : deriv_plan)
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid))
 
     rot = (u_rot, v_rot, w_rot)
     dv, br, bd, pr = ws.div, ws.br, ws.bd, ws.prod
@@ -350,13 +372,13 @@ function compute_Π_decomposed!(
         @. d = f - r
     end
 
-    Filtering.filter_apply_batch!((br..., bd...), (rot..., dv...), plan)
+    F = _filtered_with_spectra!((br..., bd...), (rot..., dv...), plan, dplan)
 
     _pair_moments!(ws.τRR, ws.τX, ws.τDD, rot, dv, br, bd, pr, plan)
 
     g = (pr[1], pr[2], pr[3])
-    _strain_sym3!(ws.SR, br, og, dplan, g, b)
-    _strain_sym3!(ws.SD, bd, og, dplan, g, b)
+    _strain_sym3!(ws.SR, br, og, dplan, g, b, (F[1], F[2], F[3]), plan)
+    _strain_sym3!(ws.SD, bd, og, dplan, g, b, (F[4], F[5], F[6]), plan)
 
     return _decomposed_channels!(ws, FlowGeometries.Grids.mask(og), T)
 end
@@ -392,9 +414,10 @@ function SphericalPiDecomposed3DWorkspace(
     at = Placement(grid; execution = execution)
     gsz = FlowGeometries.Grids.size_tuple(grid)
     z() = _zeros(at, T, gsz)
-    t(n) = ntuple(_ -> z(), n)
+    t3() = (z(), z(), z())
+    t6() = (t3()..., t3()...)
     return SphericalPiDecomposed3DWorkspace(
-        t(3), t(3), t(3), t(3), t(6), t(6), t(6), t(6), t(6), t(6), t(3), z(), z(), z(), z(), at,
+        t3(), t3(), t3(), t3(), t6(), t6(), t6(), t6(), t6(), t6(), t3(), z(), z(), z(), z(), at,
     )
 end
 
@@ -419,6 +442,7 @@ function compute_Π_decomposed(
     scale::T;
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
     gsz = FlowGeometries.Grids.size_tuple(grid)
     for (nm, a) in (("u", u), ("v", v), ("w", w),
@@ -429,7 +453,7 @@ function compute_Π_decomposed(
     return compute_Π_decomposed!(
         SphericalPiDecomposed3DWorkspace(grid; execution = Filtering.plan_execution(plan)),
         u, v, w, u_rot, v_rot, w_rot, grid, kernel, scale;
-        filter_plan = plan, deriv_plan = Derivatives.derivative_plan(output_grid(grid, plan)),
+        filter_plan = plan, derivative = derivative,
     )
 end
 
@@ -454,31 +478,32 @@ function compute_Π_decomposed!(
     deriv_plan::Union{Nothing,FlowGeometries.Operators.StencilPlans} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
+    derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
     plan = filter_plan === nothing ?
         Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution) :
         filter_plan
     _check_placement(ws.at, plan)
     b = ws.at.execution
-    og = _output(ws.at, plan)
-    dplan = _placed(ws.at, deriv_plan === nothing ? Derivatives.derivative_plan(output_grid(grid, plan)) : deriv_plan)
+    og, fr = _output(ws.at, plan), _output_frames(ws.at, plan)
+    dplan = _placed(ws.at, _shell_route(_derivative_route(derivative, deriv_plan, plan, grid)))
     pr, pd, br, bd = ws.pr, ws.pd, ws.br, ws.bd
 
-    _fill_tau3_velocity!(pr, u_rot, v_rot, w_rot, ws.at.grid, b)
-    _fill_tau3_velocity!(pd, u, v, w, ws.at.grid, b)
+    _fill_tau3_velocity!(pr, u_rot, v_rot, w_rot, ws.at.grid, ws.at.frames, b)
+    _fill_tau3_velocity!(pd, u, v, w, ws.at.grid, ws.at.frames, b)
     for c in 1:3
         @. pd[c] = pd[c] - pr[c]
     end
 
     Filtering.filter_apply_batch!((br..., bd...), (pr..., pd...), plan)
     _pair_moments!(ws.τRR, ws.τX, ws.τDD, pr, pd, br, bd, ws.prod, plan)
-    _rotate_tau3_to_local!((ws.τRR, ws.τX, ws.τDD), og, b)
+    _rotate_tau3_to_local!((ws.τRR, ws.τX, ws.τDD), og, fr, b)
 
     # The product buffers are free once the stresses are formed.
     g = (ws.prod[1], ws.prod[2], ws.prod[3])
-    _localize_triple!(ws.loc, br, og, b)
+    _localize_triple!(ws.loc, br, og, fr, b)
     _strain_sym3!(ws.SR, ws.loc, og, dplan, g, b)
-    _localize_triple!(ws.loc, bd, og, b)
+    _localize_triple!(ws.loc, bd, og, fr, b)
     _strain_sym3!(ws.SD, ws.loc, og, dplan, g, b)
 
     return _decomposed_channels!(ws, FlowGeometries.Grids.mask(og), T)

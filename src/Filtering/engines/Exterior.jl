@@ -22,10 +22,10 @@ function _exterior_mass(
     lattice = _exterior_lattice(grid, rad)
     lattice === nothing && return nothing
     ext, lo, extended = lattice
-    # A uniform periodic axis 1 the continuation leaves alone maps the continued lattice onto itself
-    # under a shift along it, so every target of a row has the row's first target's mass.
-    ring = !first(extended) && FlowGeometries.Grids.isperiodic(grid, 1) &&
-           FlowGeometries.Grids.coordinates(grid, 1) isa AbstractRange
+    # A periodic direction 1 uniform around its wrap, which the continuation leaves alone, maps the
+    # continued lattice onto itself under a shift along it, so every target of a row has the row's first
+    # target's mass.
+    ring = !first(extended) && FlowGeometries.Grids.isperiodic(grid, 1) && FlowGeometries.Grids.isuniform(grid, 1)
     return _exterior_mass(ext, lo, extended, FlowGeometries.Grids.size_tuple(grid), kernel, scale, rad, dim, ring)
 end
 
@@ -117,7 +117,7 @@ function _exterior_lattice(
     parts = ntuple(d -> _axis_extension(geo, grid, d, rad, cap), Val(N))
     extended = map(p -> p[1] > 0 || p[2] > 0, parts)
     any(extended) || return nothing
-    closure = ntuple(d -> _ext_closure(geo, grid, d), Val(N))
+    closure = map(v -> _ext_closure(geo, grid, v), ntuple(Val, Val(N)))
     ext = FlowGeometries.Grids.StructuredGrid(
         geo, map(p -> p[3], parts)...; topology = map(first, closure), period = map(last, closure),
     )
@@ -130,7 +130,7 @@ end
 _exact_continued_measure(ext, ::FlowGeometries.Geometry.AbstractGeometry, _, _) = ext
 
 function _exact_continued_measure(
-    ext::FlowGeometries.Grids.StructuredGrid{T,G,N}, geo::FlowGeometries.Geometry.AbstractSphericalGeometry{T},
+    ext::FlowGeometries.Grids.StructuredGrid{T,G,N}, geo::FlowGeometries.Geometry.AbstractLonLatGeometry{T},
     grid::FlowGeometries.Grids.StructuredGrid, parts,
 ) where {T<:AbstractFloat, G, N}
     N >= 2 || return ext
@@ -173,17 +173,35 @@ end
     return N == 2 ? R * R * s : s
 end
 
-# `(topology, period)` of direction `d` of the continued lattice: the grid's own, except a longitude of
-# more than one column, which identifies, so the lattice closes it with period 2π whether or not the
-# grid's cells reach round.
-function _ext_closure(geo::FlowGeometries.Geometry.AbstractGeometry{T}, grid, d::Int) where {T}
-    if geo isa FlowGeometries.Geometry.AbstractSphericalGeometry && d == 1 &&
-       length(FlowGeometries.Grids.coordinates(grid, 1)) > 1
-        return (FlowGeometries.Grids.Periodic(), T(2π))
+# A spheroid's, as FlowGeometries measures its cells: latitude `∫ M(φ)N(φ)cos φ dφ`, along a single meridian its arc
+# `∫ M(φ) dφ`, by 8-point Gauss–Legendre.
+@inline function _cell_factor(
+    geo::FlowGeometries.Geometry.AbstractEllipsoidalGeometry{T}, ::Int, ::Int, nλ::Int, a::T, b::T,
+) where {T<:AbstractFloat}
+    μ, w = _gl8(T)
+    h, c = (b - a) / 2, (a + b) / 2
+    s = zero(T)
+    for k in 1:8
+        φ = c + h * μ[k]
+        M = T(FlowGeometries.Geometry.meridional_radius(geo, φ))
+        s += w[k] * (nλ == 1 ? M : M * T(FlowGeometries.Geometry.prime_vertical_radius(geo, φ)) * cos(φ))
     end
-    periodic = FlowGeometries.Grids.isperiodic(grid, d)
-    return (FlowGeometries.Grids.topology(grid, d), periodic ? FlowGeometries.Grids.period(grid, d) : nothing)
+    return h * s
 end
+
+_gl8(::Type{T}) where {T} = (r = FlowTransformBindings.gauss_legendre(T, 8); (r.μ, r.w))
+
+# `(topology, period)` of direction `d` of the continued lattice: the grid's own, except a spherical
+# longitude, which identifies, so the lattice closes it with period 2π whether or not the grid's cells
+# reach round. A single meridian keeps its arc-length measure: `_exact_continued_measure` takes the
+# grid's own longitude factors.
+_ext_closure(::FlowGeometries.Geometry.AbstractLonLatGeometry{T}, grid, ::Val{1}) where {T} =
+    (FlowGeometries.Grids.Periodic(), T(2π))
+_ext_closure(::FlowGeometries.Geometry.AbstractGeometry, grid, ::Val{d}) where {d} =
+    _closure(FlowGeometries.Grids.topology(grid, d), grid, d)
+
+_closure(t::FlowGeometries.Grids.Periodic, grid, d::Int) = (t, FlowGeometries.Grids.period(grid, d))
+_closure(t::FlowGeometries.Grids.Bounded, grid, d::Int) = (t, nothing)
 
 # `(n_lo, n_hi)`: how many cells direction `d` continues by below its first and above its last.
 function _axis_counts(
@@ -195,11 +213,10 @@ function _axis_counts(
     return _extension_counts(geo, d, x, T(x[2] - x[1]), T(x[n] - x[n - 1]), rad, cap)
 end
 
-# A spectral-quadrature sampling spans the sphere in latitude: its cells' measures total the sphere's
-# area, so nothing lies past either end.
+# A grid that covers the sphere spans it in latitude, so nothing lies past either end.
 _spans_sphere(::FlowGeometries.Geometry.AbstractGeometry, _, ::Int) = false
-_spans_sphere(::FlowGeometries.Geometry.AbstractSphericalGeometry, grid, d::Int) =
-    d == 2 && FlowGeometries.Grids.sampling(grid) isa FlowGeometries.SphericalSampling.AbstractSpectralQuadratureSampling
+_spans_sphere(::FlowGeometries.Geometry.AbstractLonLatGeometry, grid, d::Int) =
+    d == 2 && FlowGeometries.Grids.covers_sphere(grid)
 
 # `(n_lo, n_hi, axis, faces)`: direction `d` continued by `n_lo` cells below its first and `n_hi` above
 # its last, each at the spacing of the gap it continues. `faces = (lo_a, lo_b, hi_a, hi_b)` bounds each
@@ -236,9 +253,16 @@ end
 # Whether `v` lies short of `lim` stepping `h`.
 @inline _short_of(v, lim, h) = h > 0 ? v < lim : v > lim
 
+# The least ground distance per radian of latitude: the sphere's radius, a spheroid's meridional radius at the
+# equator, so a latitude continuation by it reaches at least as far as the kernel.
+_least_meridian_radius(geo::FlowGeometries.Geometry.AbstractSphericalGeometry{T}) where {T} =
+    T(FlowGeometries.Geometry.radius(geo))
+_least_meridian_radius(geo::FlowGeometries.Geometry.AbstractEllipsoidalGeometry{T}) where {T} =
+    T(FlowGeometries.Geometry.meridional_radius(geo, zero(T)))
+
 # Where direction `d` ends when stepping `h`: a pole in latitude, the origin in radius toward the centre.
 _cut_limit(::FlowGeometries.Geometry.AbstractGeometry, ::Int, h) = nothing
-function _cut_limit(::FlowGeometries.Geometry.AbstractSphericalGeometry, d::Int, h::T) where {T}
+function _cut_limit(::FlowGeometries.Geometry.AbstractLonLatGeometry, d::Int, h::T) where {T}
     d == 2 && return h > 0 ? T(π) / 2 : -T(π) / 2
     (d == 3 && h < 0) && return zero(T)
     return nothing
@@ -254,7 +278,7 @@ _extension_counts(
 # a half cells, which the periodic continued axis absorbs into the seam cells. Latitude continues toward
 # the pole it heads for, and the radius toward the origin, as far as the kernel reaches.
 function _extension_counts(
-    geo::FlowGeometries.Geometry.AbstractSphericalGeometry{T}, d::Int, x, s_lo::T, s_hi::T, rad::T,
+    geo::FlowGeometries.Geometry.AbstractLonLatGeometry{T}, d::Int, x, s_lo::T, s_hi::T, rad::T,
     cap::Bool,
 ) where {T<:AbstractFloat}
     n = length(x)
@@ -263,7 +287,7 @@ function _extension_counts(
         m = max(0, floor(Int, (T(2π) - abs(T(x[n] - x[1]))) / s - T(1) / 2))
         return (m ÷ 2, m - m ÷ 2)
     end
-    step = d == 2 ? T(FlowGeometries.Geometry.radius(geo)) : one(T)
+    step = d == 2 ? _least_meridian_radius(geo) : one(T)
     reach(s) = ceil(Int, rad / (step * abs(s)))
     return (_continuation(d, T(x[1]), -s_lo, reach(s_lo), cap), _continuation(d, T(x[n]), s_hi, reach(s_hi), cap))
 end

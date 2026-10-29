@@ -4,6 +4,8 @@ using CairoMakie: CairoMakie
 using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes as CGEF
 using FlowGeometries: FlowGeometries
 
+CGEF.Visualization._plotting_loaded() = true
+
 """
     plot_Π_map(res, scale_idx, grid; colormap=:balance, title=nothing) -> Figure
 

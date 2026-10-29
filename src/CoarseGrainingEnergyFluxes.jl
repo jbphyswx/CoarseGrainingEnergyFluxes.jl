@@ -13,6 +13,7 @@ public ComputationalBackends
 public FlowGeometries
 public SpectralBackends
 
+include("Geometry.jl")
 include("Kernels.jl")
 include("Filtering.jl")
 include("Derivatives.jl")
@@ -23,6 +24,7 @@ include("Visualization.jl")
 using .Kernels: Kernels
 using .Filtering: Filtering
 using .Derivatives: Derivatives
+using .Geometry: Geometry
 using .Diagnostics: Diagnostics
 using .Pipeline: Pipeline
 using .Visualization: Visualization

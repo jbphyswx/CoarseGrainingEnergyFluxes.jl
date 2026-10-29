@@ -42,7 +42,7 @@ struct Deformable <: AbstractMaskStrategy end
 
 How the convolution is evaluated: [`RealSpace`](@ref) (physical-space footprint, any grid/mask) or
 [`Spectral`](@ref) (transform-space multiply, provided by extensions: an FFT on a uniform Cartesian
-grid, zero-padded along a bounded axis; spherical harmonics on a Clenshaw–Curtis sphere; a NUFFT or
+grid, zero-padded along a bounded axis; spherical harmonics on a Fejér first-rule sphere; a NUFFT or
 NUFSHT on scattered points).
 """
 abstract type AbstractFilterMethod end

@@ -18,7 +18,11 @@ function _cgef_continuum_moments(kern, D::Int; n = 200_000)
 end
 
 Test.@testset "Kernel weights and per-component second moments" begin
-    th = CGEF.TopHatKernel()
+    # The top-hat's profile is `CellCentre`'s weight; `CellOverlap`'s depends on a cell's shape, and a node
+    # set's points take the centre test.
+    th = CGEF.TopHatKernel(; cells = CGEF.Kernels.CellCentre())
+    Test.@test CGEF.Kernels.point_kernel(CGEF.TopHatKernel()) === th
+    Test.@test_throws MethodError CGEF.Kernels.kernel_weight(CGEF.TopHatKernel(), 0.1, 1.0)
     ℓ = 1.0
     Test.@test CGEF.Kernels.kernel_weight(th, 0.49ℓ, ℓ) == 1.0
     Test.@test CGEF.Kernels.kernel_weight(th, 0.51ℓ, ℓ) == 0.0
@@ -43,16 +47,28 @@ Test.@testset "Kernel weights and per-component second moments" begin
         Test.@test r2 / D ≈ x2 rtol = 1e-4
     end
 
+    # A smooth kernel's footprint ends where its weight falls to `truncation_tol(T)` of its peak, `1e-10` or
+    # `8 eps(T)` where the element type resolves less, to the rounding of the radius's inverse function there.
+    Test.@test CGEF.Kernels.truncation_tol(Float64) == 1e-10 && CGEF.Kernels.truncation_tol(Float32) == 8eps(Float32)
+    for T in (Float32, Float64), kern in (CGEF.GaussianKernel(), CGEF.Kernels.SmoothHatKernel(), CGEF.Kernels.HyperGaussianKernel())
+        tol = CGEF.Kernels.truncation_tol(T)
+        R = CGEF.Kernels.kernel_radius(kern, one(T))
+        Test.@test R isa T && isfinite(R)
+        Test.@test tol / 2 < CGEF.Kernels.kernel_weight(kern, R, one(T)) / CGEF.Kernels.kernel_weight(kern, zero(T), one(T)) < 2tol
+    end
+
     # Π is a pointwise transfer only for a non-negative kernel; the brick wall's inverse transform is
     # signed in every dimension.
     for kern in (th, CGEF.GaussianKernel(), CGEF.Kernels.SmoothHatKernel(), CGEF.Kernels.HyperGaussianKernel())
         R = CGEF.Kernels.kernel_radius(kern, 1.0)
         Test.@test all(r -> CGEF.Kernels.kernel_weight(kern, r, 1.0) >= 0, range(0.0, R; length = 2001))
+        Test.@test CGEF.Kernels.is_nonnegative(kern)
     end
     for D in 1:3
         Test.@test any(r -> CGEF.Kernels.kernel_weight(CGEF.SharpSpectralKernel(), r, 1.0, Val(D)) < 0,
                        range(0.0, 10.0; length = 2001))
     end
+    Test.@test !CGEF.Kernels.is_nonnegative(CGEF.SharpSpectralKernel())
 end
 
 # `SharpSpectralKernel` in real space is the inverse transform of its brick wall in the grid's own

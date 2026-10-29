@@ -20,9 +20,11 @@ run `using CairoMakie` to enable it.
 """
 function plot_spectrum end
 
+# Whether the CairoMakie extension, which defines the plotting methods, is loaded: `true` from it.
+_plotting_loaded() = false
+
 function _no_plot_method(name::Symbol, args)
-    loaded = Base.get_extension(parentmodule(@__MODULE__), :CoarseGrainingEnergyFluxesCairoMakieExt) !== nothing
-    throw(ArgumentError(loaded ?
+    throw(ArgumentError(_plotting_loaded() ?
         "$name has no method for $(map(typeof, args)); the CairoMakie extension plots a " *
         "`CoarseGrainResult` over a `StructuredGrid`." :
         "$name requires the CairoMakie extension — run `using CairoMakie`."))

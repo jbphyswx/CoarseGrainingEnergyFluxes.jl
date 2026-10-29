@@ -19,6 +19,60 @@ struct PhysicalFilterPlan{FP, G<:FlowGeometries.Grids.AbstractGrid, S<:AbstractM
 end
 
 """
+    AbstractEngine
+
+The real-space engine a [`plan_filter`](@ref) builds, its `engine` keyword: [`AutoEngine`](@ref), the
+default, or one named. [`PaddedFFTEngine`](@ref) and [`ZonalFFTEngine`](@ref) evaluate the footprint sum by
+transforms on a rectilinear grid, [`BinnedTopHatEngine`](@ref) and [`NUFFTSumEngine`](@ref) over Cartesian
+points, and [`FootprintEngine`](@ref) is the grid's own `build_footprint`.
+"""
+abstract type AbstractEngine end
+
+"""
+    AutoEngine()
+
+The engine [`_select_engine`](@ref) picks, once, at plan build.
+"""
+struct AutoEngine <: AbstractEngine end
+
+"""
+    PaddedFFTEngine()
+
+The footprint sum of any kernel on a uniform Cartesian grid by FFTs over the padded box.
+"""
+struct PaddedFFTEngine <: AbstractEngine end
+
+"""
+    ZonalFFTEngine()
+
+The footprint sum on a sphere of uniform longitude by FFTs along longitude, for weights that depend on
+the longitude offset alone.
+"""
+struct ZonalFFTEngine <: AbstractEngine end
+
+"""
+    BinnedTopHatEngine()
+
+The top-hat over Cartesian points by prefix sums over the point bins.
+"""
+struct BinnedTopHatEngine <: AbstractEngine end
+
+"""
+    NUFFTSumEngine()
+
+The kernel sum over Cartesian points by nonuniform FFTs, for a kernel with a transfer cutoff.
+"""
+struct NUFFTSumEngine <: AbstractEngine end
+
+"""
+    FootprintEngine()
+
+The grid's own real-space footprint, `build_footprint`: the banded, separable, prefix-sum, cell-by-cell or
+node engine its type selects.
+"""
+struct FootprintEngine <: AbstractEngine end
+
+"""
     plan_strategy(plan) -> AbstractMaskStrategy
 
 The mask strategy `plan` filters under. Every plan type defines a method.
@@ -36,6 +90,144 @@ plan_method(::PhysicalFilterPlan) = RealSpace()
 plan_method(::AbstractFilterPlan) = Spectral()
 
 """
+    AbstractSeriesForm
+
+What a plan's output is as a function of position, by [`series_form`](@ref): [`NoSeries`](@ref),
+[`Series`](@ref) or [`SeriesRatio`](@ref).
+"""
+abstract type AbstractSeriesForm end
+
+"""
+    NoSeries()
+
+A plan whose output has no series form at hand: a real-space footprint sum.
+"""
+struct NoSeries <: AbstractSeriesForm end
+
+"""
+    Series()
+
+A plan whose output is `ū(x) = Σ_k w_k Ĝ(k) F̂(k) e^{ik·x}`, `F̂` the analysis [`filter_analyze!`](@ref) writes.
+"""
+struct Series <: AbstractSeriesForm end
+
+"""
+    SeriesRatio()
+
+A plan whose output is `ū = N/M`, `N` the field's series and `M` its window mass's, both of
+[`Series`](@ref)'s form: a renormalized window.
+"""
+struct SeriesRatio <: AbstractSeriesForm end
+
+"""
+    series_form(plan) -> AbstractSeriesForm
+
+What `plan`'s output is; [`filter_synthesize_derivative!`](@ref) differentiates a [`Series`](@ref) or a
+[`SeriesRatio`](@ref).
+"""
+series_form(::AbstractFilterPlan) = NoSeries()
+series_form(::AbstractMaskStrategy) = NoSeries()
+
+# A spectral plan's form by its `Deformable` renormalization: none, or the reciprocal window mass.
+_ratio_form(::Nothing) = Series()
+_ratio_form(::AbstractArray) = SeriesRatio()
+
+"""
+    filter_synthesize_derivative!(out, F̂, ū, plan, d) -> out
+
+`∂ū/∂x_d` at the plan's points, `ū` the filtered field and `F̂` its field's analysis: the synthesis of
+`i k_d Ĝ F̂` for a [`Series`](@ref) plan, and for a [`SeriesRatio`](@ref) one the quotient rule,
+`(∂_d N − ū ∂_d M)/M`, with `∂_d M` synthesized once at plan build. A method per plan type whose
+[`series_form`](@ref) is not [`NoSeries`](@ref) and whose [`series_gradient`](@ref) is `nothing`; a sphere's
+plans differentiate through [`filter_synthesize_gradient!`](@ref).
+"""
+function filter_synthesize_derivative! end
+
+"""
+    series_gradient(plan) -> gradient state or nothing
+
+What [`filter_synthesize_gradient!`](@ref) reads beyond `plan` itself: on a sphere the spin-1 synthesis of
+the surface gradient, built here so that a plan used only to filter holds none; `nothing` for a plan whose
+[`filter_synthesize_derivative!`](@ref) needs nothing more.
+"""
+series_gradient(_) = nothing
+
+"""
+    filter_synthesize_gradient!(g1, g2, F̂, ū, plan, gradient) -> (g1, g2)
+
+`∂ū/∂x_1` and `∂ū/∂x_2` at the plan's points, as [`filter_synthesize_derivative!`](@ref) takes each;
+`gradient` is [`series_gradient(plan)`](@ref series_gradient). On a sphere the east and north components per
+unit distance, from one spin-1 synthesis of `ðū = ∂_n ū − i∂_e ū`.
+"""
+function filter_synthesize_gradient!(g1, g2, F̂, ū, plan, ::Nothing)
+    filter_synthesize_derivative!(g1, F̂, ū, plan, 1)
+    filter_synthesize_derivative!(g2, F̂, ū, plan, 2)
+    return g1, g2
+end
+
+"""
+    rate_plan(plan, kernel, scale) -> plan
+
+`plan` with its transfer replaced by `∂_ℓĜ` (`Kernels.TransferRate(kernel)`) at `scale`, everything else shared:
+its synthesis of an analysis `plan` writes is `∂_ℓN/M`, with `M` the window mass a renormalized `plan` divides
+by (`1` otherwise), so `∂_ℓū = synth(F̂) − ū · synth(M̂)`, `M̂` the analysis of a field of ones. A method per
+spectral plan type; [`rate_available`](@ref) answers where the kernel has the derivative.
+"""
+function rate_plan end
+
+"""
+    rate_available(plan, kernel) -> Bool
+
+Whether [`rate_plan`](@ref) serves `plan` with `kernel`: a spectral plan whose transfer the kernel differentiates
+in its width (`Kernels.has_transfer_rate` on the plane, `Kernels.has_degree_rate` on a sphere).
+"""
+rate_available(_plan, _kernel) = false
+
+"""
+    curvature_available(plan, kernel) -> Bool
+
+Whether `plan`'s filter has a second derivative in its width with `kernel`: [`rate_available`](@ref) of the
+first derivative's kernel, `Kernels.TransferRate(kernel)` for a spectral plan or a kernel sum and
+`Kernels.ScaleRate(kernel)` for a footprint sum.
+"""
+curvature_available(plan, kernel::Kernels.AbstractFilterKernel) = rate_available(plan, Kernels.TransferRate(kernel))
+
+"""
+    AbstractScaleRates
+
+[`plan_filter_sweep`](@ref)'s `scale_rates`: [`ScaleRates`](@ref) to build each real-space plan's
+[`scale_rate`](@ref) with the family, [`ScaleCurvatures`](@ref) to build its second derivative as well,
+[`NoScaleRates`](@ref) (the default) to leave them to the sweep.
+"""
+abstract type AbstractScaleRates end
+
+"""
+    NoScaleRates()
+
+A family holding no [`scale_rate`](@ref)s; a sweep's exact filtering spectrum builds them per call.
+"""
+struct NoScaleRates <: AbstractScaleRates end
+
+"""
+    ScaleRates()
+
+A family holding each plan's [`scale_rate`](@ref), built once with it. Every plan must be a real-space plan
+whose kernel has a derivative in its width ([`rate_available`](@ref)).
+"""
+struct ScaleRates <: AbstractScaleRates end
+
+"""
+    ScaleCurvatures()
+
+A family holding each plan's [`scale_rate`](@ref) with its second derivative in the width, which a sweep's
+spectral slopes read. Every plan must be a real-space plan whose kernel has both
+([`curvature_available`](@ref)).
+"""
+struct ScaleCurvatures <: AbstractScaleRates end
+
+_family_rates(::NoScaleRates, _plans) = nothing
+
+"""
     plan_execution(plan) -> AbstractExecutionBackend
 
 The execution backend `plan` was built for, whose memory its inputs and outputs live in. Every plan
@@ -43,6 +235,23 @@ type defines a method.
 """
 function plan_execution end
 plan_execution(plan::PhysicalFilterPlan) = plan.execution
+
+"""
+    analysis_status(plan) -> (; converged, iterations, residual)
+    analysis_status(workspace) -> (; converged, iterations, residual)
+
+The outcome of the analysis of `plan`'s last apply. A plan whose analysis is a least-squares fit (NUFSHT's
+over a spherical node set) passes on the fitting library's report, combined with its mask's fit: a fit that
+stops short still writes its coefficients, and is reported here. Every other plan's analysis is exact,
+`(true, 0, 0)`. A diagnostic workspace reports the worst of the [`LeastSquares`](@ref) fits its generalized
+convolution has run.
+"""
+analysis_status(::AbstractFilterPlan) = AnalysisStatus{Float64}((true, 0, 0.0))
+
+const AnalysisStatus{T} = @NamedTuple{converged::Bool, iterations::Int, residual::T}
+_exact_status(::Type{T}) where {T} = AnalysisStatus{T}((true, 0, zero(T)))
+_combine_status(a::AnalysisStatus{T}, b::AnalysisStatus{T}) where {T} =
+    AnalysisStatus{T}((a.converged & b.converged, max(a.iterations, b.iterations), max(a.residual, b.residual)))
 
 """
     prepare_workspace(backend, grid, footprint) -> workspace
@@ -71,13 +280,15 @@ end
     plan_filter(grid, kernel, scale; mask_strategy = ZeroFill(), execution = AutoBackend(),
                 method = RealSpace(), transform = AutoSpectralBackend(),
                 cache_strategy = AutoCache(), cache_byte_budget = default_cache_byte_budget(),
-                grid_plan = nothing, scratch = nothing) -> AbstractFilterPlan
+                grid_plan = nothing, scratch = nothing, fft_options = (;)) -> AbstractFilterPlan
 
 A reusable filter plan for `execution`, applied by `filter_apply!(out, field, plan)`: the real-space
 footprint, or under `method = Spectral()` the transform plan. A spectral plan also takes `batch = nb`
-for a trailing batch axis and, over a spherical node set, `nufft`, the NUFFT library NUFSHT runs; a
-keyword the method does not take raises an `ArgumentError`. `grid_plan` and `scratch` are the parts a
-sweep shares; see [`plan_filter_sweep`](@ref).
+for a trailing batch axis and, over a spherical node set, `nufft`, the NUFFT library NUFSHT runs, and
+`analysis` ([`AbstractAnalysis`](@ref)); a keyword the method does not take raises an `ArgumentError`.
+`grid_plan` and `scratch` are the parts a sweep shares; see [`plan_filter_sweep`](@ref). `fft_options` are
+the planner keywords of the FFTs the plan makes (the spectral FFT filter, the padded and zonal FFT engines),
+passed to the FFT library's `plan_*` as they stand, e.g. `(; flags = FFTW.MEASURE)` under FFTW.
 
 A transform runs on 1 thread under `SerialBackend()` and on `Threads.nthreads()` under
 `ThreadedBackend()`, `AutoBackend()` and `GPUBackend()`, in the device's memory under the last.
@@ -101,6 +312,8 @@ function plan_filter(
     cache_byte_budget::Integer = default_cache_byte_budget(),
     grid_plan::Union{Nothing,AbstractGridPlan} = nothing,
     scratch::Union{Nothing,AbstractFilterScratch} = nothing,
+    engine::AbstractEngine = AutoEngine(),
+    fft_options::NamedTuple = (;),
     kwargs...,
 ) where {G<:FlowGeometries.Geometry.AbstractGeometry{T}} where {T<:AbstractFloat}
     _validate_scale(scale)
@@ -108,23 +321,15 @@ function plan_filter(
         return spectral_filter_plan(
             transform, grid, kernel, scale;
             mask_strategy = mask_strategy, execution = execution,
-            grid_plan = grid_plan, scratch = scratch, kwargs...,
+            grid_plan = grid_plan, scratch = scratch, _fft_keywords(fft_options)..., kwargs...,
         )
     end
     isempty(kwargs) || _unused_keywords(kwargs, method)
     resolved = _resolve_backend(execution, grid)
     _check_backend_compatible(grid, execution)
-    # The transform engines run on the host (see `_driven_footprint`); a device, distributed or MPI plan
-    # takes the direct engine.
-    host = _host_backend(resolved)
-    fp = if host && _takes_padded_fft(grid, kernel, scale)
-        padded_fft_footprint(grid, kernel, scale; mask_strategy = mask_strategy, threads = _library_threads(resolved))
-    elseif host && _takes_zonal_fft(grid, kernel, scale)
-        zonal_fft_footprint(grid, kernel, scale; mask_strategy = mask_strategy, threads = _library_threads(resolved))
-    else
-        build_footprint(grid, kernel, scale; mask_strategy = mask_strategy,
-            cache_strategy = cache_strategy, cache_byte_budget = cache_byte_budget,
-            grid_plan = grid_plan, scratch = scratch)
-    end
-    return PhysicalFilterPlan(prepare_workspace(resolved, grid, fp), grid, mask_strategy, kernel, scale, resolved)
+    return _physical_plan(
+        resolved, engine, grid, kernel, scale, mask_strategy,
+        (; mask_strategy = mask_strategy, cache_strategy = cache_strategy, cache_byte_budget = cache_byte_budget,
+           grid_plan = grid_plan, scratch = scratch, _fft_keywords(fft_options)...),
+    )
 end

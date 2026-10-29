@@ -15,28 +15,46 @@
 # ---------------------------------------------------------------------------
 
 """
-    PrefixSum3DScratch{T,A} <: AbstractFilterScratch
+    PrefixSum3DScratch{T,A,VV} <: AbstractFilterScratch
 
-The 3-D top-hat engine's per-apply buffer: the axis-1 [`CompensatedScan`](@ref) of `mask · field`,
-sized `(Nx+1, Ny, Nz)`. Refilled at the start of every apply, so one copy serves a whole sweep.
+The 3-D top-hat engine's per-apply buffers: the axis-1 [`CompensatedScan`](@ref) of `mask · field`,
+sized `(Nx+1, Ny, Nz)`, and the cells' values `mask · field` (`cell_values`, `Nx × Ny × Nz`), which the
+cells the ball's boundary cuts read; `nothing` under [`Kernels.CellCentre`](@ref). Refilled at the start
+of every apply.
 """
-struct PrefixSum3DScratch{T<:AbstractFloat, A<:AbstractArray{T,3}} <: AbstractFilterScratch
+struct PrefixSum3DScratch{
+    T<:AbstractFloat, A<:AbstractArray{T,3}, VV<:Union{Nothing,AbstractArray{T,3}},
+} <: AbstractFilterScratch
     prefix::CompensatedScan{T,A}
+    cell_values::VV
 end
 
 """
-    PrefixSumTopHat3DPlan{T,SC,A,WT,MS}
+    PrefixEdgeCells3D{VO,VT}
+
+The cells the support of a [`Kernels.CellOverlap`](@ref) top-hat cuts on a uniform 3-D grid: tap `s` at offset
+`offsets[s]` with weight `w[s]`, the cell's fraction inside the support, applied to the cell's scanned value.
+"""
+struct PrefixEdgeCells3D{VO<:AbstractVector{NTuple{3,Int}}, VT<:AbstractVector}
+    offsets::VO
+    w::VT
+end
+
+"""
+    PrefixSumTopHat3DPlan{T,SC,A,WT,MS,RM}
 
 Exact `O(N·w_y·w_z)` top-hat footprint for a uniform 3-D Cartesian `StructuredGrid`.
 
 `wcell` is the `(2·dj_lim+1) × (2·dk_lim+1)` table of the ball's axis-1 half-width at each offset
-`(dj, dk)`, `-1` where that slice is empty; on a uniform grid it is the same at every point.
+`(dj, dk)`, `-1` where that slice is empty; on a uniform grid it is the same at every point. Under
+[`Kernels.CellOverlap`](@ref) it is the half-width of the cells wholly inside, and `edge` the
+[`PrefixEdgeCells3D`](@ref) of those the boundary cuts; `nothing` under [`Kernels.CellCentre`](@ref).
 
 `invden` is the reciprocal window mass, built once per scale under `strategy`.
 """
 struct PrefixSumTopHat3DPlan{
     T<:AbstractFloat, SC<:PrefixSum3DScratch{T}, A<:AbstractArray{T,3},
-    WT<:AbstractMatrix{Int}, MS<:AbstractMaskStrategy,
+    WT<:AbstractMatrix{Int}, MS<:AbstractMaskStrategy, RM<:Union{Nothing,PrefixEdgeCells3D},
 }
     scratch::SC
     rad::T
@@ -48,25 +66,30 @@ struct PrefixSumTopHat3DPlan{
     strategy::MS
     wcell::WT      # axis-1 half-width per (dj, dk); -1 where that slice of the ball is empty
     invden::A      # 1/(window mass); zero where empty or, under Deformable, at an inactive target
+    edge::RM
 end
 
-function _prefixsum3d_scratch(grid::FlowGeometries.Grids.StructuredGrid{T,G,3}) where {T,G}
+function _prefixsum3d_scratch(grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, kernel::Kernels.TopHatKernel) where {T,G}
     Nx, Ny, Nz = FlowGeometries.Grids.size_tuple(grid)
-    return PrefixSum3DScratch(CompensatedScan(T, Nx + 1, Ny, Nz))
+    return PrefixSum3DScratch(CompensatedScan(T, Nx + 1, Ny, Nz), _cell_values_3d(T, kernel, Nx, Ny, Nz))
 end
+
+_cell_values_3d(::Type, ::Kernels.TopHatKernel{Kernels.CellCentre}, _, _, _) = nothing
+_cell_values_3d(::Type{T}, ::Kernels.TopHatKernel{Kernels.CellOverlap}, Nx, Ny, Nz) where {T} = Array{T,3}(undef, Nx, Ny, Nz)
 
 """
-    _prefixsum3d_fill_plane!(P, src, grid, masked, j, k) -> nothing
+    _prefixsum3d_fill_plane!(sc, src, grid, masked, j, k) -> nothing
 
-Compensated scan along axis 1 of `src` for one `(j, k)` plane, with entry 1 the empty prefix. Writes
-only that plane's column, so planes may be filled concurrently.
+Compensated scan along axis 1 of `src` for one `(j, k)` plane into `sc.prefix`, with entry 1 the empty
+prefix, and the plane's values into `sc.cell_values` where it holds them. Writes only that plane, so
+planes may be filled concurrently.
 """
 @inline function _prefixsum3d_fill_plane!(
-    P::CompensatedScan{T}, src::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
+    sc::PrefixSum3DScratch{T}, src::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
     masked::Bool, j::Integer, k::Integer,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     Nx = FlowGeometries.Grids.size_tuple(grid)[1]
-    Ph, Pl = P.hi, P.lo
+    Ph, Pl = sc.prefix.hi, sc.prefix.lo
     h = l = zero(T)
     @inbounds begin
         Ph[1, j, k] = h
@@ -78,16 +101,25 @@ only that plane's column, so planes may be filled concurrently.
             Pl[i + 1, j, k] = l
         end
     end
+    _store_plane_values!(sc.cell_values, src, grid, masked, j, k)
+    return nothing
+end
+
+@inline _store_plane_values!(::Nothing, src, grid, masked, j, k) = nothing
+@inline function _store_plane_values!(V::AbstractArray{T,3}, src, grid, masked::Bool, j, k) where {T}
+    @inbounds for i in axes(V, 1)
+        V[i, j, k] = (masked && !FlowGeometries.Grids.isactive(grid, i, j, k)) ? zero(T) : T(src[i, j, k])
+    end
     return nothing
 end
 
 function _prefixsum3d_fill!(
-    P::CompensatedScan{T}, src::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
+    sc::PrefixSum3DScratch{T}, src::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
     masked::Bool,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _, Ny, Nz = FlowGeometries.Grids.size_tuple(grid)
     for k in 1:Nz, j in 1:Ny
-        _prefixsum3d_fill_plane!(P, src, grid, masked, j, k)
+        _prefixsum3d_fill_plane!(sc, src, grid, masked, j, k)
     end
     return nothing
 end
@@ -164,7 +196,7 @@ end
 
 function _build_prefixsum_tophat_3d(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
-    kernel::Kernels.TopHatKernel,
+    kernel::Kernels.TopHatKernel{Kernels.CellCentre},
     scale::T;
     mask_strategy::AbstractMaskStrategy = ZeroFill(),
     scratch::Union{Nothing,PrefixSum3DScratch} = nothing,
@@ -175,7 +207,7 @@ function _build_prefixsum_tophat_3d(
     dx = step(FlowGeometries.Grids.coordinates(grid, 1))
     dy = step(FlowGeometries.Grids.coordinates(grid, 2))
     dz = step(FlowGeometries.Grids.coordinates(grid, 3))
-    periodic = ntuple(d -> FlowGeometries.Grids.isperiodic(grid, d), 3)
+    periodic = ntuple(d -> FlowGeometries.Grids.isperiodic(grid, d), Val(3))
     # A periodic direction tiles, so the ball reaches a plane through each of its images and the band
     # count is not capped at the axis.
     dj_lim = dy > 0 ? (periodic[2] ? ceil(Int, rad / dy) : min(Ny - 1, ceil(Int, rad / dy))) : 0
@@ -189,7 +221,7 @@ function _build_prefixsum_tophat_3d(
         wcell[dj + dj_lim + 1, dk + dk_lim + 1] = dx > 0 ? floor(Int, sqrt(rem2) / dx) : 0
     end
 
-    sc = scratch === nothing ? _prefixsum3d_scratch(grid) : scratch
+    sc = scratch === nothing ? _prefixsum3d_scratch(grid, kernel) : scratch
     masked = !all(FlowGeometries.Grids.mask(grid))
 
     # Window mass, in cells: `ZeroFill` counts every in-support cell and the exterior ones past a bounded
@@ -204,7 +236,7 @@ function _build_prefixsum_tophat_3d(
         end
     end
     P = sc.prefix
-    _prefixsum3d_fill!(P, mass, grid, false)
+    _prefixsum3d_fill!(sc, mass, grid, false)
     den = zeros(T, Nx, Ny, Nz)
     for k in 1:Nz, j in 1:Ny
         oc = view(den, :, j, k)
@@ -219,7 +251,121 @@ function _build_prefixsum_tophat_3d(
     end
 
     bound = masked || _reaches_exterior(grid, kernel, scale)
-    return PrefixSumTopHat3DPlan(sc, rad, dj_lim, dk_lim, periodic, masked, bound, mask_strategy, wcell, den)
+    return PrefixSumTopHat3DPlan(sc, rad, dj_lim, dk_lim, periodic, masked, bound, mask_strategy, wcell, den, nothing)
+end
+
+"""
+    _build_prefixsum_tophat_3d(grid, kernel::TopHatKernel{CellOverlap}, scale; ...) -> PrefixSumTopHat3DPlan
+
+The 3-D prefix-sum top-hat with each cell weighted by its fraction inside the ball: per `(dj, dk)` the
+half-width of the cells wholly inside about the target, and a tap for every cell the ball's boundary cuts.
+`ZeroFill` divides by the ball's measure where a window leaves the grid, and by the summed weights elsewhere.
+"""
+function _build_prefixsum_tophat_3d(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
+    kernel::Kernels.TopHatKernel{Kernels.CellOverlap},
+    scale::T;
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
+    scratch::Union{Nothing,PrefixSum3DScratch{T,<:Any,<:AbstractArray}} = nothing,
+    kwargs...,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    Nx, Ny, Nz = FlowGeometries.Grids.size_tuple(grid)
+    rad = Kernels.kernel_radius(kernel, scale)
+    Δ = ntuple(d -> abs(T(step(FlowGeometries.Grids.coordinates(grid, d)))), Val(3))
+    ov = _overlap_rule(FlowGeometries.Grids.grid_geometry(grid), rad)
+    periodic = ntuple(d -> FlowGeometries.Grids.isperiodic(grid, d), Val(3))
+    reach(d, n) = Δ[d] > 0 ? (periodic[d] ? ceil(Int, rad / Δ[d] + T(1) / 2) : min(n - 1, ceil(Int, rad / Δ[d] + T(1) / 2))) : 0
+    dj_lim, dk_lim = reach(2, Ny), reach(3, Nz)
+    di_max = periodic[1] ? typemax(Int) - 1 : Nx - 1
+
+    wcell = fill(-1, 2 * dj_lim + 1, 2 * dk_lim + 1)
+    offsets = NTuple{3,Int}[]
+    w = T[]
+    fr = _overlap_float(T)[]
+    for dk in (-dk_lim):dk_lim, dj in (-dj_lim):dj_lim
+        empty!(fr)
+        for di in 0:di_max
+            f = _lattice_fraction(ov, CartesianIndex(di, dj, dk), Δ)
+            iszero(f) && break
+            push!(fr, f)
+        end
+        wf = 0
+        while wf < length(fr) && isone(fr[wf + 1])
+            wf += 1
+        end
+        wcell[dj + dj_lim + 1, dk + dk_lim + 1] = wf - 1
+        for di in wf:(length(fr) - 1)
+            push!(offsets, (di, dj, dk)); push!(w, T(fr[di + 1]))
+            di > 0 && (push!(offsets, (-di, dj, dk)); push!(w, T(fr[di + 1])))
+        end
+    end
+    edge = PrefixEdgeCells3D(offsets, w)
+
+    sc = scratch === nothing ? _prefixsum3d_scratch(grid, kernel) : scratch
+    masked = !all(FlowGeometries.Grids.mask(grid))
+    zerofill = mask_strategy isa ZeroFill
+    mass = Array{T,3}(undef, Nx, Ny, Nz)
+    if zerofill
+        fill!(mass, one(T))
+    else
+        @inbounds for k in 1:Nz, j in 1:Ny, i in 1:Nx
+            mass[i, j, k] = FlowGeometries.Grids.isactive(grid, i, j, k) ? one(T) : zero(T)
+        end
+    end
+    P = sc.prefix
+    _prefixsum3d_fill!(sc, mass, grid, false)
+    den = zeros(T, Nx, Ny, Nz)
+    for k in 1:Nz, j in 1:Ny
+        oc = view(den, :, j, k)
+        _prefixsum3d_plane!(oc, P, wcell, dj_lim, dk_lim, periodic, Nx, Ny, Nz, j, k)
+        _prefixsum3d_edge!(oc, sc.cell_values, edge, periodic, Nx, Ny, Nz, j, k)
+    end
+    # The scan sums cells, so the support's measure enters in cells.
+    zerofill && _full_support(grid, kernel, scale) &&
+        fill!(den, _support_measure(grid, kernel, scale, 1) / FlowGeometries.Grids.area(grid, 1, 1, 1))
+    @inbounds for k in 1:Nz, j in 1:Ny, i in 1:Nx
+        keep = zerofill || FlowGeometries.Grids.isactive(grid, i, j, k)
+        den[i, j, k] = keep ? _inv_mass(den[i, j, k]) : zero(T)
+    end
+    bound = masked || _reaches_exterior(grid, kernel, scale)
+    return PrefixSumTopHat3DPlan(sc, rad, dj_lim, dk_lim, periodic, masked, bound, mask_strategy, wcell, den, edge)
+end
+
+# Add the edge taps' contributions to output plane `(j, k)` from the cells' values `V`. Nothing under
+# `CellCentre`.
+@inline _prefixsum3d_edge!(oc, V, ::Nothing, periodic, Nx, Ny, Nz, j, k) = oc
+
+@inline function _prefixsum3d_edge!(
+    oc::AbstractVector{T}, V::AbstractArray{T,3}, edge::PrefixEdgeCells3D, periodic::NTuple{3,Bool},
+    Nx::Int, Ny::Int, Nz::Int, j::Int, k::Int,
+) where {T<:AbstractFloat}
+    @inbounds for s in eachindex(edge.offsets)
+        di, dj, dk = edge.offsets[s]
+        jj, kk = j + dj, k + dk
+        if jj < 1 || jj > Ny
+            periodic[2] || continue
+            jj = mod1(jj, Ny)
+        end
+        if kk < 1 || kk > Nz
+            periodic[3] || continue
+            kk = mod1(kk, Nz)
+        end
+        ws = T(edge.w[s])
+        if !periodic[1]
+            @simd for i in max(1, 1 - di):min(Nx, Nx - di)
+                oc[i] += ws * V[i + di, jj, kk]
+            end
+        else
+            r = mod(di, Nx)
+            @simd for i in 1:(Nx - r)
+                oc[i] += ws * V[i + r, jj, kk]
+            end
+            @simd for i in (Nx - r + 1):Nx
+                oc[i] += ws * V[i + r - Nx, jj, kk]
+            end
+        end
+    end
+    return oc
 end
 
 @noinline function _prefixsum3d_strategy_mismatch()
@@ -251,6 +397,7 @@ mass. Writes only that plane, so planes may run concurrently.
         oc[i] = zero(T)
     end
     _prefixsum3d_plane!(oc, fp.scratch.prefix, fp.wcell, fp.dj_lim, fp.dk_lim, fp.periodic, Nx, Ny, Nz, j, k)
+    _prefixsum3d_edge!(oc, fp.scratch.cell_values, fp.edge, fp.periodic, Nx, Ny, Nz, j, k)
     invden = fp.invden
     @inbounds @simd for i in 1:Nx
         oc[i] *= invden[i, j, k]
@@ -265,7 +412,7 @@ function apply_prefixsum_tophat_3d!(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _prefixsum3d_check_strategy(fp, strategy)
     _, Ny, Nz = FlowGeometries.Grids.size_tuple(grid)
-    _prefixsum3d_fill!(fp.scratch.prefix, field, grid, fp.masked)
+    _prefixsum3d_fill!(fp.scratch, field, grid, fp.masked)
     for k in 1:Nz, j in 1:Ny
         _prefixsum3d_out_plane!(out, fp, j, k)
     end
@@ -278,262 +425,12 @@ apply_footprint!(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
     apply_prefixsum_tophat_3d!(out, field, grid, fp, strategy)
 
-# More specific in the kernel than the generic 3-D `Range`-axis method, so a top-hat on a uniform
+# More specific in the kernel than the generic 3-D uniform-axis method, so a top-hat on a uniform
 # Cartesian volume dispatches here.
-build_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,3,S,TP,<:Tuple{AbstractRange,AbstractRange,AbstractRange}},
+_structured_footprint(
+    ::NTuple{3,FlowGeometries.Axes.UniformSpacing}, grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
     kernel::Kernels.TopHatKernel, scale::T; kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, S, TP<:NTuple{3,FlowGeometries.Grids.AbstractTopology}} =
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
     _build_prefixsum_tophat_3d(grid, kernel, scale; kwargs...)
 
-# Cell-by-cell engine for the 1-D and 3-D grids no more specific method takes: a plain
-# `AbstractVector` axis, or a non-Cartesian geometry.
-build_footprint(grid::FlowGeometries.Grids.StructuredGrid{T,G,1}, kernel::Kernels.AbstractFilterKernel, scale::T; kwargs...) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
-    _build_footprint_nd_scattered(grid, kernel, scale; kwargs...)
-build_footprint(grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, kernel::Kernels.AbstractFilterKernel, scale::T; kwargs...) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}} =
-    _build_footprint_nd_scattered(grid, kernel, scale; kwargs...)
 
-"""
-    NDScatteredCache{N, T}
-
-The full per-target-point neighbour list for an [`NDScatteredFilterPlan`](@ref) (absolute neighbour
-multi-indices + weights), built only when the plan's [`AbstractCacheStrategy`](@ref) calls for it.
-"""
-struct NDScatteredCache{N, T<:AbstractFloat, VO<:AbstractVector{NTuple{N,Int}}, VT<:AbstractVector{T}, VI<:AbstractVector{Int}}
-    nbrs::VO
-    w::VT
-    ptr::VI   # target t = LinearIndices(dims)[I]; entries ptr[t]:ptr[t+1]-1
-end
-
-"""
-    NDScatteredFilterPlan{N, T, K, C, MT}
-
-N-D (1D or 3D) analog of [`ScatteredFilterPlan`](@ref), for a grid with no translation-invariant
-footprint, such as one with a plain `AbstractVector` axis: the kernel, the support radius, the
-per-axis index window `lim` at the worst cell, and the grid's ball-query topology. `cache` holds the
-[`NDScatteredCache`](@ref) when the plan's cache strategy builds one, `nothing` otherwise (apply-time
-recomputation). `exterior` is the mass past a bounded edge that `ZeroFill` adds to each point's
-denominator, or `nothing`. `weights` is the rule a cell's weight comes from, [`RadialWeights`](@ref)
-or [`HighOrderWeights`](@ref).
-"""
-struct NDScatteredFilterPlan{
-    N, T<:AbstractFloat, K<:Kernels.AbstractFilterKernel, C<:Union{Nothing,NDScatteredCache{N,T}}, MT,
-    EX<:Union{Nothing,AbstractArray{T,N}}, W,
-}
-    kernel::K
-    scale::T
-    rad::T
-    lim::NTuple{N,Int}
-    cache::C
-    topology::MT   # built once; the cache build and the streaming apply both query through it
-    exterior::EX
-    weights::W
-end
-
-# Entries of an N-D cache, counted in target order, stopping once past `limit`.
-function _count_nd_scattered(grid, rad, mt, limit::Int)
-    n = 0
-    for I in CartesianIndices(FlowGeometries.Grids.size_tuple(grid))
-        n = _nd_foldl((m, _, _) -> m + 1, n, grid, Tuple(I), rad, mt)
-        n > limit && break
-    end
-    return n
-end
-
-# The N-D cache, `n` entries from `_count_nd_scattered`, filled in linear target order.
-function _fill_nd_scattered(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, rule::RadialWeights, rad, mt, n::Int,
-) where {T, G, N}
-    dims = FlowGeometries.Grids.size_tuple(grid)
-    nbrs = Vector{NTuple{N,Int}}(undef, n)
-    w = Vector{T}(undef, n)
-    ptr = Vector{Int}(undef, prod(dims) + 1)
-    ptr[1] = 1
-    k = 0
-    for (t, I) in enumerate(CartesianIndices(dims))
-        Ti = Tuple(I)
-        k = _nd_foldl(k, grid, Ti, rad, mt) do m, J, d
-            m += 1
-            nbrs[m] = J
-            w[m] = last(_cell_weight(rule, grid, t, Ti, J, d))
-            m
-        end
-        ptr[t + 1] = k + 1
-    end
-    return NDScatteredCache(nbrs, w, ptr)
-end
-
-# An N-D cell-by-cell plan's neighbour cache (or `nothing`), its mass past a bounded edge (or `nothing`)
-# and its weight rule, as `_scattered_parts` gives them in two dimensions.
-function _nd_scattered_parts(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::Kernels.AbstractFilterKernel, scale::T,
-    rad, mt, strategy, budget,
-) where {T, G, N}
-    rule = RadialWeights(kernel, scale, Val(N))
-    n = _cache_entries(strategy, budget, _cache_entry_bytes(Val(N), T)) do limit
-        _count_nd_scattered(grid, rad, mt, limit)
-    end
-    cache = n === nothing ? nothing : _fill_nd_scattered(grid, rule, rad, mt, n)
-    return cache, _exterior_mass(grid, kernel, scale), rule
-end
-
-function _nd_scattered_parts(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::Kernels.HighOrderKernel, scale::T,
-    rad, mt, strategy, budget,
-) where {T, G, N}
-    fold = (f, acc, I) -> _nd_foldl(f, acc, grid, I, rad, mt)
-    keep = _cache_keep(strategy, budget, _cache_entry_bytes(Val(N), T))
-    weights, exterior, kept = _highorder_targets(grid, kernel, scale, rad, fold, _ho_lattice(grid, rad), keep)
-    cache = kept === nothing ? nothing : NDScatteredCache(kept...)
-    return cache, exterior, weights
-end
-
-function _build_footprint_nd_scattered(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
-    kernel::Kernels.AbstractFilterKernel,
-    scale::T;
-    cache_strategy::AbstractCacheStrategy = AutoCache(),
-    cache_byte_budget::Integer = default_cache_byte_budget(),
-    kwargs...,   # absorbs and ignores the other engines' keywords, such as `mask_strategy`
-) where {N, T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    rad = _query_radius(grid, kernel, scale)
-    # Per-axis index bound at the worst cell; the traversal is the grid's.
-    lim = FlowGeometries.Connectivity.metric_window(grid, rad)
-    mt = _query_topology(grid, rad)
-    cache, exterior, weights = _nd_scattered_parts(grid, kernel, scale, rad, mt, cache_strategy, cache_byte_budget)
-    # `cache` and `exterior` are typed `Union{Nothing,…}`, so the plan's type depends on the grid and
-    # the kernel alone.
-    return NDScatteredFilterPlan{
-        N, T, typeof(kernel),
-        Union{Nothing,NDScatteredCache{N,T,Vector{NTuple{N,Int}},Vector{T},Vector{Int}}}, typeof(mt),
-        Union{Nothing,Array{T,N}}, typeof(weights),
-    }(kernel, scale, rad, lim, cache, mt, exterior, weights)
-end
-
-# Folds `acc = f(acc, J, d)` over every in-support neighbour of `Ti`, the centre included, through the
-# grid's own ball query. A periodic Cartesian direction tiles, so each image of a cell inside the
-# support comes at its own displacement; a periodic angle identifies, so its cells come once.
-@inline _nd_foldl(
-    f::F, acc, grid::FlowGeometries.Grids.StructuredGrid, Ti::NTuple{N,Int}, rad, mt,
-) where {F, N} = FlowGeometries.Connectivity.fold_within(
-    f, acc, grid, Ti...;
-    ball = rad, self = true, active_only = false, topology = mt, images = _image_convention(grid),
-)
-
-@inline _image_convention(grid::FlowGeometries.Grids.StructuredGrid) =
-    _image_convention(FlowGeometries.Grids.grid_geometry(grid))
-@inline _image_convention(::FlowGeometries.Geometry.AbstractCartesianGeometry) =
-    FlowGeometries.Connectivity.AllImages()
-@inline _image_convention(::FlowGeometries.Geometry.AbstractGeometry) =
-    FlowGeometries.Connectivity.NearestImage()
-
-# The two point functions below return zero at a target the strategy skips, so a caller evaluates them
-# at every point. The parallel backend extensions call them too.
-@inline function _footprint_nd_point_cached(
-    field::AbstractArray, cache::NDScatteredCache{N,T}, exterior, strategy::AbstractMaskStrategy,
-    mask, lin::LinearIndices{N}, I::CartesianIndex{N},
-) where {N, T<:AbstractFloat}
-    _filters_target(strategy, @inbounds mask[I]) || return zero(T)
-    t = lin[I]
-    lo = cache.ptr[t]
-    hi = cache.ptr[t+1] - 1
-    ws = zero(T)
-    wn = zero(T)
-    zerofill = strategy isa ZeroFill
-    @inbounds for k in lo:hi
-        J = cache.nbrs[k]
-        active = mask[J...]
-        wk = cache.w[k]
-        if zerofill
-            wn += wk
-            active && (ws += wk * field[J...])
-        elseif active
-            wn += wk
-            ws += wk * field[J...]
-        end
-    end
-    zerofill && (wn = _add_exterior(wn, exterior, I))
-    return _normalized(ws, wn)
-end
-
-# Per-point recompute without a cache, over the enumeration the cache builder uses. The accumulator
-# travels through the fold's return value, so the closure mutates no captured variable.
-function _footprint_nd_point_streaming(
-    field::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, fp::NDScatteredFilterPlan{N,T},
-    strategy::AbstractMaskStrategy, mask, I::CartesianIndex{N},
-) where {N, T<:AbstractFloat, G}
-    _filters_target(strategy, @inbounds mask[I]) || return zero(T)
-    rule = fp.weights
-    Ti = Tuple(I)
-    t = LinearIndices(FlowGeometries.Grids.size_tuple(grid))[I]
-    zerofill = strategy isa ZeroFill
-    ws, wn = _nd_foldl((zero(T), zero(T)), grid, Ti, fp.rad, fp.topology) do acc, J, d
-        s, n = acc
-        active = mask[J...]
-        wk = last(_cell_weight(rule, grid, t, Ti, J, d))
-        if zerofill
-            return (active ? s + wk * field[J...] : s, n + wk)
-        else
-            active || return acc
-            return (s + wk * field[J...], n + wk)
-        end
-    end
-    zerofill && (wn = _add_exterior(wn, fp.exterior, I))
-    return _normalized(ws, wn)
-end
-
-function apply_footprint_nd!(
-    out::AbstractArray{T,N},
-    field::AbstractArray,
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
-    fp::NDScatteredFilterPlan{N,T},
-    strategy::AbstractMaskStrategy,
-) where {N, T<:AbstractFloat, G}
-    dims = FlowGeometries.Grids.size_tuple(grid)
-    mask = FlowGeometries.Grids.mask(grid)
-    if fp.cache !== nothing
-        lin = LinearIndices(dims)
-        cache = fp.cache
-        @inbounds for I in CartesianIndices(out)
-            out[I] = _footprint_nd_point_cached(field, cache, fp.exterior, strategy, mask, lin, I)
-        end
-    else
-        @inbounds for I in CartesianIndices(out)
-            out[I] = _footprint_nd_point_streaming(field, grid, fp, strategy, mask, I)
-        end
-    end
-    return out
-end
-
-"""
-    NodeFilterPlan{T}
-
-Real-space filter footprint for a node set: per-node CSR neighbour blocks (`nbrs`, `w`, offsets `ptr`)
-with their geometric weights `w = kernel_weight(d) · control volume`, found once at plan time.
-
-Each node's block includes the node itself, which `Connectivity.neighbors_within` leaves out.
-"""
-struct NodeFilterPlan{T<:AbstractFloat, VI<:AbstractVector{Int}, VT<:AbstractVector{T}}
-    nbrs::VI
-    w::VT
-    ptr::VI
-end
-
-_apply_serial!(out, field, grid, fp::FilterFootprint, strategy) =
-    apply_footprint!(out, field, grid, fp, strategy, FlowGeometries.Grids.isperiodic(grid, 1), FlowGeometries.Grids.isperiodic(grid, 2))
-_apply_serial!(out, field, grid, fp::ScatteredFilterPlan, strategy) =
-    apply_footprint!(out, field, grid, fp, strategy, FlowGeometries.Grids.isperiodic(grid, 1), FlowGeometries.Grids.isperiodic(grid, 2))
-_apply_serial!(out, field, grid, fp::FilterFootprintND, strategy) =
-    apply_footprint_nd!(out, field, grid, fp, strategy)
-_apply_serial!(out, field, grid, fp::NDScatteredFilterPlan, strategy) =
-    apply_footprint_nd!(out, field, grid, fp, strategy)
-_apply_serial!(out, field, grid, fp::PrefixSumTopHatPlan, strategy) =
-    apply_prefixsum_tophat!(out, field, grid, fp, strategy)
-_apply_serial!(out, field, grid, fp::PrefixSumTopHat3DPlan, strategy) =
-    apply_prefixsum_tophat_3d!(out, field, grid, fp, strategy)
-_apply_serial!(out, field, grid, fp::SeparableFootprintND, strategy) =
-    apply_separable_nd!(out, field, grid, fp, strategy)
-_apply_serial!(out, field, grid, fp::NodeFilterPlan, strategy) =
-    apply_footprint!(out, field, grid, fp, strategy)
-_apply_serial!(out, field, grid, fp::SeparableFootprint, strategy) =
-    apply_separable!(out, field, grid, fp, strategy)

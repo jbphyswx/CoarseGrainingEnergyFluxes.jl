@@ -3,14 +3,6 @@
 
 _cgef_same_result(a, b) = isequal(a.Π, b.Π) && isequal(a.cumulative_energy, b.cumulative_energy) &&
                           isequal(a.filtering_spectrum, b.filtering_spectrum)
-
-# A device reduces each energy in its own order. The summands `½|ū|²·A` are non-negative, so two orders
-# of a sum of `n` of them lie within `2n·eps` of each other, relative; the spectrum is the density of the
-# result's own energies.
-_cgef_device_energies(a, b, n) =
-    isapprox(collect(a.cumulative_energy), collect(b.cumulative_energy); rtol = 2n * eps()) &&
-    isequal(collect(a.filtering_spectrum),
-            CGEF.Diagnostics.spectral_density(collect(a.cumulative_energy), collect(a.wavenumber)))
 _cgef_device_result(a, b, n) = isequal(a.Π, b.Π) && _cgef_device_energies(a, b, n)
 
 Test.@testset "Pipeline batches equal the per-slice sweep" begin
@@ -146,7 +138,7 @@ Test.@testset "A spectral sweep equals the per-scale flux" begin
     v = [cos(0.4i - 0.2j) for i in 1:N, j in 1:N]
     k = CGEF.GaussianKernel()
     for mk in (trues(N, N), m), s in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
-        g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs, mk; periodic = (true, true))
+        g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs, mk; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()))
         got = CGEF.coarse_grain(u, v, g; scales, kernel = k, method = CGEF.Filtering.Spectral(), mask_strategy = s,
                                 execution = CB.SerialBackend())
         for (i, ℓ) in enumerate(scales)

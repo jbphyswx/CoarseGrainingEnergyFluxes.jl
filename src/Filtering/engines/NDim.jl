@@ -58,12 +58,12 @@ that divides a pass among processes defines its own methods, assembling `dst` on
 
 @inline function _separable_pass!(
     dst::AbstractArray{T,N}, src::AbstractArray{T,N}, g::AbstractVecOrMat{T},
-    lim::Int, periodic::Bool, dims::NTuple{N,Int}, ::Val{d}, driver::D,
+    lim::Int, periodic::Bool, dims::NTuple{N,Int}, ::Val{d}, driver::D, lines = nothing,
 ) where {T<:AbstractFloat, N, d, D}
     n = dims[d]
     # One driver call per dimension-1 line, which that call alone writes. On rank 1 `CartesianIndices(())`
     # holds one index, so the column pass runs once over the whole vector.
-    _drive_pass!(driver, CartesianIndices(Base.tail(dims)), dst) do J
+    _drive_pass!(driver, _line_indices(dims, lines), dst) do J
         if d == 1
             _separable_col_pass!(dst, src, g, lim, periodic, dims[1], Tuple(J))
         else
@@ -145,50 +145,60 @@ end
 end
 
 # Passes `d…N`, unrolled by recursion on `Val(d)`: pass `d < N` writes `b1` for odd `d` and `b2` for even
-# `d`, and pass `N` writes `dst`. `src` may alias `b2`; `dst` aliases neither buffer. `dims` is the driven
-# shape, trailing batch axes included, and `N` is the grid's rank, the number of passes.
-@inline _sep_pass_chain!(dst, src, fp, dims, ::Val{N}, ::Val{N}, driver::D, b1, b2) where {N,D} =
-    _separable_pass!(dst, src, fp.g[N], fp.lim[N], fp.periodic[N], dims, Val(N), driver)
+# `d`, and pass `N` writes `dst`, on the lines `lines` (every line for `nothing`). `src` may alias `b2`;
+# `dst` aliases neither buffer. `dims` is the driven shape, trailing batch axes included, and `N` is the
+# grid's rank, the number of passes.
+@inline _sep_pass_chain!(dst, src, fp, dims, ::Val{N}, ::Val{N}, driver::D, b1, b2, lines = nothing) where {N,D} =
+    _separable_pass!(dst, src, fp.g[N], fp.lim[N], fp.periodic[N], dims, Val(N), driver, lines)
 
-@inline function _sep_pass_chain!(dst, src, fp, dims, ::Val{N}, ::Val{d}, driver::D, b1, b2) where {N,d,D}
+@inline function _sep_pass_chain!(dst, src, fp, dims, ::Val{N}, ::Val{d}, driver::D, b1, b2, lines = nothing) where {N,d,D}
     buf = isodd(d) ? b1 : b2
     _separable_pass!(buf, src, fp.g[d], fp.lim[d], fp.periodic[d], dims, Val(d), driver)
-    return _sep_pass_chain!(dst, buf, fp, dims, Val(N), Val(d + 1), driver, b1, b2)
+    return _sep_pass_chain!(dst, buf, fp, dims, Val(N), Val(d + 1), driver, b1, b2, lines)
 end
+
+# The lines along axis 1 of a shape `dims`, all or the block `lines` of their linear order, and the cells
+# they hold.
+@inline _line_indices(dims, ::Nothing) = CartesianIndices(Base.tail(dims))
+@inline _line_indices(dims, lines::UnitRange{Int}) = view(CartesianIndices(Base.tail(dims)), lines)
+@inline _line_cells(dims, ::Nothing) = CartesianIndices(dims)
+@inline _line_cells(dims, lines::UnitRange{Int}) =
+    view(CartesianIndices(dims), ((first(lines) - 1) * dims[1] + 1):(last(lines) * dims[1]))
 
 # Unbatched callers keep the footprint's own buffers.
 @inline _sep_pass_chain!(dst, src, fp, dims, vn::Val, vd::Val, driver::D = _sep_serial) where {D} =
     _sep_pass_chain!(dst, src, fp, dims, vn, vd, driver, fp.scratch, fp.masked_input)
 
 function _build_separable_nd(
+    sp::Tuple,
     grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
     kernel::SeparableKernel,
     scale::T;
     mask_strategy::AbstractMaskStrategy = ZeroFill(),
+    scratch::Union{Nothing,SeparableScratch} = nothing,
     kwargs...,
 ) where {T<:AbstractFloat, N, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     dims = FlowGeometries.Grids.size_tuple(grid)
-    (; g, lim, periodic, mf) = _separable_tables(grid, kernel, scale)
+    (; g, lim, periodic, mf) = _separable_tables(sp, grid, kernel, scale)
 
-    masked_input = zeros(T, dims)
-    scratch = zeros(T, dims)
+    masked_input, buffer = scratch === nothing ? (zeros(T, dims), zeros(T, dims)) : (scratch.masked_input, scratch.row_pass)
     fully_active = all(FlowGeometries.Grids.mask(grid))
     zerofill = mask_strategy isa ZeroFill
     bound = !fully_active || _reaches_exterior(grid, kernel, scale)
     fp_partial = SeparableFootprintND(
-        g, lim, periodic, nothing, nothing, mask_strategy, !fully_active, bound, masked_input, scratch,
+        g, lim, periodic, nothing, nothing, mask_strategy, !fully_active, bound, masked_input, buffer,
     )
-    if zerofill || fully_active
+    if _mask_free_mass(mask_strategy, FlowGeometries.Grids.mask(grid))
         # Mask-independent denominator, a product of one factor per axis: `ZeroFill` counts the offsets
-        # past a bounded edge, `Deformable` on a fully active grid only the in-domain ones.
+        # past a bounded edge, `Deformable` on an `AllActive` grid only the in-domain ones.
         profiles = ntuple(Val(N)) do d
             _separable_profile(
-                FlowGeometries.Grids.coordinates(grid, d), lim[d], g[d], periodic[d], kernel, scale,
-                convert(AbstractVector{T}, mf[d]), zerofill,
+                FlowGeometries.Grids.coordinates(grid, d), lim[d], g[d], periodic[d], Kernels._axis_kernel(kernel, Val(d)),
+                scale, convert(AbstractVector{T}, mf[d]), zerofill,
             )
         end
         return SeparableFootprintND(
-            g, lim, periodic, profiles, nothing, mask_strategy, !fully_active, bound, masked_input, scratch,
+            g, lim, periodic, profiles, nothing, mask_strategy, !fully_active, bound, masked_input, buffer,
         )
     end
     maskf = T.(FlowGeometries.Grids.mask(grid))
@@ -198,7 +208,7 @@ function _build_separable_nd(
     invrenorm = similar(denom)
     @. invrenorm = _inv_mass(denom)
     return SeparableFootprintND(
-        g, lim, periodic, nothing, invrenorm, mask_strategy, !fully_active, bound, masked_input, scratch,
+        g, lim, periodic, nothing, invrenorm, mask_strategy, !fully_active, bound, masked_input, buffer,
     )
 end
 
@@ -210,29 +220,33 @@ end
 end
 
 """
-    apply_separable_nd!(out, field, grid, fp, strategy, driver = _sep_serial)
+    apply_separable_nd!(out, field, grid, fp, strategy, driver = _sep_serial, buffers = _sep_nd_buffers(fp, out, Val(R)), lines = nothing)
 
 Filter `field` into `out`: the `R` separable passes, then the pointwise normalization. `driver` runs
 each pass's index sweep under [`_sep_serial`](@ref)'s contract. `strategy` must match the footprint's
-wherever the two strategies' denominators differ (`fp.bound`).
+wherever the two strategies' denominators differ (`fp.bound`). With `lines`, a block of the lines along
+axis 1 in their linear order, every pass but the last covers the whole grid and the last pass and the
+normalization write those lines alone.
 
 `out` and `field` may carry trailing batch axes beyond the grid's rank `R`; each pass covers the whole
-batch. The profiles, the renormalization array and the mask are indexed by the leading `R` components
-of the driven index.
+batch, through `buffers`, two arrays of `out`'s shape. The profiles, the renormalization array and the
+mask are indexed by the leading `R` components of the driven index.
 """
 function apply_separable_nd!(
     out::AbstractArray{T}, field::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid,
     fp::SeparableFootprintND{R,T}, strategy::AbstractMaskStrategy, driver::D = _sep_serial,
+    buffers::Tuple{AbstractArray{T},AbstractArray{T}} = _sep_nd_buffers(fp, out, Val(R)),
+    lines::Union{Nothing,UnitRange{Int}} = nothing,
 ) where {T<:AbstractFloat, R, D}
     _separable_check_strategy(fp, strategy)
     dims = size(out)
     mask = FlowGeometries.Grids.mask(grid)
-    b1, b2 = _sep_nd_buffers(fp, out, Val(R))
+    b1, b2 = buffers
     @. b2 = mask * field   # a `Bool` strong zero: an inactive cell contributes nothing, whatever it holds
-    _sep_pass_chain!(out, b2, fp, dims, Val(R), Val(1), driver, b1, b2)
+    _sep_pass_chain!(out, b2, fp, dims, Val(R), Val(1), driver, b1, b2, lines)
     prof = fp.profiles
     inv = fp.invrenorm
-    _drive_pointwise!(driver, CartesianIndices(dims)) do I
+    _drive_pointwise!(driver, _line_cells(dims, lines)) do I
         @inbounds begin
             Is = CartesianIndex(ntuple(d -> I[d], Val(R)))
             if inv === nothing
@@ -246,48 +260,64 @@ function apply_separable_nd!(
     return out
 end
 
-# The footprint's own pass buffers for an unbatched apply, fresh batch-sized ones otherwise.
+# The normalization of line `J` along axis 1 of an unbatched output, as `apply_separable_nd!` normalizes
+# each point.
+@inline function _separable_nd_normalize_line!(
+    out::AbstractArray{T,R}, fp::SeparableFootprintND{R,T}, mask, J::Tuple,
+) where {R, T}
+    prof, inv = fp.profiles, fp.invrenorm
+    @inbounds for i in axes(out, 1)
+        I = CartesianIndex(i, J...)
+        if inv === nothing
+            out[I] = _normalized(out[I], prod(ntuple(d -> prof[d][I[d]], Val(R))))
+        else
+            out[I] = mask[I] ? out[I] * inv[I] : zero(T)
+        end
+    end
+    return nothing
+end
+
+# The footprint's own pass buffers for an unbatched apply, fresh batch-sized ones otherwise; a caller
+# applying batches repeatedly holds its own and passes them.
 @inline function _sep_nd_buffers(fp, out::AbstractArray{T}, ::Val{R}) where {T,R}
     ndims(out) == R && return (fp.scratch, fp.masked_input)
     return (similar(out), similar(out))
 end
 
 # A `SeparableKernel` on a 1-D or 3-D Cartesian grid of any spacing takes the `N`-pass engine.
-build_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,1},
-    kernel::SeparableKernel, scale::T; kwargs...,
+_structured_footprint(
+    sp::Tuple, grid::FlowGeometries.Grids.StructuredGrid{T,G,1}, kernel::SeparableKernel, scale::T; kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
-    _build_separable_nd(grid, kernel, scale; kwargs...)
+    _build_separable_nd(sp, grid, kernel, scale; kwargs...)
 
-build_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
-    kernel::SeparableKernel, scale::T; kwargs...,
+_structured_footprint(
+    sp::Tuple, grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, kernel::SeparableKernel, scale::T; kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
-    _build_separable_nd(grid, kernel, scale; kwargs...)
+    _build_separable_nd(sp, grid, kernel, scale; kwargs...)
 
-# `Range` axes with a `SeparableKernel` match both the methods above and those below; these resolve the
+# Uniform axes with a `SeparableKernel` match both the methods above and those below; these resolve the
 # ambiguity, to the separable engine.
-build_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,1,S,TP,<:Tuple{AbstractRange}},
+_structured_footprint(
+    sp::Tuple{FlowGeometries.Axes.UniformSpacing}, grid::FlowGeometries.Grids.StructuredGrid{T,G,1},
     kernel::SeparableKernel, scale::T; kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, S, TP<:NTuple{1,FlowGeometries.Grids.AbstractTopology}} =
-    _build_separable_nd(grid, kernel, scale; kwargs...)
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
+    _build_separable_nd(sp, grid, kernel, scale; kwargs...)
 
-build_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,3,S,TP,<:Tuple{AbstractRange,AbstractRange,AbstractRange}},
+_structured_footprint(
+    sp::NTuple{3,FlowGeometries.Axes.UniformSpacing}, grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
     kernel::SeparableKernel, scale::T; kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, S, TP<:NTuple{3,FlowGeometries.Grids.AbstractTopology}} =
-    _build_separable_nd(grid, kernel, scale; kwargs...)
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
+    _build_separable_nd(sp, grid, kernel, scale; kwargs...)
 
-build_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,1,S,TP,<:Tuple{AbstractRange}},
+_structured_footprint(
+    ::Tuple{FlowGeometries.Axes.UniformSpacing}, grid::FlowGeometries.Grids.StructuredGrid{T,G,1},
     kernel::Kernels.AbstractFilterKernel, scale::T; kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, S, TP<:NTuple{1,FlowGeometries.Grids.AbstractTopology}} =
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
     _build_footprint_nd(grid, kernel, scale; kwargs...)
-build_footprint(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,3,S,TP,<:Tuple{AbstractRange,AbstractRange,AbstractRange}},
+_structured_footprint(
+    ::NTuple{3,FlowGeometries.Axes.UniformSpacing}, grid::FlowGeometries.Grids.StructuredGrid{T,G,3},
     kernel::Kernels.AbstractFilterKernel, scale::T; kwargs...,
-) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}, S, TP<:NTuple{3,FlowGeometries.Grids.AbstractTopology}} =
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}} =
     _build_footprint_nd(grid, kernel, scale; kwargs...)
 
 """
@@ -422,23 +452,18 @@ function apply_footprint_nd!(
     return out
 end
 
-function _build_footprint_nd(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
-    kernel::Kernels.AbstractFilterKernel,
-    scale::T;
-    mask_strategy::AbstractMaskStrategy = ZeroFill(),
-    kwargs...,
-) where {N, T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+# The taps of a uniform Cartesian lattice of steps `spacing`: the offsets within `kernel_radius` and their
+# weights `kernel_weight · A`, or under a `CellOverlap` top-hat every offset whose cell the support reaches,
+# weighted `A` times the cell's fraction inside.
+function _nd_taps(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::Kernels.AbstractFilterKernel, scale::T,
+    spacing::NTuple{N,T}, A,
+) where {T,G,N}
     rad = Kernels.kernel_radius(kernel, scale, Val(N))
-    # The caller's dispatch guarantees every coordinate axis is a `Range`.
-    spacing = ntuple(d -> step(FlowGeometries.Grids.coordinates(grid, d)), N)
-    A = FlowGeometries.Grids.measure(grid)[ntuple(_ -> 1, N)...]   # uniform Cartesian cell measure
-    lim = ntuple(d -> spacing[d] > 0 ? ceil(Int, rad / spacing[d]) : 0, N)
-    offsets = NTuple{N,Int}[]
-    w = T[]
-    sizehint!(offsets, prod(2 .* lim .+ 1))
-    sizehint!(w, prod(2 .* lim .+ 1))
-    for off in CartesianIndices(ntuple(d -> (-lim[d]):lim[d], N))
+    lim = map(s -> s > 0 ? ceil(Int, rad / s) : 0, spacing)
+    offsets = sizehint!(NTuple{N,Int}[], prod(2 .* lim .+ 1))
+    w = sizehint!(T[], prod(2 .* lim .+ 1))
+    for off in CartesianIndices(map(l -> (-l):l, lim))
         o = Tuple(off)
         d2 = zero(T)
         for d in 1:N
@@ -450,13 +475,57 @@ function _build_footprint_nd(
             push!(w, Kernels.kernel_weight(kernel, dist, scale, Val(N)) * A)
         end
     end
+    return offsets, w
+end
+
+function _nd_taps(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T,
+    spacing::NTuple{N,T}, A,
+) where {T,G,N}
+    rad = Kernels.kernel_radius(kernel, scale, Val(N))
+    ov = _overlap_rule(FlowGeometries.Grids.grid_geometry(grid), rad)
+    lim = map(s -> s > 0 ? ceil(Int, rad / s + T(1) / 2) : 0, spacing)
+    offsets = NTuple{N,Int}[]
+    w = T[]
+    for off in CartesianIndices(map(l -> (-l):l, lim))
+        f = _lattice_fraction(ov, off, spacing)
+        iszero(f) && continue
+        push!(offsets, Tuple(off))
+        push!(w, A * T(f))
+    end
+    return offsets, w
+end
+
+# `ZeroFill`'s mass past a bounded edge, added to the in-domain mass `den`: the continued lattice's, or under a
+# `CellOverlap` top-hat that reaches past an edge the support's measure in place of the sum.
+function _add_exterior_mass!(den, grid, kernel, scale)
+    exterior = _exterior_mass(grid, kernel, scale)
+    exterior === nothing || (den .+= exterior)
+    return den
+end
+
+function _add_exterior_mass!(den, grid, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale)
+    _full_support(grid, kernel, scale) && fill!(den, _support_measure(grid, kernel, scale, 1))
+    return den
+end
+
+function _build_footprint_nd(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
+    kernel::Kernels.AbstractFilterKernel,
+    scale::T;
+    mask_strategy::AbstractMaskStrategy = ZeroFill(),
+    kwargs...,
+) where {N, T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
+    # The caller's dispatch guarantees every coordinate axis is a `Range`.
+    spacing = map(s -> abs(T(step(s))), FlowGeometries.Grids.coordinates(grid))
+    A = FlowGeometries.Grids.measure(grid)[ntuple(_ -> 1, Val(N))...]   # uniform Cartesian cell measure
+    offsets, w = _nd_taps(grid, kernel, scale, spacing, A)
     runs = _line_runs(offsets, w)
     dims = FlowGeometries.Grids.size_tuple(grid)
     periodic = FlowGeometries.Grids.periodic_flags(grid)
     mask = FlowGeometries.Grids.mask(grid)
     masked = !all(mask)
     zerofill = mask_strategy isa ZeroFill
-    exterior = _exterior_mass(grid, kernel, scale)
     # Window mass: `ZeroFill` counts every in-support cell and those past a bounded edge, `Deformable`
     # only the active in-domain ones.
     massf = zerofill ? fill(one(T), dims) : T.(mask)
@@ -464,7 +533,7 @@ function _build_footprint_nd(
     for J in CartesianIndices(Base.tail(dims))
         _nd_line_accumulate!(view(den, :, Tuple(J)...), massf, runs, Tuple(J), dims, periodic)
     end
-    zerofill && exterior !== nothing && (den .+= exterior)
+    zerofill && _add_exterior_mass!(den, grid, kernel, scale)
     @inbounds for I in CartesianIndices(dims)
         den[I] = (zerofill || mask[I]) ? _inv_mass(den[I]) : zero(T)
     end
