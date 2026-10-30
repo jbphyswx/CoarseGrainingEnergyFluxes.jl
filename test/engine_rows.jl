@@ -19,6 +19,10 @@ _cgef_field(sz) = [sin(1.3 * I[1] + 0.7 * get(Tuple(I), 2, 0) + 0.4 * get(Tuple(
 _cgef_row(grid, kernel, ℓ, engine; reference = _cgef_direct_filter, rtol = 1e-11, kw...) =
     (; grid, kernel, ℓ, engine, reference, rtol, kw = (; kw...))
 
+# The cell overlap's reference in three dimensions at 40 Gauss–Legendre nodes: its 10-node ball fractions fall short
+# of the rows' `rtol`. The engines' own 10-node fractions are within 1e-10 of the ball's, those rows' `rtol`.
+_cgef_ball40(grid, kernel, ℓ, f, strategy) = _cgef_direct_filter(grid, kernel, ℓ, f, strategy, 40)
+
 # Top-hat radii here sit off every distance between cells, so no cell lies on a support boundary.
 function _cgef_cartesian_rows()
     cart = FG.Geometry.CartesianGeometry()
@@ -32,7 +36,6 @@ function _cgef_cartesian_rows()
     gp = FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:7.7; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()))
     row(gp, _CGEF_THC, 1.5, :PrefixSumTopHatPlan)
     row(gp, _CGEF_TH, 1.5, :PrefixSumTopHatPlan)
-    row(gp, _CGEF_TH, 1.5, :PaddedFFTFootprint; engine = CGEF.Filtering.PaddedFFTEngine())
     row(gp, _CGEF_SH, 1.5, :FilterFootprint)
     row(gp, _CGEF_GA, 1.5, :SeparableFootprint; rtol = 1e-8)
     for ℓ in (4.8, 19.2, 40.8)
@@ -101,10 +104,10 @@ function _cgef_cartesian_rows()
 
     # Three dimensions: whole turns of axis 1 and images along axes 2 and 3; stretched; bounded and masked.
     g3 = FG.Grids.StructuredGrid(cart, 0.0:1.0:5.0, 0.0:0.7:2.8, 0.0:0.9:2.7; topology = (FG.Grids.Periodic(), FG.Grids.Periodic(), FG.Grids.Periodic()))
-    row(g3, _CGEF_TH, 1.5, :PrefixSumTopHat3DPlan)
+    row(g3, _CGEF_TH, 1.5, :PrefixSumTopHat3DPlan; reference = _cgef_ball40, rtol = 1e-10)
     row(g3, _CGEF_GA, 1.5, :SeparableFootprintND; rtol = 1e-8)
     for ℓ in (4.8, 13.3)
-        row(g3, _CGEF_TH, ℓ, :PaddedFFTFootprint)
+        row(g3, _CGEF_TH, ℓ, :PaddedFFTFootprint; reference = _cgef_ball40, rtol = 1e-10)
         row(g3, _CGEF_SH, ℓ, :PaddedFFTFootprint)
     end
     row(g3, _CGEF_GA, 2.9, :PaddedFFTFootprint; rtol = 1e-8)
@@ -116,9 +119,9 @@ function _cgef_cartesian_rows()
     m3 = trues(6, 5, 4)
     m3[2:3, 2:3, 2] .= false
     g3b = FG.Grids.StructuredGrid(cart, 0.0:1.0:5.0, 0.0:0.7:2.8, 0.0:0.9:2.7, m3)
-    row(g3b, _CGEF_TH, 2.9, :PrefixSumTopHat3DPlan)
-    row(g3b, _CGEF_TH, 5.3, :PaddedFFTFootprint)
-    row(g3b, _CGEF_TH, 5.3, :PrefixSumTopHat3DPlan; engine = _CGEF_FE)
+    row(g3b, _CGEF_TH, 2.9, :PrefixSumTopHat3DPlan; reference = _cgef_ball40, rtol = 1e-10)
+    row(g3b, _CGEF_TH, 8.3, :PaddedFFTFootprint; reference = _cgef_ball40, rtol = 1e-10)
+    row(g3b, _CGEF_TH, 8.3, :PrefixSumTopHat3DPlan; engine = _CGEF_FE, reference = _cgef_ball40, rtol = 1e-10)
     row(g3b, _CGEF_SH, 2.9, :FilterFootprintND)
     row(g3b, _CGEF_SH, 5.3, :PaddedFFTFootprint)
     return rows
@@ -126,8 +129,7 @@ end
 
 # A spherical longitude identifies, so each cell counts once however far the support reaches. A uniform
 # longitude takes the kernel's own engine or, where it costs fewer operations, the transform along
-# longitude; the cell overlap's top-hat takes the prefix sums on these grids and the transform on the box spanning
-# its gap, where a row naming the prefix sums keeps their seam case.
+# longitude; the top-hat takes the prefix sums on every one of these grids, the box spanning its gap included.
 function _cgef_spherical_rows()
     sph = FG.Geometry.SphericalGeometry(6.371e6)
     rows = Any[]
@@ -139,7 +141,7 @@ function _cgef_spherical_rows()
     gw = FG.Grids.StructuredGrid(sph, ring, range(deg2rad(-80.0); step = deg2rad(10.0), length = 17); topology = (FG.Grids.Periodic(), FG.Grids.Bounded()))
     row(gw, _CGEF_THC, 2.0e6, :PrefixSumTopHatPlan)
     tophat(gw, 2.0e6)
-    row(gw, _CGEF_TH, 2 * 12_000e3, :ZonalFFTFootprint)
+    tophat(gw, 2 * 12_000e3)
     row(gw, _CGEF_GA, 0.5e6, :FilterFootprint)
     row(gw, _CGEF_GA, 3.0e6, :ZonalFFTFootprint)
 
@@ -168,9 +170,8 @@ function _cgef_spherical_rows()
     # neighbours across the gap.
     λw = range(0.0; step = deg2rad(10.0), length = 33)
     φw = range(deg2rad(50.0), deg2rad(70.0); length = 5)
-    row(FG.Grids.StructuredGrid(sph, λw, φw), _CGEF_TH, 3.1e6, :ZonalFFTFootprint)
-    row(FG.Grids.StructuredGrid(sph, λw, φw), _CGEF_TH, 3.1e6, :PrefixSumTopHatPlan; engine = _CGEF_FE)
-    row(FG.Grids.StructuredGrid(sph, λw, φw), _CGEF_TH, 5.0e6, :ZonalFFTFootprint)
+    tophat(FG.Grids.StructuredGrid(sph, λw, φw), 3.1e6)
+    tophat(FG.Grids.StructuredGrid(sph, λw, φw), 5.0e6)
     row(FG.Grids.StructuredGrid(sph, λw, φw), _CGEF_SH, 3.5e6, :ZonalFFTFootprint)
     for cs in _CGEF_CACHES
         row(FG.Grids.StructuredGrid(sph, collect(λw), collect(φw)), _CGEF_SH, 2.5e6, :ScatteredFilterPlan;

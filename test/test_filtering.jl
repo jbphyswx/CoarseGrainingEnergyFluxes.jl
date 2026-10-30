@@ -347,6 +347,18 @@ Test.@testset "HighOrderKernel on a sphere: one filter whichever engine runs it,
         end
     end
 
+    # A row's correction runs over the cells on and east of the target's meridian, each east one standing for its
+    # mirror image too, so the row's weights are symmetric in the longitude offset, exactly.
+    box = FG.Grids.StructuredGrid(sph, FG.Axes.UniformAxis(deg2rad(230.0), deg2rad(0.1), 120),
+                                  FG.Axes.UniformAxis(deg2rad(30.0), deg2rad(0.09), 150))
+    for order in (3, 5)
+        di, dj, w, ptr, _ = CGEF.Filtering._highorder_rows(box, CGEF.Kernels.HighOrderKernel(; order), 300e3)
+        for j in (1, 75, 150)
+            taps = Dict((di[q], dj[q]) => w[q] for q in ptr[j]:(ptr[j + 1] - 1))
+            Test.@test all(p -> get(taps, (-p.first[1], p.first[2]), NaN) == p.second, taps)
+        end
+    end
+
     λ = range(0, 2π; length = 361)[1:360]
     φ = range(deg2rad(-75), deg2rad(75); length = 151)
     g = FG.Grids.StructuredGrid(sph, λ, φ; topology = (FG.Grids.Periodic(), FG.Grids.Bounded()))
@@ -362,8 +374,10 @@ Test.@testset "HighOrderKernel on a sphere: one filter whichever engine runs it,
     end
 end
 
-# The correction solved in the field's precision: on scattered points whose coordinates both precisions hold
-# exactly, a Float32 filter is the Float64 one to Float32's precision at all but a few ill-conditioned points.
+# The correction formed and solved in `Float64` whatever the field's precision: on scattered points whose coordinates
+# both precisions hold exactly, a Float32 filter is the Float64 one to Float32's precision at all but a few
+# ill-conditioned points; on a regional box's latitude rows, against the Float64 grid of the same points (longitude by
+# the box's start and step, latitude as it stores it), at every point.
 Test.@testset "HighOrderKernel in Float32" begin
     n = 4000
     px, py = Float64.(Float32.(90 .* rand(n))), Float64.(Float32.(90 .* rand(n)))
@@ -374,6 +388,21 @@ Test.@testset "HighOrderKernel in Float32" begin
     o64, o32 = out(Float64), out(Float32)
     e = sort(abs.(o32 .- o64) ./ maximum(abs, o64))
     Test.@test e[ceil(Int, 0.999 * n)] < 1e-5
+
+    s0, dλ, φ0, dφ = Float32(deg2rad(230.0)), Float32(deg2rad(0.1)), Float32(deg2rad(30.0)), Float32(deg2rad(0.09))
+    b32 = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry{Float32}(6.371f6), FG.Axes.UniformAxis{Float32}(s0, dλ, 120),
+                                  FG.Axes.UniformAxis{Float32}(φ0, dφ, 150))
+    b64 = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry{Float64}(6.371e6),
+                                  FG.Axes.UniformAxis{Float64}(Float64(s0), Float64(dλ), 120),
+                                  Float64.(collect(FG.Grids.coordinates(b32, 2))))
+    fb = Float32.(randn(120, 150))
+    for order in (3, 5)
+        k = CGEF.Kernels.HighOrderKernel(; order)
+        o32 = CGEF.Filtering.filter_apply!(similar(fb), fb, CGEF.Filtering.plan_filter(b32, k, 3f5; execution = _CGEF_SERIAL))
+        o64 = CGEF.Filtering.filter_apply!(zeros(120, 150), Float64.(fb), CGEF.Filtering.plan_filter(b64, k, 3e5;
+                                                                                                    execution = _CGEF_SERIAL))
+        Test.@test maximum(abs, Float64.(o32) .- o64) < 1e-5 * maximum(abs, o64)
+    end
 end
 
 # On a periodic lattice with `k_c ≤ π/Δx` the real-space brick wall transforms to the transfer function of

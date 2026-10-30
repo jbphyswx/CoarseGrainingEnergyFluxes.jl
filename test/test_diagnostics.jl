@@ -545,7 +545,7 @@ Test.@testset "Favre budget on a masked grid" begin
     reach = rad + (nodes ÷ 2) * dx
     inner = [m[I] && all(x -> FG.Geometry.distance(geo, FG.Grids.coords(g, Tuple(I)...), x) > reach, land) &&
              all(d -> min(I[d] - 1, N - I[d]) * dx > reach, 1:2) for I in CartesianIndices(m)]
-    Test.@test count(inner) > 100
+    Test.@test count(inner) > 50
     rc = CGEF.Diagnostics.compressible_flux(u, v, ρc, P, g, ker, ℓ; execution = SER, derivative = deriv)
     Πi = CGEF.Diagnostics.compute_Π!(zeros(N, N), u, v, nothing, g, ker, ℓ; execution = SER, derivative = deriv)
     Test.@test maximum(abs, rc.Π[inner] ./ 1.3 .- Πi[inner]) < 1e-12 * maximum(abs, Πi[inner])

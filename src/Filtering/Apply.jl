@@ -285,6 +285,55 @@ end
     return nothing
 end
 
+# The per-field sums a batch of unknown width accumulates into; an `NTuple` batch folds its sums as values.
+_nd_batch_buffer(::NTuple, ::Type) = nothing
+_nd_batch_buffer(v::AbstractVector, ::Type{T}) where {T<:AbstractFloat} = zeros(T, length(v))
+
+# One cached point of the ND batch, over the cells and weights the cache lists for it; the fields share one window
+# mass.
+@inline function _nd_cached_point!(
+    outs::NTuple{K,<:AbstractArray}, fields::NTuple{K,<:AbstractArray},
+    cache::Union{NDScatteredCache{N,T},NDRingCache{N,T}}, exterior, strategy::AbstractMaskStrategy, mask,
+    I::CartesianIndex{N}, t::Int, _acc_ws,
+) where {K, N, T<:AbstractFloat}
+    zerofill = strategy isa ZeroFill
+    ws, wn = _fold_cells((zero(SA.SVector{K,T}), zero(T)), cache, t, I) do a, J, wk
+        aws, awn = a
+        active = _cell_active(mask, J)
+        (zerofill || active) || return a
+        active && (aws = aws .+ wk .* SA.SVector{K,T}(ntuple(m -> _at(fields[m], J), Val(K))))
+        (aws, awn + wk)
+    end
+    zerofill && (wn = _add_exterior(wn, exterior, I))
+    @inbounds for m in 1:K
+        outs[m][I] = _normalized(ws[m], wn)
+    end
+    return nothing
+end
+
+@inline function _nd_cached_point!(
+    outs, fields, cache::Union{NDScatteredCache{N,T},NDRingCache{N,T}}, exterior, strategy::AbstractMaskStrategy, mask,
+    I::CartesianIndex{N}, t::Int, acc_ws,
+) where {N, T<:AbstractFloat}
+    fill!(acc_ws, zero(T))
+    zerofill = strategy isa ZeroFill
+    wn = _fold_cells(zero(T), cache, t, I) do n, J, wk
+        active = _cell_active(mask, J)
+        (zerofill || active) || return n
+        if active
+            for m in eachindex(fields)
+                acc_ws[m] += wk * _at(fields[m], J)
+            end
+        end
+        n + wk
+    end
+    zerofill && (wn = _add_exterior(wn, exterior, I))
+    @inbounds for m in eachindex(outs)
+        outs[m][I] = _normalized(acc_ws[m], wn)
+    end
+    return nothing
+end
+
 """
     apply_footprint_nd_batch_over!(outs, fields, grid, fp, strategy, indices) -> outs
 
@@ -297,28 +346,13 @@ function apply_footprint_nd_batch_over!(
 ) where {N, T<:AbstractFloat, G}
     dims = FlowGeometries.Grids.size_tuple(grid)
     mask = FlowGeometries.Grids.mask(grid)
-    acc_ws = _batch_zeros(outs, T)
-    zerofill = strategy isa ZeroFill
+    acc_ws = _nd_batch_buffer(outs, T)
     if fp.cache !== nothing
         cache = fp.cache
         lin = LinearIndices(dims)
         @inbounds for I in indices
             _filters_target(strategy, mask[I]) || continue
-            fill!(acc_ws, zero(T))
-            wn = _fold_cells(zero(T), cache, lin[I], I) do n, J, wk
-                active = _cell_active(mask, J)
-                (zerofill || active) || return n
-                if active
-                    for m in eachindex(fields)
-                        acc_ws[m] += wk * _at(fields[m], J)
-                    end
-                end
-                n + wk
-            end
-            zerofill && (wn = _add_exterior(wn, fp.exterior, I))
-            for m in eachindex(outs)
-                outs[m][I] = _normalized(acc_ws[m], wn)
-            end
+            _nd_cached_point!(outs, fields, cache, fp.exterior, strategy, mask, I, lin[I], acc_ws)
         end
     else
         lin = LinearIndices(dims)

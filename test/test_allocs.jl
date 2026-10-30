@@ -147,6 +147,16 @@ Test.@testset "Allocations" begin
         b6 = CGEF.Pipeline.CoarseGrainBatchResult(g2, 2, (6,))
         u6, v6 = cat(u3, u3; dims = 3), cat(v3, v3; dims = 3)
         Test.@test _cgef_second(() -> _cgef_a_batch(b6, u6, v6, g2, bkw)) == _cgef_second(() -> _cgef_a_batch(b, u3, v3, g2, bkw))
+        # So does a threaded batch on a sphere, whose workers each sweep their slices serially: the strain's frame terms
+        # cost nothing per cell. Both batches run one worker per thread.
+        W = Threads.nthreads()
+        tkw = (; scales = [1.5e6, 3e6], kernel = k, execution = CGEF.ComputationalBackends.ThreadedBackend(),
+               spectrum = CGEF.Diagnostics.NoSpectrum())
+        us1, vs1 = field((45, 21, W)), field((45, 21, W)) .^ 2
+        bs1, bs2 = CGEF.Pipeline.CoarseGrainBatchResult(gs, 2, (W,)), CGEF.Pipeline.CoarseGrainBatchResult(gs, 2, (2W,))
+        us2, vs2 = cat(us1, us1; dims = 3), cat(vs1, vs1; dims = 3)
+        Test.@test _cgef_second(() -> _cgef_a_batch(bs2, us2, vs2, gs, tkw)) -
+                   _cgef_second(() -> _cgef_a_batch(bs1, us1, vs1, gs, tkw)) < W * 4096
         E = zeros(2)
         Test.@test _cgef_second(() -> _cgef_a_cumulative(E, u, v, g2, k, scales, ws, plans)) == 0
         Test.@test _cgef_second(() -> _cgef_a_density(zeros(2), E, 1.0 ./ scales)) == 0
@@ -254,12 +264,13 @@ Test.@testset "Allocations" begin
         sg = FG.Connectivity.structured_grid(FG.SphericalSampling.Fejer1Sampling(), 17; geometry = FG.Geometry.SphericalGeometry(R))
         ps = CGEF.Filtering.plan_filter(sg, ga, π * R / 8; execution = SER, method = CGEF.Filtering.Spectral())
         Test.@test _cgef_second(() -> _cgef_a_apply(zeros(33, 17), field((33, 17)), ps)) <= TASK_SLACK
-        # NUFSHT allocates inside its own fit; the extension adds nothing over the same upstream calls.
+        # NUFSHT allocates inside its own least-squares fit; the extension adds nothing over the same upstream calls.
         M = 200
         lat = asin.(clamp.(2 .* mod.(0.618 .* (1:M), 1.0) .- 1, -1, 1))
         lon = 2π .* mod.(0.4142 .* (1:M), 1.0)
         nug = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(R), lon, lat, fill(4π * R^2 / M, M), trues(M))
-        pq = CGEF.Filtering.plan_filter(nug, ga, π * R / 8; execution = SER, method = CGEF.Filtering.Spectral())
+        pq = CGEF.Filtering.plan_filter(nug, ga, π * R / 8; execution = SER, method = CGEF.Filtering.Spectral(),
+                                        analysis = CGEF.Filtering.LeastSquares())
         f = sin.(lon) .* cos.(lat)
         CGEF.Filtering.filter_apply!(zeros(M), f, pq)
         rtol = Base.get_extension(CGEF, :CoarseGrainingEnergyFluxesNUFSHTExt)._fit_rtol(pq.grid_plan.plan.tol, Float64)
@@ -281,5 +292,15 @@ Test.@testset "Allocations" begin
         build(2dx)
         build(4dx)
         Test.@test build(4dx) < 1.5 * build(2dx)
+        # A high-order kept list's build allocates its entries and little else: no recorded cell boxed.
+        for T in (Float32, Float64)
+            cv = FG.Grids.CurvilinearGrid(FG.Geometry.CartesianGeometry{T}(), T[i + 0.2j for i in 1:64, j in 1:64],
+                                          T[j + 0.1i for i in 1:64, j in 1:64], trues(64, 64))
+            k3 = CGEF.Kernels.HighOrderKernel(; order = 3)
+            hbuild(ℓ) = @allocated CGEF.Filtering.build_footprint(cv, k3, ℓ; cache_strategy = CGEF.Filtering.AlwaysCache())
+            hbuild(T(4))
+            bytes = hbuild(T(6))
+            Test.@test bytes < 32 * length(CGEF.Filtering.build_footprint(cv, k3, T(6)).cache.w)
+        end
     end
 end

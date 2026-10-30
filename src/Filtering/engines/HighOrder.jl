@@ -23,7 +23,8 @@
 #
 # A rectilinear Cartesian grid takes the product one axis at a time, with the one-dimensional case of the
 # correction. The identity filter meets these conditions, so the system is consistent even where too few
-# cells make its matrix singular, and its minimum-norm solution is taken there.
+# cells make its matrix singular, and there every solution `c` gives the same correction `Aₖ p(eₖ/h)`. The
+# sums and the solve run in `Float64` at least.
 
 """
     _ho_exponents(Val(D), Val(P)) -> NTuple
@@ -40,6 +41,15 @@ total degree at most `P`.
 end
 
 @inline _ho_nbasis(::Val{D}, ::Val{P}) where {D,P} = length(_ho_exponents(Val(D), Val(P)))
+
+# The polynomials a correction solves for, as indices into `_ho_exponents`: every one, or those even in the first
+# coordinate, which alone carry a correction over cells set symmetrically about the target along it.
+struct _AllPolynomials end
+struct _EvenInFirst end
+
+@generated _ho_indices(::Val{D}, ::Val{P}, ::_AllPolynomials) where {D,P} = Tuple(1:_ho_nbasis(Val(D), Val(P)))
+@generated _ho_indices(::Val{D}, ::Val{P}, ::_EvenInFirst) where {D,P} =
+    Tuple(i for (i, a) in enumerate(_ho_exponents(Val(D), Val(P))) if iseven(a[1]))
 
 # `(P₀(x), …, P_P(x))`, by `(n + 1) P_{n+1} = (2n + 1) x Pₙ − n P_{n−1}`.
 @generated function _legendre(x::T, ::Val{P}) where {T,P}
@@ -178,9 +188,19 @@ function _query_radius(
     return _ho_reach(sup, Kernels.kernel_radius(kernel, scale), _cell_size(sup, Amax, _kernel_dim(grid)))
 end
 
-# Cell `J`'s normal coordinates about target `I`, in `T`.
-@inline _ho_normal(::Type{T}, grid, I, J) where {T} =
-    map(T, Tuple(FlowGeometries.Geometry.normal_coordinates(grid, I, J)))
+# Cell `J`'s normal coordinates about target `I` in `W`, from the pair's coordinates (the nearest image across a
+# periodic seam) converted to `W`.
+@inline function _ho_normal(::Type{W}, grid, I, J) where {W}
+    a, b = FlowGeometries.Grids._cell_image_pair(grid, I, J)
+    geo = FlowGeometries.Geometry.similar_geometry(W, FlowGeometries.Grids.grid_geometry(grid))
+    return map(W, Tuple(FlowGeometries.Geometry.normal_coordinates(geo, map(W, a), map(W, b))))
+end
+
+# Whether a cell of measure `A` at normal coordinates `e` (in `W`) meets the support of half-width `h`, and its size.
+@inline function _ho_cell(sup, e::NTuple{D,W}, A::T, h::T) where {D,W,T}
+    x = _cell_size(sup, A, Val(D))
+    return _ho_meets(sup, e, map(W, x), W(h)), x
+end
 
 """
     HighOrderWeights{P,D,T,K,C,S}
@@ -208,219 +228,234 @@ _with_coeffs(r::HighOrderWeights{P,D}, coeffs) where {P,D} =
     HighOrderWeights(r.kernel, r.scale, r.half, coeffs, r.support, Val(D))
 
 @inline function _cell_weight(r::HighOrderWeights{P,D,T}, grid, t, I, J, _) where {P,D,T}
-    e = _ho_normal(T, grid, I, J)
+    W = promote_type(T, Float64)
+    e = _ho_normal(W, grid, I, J)
     A = T(_cell_measure(grid, J))
-    x = _cell_size(r.support, A, Val(D))
-    _ho_meets(r.support, e, x, r.half) || return (false, zero(T))
-    φ = _ho_basis(map(v -> v / r.half, e), Val(P))
-    p = zero(T)
+    meets, x = _ho_cell(r.support, e, A, r.half)
+    meets || return (false, zero(T))
+    hw = W(r.half)
+    φ = _ho_basis(map(v -> v / hw, e), Val(P))
+    p = zero(W)
     @inbounds for i in eachindex(φ)
-        p += r.coeffs[i, t] * φ[i]
+        p += W(r.coeffs[i, t]) * φ[i]
     end
-    # `w̃ + A p`: the cached weight `w̃ + √A z` of `_ho_correct!`, to rounding.
-    return (true, A * _ho_mean(r.support, r.kernel, r.scale, e, x) + A * p)
+    # `w̃ + A p`: the cached weight of `_ho_correct!`, to rounding.
+    return (true, T(W(A * _ho_mean(r.support, r.kernel, r.scale, map(T, e), x)) + W(A) * p))
 end
 
 """
     HighOrderScratch
 
-One target's support cells — index, normal coordinates, size, measure, weight, and whether the cell lies
-past a bounded edge — with the storage of the weighted basis `√A φ`, one column per basis polynomial, the
-right-hand side its correction uses, and its factorization's reflector factors `τ`, column order `piv` and
-triangular solution `u`.
+One target's support cells — index, normal coordinates (in `W = promote_type(T, Float64)`), measure, weight, whether
+the cell lies past a bounded edge, and whether it stands for its mirror image too — with the correction's moment
+matrix `G = Σ A φφᵀ`, its right-hand side `r`
+(then its solution), the solve's work vector `y` and pivot order `piv`, and a block of cells' basis values `φ`, `Aφ`
+and weights `w̃` the sums run over (`_HO_BLOCK` rows), all in `W`.
 """
 struct HighOrderScratch{
-    T<:AbstractFloat, D, C,
-    VC<:AbstractVector{C}, VE<:AbstractVector{NTuple{D,T}}, VT<:AbstractVector{T}, VB<:AbstractVector{Bool},
-    VI<:AbstractVector{Int},
+    T<:AbstractFloat, D, C, W<:AbstractFloat,
+    VC<:AbstractVector{C}, VE<:AbstractVector{NTuple{D,W}}, VT<:AbstractVector{T}, VB<:AbstractVector{Bool},
+    MW<:AbstractMatrix{W}, VW<:AbstractVector{W}, VI<:AbstractVector{Int},
 }
     cell::VC
     e::VE
-    x::VE
     A::VT
     w::VT
     outside::VB
-    V::VT
-    z::VT
-    r::VT
-    τ::VT
-    u::VT
+    pair::VB
+    G::MW
+    r::VW
+    y::VW
     piv::VI
+    φ::MW
+    Aφ::MW
+    w̃::VW
 end
 
-HighOrderScratch(::Type{T}, ::Val{D}, nb::Int, ::Type{C}) where {T,D,C} =
-    HighOrderScratch(C[], NTuple{D,T}[], NTuple{D,T}[], T[], T[], Bool[], T[], T[], zeros(T, nb), zeros(T, nb),
-                     zeros(T, nb), zeros(Int, nb))
+# The cells per block of the correction's sums, whose `φ` and `Aφ` stay in a core's first-level cache.
+const _HO_BLOCK = 64
+
+function HighOrderScratch(::Type{T}, ::Val{D}, nb::Int, ::Type{C}) where {T,D,C}
+    W = promote_type(T, Float64)
+    return HighOrderScratch(C[], NTuple{D,W}[], T[], T[], Bool[], Bool[], zeros(W, nb, nb), zeros(W, nb), zeros(W, nb),
+                            zeros(Int, nb), zeros(W, _HO_BLOCK, nb), zeros(W, _HO_BLOCK, nb), zeros(W, _HO_BLOCK))
+end
 
 function _ho_reset!(s::HighOrderScratch)
-    empty!(s.cell); empty!(s.e); empty!(s.x); empty!(s.A); empty!(s.w); empty!(s.outside)
+    empty!(s.cell); empty!(s.e); empty!(s.A); empty!(s.w); empty!(s.outside); empty!(s.pair)
     return s
 end
 
 @inline function _ho_record!(
-    s::HighOrderScratch{T,D}, J, e::NTuple{D,T}, x::NTuple{D,T}, A::T, w::T, outside::Bool,
-) where {T,D}
-    push!(s.cell, J); push!(s.e, e); push!(s.x, x); push!(s.A, A); push!(s.w, w); push!(s.outside, outside)
+    s::HighOrderScratch{T,D,C,W}, J, e::NTuple{D,W}, A::T, w::T, outside::Bool, pair::Bool = false,
+) where {T,D,C,W}
+    push!(s.cell, J); push!(s.e, e); push!(s.A, A); push!(s.w, w); push!(s.outside, outside); push!(s.pair, pair)
     return s
 end
 
 # Records cell `J` about target `I` when it meets the support, with `w̃` as its weight.
 @inline function _ho_push!(
-    s::HighOrderScratch{T,D}, sup, grid, I, J, k::Kernels.HighOrderKernel, ℓ::T, h::T, outside::Bool,
-) where {T,D}
-    e = _ho_normal(T, grid, I, J)
+    s::HighOrderScratch{T,D,C,W}, sup, grid, I, J, k::Kernels.HighOrderKernel, ℓ::T, h::T, outside::Bool,
+) where {T,D,C,W}
+    e = _ho_normal(W, grid, I, J)
     A = T(_cell_measure(grid, J))
-    x = _cell_size(sup, A, Val(D))
-    _ho_meets(sup, e, x, h) || return s
-    return _ho_record!(s, J, e, x, A, A * _ho_mean(sup, k, ℓ, e, x), outside)
+    meets, x = _ho_cell(sup, e, A, h)
+    meets || return s
+    return _ho_record!(s, J, e, A, A * _ho_mean(sup, k, ℓ, map(T, e), x), outside)
 end
 
-# The least correction `δ = √A·z` whose moments cancel `r`, `V` the `m × nb` weighted basis: with the column-pivoted
-# QR `VP = QR` and `R₁₁` its leading `k` pivots whose diagonal exceeds `nb·eps` of the first, `z = Q[u; 0]` with
-# `R₁₁ᵀu = (Pᵀr)₁:ₖ`. A target with too few cells for every polynomial has `k < nb`; its system is consistent, since
-# the identity filter meets it. Returns `z` (in `s.z`) and the coefficients `c = P[R₁₁⁻¹u; 0]` of the correction's
-# polynomial `δ/A = Σcᵢφᵢ` (in `s.r`), which a streamed plan's weights read. `Q = H₁⋯Hₖ`, and `Hᵢ` for `i > k` leaves
-# `[u; 0]` unchanged.
-function _ho_solve!(s::HighOrderScratch{T}, V::AbstractMatrix{T}) where {T}
-    r, τ, u, piv = s.r, s.τ, s.u, s.piv
-    m, nb = size(V)
-    kmax = min(m, nb)
-    _ho_pivoted_qr!(V, τ, piv, kmax)
-    lead = kmax > 0 ? abs(V[1, 1]) : zero(T)
-    k = count(i -> abs(V[i, i]) > nb * eps(T) * lead, 1:kmax)
+# `G c = r` for the moment matrix `G` (its lower triangle) of `s`, into `s.r`: the Cholesky factorization with diagonal
+# pivoting `PᵀGP = LLᵀ` (Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed., §10.3), stopped at the
+# first pivot at or below `nb·eps` of the largest diagonal entry, `L₁₁` its leading `k` columns, and
+# `c = P[L₁₁⁻ᵀL₁₁⁻¹(Pᵀr)₁:ₖ; 0]`. A target with too few cells for every polynomial has `k < nb`; its system is
+# consistent, since the identity filter meets it, and the correction `Aₖ p(eₖ/h)` is the same for every solution.
+_ho_solve!(s::HighOrderScratch) = _ho_solve!(s.G, s.r, s.y, s.piv, length(s.r))
+
+# The same on the leading `nb` rows and columns of the buffers.
+function _ho_solve!(G::AbstractMatrix{W}, r::AbstractVector{W}, y::AbstractVector{W}, piv::AbstractVector{Int}, nb::Int) where {W}
+    dmax = zero(W)
+    @inbounds for j in 1:nb
+        piv[j] = j
+        dmax = max(dmax, G[j, j])
+    end
+    tol = nb * eps(W) * dmax
+    k = 0
+    @inbounds for i in 1:nb
+        p = i
+        for j in (i + 1):nb
+            G[j, j] > G[p, p] && (p = j)
+        end
+        G[p, p] > tol || break
+        p == i || _ho_swap!(G, i, p, nb)
+        piv[i], piv[p] = piv[p], piv[i]
+        L = sqrt(G[i, i])
+        G[i, i] = L
+        for q in (i + 1):nb
+            G[q, i] /= L
+        end
+        for j in (i + 1):nb
+            Lj = G[j, i]
+            for q in j:nb
+                G[q, j] -= G[q, i] * Lj
+            end
+        end
+        k = i
+    end
     @inbounds for i in 1:k
         acc = r[piv[i]]
         for j in 1:(i - 1)
-            acc -= V[j, i] * u[j]
+            acc -= G[i, j] * y[j]
         end
-        u[i] = acc / V[i, i]
-    end
-    z = s.z
-    resize!(z, m)
-    fill!(z, zero(T))
-    @inbounds for i in 1:k
-        z[i] = u[i]
+        y[i] = acc / G[i, i]
     end
     @inbounds for i in k:-1:1
-        acc = z[i]
-        for q in (i + 1):m
-            acc += V[q, i] * z[q]
-        end
-        acc *= τ[i]
-        z[i] -= acc
-        for q in (i + 1):m
-            z[q] -= acc * V[q, i]
-        end
-    end
-    @inbounds for i in k:-1:1
-        acc = u[i]
+        acc = y[i]
         for j in (i + 1):k
-            acc -= V[i, j] * u[j]
+            acc -= G[j, i] * y[j]
         end
-        u[i] = acc / V[i, i]
+        y[i] = acc / G[i, i]
     end
-    fill!(r, zero(T))
+    fill!(r, zero(W))
     @inbounds for i in 1:k
-        r[piv[i]] = u[i]
+        r[piv[i]] = y[i]
     end
-    return z, r
+    return r
 end
 
-# The Householder QR of `V` with column pivoting over its first `kmax` columns (Golub & Van Loan, *Matrix
-# Computations*, 4th ed., Algorithm 5.4.1), in place and packed as LAPACK's `geqp3` packs it: `R` on and above the
-# diagonal, reflector `Hᵢ = I − τᵢ vvᵀ` with `v = [1; V[i+1:m, i]]` below it. `piv[i]` is the column of `V` that
-# became column `i`. Each step takes the column of largest norm over the rows not yet reduced.
-function _ho_pivoted_qr!(V::AbstractMatrix{T}, τ::AbstractVector{T}, piv::AbstractVector{Int}, kmax::Int) where {T}
-    m, nb = size(V)
-    @inbounds for j in 1:nb
-        piv[j] = j
-    end
-    @inbounds for i in 1:kmax
-        best, p = -one(T), i
-        for j in i:nb
-            n2 = zero(T)
-            for q in i:m
-                n2 += V[q, j]^2
-            end
-            n2 > best && (best = n2; p = j)
+# Rows and columns `i < p` of the symmetric matrix whose lower triangle `G` holds, exchanged in place.
+@inline function _ho_swap!(G::AbstractMatrix, i::Int, p::Int, nb::Int)
+    @inbounds begin
+        G[i, i], G[p, p] = G[p, p], G[i, i]
+        for q in 1:(i - 1)
+            G[i, q], G[p, q] = G[p, q], G[i, q]
         end
-        if p != i
-            for q in 1:m
-                V[q, i], V[q, p] = V[q, p], V[q, i]
-            end
-            piv[i], piv[p] = piv[p], piv[i]
+        for q in (i + 1):(p - 1)
+            G[q, i], G[p, q] = G[p, q], G[q, i]
         end
-        α = V[i, i]
-        σ = zero(T)
-        for q in (i + 1):m
-            σ += V[q, i]^2
-        end
-        if iszero(σ)
-            τ[i] = zero(T)
-            continue
-        end
-        β = -copysign(sqrt(α^2 + σ), α)
-        τ[i] = (β - α) / β
-        g = one(T) / (α - β)
-        for q in (i + 1):m
-            V[q, i] *= g
-        end
-        V[i, i] = β
-        for j in (i + 1):nb
-            acc = V[i, j]
-            for q in (i + 1):m
-                acc += V[q, i] * V[q, j]
-            end
-            acc *= τ[i]
-            V[i, j] -= acc
-            for q in (i + 1):m
-                V[q, j] -= acc * V[q, i]
-            end
+        for q in (p + 1):nb
+            G[q, i], G[q, p] = G[q, p], G[q, i]
         end
     end
-    return V
-end
-
-# The weighted basis's storage for `m` cells and `nb` polynomials, grown as a target needs.
-function _ho_basis_matrix!(s::HighOrderScratch{T}, m::Int, nb::Int) where {T}
-    length(s.V) < m * nb && resize!(s.V, m * nb)
-    return reshape(view(s.V, 1:(m * nb)), m, nb)
+    return G
 end
 
 """
     _ho_correct!(s, kernel, ℓ, h) -> c
 
 Correct the recorded cells' weights `w̃` in place to `wₖ = w̃ₖ + Aₖ p(eₖ/h)`, with `p = Σ cᵢ φᵢ` the
-polynomial that keeps the total and zeroes every moment of order `1…P`, and return `c`.
+polynomial that keeps the total and zeroes every moment of order `1…P`, and return `c`: one pass sums the moment
+matrix and right-hand side block by block, a second adds the correction.
+"""
+_ho_correct!(s::HighOrderScratch{T,D}, k::Kernels.HighOrderKernel{P}, ℓ::T, h::T) where {T,D,P} =
+    _ho_correct!(s, k, ℓ, h, _ho_indices(Val(D), Val(P), _AllPolynomials()))
+
+"""
+    _ho_correct!(s, kernel, ℓ, h, ix) -> c
+
+The correction over the polynomials `ix` (indices into `_ho_exponents`), each recorded cell counted
+[`_ho_multiplicity`](@ref) times; `c[i]` is polynomial `ix[i]`'s coefficient.
 """
 function _ho_correct!(
-    s::HighOrderScratch{T,D}, ::Kernels.HighOrderKernel{P}, ::T, h::T,
-) where {T,D,P}
-    r = s.r
-    nb = length(r)
-    V = _ho_basis_matrix!(s, length(s.w), nb)
-    fill!(r, zero(T))
-    m₀ = zero(T)
-    @inbounds for c in eachindex(s.w)
-        φ = _ho_basis(map(v -> v / h, s.e[c]), Val(P))
-        sA = sqrt(s.A[c])
-        w̃ = s.w[c]
-        m₀ += w̃
-        for j in 1:nb
-            V[c, j] = sA * φ[j]
-            r[j] -= w̃ * φ[j]
+    s::HighOrderScratch{T,D}, ::Kernels.HighOrderKernel{P}, ::T, h::T, ix::NTuple{nb,Int},
+) where {T,D,P,nb}
+    G, r, Φ, AΦ, w̃ = s.G, s.r, s.φ, s.Aφ, s.w̃
+    W = eltype(r)
+    hw = W(h)
+    fill!(G, zero(W))
+    fill!(r, zero(W))
+    m₀ = zero(W)
+    n = length(s.w)
+    for c0 in 1:_HO_BLOCK:n
+        L = min(_HO_BLOCK, n - c0 + 1)
+        @inbounds for q in 1:L
+            c = c0 + q - 1
+            φ = _ho_basis(map(v -> v / hw, s.e[c]), Val(P))
+            m = _ho_multiplicity(s, c, W)
+            A = W(s.A[c]) * m
+            w̃[q] = W(s.w[c]) * m
+            m₀ += w̃[q]
+            for j in 1:nb
+                Φ[q, j] = φ[ix[j]]
+                AΦ[q, j] = A * φ[ix[j]]
+            end
+        end
+        @inbounds for j in 1:nb
+            acc = zero(W)
+            @simd for q in 1:L
+                acc += w̃[q] * Φ[q, j]
+            end
+            r[j] -= acc
+            for i in j:nb
+                acc = zero(W)
+                @simd for q in 1:L
+                    acc += AΦ[q, j] * Φ[q, i]
+                end
+                G[i, j] += acc
+            end
         end
     end
-    φ0 = _ho_basis(ntuple(_ -> zero(T), Val(D)), Val(P))
+    φ0 = _ho_basis(ntuple(_ -> zero(W), Val(D)), Val(P))
     @inbounds for i in 1:nb
-        r[i] += m₀ * φ0[i]
+        r[i] += m₀ * φ0[ix[i]]
     end
-    z, c = _ho_solve!(s, V)
+    c = _ho_solve!(G, r, s.y, s.piv, nb)
     @inbounds for q in eachindex(s.w)
-        s.w[q] += sqrt(s.A[q]) * z[q]
+        φ = _ho_basis(map(v -> v / hw, s.e[q]), Val(P))
+        p = zero(W)
+        for i in 1:nb
+            p += c[i] * φ[ix[i]]
+        end
+        s.w[q] = T(W(s.w[q]) + W(s.A[q]) * p)
     end
     return c
 end
+
+"""
+    _ho_multiplicity(s, c, W) -> W
+
+How many cells recorded cell `c` stands for: 2 where it is marked as standing for its mirror image too, else 1.
+"""
+@inline _ho_multiplicity(s::HighOrderScratch, c::Int, ::Type{W}) where {W} = @inbounds(s.pair[c]) ? W(2) : one(W)
 
 # ---- one axis: the separable engine -----------------------------------------------------------------
 
@@ -465,17 +500,18 @@ end
 
 # The weights over the cells `(ss, wcs)`, into `w`: zero for a cell outside the support.
 function _highorder_axis_correct!(
-    w::AbstractVector{T}, s::HighOrderScratch{T,1}, k::Kernels.HighOrderKernel, ss::AbstractVector{T},
+    w::AbstractVector{T}, s::HighOrderScratch{T,1,C,W}, k::Kernels.HighOrderKernel, ss::AbstractVector{T},
     wcs::AbstractVector{T}, ℓ::T,
-) where {T<:AbstractFloat}
+) where {T<:AbstractFloat, C, W}
     h = Kernels.kernel_radius(k, ℓ)
     sup = ProductSupport()
     _ho_reset!(s)
     fill!(w, zero(T))
     for t in eachindex(w)
-        e, x = (ss[t],), (wcs[t],)
-        _ho_meets(sup, e, x, h) || continue
-        _ho_record!(s, t, e, x, wcs[t], wcs[t] * _ho_mean(sup, k, ℓ, e, x), false)
+        e = (W(ss[t]),)
+        meets, x = _ho_cell(sup, e, wcs[t], h)
+        meets || continue
+        _ho_record!(s, t, e, wcs[t], wcs[t] * _ho_mean(sup, k, ℓ, (ss[t],), x), false)
     end
     _ho_correct!(s, k, ℓ, h)
     for q in eachindex(s.w)
@@ -679,11 +715,8 @@ _grid_cell(::FlowGeometries.Grids.CartesianCells, grid, t::Int) =
     Tuple(CartesianIndices(FlowGeometries.Grids.size_tuple(grid))[t])
 
 # Whether cell `J` meets the support about target `I`: the test `_ho_push!` records a cell by.
-@inline function _ho_in_support(sup, grid, I, J, h::T) where {T}
-    e = _ho_normal(T, grid, I, J)
-    x = _cell_size(sup, T(_cell_measure(grid, J)), Val(length(e)))
-    return _ho_meets(sup, e, x, h)
-end
+@inline _ho_in_support(sup, grid, I, J, h::T) where {T} =
+    first(_ho_cell(sup, _ho_normal(promote_type(T, Float64), grid, I, J), T(_cell_measure(grid, J)), h))
 
 """
     _highorder_shares_rows(grid, kernel, scale) -> Bool
@@ -747,18 +780,32 @@ function _highorder_band_rows(
     Ny = FlowGeometries.Grids.size_tuple(grid)[2]
     windows = [FlowGeometries.Connectivity.metric_window(lat, (1 + lo[1], j + lo[2]), rad, mt) for j in 1:Ny]
     s = HighOrderScratch(T, Val(2), _ho_nbasis(Val(2), Val(P)), NTuple{2,Int})
+    dls = first.(windows)
+    lim = _row_lon_offsets(FlowGeometries.Grids.isperiodic(grid, 1), maximum(dls; init = 0),
+                           FlowGeometries.Grids.size_tuple(lat)[1])
+    W = promote_type(T, Float64)
+    dλ = W(step(FlowGeometries.Grids.coordinates(grid, 1)))
+    sinλ = [sin(W(d) * dλ) for d in 0:(-first(lim))]
+    havλ = [sin(W(d) * dλ / W(2))^2 for d in 0:(-first(lim))]
     return HighOrderBandRows(lat, lo, mt, grid, kernel, scale, rad, _ho_support(grid, kernel, scale),
-                             Kernels.kernel_radius(kernel, scale), s, first.(windows), last.(windows))
+                             Kernels.kernel_radius(kernel, scale), s, dls, last.(windows), sinλ, havλ)
 end
+
+# The longitude offsets of a row's window of half-width `dl`: each column of a ring once (the antipodal column of an
+# even ring from the west), any offset on a box.
+_row_lon_offsets(periodic::Bool, dl::Int, nλ::Int) =
+    periodic ? (lim = min(dl, nλ ÷ 2); (-lim):(2lim + 1 > nλ ? lim - 1 : lim)) : ((-dl):dl)
 
 """
     HighOrderBandRows
 
 A latitude–longitude grid's corrected weights by row over `lat`, the grid itself or its continued lattice, whose
-cell `I + lo` is grid cell `I`; `mt` is the topology its folds use, `windows` each row's index half-widths.
+cell `I + lo` is grid cell `I`; `mt` is the topology its folds use, `dls` and `djls` each row's index half-widths,
+and `sinλ`, `havλ` the `sin Δλ` and `sin²(Δλ/2)` of each longitude offset `Δi ≥ 0`, at `Δi + 1`, in the
+correction's `promote_type(T, Float64)`.
 """
 struct HighOrderBandRows{
-    L, M, GR, K, T<:AbstractFloat, S, HS<:HighOrderScratch{T}, VI<:AbstractVector{Int},
+    L, M, GR, K, T<:AbstractFloat, S, HS<:HighOrderScratch{T}, VI<:AbstractVector{Int}, VT<:AbstractVector{<:AbstractFloat},
 }
     lat::L
     lo::NTuple{2,Int}
@@ -772,6 +819,8 @@ struct HighOrderBandRows{
     scratch::HS
     dls::VI
     djls::VI
+    sinλ::VT
+    havλ::VT
 end
 
 _nrows(r::HighOrderBandRows) = length(r.djls)
@@ -782,31 +831,70 @@ _has_row_mass(::HighOrderBandRows) = true
 
 _row_worker(r::HighOrderBandRows{L,M,GR,K,T}) where {L,M,GR,K,T} = HighOrderBandRows(
     r.lat, r.lo, r.mt, r.grid, r.kernel, r.scale, r.rad, r.support, r.half,
-    HighOrderScratch(T, Val(2), length(r.scratch.r), NTuple{2,Int}), r.dls, r.djls,
+    HighOrderScratch(T, Val(2), length(r.scratch.r), NTuple{2,Int}), r.dls, r.djls, r.sinλ, r.havλ,
 )
 
+# Row `j`'s cells over its window, each lattice row's factors once and each longitude offset's from the tables, in the
+# correction's `W`: a cell's normal coordinates by the half-angle formulas of `FlowGeometries.Geometry.normal_coordinates`
+# on a sphere. The window is symmetric about the target's meridian and a cell's mirror image across it has the mirrored
+# coordinates `(−e₁, e₂)`, so the cells on and east of it are recorded, each east one standing for its mirror too (the
+# antipodal column of an even ring is its own), and corrected over the polynomials even in `e₁`, the others' moments
+# vanishing over the mirrored set.
 function _row_taps!(f::F, r::HighOrderBandRows{L,M,GR,K,T}, j::Int) where {F, L, M, GR, K, T}
     Ny = _nrows(r)
+    s, lo, lat = r.scratch, r.lo, r.lat
+    W = eltype(r.sinλ)
     periodic = FlowGeometries.Grids.isperiodic(r.grid, 1)
-    nλ = FlowGeometries.Grids.size_tuple(r.lat)[1]
-    s, lo = r.scratch, r.lo
+    nλ, nφ = FlowGeometries.Grids.size_tuple(lat)
+    φs = FlowGeometries.Grids.coordinates(lat, 2)
+    R = W(FlowGeometries.Geometry.radius(FlowGeometries.Grids.grid_geometry(lat)))
     Ie = (1 + lo[1], j + lo[2])
+    φ1 = W(φs[Ie[2]])
+    sinφ1, cosφ1 = sincos(φ1)
+    east = 0:(-first(_row_lon_offsets(periodic, r.dls[j], nλ)))
+    djl = r.djls[j]
+    hw = W(r.half)
     _ho_reset!(s)
-    FlowGeometries.Connectivity.fold_within(
-        nothing, r.lat, Ie...;
-        ball = r.rad, self = true, active_only = false, topology = r.mt,
-        images = FlowGeometries.Connectivity.NearestImage(),
-    ) do _, Je, _
-        _ho_push!(s, r.support, r.lat, Ie, Je, r.kernel, r.scale, r.half, false)
-        nothing
+    @inbounds for Jy in max(1, Ie[2] - djl):min(nφ, Ie[2] + djl)
+        φ2 = W(φs[Jy])
+        Δφ = φ2 - φ1
+        cosφ2 = cos(φ2)
+        sinΔφ = sin(Δφ)
+        havφ = sin(Δφ / W(2))^2
+        A = T(_cell_measure(lat, (Ie[1], Jy)))
+        x = _cell_size(r.support, A, Val(2))
+        xw = map(W, x)
+        for Δi in east
+            s² = r.havλ[Δi + 1]
+            e = _sphere_frame(R, cosφ2 * r.sinλ[Δi + 1], sinΔφ + W(2) * sinφ1 * cosφ2 * s², havφ + cosφ1 * cosφ2 * s²)
+            _ho_meets(r.support, e, xw, hw) || continue
+            Jx = periodic ? mod1(Ie[1] + Δi, nλ) : Ie[1] + Δi
+            pair = Δi > 0 && !(periodic && 2Δi == nλ)
+            _ho_record!(s, (Jx, Jy), e, A, A * _ho_mean(r.support, r.kernel, r.scale, map(T, e), x), false, pair)
+        end
     end
-    _ho_correct!(s, r.kernel, r.scale, r.half)
+    _ho_correct!(s, r.kernel, r.scale, r.half, _ho_indices(Val(2), _ho_order(r.kernel), _EvenInFirst()))
+    mass = zero(T)
     for q in eachindex(s.w)
+        mass += s.pair[q] ? T(2) * s.w[q] : s.w[q]
         Je = s.cell[q]
         1 <= Je[2] - lo[2] <= Ny || continue
         Δi = Je[1] - Ie[1]
         periodic && (Δi = mod(Δi + nλ ÷ 2, nλ) - nλ ÷ 2)
         f(Δi, Je[2] - Ie[2], s.w[q])
+        s.pair[q] && f(-Δi, Je[2] - Ie[2], s.w[q])
     end
-    return sum(s.w)
+    return mass
+end
+
+@inline _ho_order(::Kernels.HighOrderKernel{P}) where {P} = Val(P)
+
+# The normal coordinates `R·σ·(sin α, cos α)` of the point whose unit vector on the frame has east and north components
+# `pe`, `pn` and whose central angle has haversine `hav`.
+@inline function _sphere_frame(R::T, pe::T, pn::T, hav::T) where {T}
+    σ = T(2) * atan(sqrt(hav), sqrt(max(zero(T), one(T) - hav)))
+    sσ = hypot(pe, pn)
+    iszero(sσ) && return (zero(T), R * σ)
+    k = R * σ / sσ
+    return (k * pe, k * pn)
 end

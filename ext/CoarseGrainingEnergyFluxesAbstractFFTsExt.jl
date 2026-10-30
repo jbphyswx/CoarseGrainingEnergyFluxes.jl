@@ -967,6 +967,7 @@ function _zonal_fft_footprint(
         gcol_h = zeros(T, Px, nb)
         gcol = zs(T, Px, nb)
         Ĝ = gplan * gcol
+        s = zeros(T, cut ? nk : 0, nb)
         for j in js
             fill!(gcol_h, zero(T))
             m = CGEF.Filtering._row_taps!(r, j) do ddi, ddj, wt
@@ -980,10 +981,10 @@ function _zonal_fft_footprint(
             copyto!(gcol, gcol_h)
             LA.mul!(Ĝ, gplan, gcol)
             if cut
-                s = Array(real.(Ĝ))
+                _real_part!(s, Ĝ)
                 spectra[j] = s[1:_zonal_modes(s, tol), :]
             else
-                view(full, :, :, j) .= Array(real.(Ĝ))
+                _real_part!(view(full, :, :, j), Ĝ)
             end
         end
     end
@@ -1013,6 +1014,10 @@ function _zonal_fft_footprint(
     _masked_inverse!(fp.invden, den, mask_strategy, mask)
     return fp
 end
+
+# `dst .= real.(Ĝ)` into host memory, through one copy from a device's.
+_real_part!(dst::AbstractArray, Ĝ::Array) = (dst .= real.(Ĝ))
+_real_part!(dst::AbstractArray, Ĝ::AbstractArray) = copyto!(dst, Array(real.(Ĝ)))
 
 # The taps of the target rows, one row at a time (`Filtering._row_taps!`): the banded engine's for a radial
 # kernel, a `HighOrderKernel`'s corrected rows, a `CellOverlap` top-hat's overlap weights.

@@ -399,15 +399,19 @@ end
 
 The taps of a sphere of uniform longitude, one latitude row at a time ([`_row_taps!`](@ref)): each row's
 window from `metric_window`, which holds every row its ball reaches (a row nearer a pole spans more longitude at
-the same radius), as longitude offsets ([`_banded_lon_offsets`](@ref)) and a latitude half-width.
+the same radius), as longitude offsets ([`_banded_lon_offsets`](@ref)) and a latitude half-width, and `havλ[k + 1]`
+the `sin²(k·dλ/2)` of each longitude offset `±k`.
 """
-struct SphereBandRows{GR, K, T<:AbstractFloat, VO<:AbstractVector{NTuple{3,UnitRange{Int}}}, VI<:AbstractVector{Int}}
+struct SphereBandRows{
+    GR, K, T<:AbstractFloat, VO<:AbstractVector{NTuple{3,UnitRange{Int}}}, VI<:AbstractVector{Int}, VT<:AbstractVector{T},
+}
     grid::GR
     kernel::K
     scale::T
     rad::T
     offsets::VO
     dj_lims::VI
+    havλ::VT
 end
 
 function SphereBandRows(
@@ -423,7 +427,8 @@ function SphereBandRows(
         offsets[j] = _banded_lon_offsets(dl, Nx, dλ, periodic_λ)
         dj_lims[j] = djl
     end
-    return SphereBandRows(grid, kernel, scale, rad, offsets, dj_lims)
+    havλ = [sin(T(k) * T(dλ) / T(2))^2 for k in 0:(Nx - 1)]
+    return SphereBandRows(grid, kernel, scale, rad, offsets, dj_lims, havλ)
 end
 
 _nrows(r::SphereBandRows) = length(r.dj_lims)
@@ -433,8 +438,15 @@ _row_dj_lim(r::SphereBandRows) = min(maximum(r.dj_lims; init = 0), _nrows(r) - 1
 _row_reach(r::SphereBandRows) = maximum(o -> maximum(q -> isempty(q) ? 0 : max(abs(first(q)), abs(last(q))), o), r.offsets; init = 0)
 
 # An upper bound on the taps of every row, from the windows.
-_row_entries(r::SphereBandRows) =
-    sum(j -> sum(length, r.offsets[j]) * count(ddj -> 1 <= j + ddj <= _nrows(r), -r.dj_lims[j]:r.dj_lims[j]), 1:_nrows(r); init = 0)
+function _row_entries(r::SphereBandRows)
+    Ny = _nrows(r)
+    n = 0
+    @inbounds for j in 1:Ny
+        o, djl = r.offsets[j], r.dj_lims[j]
+        n += (length(o[1]) + length(o[2]) + length(o[3])) * (min(Ny, j + djl) - max(1, j - djl) + 1)
+    end
+    return n
+end
 
 """
     _row_taps!(f, rows, j) -> mass or nothing
@@ -447,19 +459,39 @@ function _row_taps!(f::F, r::SphereBandRows{GR,K,T}, j::Int) where {F, GR, K, T}
     grid = r.grid
     geo = FlowGeometries.Grids.grid_geometry(grid)
     lat = FlowGeometries.Grids.coordinates(grid, 2)
-    dλ = step(FlowGeometries.Grids.coordinates(grid, 1))
     Ny = _nrows(r)
     djl = r.dj_lims[j]
     for ddj in -djl:djl
         jj = j + ddj
         (1 <= jj <= Ny) || continue
         A = FlowGeometries.Grids.area(grid, 1, jj)   # spherical cell area depends only on latitude
-        for range in r.offsets[j], ddi in range
-            d = FlowGeometries.Geometry.distance(
-                geo, SA.SVector{2,T}(zero(T), lat[j]), SA.SVector{2,T}(T(ddi) * dλ, lat[jj]),
-            )
-            d <= r.rad && f(ddi, ddj, Kernels.kernel_weight(r.kernel, d, r.scale, Val(2)) * A)
-        end
+        _row_pair_taps!(f, geo, r, j, ddj, T(lat[j]), T(lat[jj]), A)
+    end
+    return nothing
+end
+
+# Row `j`'s taps at latitude offset `ddj`, from target latitude `φ1` to source latitude `φ2`, each weighted by the
+# source cell's measure `A`. On a sphere the haversine's part that the two latitudes fix is formed once and each
+# longitude offset's from the table; on another surface the distance is FlowGeometries'.
+@inline function _row_pair_taps!(
+    f::F, geo::FlowGeometries.Geometry.AbstractSphericalGeometry, r::SphereBandRows{GR,K,T}, j::Int, ddj::Int,
+    φ1::T, φ2::T, A,
+) where {F, GR, K, T}
+    hr = FlowGeometries.Geometry._hav_row(φ1, φ2)
+    R = T(FlowGeometries.Geometry.radius(geo))
+    @inbounds for range in r.offsets[j], ddi in range
+        a = hr[1] + hr[2] * r.havλ[abs(ddi) + 1]
+        d = R * (T(2) * atan(sqrt(a), sqrt(max(zero(T), one(T) - a))))
+        d <= r.rad && f(ddi, ddj, Kernels.kernel_weight(r.kernel, d, r.scale, Val(2)) * A)
+    end
+    return nothing
+end
+
+@inline function _row_pair_taps!(f::F, geo, r::SphereBandRows{GR,K,T}, j::Int, ddj::Int, φ1::T, φ2::T, A) where {F, GR, K, T}
+    dλ = step(FlowGeometries.Grids.coordinates(r.grid, 1))
+    for range in r.offsets[j], ddi in range
+        d = FlowGeometries.Geometry.distance(geo, SA.SVector{2,T}(zero(T), φ1), SA.SVector{2,T}(T(ddi) * dλ, φ2))
+        d <= r.rad && f(ddi, ddj, Kernels.kernel_weight(r.kernel, d, r.scale, Val(2)) * A)
     end
     return nothing
 end

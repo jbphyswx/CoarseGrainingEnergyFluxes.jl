@@ -34,6 +34,21 @@ Test.@testset "JET: every engine's plan and apply, and the flux" begin
                                                                                 execution = ser)
         end
 
+        # The high-order correction on each path its weights take: a sphere's latitude rows, a curvilinear grid's
+        # per-target lists kept and streamed, and a rectilinear grid's axes.
+        ho = CGEF.Kernels.HighOrderKernel(; order = 5)
+        hbox = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(6.371e6), FG.Axes.UniformAxis(deg2rad(230.0), deg2rad(0.1), 60),
+                                       FG.Axes.UniformAxis(deg2rad(30.0), deg2rad(0.09), 50))
+        cg = FG.Grids.CurvilinearGrid(geo, [i + 0.2j for i in 1.0:16, j in 1.0:16], [j + 0.1i for i in 1.0:16, j in 1.0:16],
+                                      trues(16, 16))
+        for (g, ℓ, kw) in ((hbox, 150e3, (;)), (cg, 4.0, (;)), (cg, 4.0, (; cache_strategy = CGEF.Filtering.NeverCache())),
+                           (FG.Grids.StructuredGrid(geo, x, xv), 4000.0, (;)))
+            fh = _cgef_field(size(FG.Grids.mask(g)))
+            JET.@test_opt target_modules = targets CGEF.Filtering.plan_filter(g, ho, ℓ; execution = ser, kw...)
+            ph = CGEF.Filtering.plan_filter(g, ho, ℓ; execution = ser, kw...)
+            JET.@test_opt target_modules = targets CGEF.Filtering.filter_apply!(zero(fh), fh, ph)
+        end
+
         # The flux by the filter's series, on an FFT plan and by the sphere's spin transforms with a held workspace,
         # and a held sweep of one engine taking the exact filtering spectrum from its held rate parts.
         P = FG.Grids.Periodic()
