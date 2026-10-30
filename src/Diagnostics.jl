@@ -22,6 +22,7 @@ export FavreWorkspace, SphericalFavreWorkspace, Favre3DWorkspace
 export AbstractSpectrumPolicy, AutoSpectrum, StrictSpectrum, ForceSpectrum, NoSpectrum
 export AbstractScaleDerivative, AutoScaleDerivative, ExactScaleDerivative, DifferenceScaleDerivative
 export AbstractSlopes, NoSlopes, Slopes, AbstractSpectrumMaps, NoSpectrumMaps, SpectrumMaps
+export AbstractFilterPass, LowPass, HighPass
 
 include("Diagnostics/SpectrumPolicy.jl")
 include("Diagnostics/SpinFilter.jl")

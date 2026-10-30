@@ -319,9 +319,10 @@ Results of a coarse-graining sweep over `scales`.
 - `Π::A`: specific energy-flux maps (m² s⁻³) in one `(spatial dims..., Nscales)` array; scale `s` is
   `selectdim(Π, ndims(Π), s)`
 - `cumulative_energy::AbstractArray{T}`: cumulative coarse specific KE ½⟨|ū_ℓ|²⟩ per scale
-  (Sadek–Aluie Eq. 15)
+  (Sadek–Aluie Eq. 15); the residual's ½⟨|u − ū_ℓ|²⟩ under `pass = Diagnostics.HighPass()`
 - `wavenumber::AbstractVector{T}`: filtering wavenumber `k_ℓ = L/ℓ` per scale
-- `filtering_spectrum::AbstractArray{T}`: filtering spectral density `Ẽ(k_ℓ)` per scale (Eq. 14)
+- `filtering_spectrum::AbstractArray{T}`: filtering spectral density `Ẽ(k_ℓ)` per scale (Eq. 14), of the pass's
+  cumulative energy ([`Diagnostics.filtering_spectrum`](@ref))
 - `spectral_slope`: `d ln Ẽ/d ln k_ℓ` per scale under `slopes = Diagnostics.Slopes()`, `nothing` otherwise
 - `spectrum_map`: the local spectrum `Ẽ(x, k_ℓ)`, shaped like `Π`, under `spectrum_maps = Diagnostics.SpectrumMaps()`,
   `nothing` otherwise
@@ -358,8 +359,8 @@ CoarseGrainResult(scales::AbstractVector{T}, Π::AbstractArray{T,N}, cumE::Abstr
         scales, Π, cumE, kℓ, spec, slope, smap, pmap)
 
 # What a sweep writes its rates, slopes and maps into, and the derivative order they read.
-@inline _result_outputs(r, L) =
-    Diagnostics._SpectrumOutputs(r.filtering_spectrum, r.spectral_slope, r.spectrum_map, r.slope_map, L)
+@inline _result_outputs(r, L, pass) =
+    Diagnostics._SpectrumOutputs(r.filtering_spectrum, r.spectral_slope, r.spectrum_map, r.slope_map, L, pass)
 @inline _result_order(r) = Diagnostics._rate_order(r.spectral_slope, r.slope_map)
 
 # ---------------------------------------------------------------------------
@@ -370,7 +371,7 @@ CoarseGrainResult(scales::AbstractVector{T}, Π::AbstractArray{T,N}, cumE::Abstr
     coarse_grain(u, v, w, grid; scales, kernel=TopHatKernel(), execution=AutoBackend(), mask_strategy=ZeroFill(),
                  method=nothing, vector_filter=nothing, transform=AutoSpectralBackend(), L=1, spectrum=AutoSpectrum(),
                  derivative=AutoDerivative(), scale_derivative=AutoScaleDerivative(), slopes=NoSlopes(),
-                 spectrum_maps=NoSpectrumMaps())
+                 spectrum_maps=NoSpectrumMaps(), pass=LowPass())
     coarse_grain(u, v, grid; scales, ...)  # no vertical component
 
 Coarse-graining analysis across `scales`, returning a new [`CoarseGrainResult`](@ref). Allocating
@@ -418,6 +419,9 @@ field on a 1-D grid takes `coarse_grain(u, grid; …)`.
 - `slopes::AbstractSlopes=Diagnostics.NoSlopes()`: `Diagnostics.Slopes()` fills `spectral_slope`.
 - `spectrum_maps::AbstractSpectrumMaps=Diagnostics.NoSpectrumMaps()`: `Diagnostics.SpectrumMaps()` fills
   `spectrum_map`, and with `Slopes()` `slope_map`.
+- `pass::AbstractFilterPass=Diagnostics.LowPass()`: `Diagnostics.HighPass()` takes the cumulative energy, spectrum,
+  slopes and maps of the residual `u − ū_ℓ` (Zhao & Aluie 2025), which recover spectra to `k⁻⁵` with a top-hat or a
+  Gaussian; `Π` does not depend on it.
 
 # Returns
 - `CoarseGrainResult`: Container with scales, Π maps, and spectrum
@@ -450,13 +454,14 @@ function coarse_grain(
     scale_derivative::Diagnostics.AbstractScaleDerivative = Diagnostics.AutoScaleDerivative(),
     slopes::Diagnostics.AbstractSlopes = Diagnostics.NoSlopes(),
     spectrum_maps::Diagnostics.AbstractSpectrumMaps = Diagnostics.NoSpectrumMaps(),
+    pass::Diagnostics.AbstractFilterPass = Diagnostics.LowPass(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     result = _allocate_result(grid, length(scales), slopes, spectrum_maps; execution = execution)
     return coarse_grain!(
         result, u, v, w, grid;
         scales = scales, kernel = kernel, execution = execution, mask_strategy = mask_strategy,
         method = method, vector_filter = vector_filter, transform = transform, L = L, spectrum = spectrum,
-        derivative = derivative, scale_derivative = scale_derivative,
+        derivative = derivative, scale_derivative = scale_derivative, pass = pass,
     )
 end
 
@@ -583,6 +588,7 @@ function coarse_grain!(
     spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.AutoSpectrum(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
     scale_derivative::Diagnostics.AbstractScaleDerivative = Diagnostics.AutoScaleDerivative(),
+    pass::Diagnostics.AbstractFilterPass = Diagnostics.LowPass(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     _check_result_shape(result, grid, scales)
     policy = _check_spectrum(kernel, spectrum)
@@ -593,7 +599,8 @@ function coarse_grain!(
     # there, are moved once to where the workspace's loops run.
     dplan = Diagnostics._placed(ws.at, _sweep_route(derivative, deriv_plan, ws, plans, mask_strategy, grid))
     rate = _sweep_rate(policy, scale_derivative, kernel, ws, plans, mask_strategy, u, v, w, _result_order(result))
-    _coarse_grain_sweep!(result, u, v, w, grid, kernel, scales, ws, plans, dplan, rate, execution, mask_strategy, policy, L)
+    _coarse_grain_sweep!(result, u, v, w, grid, kernel, scales, ws, plans, dplan, rate, execution, mask_strategy, policy, L,
+                         pass)
     return result
 end
 
@@ -601,13 +608,13 @@ end
 # analysis, whose spectra `held`, an earlier sweep's on fields of the same shape, receives in place.
 function _coarse_grain_sweep!(
     result::CoarseGrainResult{T}, u, v, w, grid, kernel, scales, ws, plans, dplan, rate, execution, strat, policy, L,
-    held = nothing,
+    pass, held = nothing,
 ) where {T}
-    outputs = _result_outputs(result, L)
+    outputs = _result_outputs(result, L, pass)
     analyzed = _sweep!(result, outputs, u, v, w, grid, kernel, scales, ws, plans, dplan, rate, execution, strat, held)
     result.wavenumber .= T(L) ./ result.scales
     Diagnostics.filtering_density!(result.filtering_spectrum, result.cumulative_energy, result.wavenumber, policy,
-                                   rate, result.scales, L)
+                                   rate, result.scales, L, pass)
     Diagnostics.finish_slopes!(outputs, result.filtering_spectrum, result.wavenumber, policy, rate)
     return analyzed
 end
@@ -630,7 +637,7 @@ function _sweep!(
     result::CoarseGrainResult{T}, outputs, u, v, w, grid, kernel, scales, ws, plans, dplan, rate, execution, strat,
     held = nothing,
 ) where {T}
-    # `energy_from_filtered` reads the filtered velocities `compute_Π!` leaves in `ws`.
+    # The cumulative energy reads the filtered velocities `compute_Π!` leaves in `ws`.
     total_area = Diagnostics.active_area(grid)
     # The scale-independent part shared by every scale (spectral forward transforms, the spin analysis of
     # the generalized convolution, or the rotation into ambient Cartesian components), or `nothing`.
@@ -644,7 +651,7 @@ function _sweep!(
             ws, plan, execution, strat, dplan, analyzed,
         )
         result.cumulative_energy[s_idx] =
-            Diagnostics.energy_from_filtered(ws, _read_plan(plan, strat), w !== nothing, total_area)
+            Diagnostics._sweep_energy(outputs.pass, ws, _read_plan(plan, strat), u, v, w, total_area)
         Diagnostics._store_rate!(outputs, s_idx, rate, ws, _read_plan(plan, strat), kernel, scale, u, v, w, total_area,
                                  analyzed)
     end
@@ -710,8 +717,8 @@ function _batch_driver!(
     batch.wavenumber .= T(ctx.L) ./ batch.scales
     for result in batch.slices
         Diagnostics.filtering_density!(result.filtering_spectrum, result.cumulative_energy, result.wavenumber,
-                                       ctx.spectrum, rate, result.scales, ctx.L)
-        Diagnostics.finish_slopes!(_result_outputs(result, ctx.L), result.filtering_spectrum, result.wavenumber,
+                                       ctx.spectrum, rate, result.scales, ctx.L, ctx.pass)
+        Diagnostics.finish_slopes!(_result_outputs(result, ctx.L, ctx.pass), result.filtering_spectrum, result.wavenumber,
                                    ctx.spectrum, rate)
     end
     return batch
@@ -719,9 +726,9 @@ end
 
 # A batch's entries at scale `s` as a outputs over its slices: the per-scale values along the slices, the maps over the
 # spatial axes and the slices.
-_scale_outputs(batch, ::Val{R}, s::Int, L) where {R} = Diagnostics._SpectrumOutputs(
+_scale_outputs(batch, ::Val{R}, s::Int, L, pass) where {R} = Diagnostics._SpectrumOutputs(
     selectdim(batch.filtering_spectrum, 1, s), _select(batch.spectral_slope, 1, s),
-    _select(batch.spectrum_map, R + 1, s), _select(batch.slope_map, R + 1, s), L,
+    _select(batch.spectrum_map, R + 1, s), _select(batch.slope_map, R + 1, s), L, pass,
 )
 @inline _select(::Nothing, _d, _s) = nothing
 @inline _select(A::AbstractArray, d::Int, s::Int) = selectdim(A, d, s)
@@ -731,7 +738,6 @@ function _batch_scales!(batch, u, v, w, grid, ::Val{R}, ctx, ws, plans, dplan, r
     T = eltype(batch.Π)
     strat = ctx.mask_strategy
     total_area = Diagnostics.active_area(grid)
-    has_w = w !== nothing
     analyzed = Diagnostics.analyze_sweep(u, v, w, grid, ws, _read_plan(_scale_plan(plans, 1), strat))
     for s_idx in eachindex(ctx.scales)
         scale = T(ctx.scales[s_idx])
@@ -739,11 +745,11 @@ function _batch_scales!(batch, u, v, w, grid, ::Val{R}, ctx, ws, plans, dplan, r
         plan = _scale_plan(plans, s_idx)
         _flux!(selectdim(batch.Π, R + 1, s_idx), u, v, w, grid, ctx.kernel, scale, ws, plan, be, strat, dplan,
                analyzed)
-        Diagnostics.energy_from_filtered!(
-            selectdim(batch.cumulative_energy, 1, s_idx), ws, _read_plan(plan, strat), has_w, total_area,
+        Diagnostics._sweep_energies!(
+            selectdim(batch.cumulative_energy, 1, s_idx), ctx.pass, ws, _read_plan(plan, strat), u, v, w, total_area,
         )
-        Diagnostics._store_rates!(_scale_outputs(batch, Val(R), s_idx, ctx.L), s_idx, rate, ws, _read_plan(plan, strat),
-                                  ctx.kernel, scale, u, v, w, total_area)
+        Diagnostics._store_rates!(_scale_outputs(batch, Val(R), s_idx, ctx.L, ctx.pass), s_idx, rate, ws,
+                                  _read_plan(plan, strat), ctx.kernel, scale, u, v, w, total_area)
     end
     return batch
 end
@@ -881,8 +887,8 @@ length, at least the concurrency used (`Threads.nthreads()` suffices), make a re
 allocation-free; [`Filtering.worker_copy`](@ref) of one family makes a pool sharing its tables. A pool left
 `nothing` is built once and each further worker takes a worker copy of it.
 
-[`coarse_grain_slices!`](@ref) takes slices on different grids. `vector_filter`, `transform` and the
-`spectrum` policy behave as in [`coarse_grain`](@ref).
+[`coarse_grain_slices!`](@ref) takes slices on different grids. `vector_filter`, `transform`, the
+`spectrum` policy and `pass` behave as in [`coarse_grain`](@ref).
 """
 function coarse_grain_batch!(
     batch::CoarseGrainBatchResult{T,NB},
@@ -904,6 +910,7 @@ function coarse_grain_batch!(
     spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.AutoSpectrum(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
     scale_derivative::Diagnostics.AbstractScaleDerivative = Diagnostics.AutoScaleDerivative(),
+    pass::Diagnostics.AbstractFilterPass = Diagnostics.LowPass(),
 ) where {T<:AbstractFloat, NB, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     spatial = FlowGeometries.Grids.size_tuple(grid)
     valR = Val(length(spatial))
@@ -918,7 +925,7 @@ function coarse_grain_batch!(
     resolved = Filtering._resolve_slice_backend(execution)
     inner = _batch_inner_backend(resolved)
     ctx = (; scales, kernel, workspaces, filter_plans, deriv_plans, mask_strategy, method, vector_filter,
-             transform, L, spectrum = policy, inner, derivative, scale_derivative)
+             transform, L, spectrum = policy, inner, derivative, scale_derivative, pass)
     return _batch_driver!(resolved, batch, u, v, w, grid, valR, ctx)
 end
 
@@ -963,7 +970,7 @@ function coarse_grain_batch_slice!(
     return _coarse_grain_sweep!(
         result, _slice_view(u, Val(R), J), _slice_view(v, Val(R), J), _slice_view(w, Val(R), J), grid, ctx.kernel,
         ctx.scales, ws, scratch.filter_plans, Diagnostics._placed(ws.at, scratch.deriv_plan), rate, ctx.inner,
-        ctx.mask_strategy, ctx.spectrum, ctx.L, held,
+        ctx.mask_strategy, ctx.spectrum, ctx.L, ctx.pass, held,
     )
 end
 
@@ -1146,7 +1153,7 @@ Scratch is per slice: `workspaces`, `filter_plans` and `deriv_plans`, when given
 slice, each built for that slice's grid. Each slice's sweep runs serially on a host backend, as in
 `coarse_grain_batch!`.
 
-`vector_filter`, `transform` and the `spectrum` policy behave as in [`coarse_grain`](@ref).
+`vector_filter`, `transform`, the `spectrum` policy and `pass` behave as in [`coarse_grain`](@ref).
 """
 function coarse_grain_slices!(
     results::AbstractVector,
@@ -1168,6 +1175,7 @@ function coarse_grain_slices!(
     spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.AutoSpectrum(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
     scale_derivative::Diagnostics.AbstractScaleDerivative = Diagnostics.AutoScaleDerivative(),
+    pass::Diagnostics.AbstractFilterPass = Diagnostics.LowPass(),
 )
     n = length(results)
     (length(us) == n && length(vs) == n && length(grids) == n) || throw(DimensionMismatch(
@@ -1189,7 +1197,7 @@ function coarse_grain_slices!(
     resolved = Filtering._resolve_slice_backend(execution)
     inner = _batch_inner_backend(resolved)
     ctx = (; scales, kernel, workspaces, filter_plans, deriv_plans, mask_strategy, method, vector_filter,
-             transform, L, spectrum = policy, inner, derivative, scale_derivative)
+             transform, L, spectrum = policy, inner, derivative, scale_derivative, pass)
     return _slices_driver!(resolved, results, us, vs, ws, grids, ctx)
 end
 
@@ -1222,6 +1230,7 @@ function coarse_grain_slice_serial!(results, us, vs, ws, grids, ctx, t::Integer)
         spectrum = ctx.spectrum,
         derivative = ctx.derivative,
         scale_derivative = ctx.scale_derivative,
+        pass = ctx.pass,
     )
 end
 
@@ -1308,6 +1317,7 @@ function coarse_grain(
     scale_derivative::Diagnostics.AbstractScaleDerivative = Diagnostics.AutoScaleDerivative(),
     slopes::Diagnostics.AbstractSlopes = Diagnostics.NoSlopes(),
     spectrum_maps::Diagnostics.AbstractSpectrumMaps = Diagnostics.NoSpectrumMaps(),
+    pass::Diagnostics.AbstractFilterPass = Diagnostics.LowPass(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     result = _allocate_result(grid, length(scales), slopes, spectrum_maps; execution = execution)
     workspace = Diagnostics.ΠWorkspace(grid; execution = execution)   # 1-D: no vertical component
@@ -1315,7 +1325,7 @@ function coarse_grain(
         result, u, grid;
         scales = scales, kernel = kernel, workspace = workspace, filter_plans = filter_plans,
         execution = execution, mask_strategy = mask_strategy, method = method, L = L, spectrum = spectrum,
-        derivative = derivative, scale_derivative = scale_derivative,
+        derivative = derivative, scale_derivative = scale_derivative, pass = pass,
     )
 end
 
@@ -1334,6 +1344,7 @@ function coarse_grain!(
     spectrum::Diagnostics.AbstractSpectrumPolicy = Diagnostics.AutoSpectrum(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
     scale_derivative::Diagnostics.AbstractScaleDerivative = Diagnostics.AutoScaleDerivative(),
+    pass::Diagnostics.AbstractFilterPass = Diagnostics.LowPass(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     _check_result_shape(result, grid, scales)
     policy = _check_spectrum(kernel, spectrum)
@@ -1347,7 +1358,7 @@ function coarse_grain!(
     dplan = Diagnostics._placed(ws.at, _sweep_route(derivative, nothing, ws, plans, mask_strategy, grid))
     rate = _sweep_rate(policy, scale_derivative, kernel, ws, plans, mask_strategy, u, nothing, nothing,
                        _result_order(result))
-    outputs = _result_outputs(result, L)
+    outputs = _result_outputs(result, L, pass)
 
     total_area = Diagnostics.active_area(grid)
 
@@ -1362,16 +1373,13 @@ function coarse_grain!(
             workspace = ws, filter_plan = plan, execution = execution, mask_strategy = mask_strategy,
             deriv_plan = dplan,
         )
-        integrated_energy = Diagnostics._kinetic_integral(
-            (ws.u_filt,), Diagnostics._output(ws.at, plan), 0, ws.at.execution,
-        )
-        result.cumulative_energy[s_idx] = T(0.5) * integrated_energy / total_area
+        result.cumulative_energy[s_idx] = Diagnostics._sweep_energy(pass, ws, plan, u, nothing, nothing, total_area)
         Diagnostics._store_rate!(outputs, s_idx, rate, ws, plan, kernel, scale, u, nothing, nothing, total_area, nothing)
     end
 
     result.wavenumber .= T(L) ./ result.scales
     Diagnostics.filtering_density!(result.filtering_spectrum, result.cumulative_energy, result.wavenumber, policy,
-                                   rate, result.scales, L)
+                                   rate, result.scales, L, pass)
     Diagnostics.finish_slopes!(outputs, result.filtering_spectrum, result.wavenumber, policy, rate)
     return result
 end

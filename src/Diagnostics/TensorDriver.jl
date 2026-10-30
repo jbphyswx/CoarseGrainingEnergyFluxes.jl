@@ -322,24 +322,39 @@ end
 # (Aluie 2019), the stress rotated to the local frame, the strain by `route`. A `SphericalAnalysis` means
 # `ws` already holds the components.
 function _ambient_stress_strain!(u, v, w, grid, ws::ΠWorkspace, plan, route, analyzed)
-    b = ws.at.execution
     analyzed isa SphericalAnalysis || _to_ambient!(ws, u, v, w)
-
-    # The products are formed in the local-velocity buffers and the three scratch arrays, all free
-    # until the filtered velocity is rotated back.
     F = _filtered_with_spectra!((ws.ux_filt, ws.uy_filt, ws.uz_filt), (ws.ux, ws.uy, ws.uz), plan, route)
+    Filtering.filter_apply_batch!(_ambient_product_outs(ws), _ambient_products!(ws), plan)
+    _ambient_local!(ws, F, w, grid, plan, route)
+    return nothing
+end
+
+# The same from a sweep's analyses of the components and their products: each synthesized at this scale.
+function _ambient_stress_strain!(_u, _v, w, grid, ws::ΠWorkspace, plan, route, a::NamedTuple{(:velocity, :product)})
+    _synthesize_all!((ws.ux_filt, ws.uy_filt, ws.uz_filt), a.velocity, plan)
+    _synthesize_all!(_ambient_product_outs(ws), a.product, plan)
+    _ambient_local!(ws, a.velocity, w, grid, plan, route)
+    return nothing
+end
+
+# The six products of the ambient components `ws.ux/uy/uz`, formed in the local-velocity buffers and the three
+# scratch arrays, all free until the filtered velocity is rotated back; in the order of `_ambient_product_outs`.
+function _ambient_products!(ws::ΠWorkspace)
     @. ws.u_filt = ws.ux * ws.ux
     @. ws.v_filt = ws.ux * ws.uy
     @. ws.w_filt = ws.ux * ws.uz
     @. ws.scratch = ws.uy * ws.uy
     @. ws.scratch2 = ws.uy * ws.uz
     @. ws.scratch3 = ws.uz * ws.uz
-    Filtering.filter_apply_batch!(
-        (ws.uu_filt, ws.uv_filt, ws.uw_filt, ws.vv_filt, ws.vw_filt, ws.ww_filt),
-        (ws.u_filt, ws.v_filt, ws.w_filt, ws.scratch, ws.scratch2, ws.scratch3),
-        plan,
-    )
+    return (ws.u_filt, ws.v_filt, ws.w_filt, ws.scratch, ws.scratch2, ws.scratch3)
+end
 
+@inline _ambient_product_outs(ws::ΠWorkspace) = (ws.uu_filt, ws.uv_filt, ws.uw_filt, ws.vv_filt, ws.vw_filt, ws.ww_filt)
+
+# The filtered ambient components and products of `ws` into the local velocity, stress and strain; `F` the
+# components' spectra under the series route.
+function _ambient_local!(ws::ΠWorkspace, F, w, grid, plan, route)
+    b = ws.at.execution
     # A horizontal velocity has an ambient Z component, so all six ambient products enter the local
     # `τ_ee`, `τ_en`, `τ_nn`; without `w` only the radial components drop.
     fr = _output_frames(ws.at, plan)
@@ -865,19 +880,7 @@ function compute_Π!(
 
     _to_ambient!(ws, u, v, w)
     Filtering.filter_apply_batch!((ws.ux_filt, ws.uy_filt, ws.uz_filt), (ws.ux, ws.uy, ws.uz), plan)
-    # The products are formed in the local-velocity buffers and the three scratch arrays, all free until
-    # the filtered velocity is rotated back.
-    @. ws.u_filt = ws.ux * ws.ux
-    @. ws.v_filt = ws.ux * ws.uy
-    @. ws.w_filt = ws.ux * ws.uz
-    @. ws.scratch = ws.uy * ws.uy
-    @. ws.scratch2 = ws.uy * ws.uz
-    @. ws.scratch3 = ws.uz * ws.uz
-    Filtering.filter_apply_batch!(
-        (ws.uu_filt, ws.uv_filt, ws.uw_filt, ws.vv_filt, ws.vw_filt, ws.ww_filt),
-        (ws.u_filt, ws.v_filt, ws.w_filt, ws.scratch, ws.scratch2, ws.scratch3),
-        plan,
-    )
+    Filtering.filter_apply_batch!(_ambient_product_outs(ws), _ambient_products!(ws), plan)
 
     fr = _output_frames(ws.at, plan)
     FlowGeometries.Operators.to_local!(ws.u_filt, ws.v_filt, ws.w_filt, ws.ux_filt, ws.uy_filt, ws.uz_filt, fr;

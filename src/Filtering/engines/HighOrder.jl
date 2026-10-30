@@ -155,6 +155,12 @@ _grid_cells(::FlowGeometries.Grids.FlatCells, grid) = 1:length(FlowGeometries.Gr
 _grid_cells(::FlowGeometries.Grids.CartesianCells, grid) =
     Iterators.map(Tuple, CartesianIndices(FlowGeometries.Grids.size_tuple(grid)))
 
+# The type a traversal names a cell by: an id, or a tuple of as many indices as the grid has axes.
+_cell_type(grid::FlowGeometries.Grids.AbstractGrid) = _cell_type(_cell_address(grid), grid)
+_cell_type(::FlowGeometries.Grids.FlatCells, _) = Int
+_cell_type(::FlowGeometries.Grids.CartesianCells, grid) = _index_tuple(FlowGeometries.Grids.size_tuple(grid))
+_index_tuple(::NTuple{N,Int}) where {N} = NTuple{N,Int}
+
 function _query_radius(
     grid::FlowGeometries.Grids.AbstractGrid, kernel::Kernels.HighOrderKernel, scale::T,
 ) where {T<:AbstractFloat}
@@ -213,12 +219,14 @@ end
     HighOrderScratch
 
 One target's support cells — index, normal coordinates, size, measure, weight, and whether the cell lies
-past a bounded edge — with the storage of the weighted basis `√A φ`, one column per basis polynomial, and the
-right-hand side its correction uses.
+past a bounded edge — with the storage of the weighted basis `√A φ`, one column per basis polynomial, the
+right-hand side its correction uses, and its factorization's reflector factors `τ`, column order `piv` and
+triangular solution `u`.
 """
 struct HighOrderScratch{
     T<:AbstractFloat, D, C,
     VC<:AbstractVector{C}, VE<:AbstractVector{NTuple{D,T}}, VT<:AbstractVector{T}, VB<:AbstractVector{Bool},
+    VI<:AbstractVector{Int},
 }
     cell::VC
     e::VE
@@ -229,10 +237,14 @@ struct HighOrderScratch{
     V::VT
     z::VT
     r::VT
+    τ::VT
+    u::VT
+    piv::VI
 end
 
 HighOrderScratch(::Type{T}, ::Val{D}, nb::Int, ::Type{C}) where {T,D,C} =
-    HighOrderScratch(C[], NTuple{D,T}[], NTuple{D,T}[], T[], T[], Bool[], T[], T[], zeros(T, nb))
+    HighOrderScratch(C[], NTuple{D,T}[], NTuple{D,T}[], T[], T[], Bool[], T[], T[], zeros(T, nb), zeros(T, nb),
+                     zeros(T, nb), zeros(Int, nb))
 
 function _ho_reset!(s::HighOrderScratch)
     empty!(s.cell); empty!(s.e); empty!(s.x); empty!(s.A); empty!(s.w); empty!(s.outside)
@@ -261,30 +273,106 @@ end
 # QR `VP = QR` and `R₁₁` its leading `k` pivots whose diagonal exceeds `nb·eps` of the first, `z = Q[u; 0]` with
 # `R₁₁ᵀu = (Pᵀr)₁:ₖ`. A target with too few cells for every polynomial has `k < nb`; its system is consistent, since
 # the identity filter meets it. Returns `z` (in `s.z`) and the coefficients `c = P[R₁₁⁻¹u; 0]` of the correction's
-# polynomial `δ/A = Σcᵢφᵢ` (in `s.r`), which a streamed plan's weights read.
+# polynomial `δ/A = Σcᵢφᵢ` (in `s.r`), which a streamed plan's weights read. `Q = H₁⋯Hₖ`, and `Hᵢ` for `i > k` leaves
+# `[u; 0]` unchanged.
 function _ho_solve!(s::HighOrderScratch{T}, V::AbstractMatrix{T}) where {T}
-    r = s.r
+    r, τ, u, piv = s.r, s.τ, s.u, s.piv
     m, nb = size(V)
-    F = LinearAlgebra.qr!(V, LinearAlgebra.ColumnNorm())
-    R = F.R
     kmax = min(m, nb)
-    lead = kmax > 0 ? abs(R[1, 1]) : zero(T)
-    k = count(i -> abs(R[i, i]) > nb * eps(T) * lead, 1:kmax)
-    u = r[F.p]
-    R11 = view(R, 1:k, 1:k)
-    uk = view(u, 1:k)
-    LinearAlgebra.ldiv!(LinearAlgebra.LowerTriangular(transpose(R11)), uk)
+    _ho_pivoted_qr!(V, τ, piv, kmax)
+    lead = kmax > 0 ? abs(V[1, 1]) : zero(T)
+    k = count(i -> abs(V[i, i]) > nb * eps(T) * lead, 1:kmax)
+    @inbounds for i in 1:k
+        acc = r[piv[i]]
+        for j in 1:(i - 1)
+            acc -= V[j, i] * u[j]
+        end
+        u[i] = acc / V[i, i]
+    end
     z = s.z
     resize!(z, m)
     fill!(z, zero(T))
-    copyto!(z, 1, u, 1, k)
-    LinearAlgebra.lmul!(F.Q, z)
-    LinearAlgebra.ldiv!(LinearAlgebra.UpperTriangular(R11), uk)
+    @inbounds for i in 1:k
+        z[i] = u[i]
+    end
+    @inbounds for i in k:-1:1
+        acc = z[i]
+        for q in (i + 1):m
+            acc += V[q, i] * z[q]
+        end
+        acc *= τ[i]
+        z[i] -= acc
+        for q in (i + 1):m
+            z[q] -= acc * V[q, i]
+        end
+    end
+    @inbounds for i in k:-1:1
+        acc = u[i]
+        for j in (i + 1):k
+            acc -= V[i, j] * u[j]
+        end
+        u[i] = acc / V[i, i]
+    end
     fill!(r, zero(T))
     @inbounds for i in 1:k
-        r[F.p[i]] = u[i]
+        r[piv[i]] = u[i]
     end
     return z, r
+end
+
+# The Householder QR of `V` with column pivoting over its first `kmax` columns (Golub & Van Loan, *Matrix
+# Computations*, 4th ed., Algorithm 5.4.1), in place and packed as LAPACK's `geqp3` packs it: `R` on and above the
+# diagonal, reflector `Hᵢ = I − τᵢ vvᵀ` with `v = [1; V[i+1:m, i]]` below it. `piv[i]` is the column of `V` that
+# became column `i`. Each step takes the column of largest norm over the rows not yet reduced.
+function _ho_pivoted_qr!(V::AbstractMatrix{T}, τ::AbstractVector{T}, piv::AbstractVector{Int}, kmax::Int) where {T}
+    m, nb = size(V)
+    @inbounds for j in 1:nb
+        piv[j] = j
+    end
+    @inbounds for i in 1:kmax
+        best, p = -one(T), i
+        for j in i:nb
+            n2 = zero(T)
+            for q in i:m
+                n2 += V[q, j]^2
+            end
+            n2 > best && (best = n2; p = j)
+        end
+        if p != i
+            for q in 1:m
+                V[q, i], V[q, p] = V[q, p], V[q, i]
+            end
+            piv[i], piv[p] = piv[p], piv[i]
+        end
+        α = V[i, i]
+        σ = zero(T)
+        for q in (i + 1):m
+            σ += V[q, i]^2
+        end
+        if iszero(σ)
+            τ[i] = zero(T)
+            continue
+        end
+        β = -copysign(sqrt(α^2 + σ), α)
+        τ[i] = (β - α) / β
+        g = one(T) / (α - β)
+        for q in (i + 1):m
+            V[q, i] *= g
+        end
+        V[i, i] = β
+        for j in (i + 1):nb
+            acc = V[i, j]
+            for q in (i + 1):m
+                acc += V[q, i] * V[q, j]
+            end
+            acc *= τ[i]
+            V[i, j] -= acc
+            for q in (i + 1):m
+                V[q, j] -= acc * V[q, i]
+            end
+        end
+    end
+    return V
 end
 
 # The weighted basis's storage for `m` cells and `nb` polynomials, grown as a target needs.
@@ -515,7 +603,7 @@ function _highorder_targets(
     D = _kernel_dim(grid)
     sup = _ho_support(grid, kernel, scale)
     h = Kernels.kernel_radius(kernel, scale)
-    C = eltype(_grid_cells(grid))
+    C = _cell_type(grid)
     nb = _ho_nbasis(D, Val(P))
     ntarget = length(FlowGeometries.Grids.mask(grid))
     coeffs = Matrix{T}(undef, nb, stream ? ntarget : 0)

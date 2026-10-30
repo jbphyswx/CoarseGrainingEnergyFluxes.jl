@@ -131,7 +131,8 @@ end
 # Cached ND scattered footprint: `cell` holds each neighbour's linear index with the periodic wrap applied at
 # build time.
 @kernel function _cgef_filter_kernel_nd_cached!(
-    out, @Const(field), @Const(mask), @Const(cell), @Const(w), @Const(ptr), exterior, dims, strategy, lin0::Int,
+    out, @Const(field), @Const(mask), @Const(start), @Const(len), @Const(w), @Const(rptr), @Const(wptr), exterior, dims,
+    strategy, lin0::Int,
 )
     ll, b = @index(Global, NTuple)
     lin = ll + lin0
@@ -144,18 +145,22 @@ end
         if is_zerofill || mask[I]
             ws = zero(T)
             wn = zero(T)
-            for k in ptr[lin]:(ptr[lin+1] - 1)
-                c = cell[k]
-                active = CGEF.Filtering._cell_active(mask, c)
-                wk = w[k]
-                if is_zerofill
-                    wn += wk
-                    if active
+            k = wptr[lin]
+            for r in rptr[lin]:(rptr[lin + 1] - 1)
+                c0 = Int(start[r])
+                for c in c0:(c0 + Int(len[r]) - 1)
+                    active = CGEF.Filtering._cell_active(mask, c)
+                    wk = w[k]
+                    k += 1
+                    if is_zerofill
+                        wn += wk
+                        if active
+                            ws += wk * _atc(field, c, b, nspatial)
+                        end
+                    elseif active
+                        wn += wk
                         ws += wk * _atc(field, c, b, nspatial)
                     end
-                elseif active
-                    wn += wk
-                    ws += wk * _atc(field, c, b, nspatial)
                 end
             end
             is_zerofill && (wn = CGEF.Filtering._add_exterior(wn, exterior, I))
@@ -206,10 +211,11 @@ end
     end
 end
 
-# Cached scattered footprint: `cell` holds each neighbour's linear index with the periodic wrap resolved at
-# build time (`ScatteredCache`'s convention).
+# Cached scattered footprint: each neighbour's linear index, the periodic wrap resolved at build time, in runs of
+# consecutive indices (`ScatteredCache`'s convention).
 @kernel function _cgef_filter_kernel_scattered!(
-    out, @Const(field), @Const(mask), @Const(cell), @Const(w), @Const(ptr), exterior, strategy, j0::Int,
+    out, @Const(field), @Const(mask), @Const(start), @Const(len), @Const(w), @Const(rptr), @Const(wptr), exterior,
+    strategy, j0::Int,
 )
     i, jl, b = @index(Global, NTuple)
     j = jl + j0
@@ -219,22 +225,24 @@ end
     if i <= Nx && j <= Ny && b <= Nb
         if is_zerofill || mask[i, j]
             t = i + (j - 1) * Nx
-            lo = ptr[t]
-            hi = ptr[t+1] - 1
             ws = zero(T)
             wn = zero(T)
-            for k in lo:hi
-                c = cell[k]
-                active = CGEF.Filtering._cell_active(mask, c)
-                wk = w[k]
-                if is_zerofill
-                    wn += wk
-                    if active
+            k = wptr[t]
+            for r in rptr[t]:(rptr[t + 1] - 1)
+                c0 = Int(start[r])
+                for c in c0:(c0 + Int(len[r]) - 1)
+                    active = CGEF.Filtering._cell_active(mask, c)
+                    wk = w[k]
+                    k += 1
+                    if is_zerofill
+                        wn += wk
+                        if active
+                            ws += wk * _atc(field, c, b, Nx * Ny)
+                        end
+                    elseif active
+                        wn += wk
                         ws += wk * _atc(field, c, b, Nx * Ny)
                     end
-                elseif active
-                    wn += wk
-                    ws += wk * _atc(field, c, b, Nx * Ny)
                 end
             end
             is_zerofill && (wn = CGEF.Filtering._add_exterior(wn, exterior, i, j))
@@ -679,12 +687,14 @@ struct GPUBandedFootprint{F, VI, VW, MA, IN} <: GPUResident
     invden::IN   # reciprocal window mass, built once on the host with the plan
 end
 
-# Scattered footprint with a materialized neighbour cache: each neighbour's linear cell index per point.
+# Scattered footprint with a materialized neighbour cache: each point's runs of linear cell indices and weights.
 struct GPUScatteredCached{F, VC, VW, VP, MA, EX} <: GPUResident
     fp::F
-    cell::VC
+    start::VC
+    len::VC
     w::VW
-    ptr::VP
+    rptr::VP
+    wptr::VP
     maskd::MA
     exterior::EX   # `ZeroFill`'s mass past a bounded edge, or nothing
 end
@@ -752,9 +762,11 @@ end
 # Cached ND scattered footprint, device-resident.
 struct GPUScatteredNDCached{F, VC, VW, VP, MA, EX} <: GPUResident
     fp::F
-    cell::VC
+    start::VC
+    len::VC
     w::VW
-    ptr::VP
+    rptr::VP
+    wptr::VP
     maskd::MA
     exterior::EX
 end
@@ -975,7 +987,8 @@ function CGEF.Filtering.prepare_workspace(
     exterior = _moved(dev, fp.exterior)
     cache = _device_cache(grid, fp, fp.weights)
     cache === nothing || return GPUScatteredNDCached(
-        fp, move(dev, cache.cell), move(dev, cache.w), move(dev, cache.ptr), maskd, exterior,
+        fp, move(dev, cache.start), move(dev, cache.len), move(dev, cache.w), move(dev, cache.rptr),
+        move(dev, cache.wptr), maskd, exterior,
     )
     return GPUStreamingND(
         fp, KA.adapt(dev, grid), KA.adapt(dev, fp.topology), maskd, exterior, _device_weights(dev, fp.weights),
@@ -1026,7 +1039,8 @@ function CGEF.Filtering.prepare_workspace(
     exterior = _moved(dev, fp.exterior)
     cache = _device_cache(grid, fp, fp.weights)
     cache === nothing || return GPUScatteredCached(
-        fp, move(dev, cache.cell), move(dev, cache.w), move(dev, cache.ptr), maskd, exterior,
+        fp, move(dev, cache.start), move(dev, cache.len), move(dev, cache.w), move(dev, cache.rptr),
+        move(dev, cache.wptr), maskd, exterior,
     )
     # The streaming kernel queries device copies of the grid and topology (moved by FlowGeometries'
     # `Adapt` methods), visiting each point's candidates in the host's order.
@@ -1198,7 +1212,7 @@ function _run_gpu_kernel!(
 )
     dims = FlowGeometries.Grids.size_tuple(grid)
     _cgef_filter_kernel_nd_cached!(dev)(
-        out, field, ws.maskd, ws.cell, ws.w, ws.ptr, ws.exterior, dims, strategy, first(cells) - 1;
+        out, field, ws.maskd, ws.start, ws.len, ws.w, ws.rptr, ws.wptr, ws.exterior, dims, strategy, first(cells) - 1;
         ndrange = (length(cells), size(out, length(dims) + 1)),
     )
 end
@@ -1243,7 +1257,7 @@ function _run_gpu_kernel!(
     dev, out, field, ws::GPUScatteredCached, grid, strategy::CGEF.Filtering.AbstractMaskStrategy, rows::UnitRange{Int},
 )
     _cgef_filter_kernel_scattered!(dev)(
-        out, field, ws.maskd, ws.cell, ws.w, ws.ptr, ws.exterior, strategy, first(rows) - 1;
+        out, field, ws.maskd, ws.start, ws.len, ws.w, ws.rptr, ws.wptr, ws.exterior, strategy, first(rows) - 1;
         ndrange = (size(out, 1), length(rows), size(out, 3)),
     )
 end

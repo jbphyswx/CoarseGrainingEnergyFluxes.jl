@@ -43,22 +43,99 @@ end
 @inline _sumsq(c::NTuple{3,AbstractArray}, k::Int) = @inbounds (c[1][k]^2 + c[2][k]^2) + c[3][k]^2
 
 """
-    _SpectrumOutputs(rates, slopes, spectrum_map, slope_map, L)
+    _Residual(raw, ū, mask, ncell)
 
-Where an exact rate route writes a scale, from the filtered velocity `ū`, `a = ℓ∂_ℓū` and `b = ℓ²∂²_ℓū`: `rates[i] =
-⟨ū·∂_ℓū⟩`, `slopes[i]` the spectrum's slope `d ln Ẽ/d ln k_ℓ = −(2⟨ū·a⟩ + ⟨a·a⟩ + ⟨ū·b⟩)/⟨ū·a⟩`, and per cell
-`spectrum_map` the local spectrum `−(ℓ/L) ū·a` with `slope_map` its slope `−(2ū·a + a·a + ū·b)/(ū·a)`. A destination
-left `nothing` is not computed. `i` is the scale of a sweep's result, or the slice of a batch's entries at one scale.
+The residual `u′ = u − ū` of a [`HighPass`](@ref) sweep, formed entry by entry: `raw` the velocity components as
+given, read as zero where the input grid's `mask` is off, `ū` the filtered components, `ncell` the cells of one slice,
+which entry `k` of a batch-shaped array maps to cell `(k − 1) % ncell + 1` of.
 """
-struct _SpectrumOutputs{R<:AbstractArray, S, M, P, T<:Real}
+struct _Residual{R<:Tuple, U<:Tuple, M}
+    raw::R
+    ū::U
+    mask::M
+    ncell::Int
+end
+
+# What `a = ℓ∂_ℓū` is paired with and what a cumulative energy squares: `ū` for the low-pass spectrum, `u′` for the
+# high-pass one. `ū` holds as many components as the velocity given, `u` alone on a line.
+@inline _partner(::LowPass, ū::Tuple, _u, _v, _w, _ws) = ū
+@inline _partner(::HighPass, ū::Tuple, u, v, w, ws) =
+    _Residual(_raw_velocity(u, v, w), ū, FlowGeometries.Grids.mask(ws.at.grid), length(ws.at.grid))
+
+@inline _raw_velocity(u, ::Nothing, ::Nothing) = (u,)
+@inline _raw_velocity(u, v, ::Nothing) = (u, v)
+@inline _raw_velocity(u, v, w::AbstractArray) = (u, v, w)
+
+@inline _cell_of(k::Int, n::Int) = (k - 1) % n + 1
+
+# Entry `k` of component `c` of `u′`.
+@inline function _resid(raw::Tuple, ū::Tuple, mask, n::Int, ::Val{c}, k::Int) where {c}
+    T = eltype(ū[c])
+    @inbounds return ifelse(_cell_on(mask, _cell_of(k, n)), T(raw[c][k]), zero(T)) - ū[c][k]
+end
+
+@inline _resdot(raw::NTuple{1,Any}, ū, mask, n, x, k) = _resid(raw, ū, mask, n, Val(1), k) * @inbounds(x[1][k])
+@inline _resdot(raw::NTuple{2,Any}, ū, mask, n, x, k) =
+    _resid(raw, ū, mask, n, Val(1), k) * @inbounds(x[1][k]) + _resid(raw, ū, mask, n, Val(2), k) * @inbounds(x[2][k])
+@inline _resdot(raw::NTuple{3,Any}, ū, mask, n, x, k) =
+    (_resid(raw, ū, mask, n, Val(1), k) * @inbounds(x[1][k]) + _resid(raw, ū, mask, n, Val(2), k) * @inbounds(x[2][k])) +
+    _resid(raw, ū, mask, n, Val(3), k) * @inbounds(x[3][k])
+
+@inline _ressq(raw::NTuple{1,Any}, ū, mask, n, k) = _resid(raw, ū, mask, n, Val(1), k)^2
+@inline _ressq(raw::NTuple{2,Any}, ū, mask, n, k) = _resid(raw, ū, mask, n, Val(1), k)^2 + _resid(raw, ū, mask, n, Val(2), k)^2
+@inline _ressq(raw::NTuple{3,Any}, ū, mask, n, k) =
+    (_resid(raw, ū, mask, n, Val(1), k)^2 + _resid(raw, ū, mask, n, Val(2), k)^2) + _resid(raw, ū, mask, n, Val(3), k)^2
+
+function _kinetic_integral(r::_Residual, og::FlowGeometries.Grids.AbstractGrid, off::Int, b)
+    raw, ū, mi, n = r.raw, r.ū, r.mask, r.ncell
+    T = eltype(first(ū))
+    msk = FlowGeometries.Grids.mask(og)
+    m = FlowGeometries.Grids.measure(og)
+    return FlowGeometries.Execution.reduce_indices(+, zero(T), length(og), b) do i
+        @inbounds _cell_on(msk, i) ? _ressq(raw, ū, mi, n, off + i) * T(m[i]) : zero(T)
+    end
+end
+
+# `½⟨|x|²⟩` of the velocity `pass` names, from the filtered components `ū` and the velocity `u`, `v`, `w` as given,
+# over the cells of `og`, for the slice at linear offset `off`.
+@inline _pass_energy(pass, ū::Tuple, u, v, w, ws, og, off::Int, total_area::T) where {T} =
+    T(0.5) * _kinetic_integral(_partner(pass, ū, u, v, w, ws), og, off, ws.at.execution) / total_area
+
+# A sweep's cumulative energy at one scale from the filtered velocity `compute_Π!` left in `ws`, and the same per slice of
+# a batch-sized workspace into `out`.
+_sweep_energy(pass, ws, plan, u, v, w, total_area) =
+    _pass_energy(pass, _filtered_velocity(ws, v, w), u, v, w, ws, _output(ws.at, plan), 0, total_area)
+
+function _sweep_energies!(out::AbstractArray, pass, ws, plan, u, v, w, total_area)
+    og = _output(ws.at, plan)
+    n = length(og)
+    ū = _filtered_velocity(ws, v, w)
+    for (k, J) in enumerate(CartesianIndices(size(out)))
+        @inbounds out[J] = _pass_energy(pass, ū, u, v, w, ws, og, (k - 1) * n, total_area)
+    end
+    return out
+end
+
+"""
+    _SpectrumOutputs(rates, slopes, spectrum_map, slope_map, L, pass)
+
+Where an exact rate route writes a scale, from the filtered velocity `ū`, `a = ℓ∂_ℓū` and `b = ℓ²∂²_ℓū`, with `x` the
+velocity the [`AbstractFilterPass`](@ref) `pass` names, `ū` or `u′ = u − ū`, and `σ = ℓ∂_ℓx·a/a·a`, `1` for `ū` and
+`−1` for `u′`: `rates[i] = ⟨x·∂_ℓū⟩`, `slopes[i]` the spectrum's slope `d ln Ẽ/d ln k_ℓ = −(2⟨x·a⟩ + σ⟨a·a⟩ + ⟨x·b⟩)/
+⟨x·a⟩`, and per cell `spectrum_map` the local spectrum `−(ℓ/L) x·a` with `slope_map` its slope `−(2x·a + σa·a + x·b)/
+(x·a)`. A destination left `nothing` is not computed. `i` is the scale of a sweep's result, or the slice of a batch's
+entries at one scale.
+"""
+struct _SpectrumOutputs{R<:AbstractArray, S, M, P, T<:Real, PS<:AbstractFilterPass}
     rates::R
     slopes::S
     spectrum_map::M
     slope_map::P
     L::T
+    pass::PS
 end
 
-_SpectrumOutputs(rates::AbstractArray) = _SpectrumOutputs(rates, nothing, nothing, nothing, 1)
+_SpectrumOutputs(rates::AbstractArray, pass::AbstractFilterPass) = _SpectrumOutputs(rates, nothing, nothing, nothing, 1, pass)
 
 # The derivative order a outputs's destinations read: the second where a slope is asked for.
 @inline _rate_order(outputs::_SpectrumOutputs) = _rate_order(outputs.slopes, outputs.slope_map)
@@ -69,23 +146,38 @@ _SpectrumOutputs(rates::AbstractArray) = _SpectrumOutputs(rates, nothing, nothin
 @inline _scale_view(::Nothing, ::Int) = nothing
 @inline _scale_view(m::AbstractArray, s::Int) = selectdim(m, ndims(m), s)
 
-# Scale `scale`'s results from `ū`, `a`, `b` over the active cells of `og`, for the field at linear offset `off`: entry
-# `i` of the outputs's per-scale vectors, and the maps `m`, `p` (the outputs's at this scale, or `nothing`).
-function _store_outputs!(outputs::_SpectrumOutputs, i::Int, m, p, ū, a, b, og, off::Int, scale, total_area, bk)
+# Scale `scale`'s results from `x` (`_partner`'s, `ū` or `u′`), `a`, `b` over the active cells of `og`, for the field at
+# linear offset `off`: entry `i` of the outputs's per-scale vectors, and the maps `m`, `p` (the outputs's at this scale,
+# or `nothing`).
+function _store_outputs!(outputs::_SpectrumOutputs, i::Int, m, p, x, a, b, og, off::Int, scale, total_area, bk)
     T = eltype(outputs.rates)
-    S1 = _dot_integral(ū, a, og, off, bk)
+    S1 = _dot_integral(x, a, og, off, bk)
     outputs.rates[i] = S1 / (T(scale) * total_area)
-    _store_slope!(outputs.slopes, i, S1, ū, a, b, og, off, bk)
-    _store_maps!(m, p, ū, a, b, length(og), off, T(scale) / T(outputs.L), bk)
+    _store_slope!(outputs.slopes, i, S1, x, a, b, og, off, bk)
+    _store_maps!(m, p, x, a, b, length(og), off, T(scale) / T(outputs.L), bk)
     return nothing
 end
 
-_store_slope!(::Nothing, _i, _S1, _ū, _a, _b, _og, _off, _bk) = nothing
-function _store_slope!(slopes::AbstractArray, i::Int, S1, ū, a, b, og, off::Int, bk)
+# `σ` of `ℓ∂_ℓx = σa`: `ℓ∂_ℓū = a` and `ℓ∂_ℓu′ = −a`.
+@inline _rate_sign(::Tuple) = 1
+@inline _rate_sign(::_Residual) = -1
+
+_store_slope!(::Nothing, _i, _S1, _x, _a, _b, _og, _off, _bk) = nothing
+function _store_slope!(slopes::AbstractArray, i::Int, S1, x, a, b, og, off::Int, bk)
     S2 = _dot_integral(a, a, og, off, bk)
-    S3 = _dot_integral(ū, b, og, off, bk)
-    slopes[i] = -(2S1 + S2 + S3) / S1
+    S3 = _dot_integral(x, b, og, off, bk)
+    slopes[i] = -(2S1 + _rate_sign(x) * S2 + S3) / S1
     return nothing
+end
+
+function _dot_integral(r::_Residual, x::Tuple, og::FlowGeometries.Grids.AbstractGrid, off::Int, bk)
+    raw, ū, mi, n = r.raw, r.ū, r.mask, r.ncell
+    T = eltype(first(ū))
+    msk = FlowGeometries.Grids.mask(og)
+    m = FlowGeometries.Grids.measure(og)
+    return FlowGeometries.Execution.reduce_indices(+, zero(T), length(og), bk) do i
+        @inbounds _cell_on(msk, i) ? _resdot(raw, ū, mi, n, x, off + i) * T(m[i]) : zero(T)
+    end
 end
 
 _store_maps!(::Nothing, _p, _ū, _a, _b, _n, _off, _c, _bk) = nothing
@@ -102,6 +194,30 @@ end
 @inline _slope_at!(::Nothing, _i, _ua, _ū, _a, _b) = nothing
 @inline _slope_at!(p::AbstractArray, i::Int, ua, ū, a, b) =
     (@inbounds p[i] = -(2ua + _sumdot(a, a, i) + _sumdot(ū, b, i)) / ua; nothing)
+
+function _store_maps!(m::AbstractArray, p, r::_Residual, a, b, n::Int, off::Int, c, bk)
+    raw, ū, mi, nc = r.raw, r.ū, r.mask, r.ncell
+    FlowGeometries.Execution.run_indices(n, bk) do k
+        i = off + k
+        ua = _resdot(raw, ū, mi, nc, a, i)
+        @inbounds m[i] = -c * ua
+        _residual_slope_at!(p, i, ua, raw, ū, mi, nc, a, b)
+    end
+    return nothing
+end
+
+@inline _residual_slope_at!(::Nothing, _i, _ua, _raw, _ū, _mi, _nc, _a, _b) = nothing
+@inline _residual_slope_at!(p::AbstractArray, i::Int, ua, raw, ū, mi, nc, a, b) =
+    (@inbounds p[i] = -(2ua - _sumdot(a, a, i) + _resdot(raw, ū, mi, nc, b, i)) / ua; nothing)
+
+# Each entry's `½|x|²` into `m`, over the first `n` entries of `x`'s components.
+function _energy_map!(m::AbstractArray, r::_Residual, n::Int, bk)
+    raw, ū, mi, nc = r.raw, r.ū, r.mask, r.ncell
+    FlowGeometries.Execution.run_indices(n, bk) do k
+        @inbounds m[k] = _ressq(raw, ū, mi, nc, k) / 2
+    end
+    return nothing
+end
 
 """
     _SpinRate
@@ -375,10 +491,11 @@ end
 # `analyzed` is the sweep's `analyze_sweep` result. On the difference route a spectrum map holds each cell's `½|ū|²`
 # until the sweep ends.
 _store_rate!(::Nothing, _s, ::_DifferenceRate, _ws, _plan, _kernel, _scale, _u, _v, _w, _total_area, _analyzed) = nothing
-function _store_rate!(outputs::_SpectrumOutputs, s::Int, ::_DifferenceRate, ws, _plan, _kernel, _scale, _u, v, w, _total_area,
+function _store_rate!(outputs::_SpectrumOutputs, s::Int, ::_DifferenceRate, ws, _plan, _kernel, _scale, u, v, w, _total_area,
                       _analyzed)
     filt = _filtered_velocity(ws, v, w)
-    _energy_map!(_scale_view(outputs.spectrum_map, s), filt, length(first(filt)), ws.at.execution)
+    _energy_map!(_scale_view(outputs.spectrum_map, s), _partner(outputs.pass, filt, u, v, w, ws), length(first(filt)),
+                 ws.at.execution)
     return nothing
 end
 
@@ -386,25 +503,26 @@ end
 @inline _filtered_velocity(ws, ::Nothing, _w) = (ws.u_filt,)
 @inline _filtered_velocity(ws, _v, w) = _spin_filtered(ws, w)
 
-function _store_rate!(outputs::_SpectrumOutputs, s::Int, r::_SpinRate, ws, plan, kernel, scale, _u, _v, w, total_area, _analyzed)
+function _store_rate!(outputs::_SpectrumOutputs, s::Int, r::_SpinRate, ws, plan, kernel, scale, u, v, w, total_area, _analyzed)
     _spin_rate_fields!(r, _spin_of(ws.spin, plan), kernel, scale, 0)
-    _store_outputs!(outputs, s, _scale_view(outputs.spectrum_map, s), _scale_view(outputs.slope_map, s), _spin_filtered(ws, w), r.a,
-                 r.b, ws.at.unmasked, 0, scale, total_area, ws.at.execution)
+    _store_outputs!(outputs, s, _scale_view(outputs.spectrum_map, s), _scale_view(outputs.slope_map, s),
+                    _partner(outputs.pass, _spin_filtered(ws, w), u, v, w, ws), r.a, r.b, ws.at.unmasked, 0, scale, total_area,
+                    ws.at.execution)
     return nothing
 end
 
 function _store_rate!(outputs::_SpectrumOutputs, s::Int, r::_SeriesRate, ws, plan, kernel, scale, u, v, w, total_area, analyzed)
     dot, a, b, og = _series_rate_fields!(r, ws, plan, kernel, scale, u, v, w,
                                          _rate_spectra!(r, analyzed, ws, plan, u, v, w, s))
-    _store_outputs!(outputs, s, _scale_view(outputs.spectrum_map, s), _scale_view(outputs.slope_map, s), dot, a, b, og, 0, scale,
-                 total_area, ws.at.execution)
+    _store_outputs!(outputs, s, _scale_view(outputs.spectrum_map, s), _scale_view(outputs.slope_map, s),
+                    _partner(outputs.pass, dot, u, v, w, ws), a, b, og, 0, scale, total_area, ws.at.execution)
     return nothing
 end
 
 function _store_rate!(outputs::_SpectrumOutputs, s::Int, r::_WindowRate, ws, plan, _kernel, scale, u, v, w, total_area, _analyzed)
     dot, a, b = _window_rate_fields!(r, s, ws, plan, u, v, w)
-    _store_outputs!(outputs, s, _scale_view(outputs.spectrum_map, s), _scale_view(outputs.slope_map, s), dot, a, b,
-                 _output(ws.at, plan), 0, scale, total_area, ws.at.execution)
+    _store_outputs!(outputs, s, _scale_view(outputs.spectrum_map, s), _scale_view(outputs.slope_map, s),
+                    _partner(outputs.pass, dot, u, v, w, ws), a, b, _output(ws.at, plan), 0, scale, total_area, ws.at.execution)
     return nothing
 end
 
@@ -465,11 +583,9 @@ function _less_mass_rate!(loc, dot, r::_SeriesRate, rp, M̂)
     return nothing
 end
 
-# The velocity's analyses: the sweep's spectra on a plane; the ambient components analyzed at the sweep's first
-# scale where a `SphericalAnalysis` holds them fixed; otherwise analyzed per scale.
+# The velocity's analyses: the sweep's spectra, of the ambient components on a sphere or a spheroid; otherwise
+# analyzed per scale.
 _rate_spectra!(_r, a::NamedTuple, _ws, _plan, _u, _v, _w, _s) = a.velocity
-_rate_spectra!(r, ::SphericalAnalysis, ws, plan, u, v, w, s::Int) =
-    s == 1 ? _analyze_rate_fields!(r, ws, plan, u, v, w) : r.F
 _rate_spectra!(r, _analyzed, ws, plan, u, v, w, _s) = _analyze_rate_fields!(r, ws, plan, u, v, w)
 
 function _analyze_rate_fields!(r::_SeriesRate, ws, plan, u, v, w)
@@ -500,29 +616,29 @@ end
 # The same per slice of a batch-sized workspace into a outputs of one scale's entries, one per slice in linear order, its
 # maps that scale's. The flux leaves the spin coefficients of its last slice alone, so each slice's are analyzed again
 # from `u`, `v`, `w`; a spectral plan analyzes and synthesizes the whole batch at once.
-function _store_rates!(outputs::_SpectrumOutputs, _s, ::_DifferenceRate, ws, _plan, _kernel, _scale, _u, v, w, _total_area)
+function _store_rates!(outputs::_SpectrumOutputs, _s, ::_DifferenceRate, ws, _plan, _kernel, _scale, u, v, w, _total_area)
     filt = _filtered_velocity(ws, v, w)
-    _energy_map!(outputs.spectrum_map, filt, length(first(filt)), ws.at.execution)
+    _energy_map!(outputs.spectrum_map, _partner(outputs.pass, filt, u, v, w, ws), length(first(filt)), ws.at.execution)
     return nothing
 end
 
 function _store_rates!(outputs::_SpectrumOutputs, _s, r::_SeriesRate, ws, plan, kernel, scale, u, v, w, total_area)
     dot, a, b, og = _series_rate_fields!(r, ws, plan, kernel, scale, u, v, w,
                                          _analyze_rate_fields!(r, ws, plan, u, v, w))
-    _slice_store!(outputs, dot, a, b, og, scale, ws, total_area)
+    _slice_store!(outputs, _partner(outputs.pass, dot, u, v, w, ws), a, b, og, scale, ws, total_area)
     return nothing
 end
 
 function _store_rates!(outputs::_SpectrumOutputs, s::Int, r::_WindowRate, ws, plan, _kernel, scale, u, v, w, total_area)
     dot, a, b = _window_rate_fields!(r, s, ws, plan, u, v, w)
-    _slice_store!(outputs, dot, a, b, _output(ws.at, plan), scale, ws, total_area)
+    _slice_store!(outputs, _partner(outputs.pass, dot, u, v, w, ws), a, b, _output(ws.at, plan), scale, ws, total_area)
     return nothing
 end
 
-function _slice_store!(outputs, dot, a, b, og, scale, ws, total_area)
+function _slice_store!(outputs, x, a, b, og, scale, ws, total_area)
     n = length(og)
-    for (t, off) in enumerate(0:n:(length(first(dot)) - n))
-        _store_outputs!(outputs, t, outputs.spectrum_map, outputs.slope_map, dot, a, b, og, off, scale, total_area,
+    for (t, off) in enumerate(0:n:(length(first(a)) - n))
+        _store_outputs!(outputs, t, outputs.spectrum_map, outputs.slope_map, x, a, b, og, off, scale, total_area,
                      ws.at.execution)
     end
     return nothing
@@ -531,12 +647,12 @@ end
 function _store_rates!(outputs::_SpectrumOutputs, _s, r::_SpinRate, ws, plan, kernel, scale, u, v, w, total_area)
     sf = _spin_of(ws.spin, plan)
     n = sf.ncells
-    filt = _spin_filtered(ws, w)
+    x = _partner(outputs.pass, _spin_filtered(ws, w), u, v, w, ws)
     for (t, off) in enumerate(0:n:(length(u) - n))
         _spin_analyze!(sf.coeffs[1], sf, 1, true, k -> @inbounds(complex(u[off + k], v[off + k])))
         _rate_vertical_analysis!(sf, w, off)
         _spin_rate_fields!(r, sf, kernel, scale, off)
-        _store_outputs!(outputs, t, outputs.spectrum_map, outputs.slope_map, filt, r.a, r.b, ws.at.unmasked, off, scale, total_area,
+        _store_outputs!(outputs, t, outputs.spectrum_map, outputs.slope_map, x, r.a, r.b, ws.at.unmasked, off, scale, total_area,
                      ws.at.execution)
     end
     return nothing
@@ -547,28 +663,32 @@ _rate_vertical_analysis!(sf::SpinFilter, w::AbstractArray, off::Int) =
     _spin_analyze!(sf.coeffs[5], sf, 0, true, k -> @inbounds(complex(w[off + k])))
 
 """
-    filtering_density!(g, C, k, policy, rate, scales, L) -> g
+    filtering_density!(g, C, k, policy, rate, scales, L, pass) -> g
 
 The filtering spectral density at each scale: `NaN` under [`NoSpectrum`](@ref); otherwise `dC/dk` by
-[`spectral_density!`](@ref) for the difference route, and `Ẽ = −(ℓ²/L)⟨ū·∂_ℓū⟩` from the rates `g` holds for an
-exact one.
+[`spectral_density!`](@ref) for the difference route, `−dC/dk` under [`HighPass`](@ref), and `−(ℓ²/L)` times the
+rates `g` holds for an exact one.
 """
-filtering_density!(g, _C, _k, ::NoSpectrum, _rate, _scales, _L) = fill!(g, convert(eltype(g), NaN))
-filtering_density!(g, C, k, ::AbstractSpectrumPolicy, rate, scales, L) = _density!(g, C, k, rate, scales, L)
-_density!(g, C, k, ::_DifferenceRate, _scales, _L) = spectral_density!(g, C, k)
-function _density!(g, _C, _k, _rate, scales, L)
+filtering_density!(g, _C, _k, ::NoSpectrum, _rate, _scales, _L, _pass) = fill!(g, convert(eltype(g), NaN))
+filtering_density!(g, C, k, ::AbstractSpectrumPolicy, rate, scales, L, pass) = _density!(g, C, k, rate, scales, L, pass)
+_density!(g, C, k, ::_DifferenceRate, _scales, _L, pass) = _pass_sign!(spectral_density!(g, C, k), pass)
+function _density!(g, _C, _k, _rate, scales, L, _pass)
     T = eltype(g)
     @. g = -T(scales)^2 / T(L) * g
     return g
 end
+
+# A cumulative energy's density in `k`: the filtered velocity's grows with `k`, the residual's falls.
+@inline _pass_sign!(g, ::LowPass) = g
+@inline _pass_sign!(g, ::HighPass) = (g .= .-g; g)
 
 """
     finish_slopes!(outputs, g, k, policy, rate) -> outputs
 
 A outputs's slopes and maps once its density `g` over the wavenumbers `k` is filled: `NaN` under
 [`NoSpectrum`](@ref); on the difference route the slope of `ln Ẽ` in `ln k` by the three-point quadratic of
-[`spectral_density!`](@ref), and the spectrum map as `dC/dk` of each cell's `½|ū|²`, its slope likewise; an exact
-route stored them per scale.
+[`spectral_density!`](@ref), and the spectrum map as `dC/dk` of each cell's `½|ū|²` (`−dC/dk` of its `½|u′|²` under
+[`HighPass`](@ref)), its slope likewise; an exact route stored them per scale.
 """
 finish_slopes!(outputs::_SpectrumOutputs, _g, _k, ::NoSpectrum, _rate) =
     (_fill_nan!(outputs.slopes); _fill_nan!(outputs.spectrum_map); _fill_nan!(outputs.slope_map); outputs)
@@ -576,7 +696,7 @@ finish_slopes!(outputs::_SpectrumOutputs, g, k, ::AbstractSpectrumPolicy, rate) 
 _finish_slopes!(outputs, _g, _k, _rate) = outputs
 function _finish_slopes!(outputs, g, k, ::_DifferenceRate)
     _log_slope!(outputs.slopes, g, k)
-    _map_density!(outputs.spectrum_map, outputs.slope_map, k)
+    _map_density!(outputs.spectrum_map, outputs.slope_map, k, outputs.pass)
     return outputs
 end
 
@@ -588,11 +708,11 @@ _fill_nan!(x::AbstractArray) = fill!(x, convert(eltype(x), NaN))
 _log_slope!(::Nothing, _g, _k) = nothing
 _log_slope!(slopes, g, k) = spectral_density!(slopes, _log_or_nan.(g), log.(k))
 
-# A map's cells' `½|ū|²` per scale into their density in `k`, and its slope in `ln k` into `p`.
-_map_density!(::Nothing, _p, _k) = nothing
-function _map_density!(m, p, k)
+# A map's cells' `½|x|²` per scale into their density in `k`, and its slope in `ln k` into `p`.
+_map_density!(::Nothing, _p, _k, _pass) = nothing
+function _map_density!(m, p, k, pass)
     E = copy(m)
-    _density_along!(m, E, k)
+    _pass_sign!(_density_along!(m, E, k), pass)
     _map_slope!(p, m, k)
     return nothing
 end
@@ -675,7 +795,7 @@ function energy_from_filtered!(
 end
 
 """
-    cumulative_energy!(spectrum, u, v, w, grid, kernel, scales; workspace=nothing, filter_plans=nothing, execution=AutoBackend(), mask_strategy=ZeroFill(), method=RealSpace(), vector_filter=nothing, transform=AutoSpectralBackend())
+    cumulative_energy!(spectrum, u, v, w, grid, kernel, scales; workspace=nothing, filter_plans=nothing, execution=AutoBackend(), mask_strategy=ZeroFill(), method=RealSpace(), vector_filter=nothing, transform=AutoSpectralBackend(), pass=LowPass())
 
 In-place [`cumulative_energy`](@ref): writes into the caller-supplied `spectrum` vector and, when
 `workspace` (a [`ΠWorkspace`](@ref) or [`EnergyWorkspace`](@ref), in the memory of the plans' backend)
@@ -705,6 +825,7 @@ function cumulative_energy!(
     method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
     vector_filter::Union{Nothing, Filtering.AbstractVectorFilter} = nothing,
     transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
+    pass::AbstractFilterPass = LowPass(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     _check_energy_fields(u, v, w, grid)
     Nscales = length(scales)
@@ -713,14 +834,14 @@ function cumulative_energy!(
     ))
     Nscales == 0 && return spectrum
     _cumulative_energy_rates!(spectrum, nothing, DifferenceScaleDerivative(), u, v, w, grid, kernel, scales,
-                              workspace, filter_plans, execution, mask_strategy, method, vector_filter, transform)
+                              workspace, filter_plans, execution, mask_strategy, method, vector_filter, transform, pass)
     return spectrum
 end
 
-# `Ē(ℓ)` into `spectrum` and, on an exact route of `sd` with `rates` given, `⟨ū·∂_ℓū⟩` into `rates`; returns the
-# rate route taken.
+# The cumulative energy of the velocity `pass` names into `spectrum` and, on an exact route of `sd` with `rates` given,
+# its rate into `rates`; returns the rate route taken.
 function _cumulative_energy_rates!(spectrum, rates, sd::AbstractScaleDerivative, u, v, w, grid, kernel, scales,
-                                   workspace, filter_plans, execution, mask_strategy, method, vector_filter, transform)
+                                   workspace, filter_plans, execution, mask_strategy, method, vector_filter, transform, pass)
     strategy = filter_plans === nothing ? mask_strategy : Filtering.plan_strategy(first(filter_plans))
     sweep() = Filtering.plan_filter_sweep(
         grid, kernel, scales; mask_strategy = mask_strategy, execution = execution, method = method,
@@ -728,23 +849,23 @@ function _cumulative_energy_rates!(spectrum, rates, sd::AbstractScaleDerivative,
     ws, plans = _energy_setup(workspace, filter_plans, grid, strategy, w, vector_filter, transform, execution, sweep)
     _check_workspace_w(ws, w)
     total_area = active_area(grid)
-    outputs = _rates_outputs(rates)
+    outputs = _rates_outputs(rates, pass)
     if ws.spin !== nothing
         plans === nothing || _check_placement(ws.at, first(plans))
         route = _rates_route(rates, sd, kernel, ws, strategy, u, v, w)
         _spin_cumulative_energy!(spectrum, outputs, route, _spin_of(ws.spin, strategy), ws, u, v, w, kernel, scales,
-                                 total_area)
+                                 total_area, pass)
         return route
     end
     swept = _swept(plans, sweep)
     _check_placement(ws.at, first(swept))
     route = _rates_route(rates, sd, kernel, ws, swept, u, v, w)
-    _cumulative_energy!(spectrum, outputs, route, kernel, scales, ws, swept, u, v, w, grid, total_area)
+    _cumulative_energy!(spectrum, outputs, route, kernel, scales, ws, swept, u, v, w, grid, total_area, pass)
     return route
 end
 
-@inline _rates_outputs(::Nothing) = nothing
-@inline _rates_outputs(rates::AbstractVector) = _SpectrumOutputs(rates)
+@inline _rates_outputs(::Nothing, _pass) = nothing
+@inline _rates_outputs(rates::AbstractVector, pass) = _SpectrumOutputs(rates, pass)
 @inline _rates_route(::Nothing, _sd, _kernel, _ws, _plan, _u, _v, _w) = _DifferenceRate()
 @inline _rates_route(::AbstractVector, sd, kernel, ws, plan, u, v, w) =
     _rate_route(sd, kernel, ws, plan, u, v, w, Filtering.ScaleRates())
@@ -776,7 +897,7 @@ _energy_setup(ws, filter_plans, _, _, _, _, _, _, _) = (ws, filter_plans)
 
 function _cumulative_energy!(
     spectrum::AbstractVector{T}, outputs, route, kernel, scales, ws, plans, u, v, w,
-    grid::FlowGeometries.Grids.AbstractGrid{G,T}, total_area::T,
+    grid::FlowGeometries.Grids.AbstractGrid{G,T}, total_area::T, pass,
 ) where {T<:AbstractFloat, G}
     b = ws.at.execution
     u_filt, v_filt, w_filt = ws.u_filt, ws.v_filt, ws.w_filt
@@ -804,11 +925,9 @@ function _cumulative_energy!(
             Filtering.filter_apply_batch!((u_filt, v_filt), (u, v), plan)
         end
 
-        # Spatial average specific energy: E(ℓ) = 0.5 ∫ |ū_ℓ|² dA over the output grid, per unit water
-        # area.
-        integrated_energy = w === nothing ? _kinetic_integral((u_filt, v_filt), og, 0, b) :
-                                            _kinetic_integral(_with_w(u_filt, v_filt, w_filt), og, 0, b)
-        spectrum[s_idx] = T(0.5) * integrated_energy / total_area
+        # Spatial average specific energy: E(ℓ) = 0.5 ∫ |x|² dA over the output grid, per unit water area.
+        spectrum[s_idx] = _pass_energy(pass, _with_w(u_filt, v_filt, w === nothing ? nothing : w_filt), u, v, w, ws, og, 0,
+                                       total_area)
         _store_rate!(outputs, s_idx, route, ws, plan, kernel, T(scales[s_idx]), u, v, w, total_area, nothing)
     end
 
@@ -818,7 +937,7 @@ end
 # `E(ℓ)` under the generalized convolution: the velocity is analyzed once and synthesized per scale, on
 # every cell of the grid; on the spin rate route each scale's `⟨ū·∂_ℓū⟩` into the outputs.
 function _spin_cumulative_energy!(
-    spectrum::AbstractVector{T}, outputs, route, sf::SpinFilter, ws, u, v, w, kernel, scales, total_area::T,
+    spectrum::AbstractVector{T}, outputs, route, sf::SpinFilter, ws, u, v, w, kernel, scales, total_area::T, pass,
 ) where {T<:AbstractFloat}
     b = ws.at.execution
     og = ws.at.unmasked
@@ -838,29 +957,29 @@ function _spin_cumulative_energy!(
                 @inbounds w_filt[k] = real(z)
             end
         end
-        integrated_energy = w === nothing ? _kinetic_integral((u_filt, v_filt), og, 0, b) :
-                                            _kinetic_integral(_with_w(u_filt, v_filt, w_filt), og, 0, b)
-        spectrum[s_idx] = T(0.5) * integrated_energy / total_area
-        _spin_rate_at!(outputs, s_idx, route, _spin_filtered(ws, w), sf, kernel, T(scales[s_idx]), og, b, total_area)
+        x = _partner(pass, _spin_filtered(ws, w), u, v, w, ws)
+        spectrum[s_idx] = T(0.5) * _kinetic_integral(x, og, 0, b) / total_area
+        _spin_rate_at!(outputs, s_idx, route, x, sf, kernel, T(scales[s_idx]), og, b, total_area)
     end
     return spectrum
 end
 
-_spin_rate_at!(_outputs, _s, ::_DifferenceRate, _filt, _sf, _kernel, _scale, _og, _b, _total_area) = nothing
-function _spin_rate_at!(outputs::_SpectrumOutputs, s::Int, r::_SpinRate, filt, sf, kernel, scale, og, b, total_area)
+_spin_rate_at!(_outputs, _s, ::_DifferenceRate, _x, _sf, _kernel, _scale, _og, _b, _total_area) = nothing
+function _spin_rate_at!(outputs::_SpectrumOutputs, s::Int, r::_SpinRate, x, sf, kernel, scale, og, b, total_area)
     _spin_rate_fields!(r, sf, kernel, scale, 0)
-    _store_outputs!(outputs, s, _scale_view(outputs.spectrum_map, s), _scale_view(outputs.slope_map, s), filt, r.a, r.b, og, 0,
+    _store_outputs!(outputs, s, _scale_view(outputs.spectrum_map, s), _scale_view(outputs.slope_map, s), x, r.a, r.b, og, 0,
                  scale, total_area, b)
     return nothing
 end
 
 """
-    cumulative_energy(u, v, w, grid, kernel, scales; workspace=nothing, filter_plans=nothing, execution=AutoBackend(), mask_strategy=ZeroFill(), method=RealSpace(), vector_filter=nothing, transform=AutoSpectralBackend())
+    cumulative_energy(u, v, w, grid, kernel, scales; workspace=nothing, filter_plans=nothing, execution=AutoBackend(), mask_strategy=ZeroFill(), method=RealSpace(), vector_filter=nothing, transform=AutoSpectralBackend(), pass=LowPass())
 
 Cumulative coarse-grained kinetic energy `E(ℓ) = 0.5 ⟨|ū_ℓ|²⟩` at each filter scale
-(Sadek & Aluie 2018, PRF, Eq. 15). The filtering spectral density, comparable to a Fourier energy
-spectrum, is its derivative with respect to the filtering wavenumber: see
-[`Diagnostics.filtering_spectrum`](@ref). Allocating form of [`cumulative_energy!`](@ref).
+(Sadek & Aluie 2018, PRF, Eq. 15), or under `pass = HighPass()` the residual's `E′(ℓ) = 0.5 ⟨|u − ū_ℓ|²⟩` (Zhao & Aluie
+2025, eq. 6; [`HighPass`](@ref)). The filtering spectral density, comparable to a Fourier energy spectrum, is its
+derivative with respect to the filtering wavenumber: see [`Diagnostics.filtering_spectrum`](@ref). Allocating form of
+[`cumulative_energy!`](@ref).
 
 # Examples
 ```julia
@@ -886,18 +1005,19 @@ function cumulative_energy(
     method::Filtering.AbstractFilterMethod = Filtering.RealSpace(),
     vector_filter::Union{Nothing, Filtering.AbstractVectorFilter} = nothing,
     transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
+    pass::AbstractFilterPass = LowPass(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     spectrum = zeros(T, length(scales))
     return cumulative_energy!(
         spectrum, u, v, w, grid, kernel, scales;
         workspace = workspace, filter_plans = filter_plans,
         execution = execution, mask_strategy = mask_strategy, method = method,
-        vector_filter = vector_filter, transform = transform,
+        vector_filter = vector_filter, transform = transform, pass = pass,
     )
 end
 
 """
-    filtering_spectrum(u, v, w, grid, kernel, scales; L=1, workspace=nothing, filter_plans=nothing, execution=AutoBackend(), mask_strategy=ZeroFill(), method=RealSpace(), vector_filter=nothing, transform=AutoSpectralBackend(), policy=StrictSpectrum())
+    filtering_spectrum(u, v, w, grid, kernel, scales; L=1, workspace=nothing, filter_plans=nothing, execution=AutoBackend(), mask_strategy=ZeroFill(), method=RealSpace(), vector_filter=nothing, transform=AutoSpectralBackend(), policy=StrictSpectrum(), scale_derivative=AutoScaleDerivative(), pass=LowPass())
         -> (k_ℓ, Ẽ)
 
 Filtering spectral density (Sadek & Aluie 2018, PRF, Eq. 14): the derivative of the cumulative
@@ -905,6 +1025,11 @@ coarse-grained KE ([`cumulative_energy`](@ref), Eq. 15) with respect to the filt
 `k_ℓ = L/ℓ`,
 
     Ẽ(k_ℓ) = d/dk_ℓ [ ½⟨|ū_ℓ|²⟩ ] = -(ℓ²/L) d/dℓ[ ½⟨|ū_ℓ|²⟩ ].
+
+Under `pass = HighPass()` it is the spectrum of the residual `u′_ℓ = u − ū_ℓ` (Zhao & Aluie 2025, eq. 18;
+[`HighPass`](@ref)),
+
+    E′(k_ℓ) = -d/dk_ℓ [ ½⟨|u′_ℓ|²⟩ ] = (ℓ²/L) d/dℓ[ ½⟨|u′_ℓ|²⟩ ] = -(ℓ²/L)⟨u′_ℓ·∂_ℓū_ℓ⟩.
 
 `scales` need not be uniform. Returns the filtering wavenumbers `k_ℓ` and the density `Ẽ` per scale.
 
@@ -924,13 +1049,16 @@ Under `k_ℓ = C/ℓ` the density carries the Jacobian `dℓ/dk_ℓ = -ℓ²/C`,
 - **Slope ceiling.** Sadek & Aluie eq. (18): a kernel with `p` vanishing moments recovers a
   `k^{-α}` spectrum only for `α < p + 2`, and otherwise saturates at `k^{-(p+2)}`. `TopHatKernel`
   and `GaussianKernel` have `p = 1`, so the measured slope saturates at `k⁻³`, the enstrophy-range
-  slope of 2-D and QG turbulence. The flux `Π` has no such ceiling.
-- **Kernel admissibility.** `Ẽ(k_ℓ) ≥ 0` is guaranteed only when `d|Ĝ(k)|²/dk ≤ 0`. By default this
-  function throws for a kernel that fails it; pass `policy = ForceSpectrum()` to compute it anyway.
-  See [`AbstractSpectrumPolicy`](@ref) and [`Kernels.transfer_monotone`](@ref).
+  slope of 2-D and QG turbulence. The high-pass spectrum recovers `α < 2p + 3` (Zhao & Aluie 2025),
+  `k⁻⁵` for these kernels. The flux `Π` has no such ceiling.
+- **Kernel admissibility.** `Ẽ(k_ℓ) ≥ 0` is guaranteed only when `d|Ĝ(k)|²/dk ≤ 0`, which also guarantees
+  `E′(k_ℓ) ≥ 0`. By default this function throws for a kernel that fails it; pass
+  `policy = ForceSpectrum()` to compute it anyway. See [`AbstractSpectrumPolicy`](@ref) and
+  [`Kernels.transfer_monotone`](@ref).
 
 # References
 - Sadek & Aluie (2018), *Phys. Rev. Fluids* 3, 124610.
+- Zhao & Aluie (2025), *J. Renewable Sustainable Energy* 17, 013303; arXiv:2412.11891.
 """
 function filtering_spectrum(
     u::AbstractArray,
@@ -949,6 +1077,7 @@ function filtering_spectrum(
     transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
     policy::AbstractSpectrumPolicy = StrictSpectrum(),
     scale_derivative::AbstractScaleDerivative = AutoScaleDerivative(),
+    pass::AbstractFilterPass = LowPass(),
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     compute = gate_spectrum(kernel, policy)
     kℓ = T(L) ./ T.(scales)
@@ -957,8 +1086,8 @@ function filtering_spectrum(
     isempty(scales) && return kℓ, T[]
     cum, Ẽ = zeros(T, length(scales)), zeros(T, length(scales))
     route = _cumulative_energy_rates!(cum, Ẽ, scale_derivative, u, v, w, grid, kernel, scales, workspace,
-                                      filter_plans, execution, mask_strategy, method, vector_filter, transform)
-    return kℓ, filtering_density!(Ẽ, cum, kℓ, policy, route, T.(scales), L)
+                                      filter_plans, execution, mask_strategy, method, vector_filter, transform, pass)
+    return kℓ, filtering_density!(Ẽ, cum, kℓ, policy, route, T.(scales), L, pass)
 end
 
 """

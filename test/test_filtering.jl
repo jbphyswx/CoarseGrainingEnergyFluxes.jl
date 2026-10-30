@@ -246,7 +246,7 @@ Test.@testset "Neighbour lists: kept or streamed, threaded builds" begin
                CGEF.Filtering.filter_apply!(similar(f), f, p(CGEF.Filtering.NeverCache(), _CGEF_SERIAL)) rtol = 1e-13
     threaded = CGEF.ComputationalBackends.ThreadedBackend()
     a, b = p(CGEF.Filtering.AlwaysCache(), _CGEF_SERIAL).footprint, p(CGEF.Filtering.AlwaysCache(), threaded).footprint
-    Test.@test (a.cache.cell, a.cache.w, a.cache.ptr) == (b.cache.cell, b.cache.w, b.cache.ptr)
+    Test.@test map(n -> getfield(a.cache, n), fieldnames(typeof(a.cache))) == map(n -> getfield(b.cache, n), fieldnames(typeof(b.cache)))
     box = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(6.371e6), FG.Axes.UniformAxis(deg2rad(230.0), deg2rad(0.1), 120),
                                   FG.Axes.UniformAxis(deg2rad(30.0), deg2rad(0.09), 150))
     Test.@test CGEF.Filtering._exterior_mass(box, _CGEF_GA, 600e3, _CGEF_SERIAL) ==

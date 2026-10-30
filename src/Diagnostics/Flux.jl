@@ -83,7 +83,8 @@ end
 """
     SphericalAnalysis
 
-Marker that `ws.ux`/`uy`/`uz` already hold the ambient Cartesian velocity components for this sweep.
+Marker that `ws.ux`/`uy`/`uz` already hold the ambient Cartesian velocity components for this sweep, for a
+plan with no forward transform of its own.
 
 The rotation into ambient Cartesian components depends on `(u, v, w, grid)` alone, and the per-scale
 path does not write those three buffers, so one rotation serves the whole sweep.
@@ -99,8 +100,9 @@ struct SphericalAnalysis end
     _to_ambient!((ws.ux, ws.uy, ws.uz), u, v, w, ws.at.frames, ws.at.execution)
 
 # On a sphere or a spheroid a sweep shares, across its scales, the spin analysis of the generalized
-# convolution, or the rotation into ambient Cartesian components; a single `compute_Π!` call does either
-# in its own pass.
+# convolution, or the rotation into ambient Cartesian components and, for a plan with a forward transform,
+# the analyses of the components and their six products; a single `compute_Π!` call does each in its own
+# pass.
 function analyze_sweep(
     u, v, w, grid::FlowGeometries.Grids.AbstractGrid{G,T},
     ws::ΠWorkspace, plan::Filtering.AbstractFilterPlan,
@@ -111,7 +113,21 @@ function analyze_sweep(
     # rotates per scale.
     FlowGeometries.Grids.ncoordinates(grid) == 2 || return nothing
     _to_ambient!(ws, u, v, w)
-    return SphericalAnalysis()
+    return _ambient_analysis(Filtering.analyze_buffer(plan, ws.ux), ws, plan)
+end
+
+_ambient_analysis(::Nothing, _ws, _plan) = SphericalAnalysis()
+function _ambient_analysis(F̂x, ws::ΠWorkspace, plan)
+    a = (velocity = (F̂x, Filtering.analyze_buffer(plan, ws.uy), Filtering.analyze_buffer(plan, ws.uz)),
+         product = ntuple(_ -> Filtering.analyze_buffer(plan, ws.ux), Val(6)))
+    return _ambient_analyze!(a, ws, plan)
+end
+
+# The analyses of the ambient components `ws.ux/uy/uz` and of their products into `a`'s spectra.
+function _ambient_analyze!(a::NamedTuple{(:velocity, :product)}, ws::ΠWorkspace, plan)
+    map((F̂, f) -> Filtering.filter_analyze!(F̂, f, plan), a.velocity, (ws.ux, ws.uy, ws.uz))
+    map((F̂, f) -> Filtering.filter_analyze!(F̂, f, plan), a.product, _ambient_products!(ws))
+    return a
 end
 
 # A sweep reading no plan, whose workspace's generalized convolution filters every field (`_plan_for`).
@@ -163,6 +179,13 @@ function analyze_sweep!(a::NamedTuple{(:velocity, :product)}, u, v, w, grid, ws:
     map((F̂, f) -> Filtering.filter_analyze!(F̂, f, plan), a.velocity, _velocity_ins(u, v, w, has_w))
     map((F̂, f) -> Filtering.filter_analyze!(F̂, f, plan), a.product, _product_ins(ws, has_w))
     return a
+end
+
+function analyze_sweep!(a::NamedTuple{(:velocity, :product)}, u, v, w, ::FlowGeometries.Grids.AbstractGrid{G,T},
+                        ws::ΠWorkspace, plan::Filtering.AbstractFilterPlan,
+                        ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractLonLatGeometry{T}}
+    _to_ambient!(ws, u, v, w)
+    return _ambient_analyze!(a, ws, plan)
 end
 
 # The products borrow the per-scale path's scratch, which is free again once analyzed.

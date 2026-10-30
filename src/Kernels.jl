@@ -156,8 +156,9 @@ respectively, relative to the body.
 On the plane it is the paper's product `G(x, y) = G(x) G(y)` over the plane's axes ([`kernel_profile`](@ref)),
 whose support is a square. A sphere has no global axes, so there it is the isotropic form: the same
 body and limbs as a function of geodesic distance, with the amplitudes of
-[`spherical_limb_amplitudes`](@ref) and the same `P` vanishing moments of total degree.
-[`kernel_weight`](@ref) throws for it: the product is not a function of distance.
+[`spherical_limb_amplitudes`](@ref) and the same `P` vanishing moments of total degree. The isotropic form is
+this package's: Sadek & Aluie define the kernel on the plane. [`kernel_weight`](@ref) throws for it: the product
+is not a function of distance.
 
 # Slope recovery, and the domain it needs
 
@@ -177,10 +178,13 @@ more as `P` grows. A finer grid adds only modes above `1/ℓ`, which `I` does no
 # On a grid
 
 The filter a grid runs is a sum over cells, so the moments that set its order are the discrete ones,
-`Σₖ wₖ eₖᵅ` over the cells' displacements `eₖ`. Its weights are the kernel's mean over each cell times
+`Σₖ wₖ eₖᵅ` over the cells' displacements `eₖ`. The paper's grids take `ℓ` an even number of cells and `b` at
+least one, where the cell means are its stencil. Here the weights are the kernel's mean over each cell times
 the cell measure ([`profile_cell_average`](@ref) on a rectilinear grid), corrected by the least change
 that makes every moment of degree `1…P` vanish, so the order holds at every `ℓ` and on every grid; as
-`ℓ` nears a few cells the weights tend to the identity filter.
+`ℓ` nears a few cells the weights tend to the identity filter. The correction is this package's: the
+cell means alone leave the discrete moments of order 2 and up swinging as the limbs' edges cross cells, and a
+filtering spectrum differenced across closely spaced scales then swings with them, sign included.
 
 # Not for `Π`
 

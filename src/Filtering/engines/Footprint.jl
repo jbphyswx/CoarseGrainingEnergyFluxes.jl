@@ -45,15 +45,48 @@ outside a `HighOrderKernel`'s support box.
 """
     ScatteredCache{T}
 
-The full per-target neighbour list for a [`ScatteredFilterPlan`](@ref) (each neighbour's linear cell index and
-its weight), built only when the plan's [`AbstractCacheStrategy`](@ref) calls for it. CSR layout: target
-`t = i + (j-1)*Nx` holds entries `ptr[t]:ptr[t+1]-1`. A cell index is an `Int32`; a grid of more cells raises
-at build.
+The full per-target neighbour list for a [`ScatteredFilterPlan`](@ref), built only when the plan's
+[`AbstractCacheStrategy`](@ref) calls for it: each neighbour's weight, and its linear cell index
+`ii + (jj − 1)·Nx` (the periodic wrap resolved) as runs of consecutive indices. Target `t = i + (j−1)·Nx` holds
+runs `rptr[t]:rptr[t+1]−1` and weights `wptr[t]:wptr[t+1]−1`, run `r` the cells `start[r] + (0:len[r]−1)` in the
+order the weights list them. A cell index is an `Int32`; a grid of more cells raises at build.
 """
 struct ScatteredCache{T<:AbstractFloat, VC<:AbstractVector{Int32}, VT<:AbstractVector{T}, VI<:AbstractVector{Int}}
-    cell::VC  # the neighbour's linear index `ii + (jj − 1)·Nx`, the periodic wrap resolved
-    w::VT     # the cell's weight under the plan's rule, `_cell_weight`'s `w`
-    ptr::VI
+    start::VC
+    len::VC
+    w::VT     # each cell's weight under the plan's rule, `_cell_weight`'s `w`, in run order
+    rptr::VI
+    wptr::VI
+end
+
+# `(start, len, rptr)`: the runs of consecutive values in the linear indices `cells`, target `t`'s `ptr[t]:ptr[t+1]−1`,
+# target `t`'s runs `rptr[t]:rptr[t+1]−1`.
+function _runs(cells::AbstractVector{<:Integer}, ptr::AbstractVector{Int})
+    n = length(ptr) - 1
+    rptr = Vector{Int}(undef, n + 1)
+    rptr[1] = 1
+    start, len = Int32[], Int32[]
+    for t in 1:n
+        prev = typemin(Int)
+        for k in ptr[t]:(ptr[t + 1] - 1)
+            c = Int(cells[k])
+            if c == prev + 1
+                len[end] += Int32(1)
+            else
+                push!(start, c)
+                push!(len, Int32(1))
+            end
+            prev = c
+        end
+        rptr[t + 1] = length(start) + 1
+    end
+    return start, len, rptr
+end
+
+# The list of targets' linear indices `cells` (target `t`'s `ptr[t]:ptr[t+1]−1`), with `w`, as runs.
+function _run_cache(cells::AbstractVector{<:Integer}, w::AbstractVector, ptr::Vector{Int})
+    start, len, rptr = _runs(cells, ptr)
+    return ScatteredCache(start, len, w, rptr, ptr)
 end
 
 """
@@ -139,40 +172,54 @@ function _query_radius(
     return T(F(Kernels.kernel_radius(kernel, scale)) + _shell_extent(grid, faces, x))
 end
 
-# The 2-D cache in target order `t = i + (j-1)·Nx`: each target's entry count into `ptr`, their running sum, then
-# each target's entries from its offset. Every row writes its own targets' slots, so both passes divide the rows
-# among `execution`'s threads, each with its own query buffer.
+# The 2-D cache in target order `t = i + (j-1)·Nx`: each target's entry and run counts, their running sums, then
+# each target's runs and weights from its offsets. Every row writes its own targets' slots, so both passes divide
+# the rows among `execution`'s threads, each with its own query buffer.
 function _scattered_list(
     grid::FlowGeometries.Grids.AbstractGrid{G,T}, rule, rad, mt, execution,
 ) where {G,T}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    ptr = Vector{Int}(undef, Nx * Ny + 1)
-    ptr[1] = 1
+    wptr = Vector{Int}(undef, Nx * Ny + 1)
+    rptr = Vector{Int}(undef, Nx * Ny + 1)
+    wptr[1] = rptr[1] = 1
     _share_run(execution, 1:Ny) do js
         sc = FlowGeometries.Connectivity.ball_scratch()
         for j in js, i in 1:Nx
             t = i + (j - 1) * Nx
-            ptr[t + 1] = _rule_fold((m, _, _) -> m + 1, 0, rule, grid, t, (i, j), rad, mt, sc)
+            n, r, _ = _rule_fold((0, 0, typemin(Int)), rule, grid, t, (i, j), rad, mt, sc) do (n, r, prev), J, _
+                c = J[1] + (J[2] - 1) * Nx
+                (n + 1, c == prev + 1 ? r : r + 1, c)
+            end
+            wptr[t + 1], rptr[t + 1] = n, r
         end
     end
     for t in 1:(Nx * Ny)
-        ptr[t + 1] += ptr[t]
+        wptr[t + 1] += wptr[t]
+        rptr[t + 1] += rptr[t]
     end
-    cell = Vector{Int32}(undef, ptr[end] - 1)
-    w = Vector{T}(undef, ptr[end] - 1)
+    start = Vector{Int32}(undef, rptr[end] - 1)
+    len = Vector{Int32}(undef, rptr[end] - 1)
+    w = Vector{T}(undef, wptr[end] - 1)
     _share_run(execution, 1:Ny) do js
         sc = FlowGeometries.Connectivity.ball_scratch()
         for j in js, i in 1:Nx
             t = i + (j - 1) * Nx
-            _rule_fold(ptr[t] - 1, rule, grid, t, (i, j), rad, mt, sc) do m, J, wt
-                m += 1
-                cell[m] = J[1] + (J[2] - 1) * Nx
-                w[m] = wt
-                m
+            _rule_fold((wptr[t] - 1, rptr[t] - 1, typemin(Int)), rule, grid, t, (i, j), rad, mt, sc) do (k, r, prev), J, wt
+                c = J[1] + (J[2] - 1) * Nx
+                k += 1
+                w[k] = wt
+                if c == prev + 1
+                    len[r] += Int32(1)
+                else
+                    r += 1
+                    start[r] = c
+                    len[r] = Int32(1)
+                end
+                (k, r, c)
             end
         end
     end
-    return ScatteredCache(cell, w, ptr)
+    return ScatteredCache(start, len, w, rptr, wptr)
 end
 
 # A 2-D cell-by-cell plan's neighbour cache (or `nothing`), its mass past a bounded edge (or `nothing`)
@@ -230,7 +277,7 @@ function _scattered_parts(
     weights, exterior, kept = _highorder_targets(grid, kernel, scale, rad, fold, FlowGeometries.Connectivity.ball_scratch,
                                                  _ho_lattice(grid, rad), keep, !keep, _build_share(execution))
     Nx = FlowGeometries.Grids.size_tuple(grid)[1]
-    cache = kept === nothing ? nothing : ScatteredCache(Int32[J[1] + (J[2] - 1) * Nx for J in kept[1]], kept[2], kept[3])
+    cache = kept === nothing ? nothing : _run_cache([J[1] + (J[2] - 1) * Nx for J in kept[1]], kept[2], kept[3])
     return cache, exterior, weights
 end
 
@@ -532,25 +579,26 @@ function apply_footprint_row!(
     cache = fp.cache
     zerofill = strategy isa ZeroFill
     if cache !== nothing
+        mask = FlowGeometries.Grids.mask(grid)
         for i in 1:Nx
             _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
             t = i + (j - 1) * Nx
-            lo = cache.ptr[t]
-            hi = cache.ptr[t+1] - 1
             weighted_sum = zero(T)
             weight_norm = zero(T)
-            mask = FlowGeometries.Grids.mask(grid)
-            @inbounds for k in lo:hi
-                c = cache.cell[k]
-                active = _cell_active(mask, c)
-                w = cache.w[k]
-                if zerofill
-                    weight_norm += w
-                    active && (weighted_sum += w * field[c])
-                else
-                    active || continue
-                    weight_norm += w
-                    weighted_sum += w * field[c]
+            k = cache.wptr[t]
+            @inbounds for r in cache.rptr[t]:(cache.rptr[t + 1] - 1)
+                c0 = Int(cache.start[r])
+                for c in c0:(c0 + Int(cache.len[r]) - 1)
+                    active = _cell_active(mask, c)
+                    w = cache.w[k]
+                    k += 1
+                    if zerofill
+                        weight_norm += w
+                        active && (weighted_sum += w * field[c])
+                    elseif active
+                        weight_norm += w
+                        weighted_sum += w * field[c]
+                    end
                 end
             end
             zerofill && (weight_norm = _add_exterior(weight_norm, fp.exterior, i, j))

@@ -133,19 +133,21 @@ function apply_footprint_row_batch!(
         for i in 1:Nx
             _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
             t = i + (j - 1) * Nx
-            lo = cache.ptr[t]
-            hi = cache.ptr[t+1] - 1
             fill!(acc_ws, zero(T))
             wn = zero(T)
-            @inbounds for k in lo:hi
-                c = cache.cell[k]
-                active = _cell_active(mask, c)
-                (zerofill || active) || continue
-                w = cache.w[k]
-                wn += w
-                if active
-                    for m in eachindex(fields)
-                        acc_ws[m] += w * fields[m][c]
+            k = cache.wptr[t]
+            @inbounds for r in cache.rptr[t]:(cache.rptr[t + 1] - 1)
+                c0 = Int(cache.start[r])
+                for c in c0:(c0 + Int(cache.len[r]) - 1)
+                    active = _cell_active(mask, c)
+                    w = cache.w[k]
+                    k += 1
+                    (zerofill || active) || continue
+                    wn += w
+                    if active
+                        for m in eachindex(fields)
+                            acc_ws[m] += w * fields[m][c]
+                        end
                     end
                 end
             end
@@ -303,18 +305,15 @@ function apply_footprint_nd_batch_over!(
         @inbounds for I in indices
             _filters_target(strategy, mask[I]) || continue
             fill!(acc_ws, zero(T))
-            wn = zero(T)
-            for k in _entries_of(cache, lin[I], I)
-                J = _cell_of(cache, k, I)
+            wn = _fold_cells(zero(T), cache, lin[I], I) do n, J, wk
                 active = _cell_active(mask, J)
-                (zerofill || active) || continue
-                wk = cache.w[k]
-                wn += wk
+                (zerofill || active) || return n
                 if active
                     for m in eachindex(fields)
-                        acc_ws[m] += wk * fields[m][J...]
+                        acc_ws[m] += wk * _at(fields[m], J)
                     end
                 end
+                n + wk
             end
             zerofill && (wn = _add_exterior(wn, fp.exterior, I))
             for m in eachindex(outs)

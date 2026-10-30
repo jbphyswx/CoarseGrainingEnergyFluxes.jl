@@ -153,6 +153,36 @@ each cell's `½|ū|²` differenced across the scales as the spectrum is.
 """
 struct SpectrumMaps <: AbstractSpectrumMaps end
 
+"""
+    AbstractFilterPass
+
+Which part of the velocity a coarse-graining sweep's cumulative energy and filtering spectrum are taken of:
+[`LowPass`](@ref), the filtered velocity, or [`HighPass`](@ref), the residual.
+"""
+abstract type AbstractFilterPass end
+
+"""
+    LowPass()
+
+The cumulative energy of the filtered velocity, `Ē(ℓ) = ½⟨|ū_ℓ|²⟩`, and its spectrum `Ẽ(k_ℓ) = dĒ/dk_ℓ` (Sadek & Aluie
+2018, eqs. 14–15). A kernel with `p` vanishing moments recovers a `k^{−α}` spectrum for `α < p + 2`.
+"""
+struct LowPass <: AbstractFilterPass end
+
+"""
+    HighPass()
+
+The cumulative energy of the residual `u′_ℓ = u − ū_ℓ`, `E′(ℓ) = ½⟨|u′_ℓ|²⟩`, and its spectrum
+`E′(k_ℓ) = −dE′/dk_ℓ = −(ℓ²/L)⟨u′_ℓ·∂_ℓū_ℓ⟩` (Zhao & Aluie 2025, eqs. 6 and 18). A kernel with `p` vanishing moments
+recovers a `k^{−α}` spectrum for `α < 2p + 3`: `k⁻⁵` for a top-hat or a Gaussian. `u` is zero on an inactive cell, the
+value the filter reads there, and the residual's energy is summed over the cells the filtered velocity's is. Where
+`|Ĝ|²` is monotone decreasing `Ĝ` is too, so `E′ ≥ 0` wherever the low-pass spectrum is guaranteed non-negative.
+
+# References
+- Zhao & Aluie (2025), *J. Renewable Sustainable Energy* 17, 013303; arXiv:2412.11891.
+"""
+struct HighPass <: AbstractFilterPass end
+
 function gate_spectrum(kernel, ::ForceSpectrum)
     Kernels.transfer_monotone(kernel) || @warn(
         "ForceSpectrum with $(nameof(typeof(kernel))): its |Ĝ(k)|² is not monotone decreasing, so " *
