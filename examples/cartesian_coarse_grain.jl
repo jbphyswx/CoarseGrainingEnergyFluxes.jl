@@ -17,10 +17,9 @@ Random.seed!(1234)
 N = 128
 dx = 1_000.0
 geom = FG.Geometry.CartesianGeometry()
-x = 0.0:dx:dx*(N - 1)   # a Range, not `collect`ed — keeps the fast translation-invariant footprint path
+x = 0.0:dx:dx*(N - 1)   # ranges: uniform axes, which the translation-invariant engines take
 y = 0.0:dx:dx*(N - 1)
-# No mask argument: the grid then stores `AllActive`, whose `isactive` folds to a constant. Passing an
-# all-true `BitArray` instead means a load and a branch per cell — measured 3x on the derivative sweep.
+# No mask argument: the grid stores `AllActive`, whose `isactive` folds to a constant.
 grid = FG.Grids.StructuredGrid(geom, x, y)
 
 # Synthetic field: a large coherent eddy plus small-scale fluctuations

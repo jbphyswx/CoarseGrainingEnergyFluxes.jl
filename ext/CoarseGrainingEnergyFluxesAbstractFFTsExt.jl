@@ -209,6 +209,20 @@ end
 CGEF.Filtering._batched_fields(outs, plan::FFTFilterPlan) =
     plan.grid_plan.batched !== nothing && ndims(first(outs)) == 3
 
+# The grid plan's transforms are shared by every worker; each holds its own scratch.
+CGEF.Filtering._scratch(plan::FFTFilterPlan) = plan.scratch
+CGEF.Filtering._with_scratch(plan::FFTFilterPlan, sc::FFTScratch) =
+    FFTFilterPlan(plan.grid_plan, plan.transfer, plan.invrenorm, plan.dmass, plan.strategy, sc)
+CGEF.Filtering._fresh(sc::FFTScratch) = FFTScratch(
+    similar(sc.cbuf), zero(sc.masked_input), CGEF.Filtering._fresh_buffer(sc.pad_out), _fresh_set(sc.batched),
+)
+CGEF.Filtering._alike(a::S, b::S) where {S<:FFTScratch} =
+    size(a.cbuf) == size(b.cbuf) && _set_extent(a.batched) == _set_extent(b.batched)
+_fresh_set(::Nothing) = nothing
+_fresh_set(b::NamedTuple) = map(CGEF.Filtering._fresh_buffer, b)
+_set_extent(::Nothing) = nothing
+_set_extent(b::NamedTuple) = size(b.cbuf)
+
 # The transfer function, mask and renormalization are spatial and broadcast across the batch axis.
 function CGEF.Filtering.filter_apply_batched!(
     out::AbstractArray{T,3}, field::AbstractArray{T,3}, plan::FFTFilterPlan{T},
@@ -772,8 +786,9 @@ struct ZonalFFTFootprint{
     T<:AbstractFloat, A<:AbstractMatrix{T}, R3<:AbstractArray{T,3}, AR,
     C<:AbstractMatrix{Complex{T}}, FP, IP, MK, MS<:CGEF.Filtering.AbstractMaskStrategy,
 }
-    Ŵ::R3           # real kernel spectra: (Px÷2+1, dj_lim+1, Ny) per unordered row pair when `area` is a
-                    # vector, (Px÷2+1, 2·dj_lim+1, Ny) per (band offset, target row) when it is `nothing`
+    Ŵ::R3           # real kernel spectra, the first modes of `Px÷2+1` (all, or those `_zonal_modes` keeps):
+                    # (modes, dj_lim+1, Ny) per unordered row pair when `area` is a vector, (modes, 2·dj_lim+1, Ny)
+                    # per (band offset, target row) when it is `nothing`
     invden::A       # (Nx, Ny) reciprocal window mass, built through this same transform
     dj_lim::Int
     area::AR        # (Ny) cell area per latitude row, or `nothing`
@@ -814,10 +829,11 @@ _scale_rows!(F::AbstractMatrix, area::AbstractVector) = (F .*= transpose(area))
 # `acc[:, j] = Σ_dj Ŵ_{j, j+dj} F[:, j+dj]` over the rows in the grid, from either layout of `Ŵ`: on host
 # arrays through `rows`, elsewhere one broadcast per band offset `dj` over the target rows it reaches. Every target
 # adds its offsets in ascending order on both, so they agree bitwise. A spectrum stored per unordered pair is read
-# once for both of its rows on the host, by blocks of target rows.
+# once for both of its rows on the host, by blocks of target rows. `Ŵ` holds the first `size(Ŵ, 1)` modes; `acc`'s
+# modes past them are zero.
 function _band_sum!(acc::Matrix{Complex{T}}, Ŵ::Array{T,3}, F::Matrix{Complex{T}},
                     dj_lim::Int, ::Nothing, Ny::Int, rows::D) where {T<:AbstractFloat, D}
-    nk = size(F, 1)
+    nk, nw = size(F, 1), size(Ŵ, 1)
     rows(1:Ny) do j
         @inbounds begin
             @simd for n in 1:nk
@@ -826,7 +842,7 @@ function _band_sum!(acc::Matrix{Complex{T}}, Ŵ::Array{T,3}, F::Matrix{Complex{T
             for dj in (-dj_lim):dj_lim
                 jj = j + dj
                 (1 <= jj <= Ny) || continue
-                @simd for n in 1:nk
+                @simd for n in 1:nw
                     acc[n, j] += Ŵ[n, dj + dj_lim + 1, j] * F[n, jj]
                 end
             end
@@ -840,8 +856,8 @@ function _band_sum!(acc::Matrix{Complex{T}}, Ŵ::Array{T,3}, F::Matrix{Complex{T
                     dj_lim::Int, ::AbstractVector, Ny::Int, rows::D) where {T<:AbstractFloat, D}
     nb = clamp(Threads.nthreads(), 1, Ny)
     B = cld(Ny, nb)
-    rows([((k - 1) * B + 1):min(k * B, Ny) for k in 1:cld(Ny, B)]) do block
-        _pair_band_sum!(acc, Ŵ, F, dj_lim, Ny, block)
+    rows(1:cld(Ny, B)) do k
+        _pair_band_sum!(acc, Ŵ, F, dj_lim, Ny, ((k - 1) * B + 1):min(k * B, Ny))
         return nothing
     end
     return acc
@@ -852,7 +868,7 @@ end
 # `r + dj`. A target's offsets arrive in ascending order.
 @inline function _pair_band_sum!(acc::Matrix{Complex{T}}, Ŵ::Array{T,3}, F::Matrix{Complex{T}}, dj_lim::Int, Ny::Int,
                                  block::UnitRange{Int}) where {T<:AbstractFloat}
-    nk = size(F, 1)
+    nk, nw = size(F, 1), size(Ŵ, 1)
     a, b = first(block), last(block)
     @inbounds begin
         for j in block
@@ -862,18 +878,18 @@ end
         end
         for r in max(1, a - dj_lim):(a - 1), jj in a:min(b, r + dj_lim)
             dj = jj - r
-            @simd for n in 1:nk
+            @simd for n in 1:nw
                 acc[n, jj] += Ŵ[n, dj + 1, r] * F[n, r]
             end
         end
         for r in block, dj in 0:min(dj_lim, Ny - r)
             jj = r + dj
             if dj == 0 || jj > b
-                @simd for n in 1:nk
+                @simd for n in 1:nw
                     acc[n, r] += Ŵ[n, dj + 1, r] * F[n, jj]
                 end
             else
-                @simd for n in 1:nk
+                @simd for n in 1:nw
                     w = Ŵ[n, dj + 1, r]
                     acc[n, r] += w * F[n, jj]
                     acc[n, jj] += w * F[n, r]
@@ -887,10 +903,11 @@ end
 function _band_sum!(acc::AbstractMatrix{Complex{T}}, Ŵ::AbstractArray{T,3}, F::AbstractMatrix{Complex{T}},
                     dj_lim::Int, area, Ny::Int, _) where {T<:AbstractFloat}
     fill!(acc, zero(Complex{T}))
+    modes = axes(Ŵ, 1)
     for dj in (-dj_lim):dj_lim
         js = max(1, 1 - dj):min(Ny, Ny - dj)
         isempty(js) && continue
-        view(acc, :, js) .+= _band_weights(Ŵ, dj, dj_lim, js, area) .* view(F, :, js .+ dj)
+        view(acc, modes, js) .+= _band_weights(Ŵ, dj, dj_lim, js, area) .* view(F, modes, js .+ dj)
     end
     return acc
 end
@@ -921,11 +938,10 @@ function _zonal_fft_footprint(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
     rows = _zonal_rows(grid, kernel, scale)
-    di, dj, w, ptr = rows
-    dj_lim = maximum(abs, dj; init = 0)
+    dj_lim = CGEF.Filtering._row_dj_lim(rows)
     area_h = _zonal_area(grid, kernel)
     nb = area_h === nothing ? 2 * dj_lim + 1 : dj_lim + 1
-    Px = FlowGeometries.Grids.isperiodic(grid, 1) ? Nx : CGEF.Filtering._even_smooth_length(Nx + maximum(abs, di; init = 0))
+    Px = FlowGeometries.Grids.isperiodic(grid, 1) ? Nx : CGEF.Filtering._even_smooth_length(Nx + CGEF.Filtering._row_reach(rows))
     nt = CGEF.Filtering._library_threads(execution)
     zs(S, dims...) = CGEF.Filtering._allocate(execution, S, dims)
 
@@ -937,25 +953,41 @@ function _zonal_fft_footprint(
     fill!(src, zero(T))
     nk = size(Fbuf, 1)
 
-    # Each target row's taps, gathered on the host and transformed where the spectra live.
-    Ŵ = zs(T, nk, nb, Ny)
-    gcol_h = zeros(T, Px, nb)
-    gcol = zs(T, Px, nb)
-    gplan = _plan_rfft(gcol, nt, (;), 1)
-    Ĝ = gplan * gcol
-    for j in 1:Ny
-        fill!(gcol_h, zero(T))
-        for q in ptr[j]:(ptr[j + 1] - 1)
-            if area_h === nothing
-                gcol_h[mod(di[q], Px) + 1, dj[q] + dj_lim + 1] += w[q]
-            elseif dj[q] >= 0
-                gcol_h[mod(di[q], Px) + 1, dj[q] + 1] += w[q] / area_h[j + dj[q]]
+    # Each target row's taps, gathered on the host one row at a time and transformed where the spectra live, the rows
+    # divided among a threaded plan's threads. A kernel whose spectrum along longitude falls off keeps the modes above
+    # `truncation_tol` of its row's mass (`_zonal_modes`).
+    gplan = _plan_rfft(zs(T, Px, nb), 1, (;), 1)
+    tol = CGEF.Kernels.truncation_tol(T)
+    cut = _zonal_truncates(kernel)
+    spectra = Vector{Matrix{T}}(undef, cut ? Ny : 0)
+    full = zeros(T, cut ? 0 : nk, nb, cut ? 0 : Ny)
+    mass = CGEF.Filtering._has_row_mass(rows) ? Vector{T}(undef, Ny) : nothing
+    CGEF.Filtering._share_run(CGEF.Filtering._build_share(execution), 1:Ny) do js
+        r = CGEF.Filtering._row_worker(rows)
+        gcol_h = zeros(T, Px, nb)
+        gcol = zs(T, Px, nb)
+        Ĝ = gplan * gcol
+        for j in js
+            fill!(gcol_h, zero(T))
+            m = CGEF.Filtering._row_taps!(r, j) do ddi, ddj, wt
+                if area_h === nothing
+                    gcol_h[mod(ddi, Px) + 1, ddj + dj_lim + 1] += wt
+                elseif ddj >= 0
+                    gcol_h[mod(ddi, Px) + 1, ddj + 1] += wt / area_h[j + ddj]
+                end
+            end
+            mass === nothing || (mass[j] = m)
+            copyto!(gcol, gcol_h)
+            LA.mul!(Ĝ, gplan, gcol)
+            if cut
+                s = Array(real.(Ĝ))
+                spectra[j] = s[1:_zonal_modes(s, tol), :]
+            else
+                view(full, :, :, j) .= Array(real.(Ĝ))
             end
         end
-        copyto!(gcol, gcol_h)
-        LA.mul!(Ĝ, gplan, gcol)
-        view(Ŵ, :, :, j) .= real.(Ĝ)
     end
+    Ŵ = CGEF.Filtering._on_backend(execution, cut ? _stack_modes(spectra, nb) : full)
 
     mask = _resident_mask(execution, FlowGeometries.Grids.mask(grid))
     area = area_h === nothing ? nothing : CGEF.Filtering._on_backend(execution, area_h)
@@ -973,7 +1005,7 @@ function _zonal_fft_footprint(
     zerofill ? fill!(unit, one(T)) : _unit_on!(unit, mask)
     den = zs(T, Nx, Ny)
     if zerofill
-        _zonal_zerofill_mass!(den, src, fp, grid, kernel, scale, rows, execution)
+        _zonal_zerofill_mass!(den, src, fp, grid, kernel, scale, mass, execution)
     else
         _zonal_accumulate!(den, src, fp, Ny)
     end
@@ -982,13 +1014,42 @@ function _zonal_fft_footprint(
     return fp
 end
 
-# The taps of a target row: the banded engine's for a radial kernel, a `HighOrderKernel`'s corrected rows, a
-# `CellOverlap` top-hat's overlap weights.
+# The taps of the target rows, one row at a time (`Filtering._row_taps!`): the banded engine's for a radial
+# kernel, a `HighOrderKernel`'s corrected rows, a `CellOverlap` top-hat's overlap weights.
 _zonal_rows(grid, kernel, scale) =
-    CGEF.Filtering._sphere_band_rows(grid, kernel, scale, CGEF.Filtering._query_radius(grid, kernel, scale))
-_zonal_rows(grid, kernel::CGEF.Kernels.HighOrderKernel, scale) = CGEF.Filtering._highorder_rows(grid, kernel, scale)
+    CGEF.Filtering.SphereBandRows(grid, kernel, scale, CGEF.Filtering._query_radius(grid, kernel, scale))
+_zonal_rows(grid, kernel::CGEF.Kernels.HighOrderKernel, scale) =
+    _rows_or_raise(CGEF.Filtering._highorder_band_rows(grid, kernel, scale))
 _zonal_rows(grid, kernel::CGEF.Kernels.TopHatKernel{CGEF.Kernels.CellOverlap}, scale) =
-    CGEF.Filtering._overlap_band_rows(grid, kernel, scale)
+    CGEF.Filtering.ListedBandRows(CGEF.Filtering._overlap_band_rows(grid, kernel, scale)...)
+
+# Whether a kernel's row spectra fall off fast enough to drop the modes below `truncation_tol`: the Gaussian, whose
+# spectrum falls as a Gaussian.
+_zonal_truncates(::CGEF.Kernels.AbstractFilterKernel) = false
+_zonal_truncates(::CGEF.Kernels.GaussianKernel) = true
+
+# The modes of one row's spectra `s` (mode by row pair) to keep: through the last whose weights, summed over the pairs,
+# exceed `tol` times the row's mass, mode 0 summed.
+function _zonal_modes(s::AbstractMatrix{T}, tol::T) where {T}
+    m0 = sum(abs, view(s, 1, :))
+    n = findlast(i -> sum(abs, view(s, i, :)) > tol * m0, axes(s, 1))
+    return n === nothing ? 1 : n
+end
+
+# The rows' kept spectra as one table of the most modes any row keeps, zero past a row's own.
+function _stack_modes(spectra::Vector{Matrix{T}}, nb::Int) where {T}
+    W = zeros(T, maximum(s -> size(s, 1), spectra), nb, length(spectra))
+    for j in eachindex(spectra)
+        view(W, axes(spectra[j], 1), :, j) .= spectra[j]
+    end
+    return W
+end
+
+_rows_or_raise(rows) = rows
+@noinline _rows_or_raise(::Nothing) = throw(ArgumentError(
+    "the zonal-FFT engine needs one HighOrderKernel correction per latitude row, and this grid's rows do not share " *
+    "one: their supports reach the seam where the continued longitude closes. The default engine selection serves " *
+    "this grid"))
 
 # The source rows' cell areas where a weight factors as `G(d)·A_jj`, symmetric in the two rows; `nothing` for
 # weights kept per ordered pair of rows.
@@ -1001,14 +1062,14 @@ _zonal_area(::FlowGeometries.Grids.StructuredGrid, ::CGEF.Kernels.TopHatKernel{C
 # as far as the poles.
 function _zonal_zerofill_mass!(den, src, fp::ZonalFFTFootprint{T}, grid, kernel, scale, _, execution) where {T}
     _zonal_accumulate!(den, src, fp, size(den, 2))
-    exterior = CGEF.Filtering._exterior_mass(grid, kernel, scale)
+    exterior = CGEF.Filtering._exterior_mass(grid, kernel, scale, execution)
     exterior === nothing || (den .+= CGEF.Filtering._on_backend(execution, exterior))
     return den
 end
 
 # Each row's whole support mass, the continued lattice included.
-_zonal_zerofill_mass!(den, _, ::ZonalFFTFootprint{T}, _, ::CGEF.Kernels.HighOrderKernel, _, rows, execution) where {T} =
-    den .= reshape(CGEF.Filtering._on_backend(execution, collect(T, rows[5])), 1, size(den, 2))
+_zonal_zerofill_mass!(den, _, ::ZonalFFTFootprint{T}, _, ::CGEF.Kernels.HighOrderKernel, _, mass, execution) where {T} =
+    den .= reshape(CGEF.Filtering._on_backend(execution, mass), 1, size(den, 2))
 
 # The cap's measure where a window leaves the grid, which the overlap weights past the edge complete.
 function _zonal_zerofill_mass!(den, src, fp::ZonalFFTFootprint{T}, grid,
@@ -1033,6 +1094,15 @@ CGEF.Filtering._window_mass(fp::ZonalFFTFootprint, _) = CGEF.Filtering._inv_mass
 CGEF.Filtering._engine_of(::PaddedFFTFootprint) = CGEF.Filtering.PaddedFFTEngine()
 CGEF.Filtering._engine_of(::ZonalFFTFootprint) = CGEF.Filtering.ZonalFFTEngine()
 CGEF.Filtering._weight_family(::PaddedFFTFootprint, ::CGEF.Filtering.SeparableKernel) = CGEF.Filtering._AxisRates()
+
+# The buffers an apply writes; the spectra, masses and transforms are shared by every worker. A transform
+# executes on any arrays of the shapes it was planned on.
+CGEF.Filtering._scratch(fp::ZonalFFTFootprint) = CGEF.Filtering.ApplyBuffers((fp.src, fp.wide, fp.F, fp.acc))
+CGEF.Filtering._with_scratch(fp::ZonalFFTFootprint, s::CGEF.Filtering.ApplyBuffers) =
+    ZonalFFTFootprint(fp.Ŵ, fp.invden, fp.dj_lim, fp.area, fp.bound, fp.mask, fp.strategy, s.buffers..., fp.fwd, fp.inv)
+CGEF.Filtering._scratch(fp::PaddedFFTFootprint) = CGEF.Filtering.ApplyBuffers((fp.pad, fp.num, fp.spec))
+CGEF.Filtering._with_scratch(fp::PaddedFFTFootprint, s::CGEF.Filtering.ApplyBuffers) =
+    PaddedFFTFootprint(fp.Ĝ, fp.den, s.buffers..., fp.fwd, fp.inv, fp.mask, fp.strategy, fp.bound, fp.dims, fp.P)
 
 function CGEF.Filtering._check_strategy(fp::ZonalFFTFootprint, strategy::CGEF.Filtering.AbstractMaskStrategy)
     (!fp.bound || typeof(strategy) === typeof(fp.strategy)) || throw(ArgumentError(

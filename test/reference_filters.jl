@@ -121,11 +121,12 @@ _cgef_meridian(geo::FG.Geometry.AbstractSphericalGeometry, a, b) = FG.Geometry.r
 _cgef_meridian(geo::FG.Geometry.AbstractEllipsoidalGeometry, a, b) =
     FG.Geometry.meridian_distance(geo, b) - FG.Geometry.meridian_distance(geo, a)
 
-# The geodesic disk of radius `R` about latitude `t` on a spheroid, through FlowGeometries' geodesic inverse.
+# The geodesic disk of radius `R` about latitude `t` on a spheroid, through FlowGeometries' direct geodesic problem;
+# `R` below the nearest cut locus and the half meridian.
 function _cgef_geodesic_disk(geo, R, t)
-    inverse = (λ, φ) -> FG.Geometry._geodesic_inverse(geo, (λ, φ), (0.0, t))
+    direct = α -> FG.Geometry._geodesic_direct(geo, (0.0, t), α, R)
     metric = φ -> (FG.Geometry.meridional_radius(geo, φ), FG.Geometry.prime_vertical_radius(geo, φ) * cos(φ))
-    return CGEF.Geometry.geodesic_disk(inverse, metric, Float64(R), Float64(t), Float64(FG.Geometry.semimajor_axis(geo)))
+    return CGEF.Geometry.geodesic_disk(direct, metric, Float64(R), Float64(t), false)
 end
 
 # The filter's definition summed directly (Grooms et al. 2021 eq. 7; Aluie et al. 2018). `ZeroFill`
@@ -173,12 +174,14 @@ end
 function _cgef_direct_filter(grid, kernel::CGEF.TopHatKernel{CGEF.Kernels.CellOverlap}, ℓ, f,
                              strategy = CGEF.Filtering.ZeroFill(), n::Integer = 10)
     geo = FG.Grids.grid_geometry(grid)
-    geo isa FG.Geometry.AbstractEllipsoidalGeometry && return _cgef_geodesic_filter(grid, ℓ, f, strategy, n)
     cart = geo isa FG.Geometry.CartesianGeometry
     dims = FG.Grids.size_tuple(grid)
     N = length(dims)
+    ell = geo isa FG.Geometry.AbstractEllipsoidalGeometry
+    ell && N == 2 && return _cgef_geodesic_filter(grid, ℓ, f, strategy, n)
     R = ℓ / 2
-    a = cart ? 1.0 : FG.Geometry.radius(geo)
+    # A spheroid's single ring of longitude is its equator, a circle of radius `a`.
+    a = cart ? 1.0 : ell ? FG.Geometry.semimajor_axis(geo) : FG.Geometry.radius(geo)
     θ = min(R / a, π)
     T = eltype(FG.Grids.coordinates(grid, 1))
     nodes = CGEF.Filtering._overlap_nodes(T, n)
@@ -186,7 +189,7 @@ function _cgef_direct_filter(grid, kernel::CGEF.TopHatKernel{CGEF.Kernels.CellOv
     fs = map(1:N) do d
         p = FG.Grids.isperiodic(grid, d) ? FG.Grids.period(grid, d) : nothing
         v = collect(T, FG.Discretization.faces(xs[d], p))
-        (!cart && d == 2) ? clamp.(v, -π / 2, π / 2) : (!cart && d == 3) ? max.(v, 0.0) : v
+        (!cart && d == 2) ? clamp.(v, -π / 2, π / 2) : (!cart && !ell && d == 3) ? max.(v, 0.0) : v
     end
     pd = map(d -> cart && FG.Grids.isperiodic(grid, d) ? T(FG.Grids.period(grid, d)) : 0.0, 1:N)
     sg = map(d -> length(xs[d]) > 1 && xs[d][end] < xs[d][1] ? -1 : 1, 1:N)
@@ -212,6 +215,9 @@ function _cgef_direct_filter(grid, kernel::CGEF.TopHatKernel{CGEF.Kernels.CellOv
         parallel && return CGEF.Geometry.cap_arc_fraction(box[1]..., xs[2][1], xs[2][1], θ)
         cart || return N == 1 ? CGEF.Geometry.cap_arc_fraction(box[1]..., 0.0, 0.0, θ) :
             N == 2 ? CGEF.Geometry.cap_cell_fraction(box[1]..., box[2]..., xs[2][I[2]], θ, nodes) :
+            ell ? CGEF.Geometry.geodetic_cell_fraction(
+                      CGEF.Geometry.geodetic_ball(a, Float64(FG.Geometry.eccentricity²(geo)), R, xs[2][I[2]], xs[3][I[3]]),
+                      box[1]..., box[2]..., box[3]..., nodes) :
             CGEF.Geometry.shell_cell_fraction(box[1]..., box[2]..., box[3]..., xs[2][I[2]], xs[3][I[3]], R, nodes)
         N == 1 && return CGEF.Geometry.interval_fraction(box[1]..., R)
         N == 2 && return CGEF.Geometry.disk_fraction(box[1]..., box[2]..., R)

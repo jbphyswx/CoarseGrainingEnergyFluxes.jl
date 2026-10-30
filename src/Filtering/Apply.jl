@@ -129,6 +129,7 @@ function apply_footprint_row_batch!(
     zerofill = strategy isa ZeroFill
     if cache !== nothing
         acc_ws = _batch_zeros(outs, T)
+        mask = FlowGeometries.Grids.mask(grid)
         for i in 1:Nx
             _filters_target(strategy, FlowGeometries.Grids.isactive(grid, i, j)) || continue
             t = i + (j - 1) * Nx
@@ -137,15 +138,14 @@ function apply_footprint_row_batch!(
             fill!(acc_ws, zero(T))
             wn = zero(T)
             @inbounds for k in lo:hi
-                ii = cache.ii[k]
-                jj = cache.jj[k]
-                active = FlowGeometries.Grids.isactive(grid, ii, jj)
+                c = cache.cell[k]
+                active = _cell_active(mask, c)
                 (zerofill || active) || continue
                 w = cache.w[k]
                 wn += w
                 if active
                     for m in eachindex(fields)
-                        acc_ws[m] += w * fields[m][ii, jj]
+                        acc_ws[m] += w * fields[m][c]
                     end
                 end
             end
@@ -306,7 +306,7 @@ function apply_footprint_nd_batch_over!(
             wn = zero(T)
             for k in _entries_of(cache, lin[I], I)
                 J = _cell_of(cache, k, I)
-                active = mask[J...]
+                active = _cell_active(mask, J)
                 (zerofill || active) || continue
                 wk = cache.w[k]
                 wn += wk

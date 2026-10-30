@@ -205,7 +205,7 @@ _with_coeffs(r::HighOrderWeights{P,D}, coeffs) where {P,D} =
     @inbounds for i in eachindex(φ)
         p += r.coeffs[i, t] * φ[i]
     end
-    # The arithmetic of `_ho_correct!`'s `w̃ + A p`, so a streamed weight equals the cached one bit for bit.
+    # `w̃ + A p`: the cached weight `w̃ + √A z` of `_ho_correct!`, to rounding.
     return (true, A * _ho_mean(r.support, r.kernel, r.scale, e, x) + A * p)
 end
 
@@ -213,12 +213,12 @@ end
     HighOrderScratch
 
 One target's support cells — index, normal coordinates, size, measure, weight, and whether the cell lies
-past a bounded edge — with the matrix, right-hand side and moment buffer its correction uses.
+past a bounded edge — with the storage of the weighted basis `√A φ`, one column per basis polynomial, and the
+right-hand side its correction uses.
 """
 struct HighOrderScratch{
     T<:AbstractFloat, D, C,
-    VC<:AbstractVector{C}, VE<:AbstractVector{NTuple{D,T}}, VT<:AbstractVector{T},
-    VB<:AbstractVector{Bool}, MT<:AbstractMatrix{T},
+    VC<:AbstractVector{C}, VE<:AbstractVector{NTuple{D,T}}, VT<:AbstractVector{T}, VB<:AbstractVector{Bool},
 }
     cell::VC
     e::VE
@@ -226,18 +226,13 @@ struct HighOrderScratch{
     A::VT
     w::VT
     outside::VB
-    G::MT
-    Gc::MT
+    V::VT
+    z::VT
     r::VT
-    m::VT
 end
 
-function HighOrderScratch(::Type{T}, ::Val{D}, nb::Int, ::Type{C}) where {T,D,C}
-    return HighOrderScratch(
-        C[], NTuple{D,T}[], NTuple{D,T}[], T[], T[], Bool[],
-        zeros(T, nb, nb), zeros(T, nb, nb), zeros(T, nb), zeros(T, nb),
-    )
-end
+HighOrderScratch(::Type{T}, ::Val{D}, nb::Int, ::Type{C}) where {T,D,C} =
+    HighOrderScratch(C[], NTuple{D,T}[], NTuple{D,T}[], T[], T[], Bool[], T[], T[], zeros(T, nb))
 
 function _ho_reset!(s::HighOrderScratch)
     empty!(s.cell); empty!(s.e); empty!(s.x); empty!(s.A); empty!(s.w); empty!(s.outside)
@@ -262,43 +257,63 @@ end
     return _ho_record!(s, J, e, x, A, A * _ho_mean(sup, k, ℓ, e, x), outside)
 end
 
-# `(Σ A φφᵀ) c = r` for `c`, in place of `r`.
-function _ho_solve!(s::HighOrderScratch)
-    copyto!(s.Gc, s.G)
-    F = LinearAlgebra.cholesky!(LinearAlgebra.Hermitian(s.G, :U); check = false)
-    if LinearAlgebra.issuccess(F)
-        LinearAlgebra.ldiv!(F, s.r)
-    else
-        copyto!(s.r, LinearAlgebra.pinv(LinearAlgebra.Symmetric(s.Gc, :U)) * s.r)
+# The least correction `δ = √A·z` whose moments cancel `r`, `V` the `m × nb` weighted basis: with the column-pivoted
+# QR `VP = QR` and `R₁₁` its leading `k` pivots whose diagonal exceeds `nb·eps` of the first, `z = Q[u; 0]` with
+# `R₁₁ᵀu = (Pᵀr)₁:ₖ`. A target with too few cells for every polynomial has `k < nb`; its system is consistent, since
+# the identity filter meets it. Returns `z` (in `s.z`) and the coefficients `c = P[R₁₁⁻¹u; 0]` of the correction's
+# polynomial `δ/A = Σcᵢφᵢ` (in `s.r`), which a streamed plan's weights read.
+function _ho_solve!(s::HighOrderScratch{T}, V::AbstractMatrix{T}) where {T}
+    r = s.r
+    m, nb = size(V)
+    F = LinearAlgebra.qr!(V, LinearAlgebra.ColumnNorm())
+    R = F.R
+    kmax = min(m, nb)
+    lead = kmax > 0 ? abs(R[1, 1]) : zero(T)
+    k = count(i -> abs(R[i, i]) > nb * eps(T) * lead, 1:kmax)
+    u = r[F.p]
+    R11 = view(R, 1:k, 1:k)
+    uk = view(u, 1:k)
+    LinearAlgebra.ldiv!(LinearAlgebra.LowerTriangular(transpose(R11)), uk)
+    z = s.z
+    resize!(z, m)
+    fill!(z, zero(T))
+    copyto!(z, 1, u, 1, k)
+    LinearAlgebra.lmul!(F.Q, z)
+    LinearAlgebra.ldiv!(LinearAlgebra.UpperTriangular(R11), uk)
+    fill!(r, zero(T))
+    @inbounds for i in 1:k
+        r[F.p[i]] = u[i]
     end
-    return s.r
+    return z, r
+end
+
+# The weighted basis's storage for `m` cells and `nb` polynomials, grown as a target needs.
+function _ho_basis_matrix!(s::HighOrderScratch{T}, m::Int, nb::Int) where {T}
+    length(s.V) < m * nb && resize!(s.V, m * nb)
+    return reshape(view(s.V, 1:(m * nb)), m, nb)
 end
 
 """
     _ho_correct!(s, kernel, ℓ, h) -> c
 
 Correct the recorded cells' weights `w̃` in place to `wₖ = w̃ₖ + Aₖ p(eₖ/h)`, with `p = Σ cᵢ φᵢ` the
-polynomial that keeps the total and zeroes every moment of order `1…P`, and return `c`. Raises when
-the corrected moments do not vanish to `√eps` of `Σ|w|`.
+polynomial that keeps the total and zeroes every moment of order `1…P`, and return `c`.
 """
 function _ho_correct!(
-    s::HighOrderScratch{T,D}, k::Kernels.HighOrderKernel{P}, ℓ::T, h::T,
+    s::HighOrderScratch{T,D}, ::Kernels.HighOrderKernel{P}, ::T, h::T,
 ) where {T,D,P}
-    G, r, m = s.G, s.r, s.m
+    r = s.r
     nb = length(r)
-    fill!(G, zero(T))
+    V = _ho_basis_matrix!(s, length(s.w), nb)
     fill!(r, zero(T))
     m₀ = zero(T)
     @inbounds for c in eachindex(s.w)
         φ = _ho_basis(map(v -> v / h, s.e[c]), Val(P))
-        A = s.A[c]
+        sA = sqrt(s.A[c])
         w̃ = s.w[c]
         m₀ += w̃
         for j in 1:nb
-            Aφ = A * φ[j]
-            for i in 1:j
-                G[i, j] += Aφ * φ[i]
-            end
+            V[c, j] = sA * φ[j]
             r[j] -= w̃ * φ[j]
         end
     end
@@ -306,34 +321,12 @@ function _ho_correct!(
     @inbounds for i in 1:nb
         r[i] += m₀ * φ0[i]
     end
-    c = _ho_solve!(s)
-    fill!(m, zero(T))
-    total = zero(T)
+    z, c = _ho_solve!(s, V)
     @inbounds for q in eachindex(s.w)
-        φ = _ho_basis(map(v -> v / h, s.e[q]), Val(P))
-        p = zero(T)
-        for i in 1:nb
-            p += c[i] * φ[i]
-        end
-        w = s.w[q] + s.A[q] * p
-        s.w[q] = w
-        total += abs(w)
-        for i in 1:nb
-            m[i] += w * φ[i]
-        end
+        s.w[q] += sqrt(s.A[q]) * z[q]
     end
-    worst = zero(T)
-    @inbounds for i in 1:nb
-        worst = max(worst, abs(m[i] - m₀ * φ0[i]))
-    end
-    worst <= sqrt(eps(T)) * total || _no_highorder_weights(k, ℓ)
     return c
 end
-
-@noinline _no_highorder_weights(::Kernels.HighOrderKernel{P}, ℓ) where {P} = throw(ArgumentError(
-    "HighOrderKernel{$P} at ℓ = $ℓ: the corrected weights about a target did not reach $P vanishing " *
-    "moments in this precision",
-))
 
 # ---- one axis: the separable engine -----------------------------------------------------------------
 
@@ -505,64 +498,97 @@ function _ho_push_exterior!(
 end
 
 """
-    _highorder_targets(grid, kernel, scale, rad, fold, lattice, keep) -> (weights, exterior, kept)
+    _highorder_targets(grid, kernel, scale, rad, fold, scratch, lattice, keep, stream, execution) -> (weights, exterior, kept)
 
-The correction about every cell of `grid`. `fold(f, acc, I)` folds `f(acc, J, d)` over the grid's cells
-within `rad` of cell `I`; `lattice` is [`_ho_lattice`](@ref)'s. Returns the [`HighOrderWeights`](@ref),
-the mass past a bounded edge per cell (or `nothing`), and, while `keep(n)` holds for the `n` entries so
-far, every cell's in-grid neighbours and weights as `(cells, w, ptr)` in fold order, else `nothing`.
+The correction about every cell of `grid`. `fold(f, acc, I, sc)` folds `f(acc, J, d)` over the grid's cells
+within `rad` of cell `I` with the query buffer `sc`, one per task from `scratch()`; `lattice` is
+[`_ho_lattice`](@ref)'s. Returns the [`HighOrderWeights`](@ref), holding each cell's coefficients where `stream` (a
+plan that forms its weights at every apply) and none otherwise, the mass past a bounded edge per cell (or
+`nothing`), and where `keep` every cell's in-grid neighbours and weights as `(cells, w, ptr)` in fold order, else
+`nothing`. The targets are divided among `execution`'s threads: a first pass counts each target's in-grid cells,
+the second corrects each target and writes its entries from its offset.
 """
 function _highorder_targets(
     grid::FlowGeometries.Grids.AbstractGrid, kernel::Kernels.HighOrderKernel{P}, scale::T, rad::T,
-    fold::F, lattice, keep::K,
-) where {P, T<:AbstractFloat, F, K}
+    fold::F, scratch::S, lattice, keep::Bool, stream::Bool, execution,
+) where {P, T<:AbstractFloat, F, S}
     D = _kernel_dim(grid)
     sup = _ho_support(grid, kernel, scale)
     h = Kernels.kernel_radius(kernel, scale)
-    targets = _grid_cells(grid)
-    C = eltype(targets)
+    C = eltype(_grid_cells(grid))
     nb = _ho_nbasis(D, Val(P))
-    s = HighOrderScratch(T, D, nb, C)
     ntarget = length(FlowGeometries.Grids.mask(grid))
-    coeffs = Matrix{T}(undef, nb, ntarget)
+    coeffs = Matrix{T}(undef, nb, stream ? ntarget : 0)
     dims = lattice === nothing ? nothing : FlowGeometries.Grids.size_tuple(grid)
     exterior = lattice === nothing ? nothing : zeros(T, dims)
-    keeping = keep(0)
-    cells = C[]
-    ws = T[]
-    ptr = keeping ? Vector{Int}(undef, ntarget + 1) : Int[]
-    keeping && (ptr[1] = 1)
-    for (t, I) in enumerate(targets)
-        _ho_reset!(s)
-        fold(nothing, I) do _, J, _
-            _ho_push!(s, sup, grid, I, J, kernel, scale, h, false)
-            nothing
-        end
-        lattice === nothing || _ho_push_exterior!(s, sup, lattice, I, dims, rad, kernel, scale, h)
-        c = _ho_correct!(s, kernel, scale, h)
-        @inbounds for i in 1:nb
-            coeffs[i, t] = c[i]
-        end
-        if exterior !== nothing
-            past = zero(T)
-            @inbounds for q in eachindex(s.w)
-                s.outside[q] && (past += s.w[q])
+    ptr = keep ? Vector{Int}(undef, ntarget + 1) : Int[]
+    if keep
+        ptr[1] = 1
+        _share_run(execution, 1:ntarget) do ts
+            sc = scratch()
+            for t in ts
+                I = _grid_cell(grid, t)
+                ptr[t + 1] = fold(0, I, sc) do n, J, _
+                    _ho_in_support(sup, grid, I, J, h) ? n + 1 : n
+                end
             end
-            @inbounds exterior[t] = past
         end
-        if keeping
-            @inbounds for q in eachindex(s.w)
-                s.outside[q] && continue
-                push!(cells, s.cell[q])
-                push!(ws, s.w[q])
+        for t in 1:ntarget
+            ptr[t + 1] += ptr[t]
+        end
+    end
+    cells = Vector{C}(undef, keep ? ptr[end] - 1 : 0)
+    ws = Vector{T}(undef, keep ? ptr[end] - 1 : 0)
+    _share_run(execution, 1:ntarget) do ts
+        s = HighOrderScratch(T, D, nb, C)
+        sc = scratch()
+        for t in ts
+            I = _grid_cell(grid, t)
+            _ho_reset!(s)
+            fold(nothing, I, sc) do _, J, _
+                _ho_push!(s, sup, grid, I, J, kernel, scale, h, false)
+                nothing
             end
-            @inbounds ptr[t + 1] = length(ws) + 1
-            keeping = keep(length(ws))
-            keeping || (cells = C[]; ws = T[]; ptr = Int[])
+            lattice === nothing || _ho_push_exterior!(s, sup, lattice, I, dims, rad, kernel, scale, h)
+            c = _ho_correct!(s, kernel, scale, h)
+            if stream
+                @inbounds for i in 1:nb
+                    coeffs[i, t] = c[i]
+                end
+            end
+            if exterior !== nothing
+                past = zero(T)
+                @inbounds for q in eachindex(s.w)
+                    s.outside[q] && (past += s.w[q])
+                end
+                @inbounds exterior[t] = past
+            end
+            if keep
+                k = ptr[t] - 1
+                @inbounds for q in eachindex(s.w)
+                    s.outside[q] && continue
+                    k += 1
+                    cells[k] = s.cell[q]
+                    ws[k] = s.w[q]
+                end
+            end
         end
     end
     weights = HighOrderWeights(kernel, scale, h, coeffs, sup, D)
-    return weights, exterior, keeping ? (cells, ws, ptr) : nothing
+    return weights, exterior, keep ? (cells, ws, ptr) : nothing
+end
+
+# Target `t` of `grid`, as the index each traversal names a cell by (`_grid_cells`' `t`-th).
+_grid_cell(grid::FlowGeometries.Grids.AbstractGrid, t::Int) = _grid_cell(_cell_address(grid), grid, t)
+_grid_cell(::FlowGeometries.Grids.FlatCells, _, t::Int) = t
+_grid_cell(::FlowGeometries.Grids.CartesianCells, grid, t::Int) =
+    Tuple(CartesianIndices(FlowGeometries.Grids.size_tuple(grid))[t])
+
+# Whether cell `J` meets the support about target `I`: the test `_ho_push!` records a cell by.
+@inline function _ho_in_support(sup, grid, I, J, h::T) where {T}
+    e = _ho_normal(T, grid, I, J)
+    x = _cell_size(sup, T(_cell_measure(grid, J)), Val(length(e)))
+    return _ho_meets(sup, e, x, h)
 end
 
 """
@@ -576,13 +602,16 @@ function _highorder_shares_rows(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.HighOrderKernel, scale::T,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
     rad = _query_radius(grid, kernel, scale)
-    return _highorder_shares_rows(grid, rad, _ho_lattice(grid, rad))
+    return _rows_shared(grid, rad, _ho_lattice(grid, rad))
 end
 
 _highorder_shares_rows(_, _, _) = false
 
-# The same, given the query radius and the continued lattice ([`_ho_lattice`](@ref)).
-function _highorder_shares_rows(grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, rad::T, lattice) where {T,G}
+# Whether every target of a latitude row sees the same cells at the same offsets, given the query radius
+# and the continued lattice ([`_ho_lattice`](@ref)).
+_rows_shared(_, _, _) = false
+
+function _rows_shared(grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, rad::T, lattice) where {T,G}
     FlowGeometries.Grids.isuniform(grid, 1) || return false
     FlowGeometries.Grids.isperiodic(grid, 1) && return true
     (lattice !== nothing && lattice[3][1]) || return false
@@ -604,52 +633,86 @@ correction ([`_highorder_shares_rows`](@ref)).
 function _highorder_rows(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.HighOrderKernel, scale::T,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
-    rad = _query_radius(grid, kernel, scale)
-    lattice = _ho_lattice(grid, rad)
-    _highorder_shares_rows(grid, rad, lattice) || return nothing
-    lattice === nothing && return _highorder_rows_on(grid, (0, 0), _query_topology(grid, rad), grid, kernel, scale, rad)
-    return _highorder_rows_on(lattice[1], lattice[2], lattice[4], grid, kernel, scale, rad)
+    rows = _highorder_band_rows(grid, kernel, scale)
+    return rows === nothing ? nothing : _collect_rows(rows, T)
 end
 
-# The rows over `lat`, the grid itself or its continued lattice, whose cell `I + lo` is grid cell `I`; `mt`
-# is the topology its folds use.
-function _highorder_rows_on(
-    lat::FlowGeometries.Grids.StructuredGrid, lo::NTuple{2,Int}, mt,
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.HighOrderKernel{P}, scale::T, rad::T,
-) where {T<:AbstractFloat, G, P}
-    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    periodic = FlowGeometries.Grids.isperiodic(grid, 1)
-    nλ = FlowGeometries.Grids.size_tuple(lat)[1]
-    sup = _ho_support(grid, kernel, scale)
-    h = Kernels.kernel_radius(kernel, scale)
+"""
+    _highorder_band_rows(grid, kernel, scale) -> HighOrderBandRows or nothing
+
+[`_highorder_rows`](@ref)' corrections one latitude row at a time ([`_row_taps!`](@ref)); `nothing` where the
+targets of a row do not share one.
+"""
+function _highorder_band_rows(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.HighOrderKernel{P}, scale::T,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}, P}
+    rad = _query_radius(grid, kernel, scale)
+    lattice = _ho_lattice(grid, rad)
+    _rows_shared(grid, rad, lattice) || return nothing
+    lat, lo, mt = lattice === nothing ? (grid, (0, 0), _query_topology(grid, rad)) : (lattice[1], lattice[2], lattice[4])
+    Ny = FlowGeometries.Grids.size_tuple(grid)[2]
+    windows = [FlowGeometries.Connectivity.metric_window(lat, (1 + lo[1], j + lo[2]), rad, mt) for j in 1:Ny]
     s = HighOrderScratch(T, Val(2), _ho_nbasis(Val(2), Val(P)), NTuple{2,Int})
-    di, dj, w = Int[], Int[], T[]
-    ptr = Vector{Int}(undef, Ny + 1)
-    ptr[1] = 1
-    mass = Vector{T}(undef, Ny)
-    for j in 1:Ny
-        Ie = (1 + lo[1], j + lo[2])
-        _ho_reset!(s)
-        FlowGeometries.Connectivity.fold_within(
-            nothing, lat, Ie...;
-            ball = rad, self = true, active_only = false, topology = mt,
-            images = FlowGeometries.Connectivity.NearestImage(),
-        ) do _, Je, _
-            _ho_push!(s, sup, lat, Ie, Je, kernel, scale, h, false)
-            nothing
-        end
-        _ho_correct!(s, kernel, scale, h)
-        mass[j] = sum(s.w)
-        for q in eachindex(s.w)
-            Je = s.cell[q]
-            1 <= Je[2] - lo[2] <= Ny || continue
-            Δi = Je[1] - Ie[1]
-            periodic && (Δi = mod(Δi + nλ ÷ 2, nλ) - nλ ÷ 2)
-            push!(di, Δi)
-            push!(dj, Je[2] - Ie[2])
-            push!(w, s.w[q])
-        end
-        ptr[j + 1] = length(w) + 1
+    return HighOrderBandRows(lat, lo, mt, grid, kernel, scale, rad, _ho_support(grid, kernel, scale),
+                             Kernels.kernel_radius(kernel, scale), s, first.(windows), last.(windows))
+end
+
+"""
+    HighOrderBandRows
+
+A latitude–longitude grid's corrected weights by row over `lat`, the grid itself or its continued lattice, whose
+cell `I + lo` is grid cell `I`; `mt` is the topology its folds use, `windows` each row's index half-widths.
+"""
+struct HighOrderBandRows{
+    L, M, GR, K, T<:AbstractFloat, S, HS<:HighOrderScratch{T}, VI<:AbstractVector{Int},
+}
+    lat::L
+    lo::NTuple{2,Int}
+    mt::M
+    grid::GR
+    kernel::K
+    scale::T
+    rad::T
+    support::S
+    half::T
+    scratch::HS
+    dls::VI
+    djls::VI
+end
+
+_nrows(r::HighOrderBandRows) = length(r.djls)
+_row_dj_lim(r::HighOrderBandRows) = min(maximum(r.djls; init = 0), _nrows(r) - 1)
+_row_reach(r::HighOrderBandRows) = maximum(r.dls; init = 0)
+_row_entries(r::HighOrderBandRows) = sum(j -> (2 * r.dls[j] + 1) * (2 * r.djls[j] + 1), 1:_nrows(r); init = 0)
+_has_row_mass(::HighOrderBandRows) = true
+
+_row_worker(r::HighOrderBandRows{L,M,GR,K,T}) where {L,M,GR,K,T} = HighOrderBandRows(
+    r.lat, r.lo, r.mt, r.grid, r.kernel, r.scale, r.rad, r.support, r.half,
+    HighOrderScratch(T, Val(2), length(r.scratch.r), NTuple{2,Int}), r.dls, r.djls,
+)
+
+function _row_taps!(f::F, r::HighOrderBandRows{L,M,GR,K,T}, j::Int) where {F, L, M, GR, K, T}
+    Ny = _nrows(r)
+    periodic = FlowGeometries.Grids.isperiodic(r.grid, 1)
+    nλ = FlowGeometries.Grids.size_tuple(r.lat)[1]
+    s, lo = r.scratch, r.lo
+    Ie = (1 + lo[1], j + lo[2])
+    _ho_reset!(s)
+    FlowGeometries.Connectivity.fold_within(
+        nothing, r.lat, Ie...;
+        ball = r.rad, self = true, active_only = false, topology = r.mt,
+        images = FlowGeometries.Connectivity.NearestImage(),
+    ) do _, Je, _
+        _ho_push!(s, r.support, r.lat, Ie, Je, r.kernel, r.scale, r.half, false)
+        nothing
     end
-    return di, dj, w, ptr, mass
+    _ho_correct!(s, r.kernel, r.scale, r.half)
+    for q in eachindex(s.w)
+        Je = s.cell[q]
+        1 <= Je[2] - lo[2] <= Ny || continue
+        Δi = Je[1] - Ie[1]
+        periodic && (Δi = mod(Δi + nλ ÷ 2, nλ) - nλ ÷ 2)
+        f(Δi, Je[2] - Ie[2], s.w[q])
+    end
+    return sum(s.w)
 end

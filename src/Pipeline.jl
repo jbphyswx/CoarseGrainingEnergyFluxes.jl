@@ -145,8 +145,10 @@ _engine_description(::Filtering.NUFFTSumEngine) = "nonuniform-FFT kernel sum, O(
 _engine_description(::Filtering.PaddedFFTEngine) = "padded-FFT of the sampled kernel, O(N log N)"
 _engine_description(::Filtering.ZonalFFTEngine) = "zonal-FFT along longitude, O(N·(log Nλ + w_φ))"
 
-# The 2-D prefix sums take the centre-test top-hat at any spacing, the cell overlap where axis 1 is uniform.
-_prefix_sums_take(::Kernels.TopHatKernel{Kernels.CellCentre}, _) = true
+# The 2-D prefix sums take the centre-test top-hat at any spacing but on a spheroid, whose geodesic disk has no
+# closed band along a row, and the cell overlap where axis 1 is uniform.
+_prefix_sums_take(::Kernels.TopHatKernel{Kernels.CellCentre}, grid) =
+    !(FlowGeometries.Grids.grid_geometry(grid) isa FlowGeometries.Geometry.AbstractEllipsoidalGeometry)
 _prefix_sums_take(::Kernels.TopHatKernel{Kernels.CellOverlap}, grid) = FlowGeometries.Grids.isuniform(grid, 1)
 
 # The real-space engine the filter will take on the resolved backend and its cost: `Filtering._select_engine`'s
@@ -172,8 +174,9 @@ function _engine_class(grid, kernel, scale, resolved = ComputationalBackends.Ser
         return rank == 2 ? "separable two-pass, O(N·(wx+wy))" : "separable N-pass, O(N·Σ wd)"
     end
 
-    if kernel isa Kernels.TopHatKernel && is_struct && rank == 2 && sep_measure && _prefix_sums_take(kernel, grid)
-        return "prefix-sum top-hat, exact, O(N·w_y)"
+    if kernel isa Kernels.TopHatKernel && is_struct && rank == 2 && sep_measure
+        _prefix_sums_take(kernel, grid) && return "prefix-sum top-hat, exact, O(N·w_y)"
+        return "scattered per-point footprint, O(N·wx·wy) with an optional neighbour cache"
     end
     # 3-D prefix sums need uniform Cartesian axes, where the axis-1 half-width depends on the offsets
     # `(dj, dk)` alone.
@@ -364,7 +367,10 @@ CoarseGrainResult(scales::AbstractVector{T}, Π::AbstractArray{T,N}, cumE::Abstr
 # ---------------------------------------------------------------------------
 
 """
-    coarse_grain(u, v, w, grid; scales, kernel=TopHatKernel(), execution=AutoBackend(), mask_strategy=ZeroFill(), method=nothing, vector_filter=nothing, transform=AutoSpectralBackend(), L=1, spectrum=AutoSpectrum())
+    coarse_grain(u, v, w, grid; scales, kernel=TopHatKernel(), execution=AutoBackend(), mask_strategy=ZeroFill(),
+                 method=nothing, vector_filter=nothing, transform=AutoSpectralBackend(), L=1, spectrum=AutoSpectrum(),
+                 derivative=AutoDerivative(), scale_derivative=AutoScaleDerivative(), slopes=NoSlopes(),
+                 spectrum_maps=NoSpectrumMaps())
     coarse_grain(u, v, grid; scales, ...)  # no vertical component
 
 Coarse-graining analysis across `scales`, returning a new [`CoarseGrainResult`](@ref). Allocating
@@ -404,6 +410,9 @@ field on a 1-D grid takes `coarse_grain(u, grid; …)`.
   any other, the default `TopHatKernel` included. `Diagnostics.ForceSpectrum()` computes it anyway
   (warning once), `Diagnostics.StrictSpectrum()` throws for a non-monotone kernel, and
   `Diagnostics.NoSpectrum()` always fills `NaN`. `Π` and `cumulative_energy` do not depend on it.
+- `derivative::AbstractDerivative=Derivatives.AutoDerivative()`: how the strain differentiates the filtered
+  velocity: the filter's own derivative where its output is a series (`method = Spectral()` and the generalized
+  convolution), a 5-node stencil or the least-squares gradient elsewhere ([`Derivatives.AbstractDerivative`](@ref)).
 - `scale_derivative::AbstractScaleDerivative=Diagnostics.AutoScaleDerivative()`: how the density differentiates
   `E(ℓ)` in `ℓ`, exactly through the filter where its kernel allows, by differences across the scales otherwise.
 - `slopes::AbstractSlopes=Diagnostics.NoSlopes()`: `Diagnostics.Slopes()` fills `spectral_slope`.
@@ -540,7 +549,8 @@ end
 
 
 """
-    coarse_grain!(result, u, v, w, grid; scales, kernel, workspace, filter_plans, deriv_plan, execution, mask_strategy, method, vector_filter, transform, L, spectrum)
+    coarse_grain!(result, u, v, w, grid; scales, kernel, workspace, filter_plans, deriv_plan, execution, mask_strategy,
+                  method, vector_filter, transform, L, spectrum, derivative, scale_derivative)
     coarse_grain!(result, u, v, grid; scales, ...)  # no vertical component
 
 In-place [`coarse_grain`](@ref): refills every buffer of an existing [`CoarseGrainResult`](@ref).
@@ -583,22 +593,29 @@ function coarse_grain!(
     # there, are moved once to where the workspace's loops run.
     dplan = Diagnostics._placed(ws.at, _sweep_route(derivative, deriv_plan, ws, plans, mask_strategy, grid))
     rate = _sweep_rate(policy, scale_derivative, kernel, ws, plans, mask_strategy, u, v, w, _result_order(result))
-    return _coarse_grain_sweep!(result, u, v, w, grid, kernel, scales, ws, plans, dplan, rate, execution, mask_strategy,
-                                policy, L)
+    _coarse_grain_sweep!(result, u, v, w, grid, kernel, scales, ws, plans, dplan, rate, execution, mask_strategy, policy, L)
+    return result
 end
 
-# The sweep and its density on a set-up workspace, plans, derivative plan and rate route.
+# The sweep and its density on a set-up workspace, plans, derivative plan and rate route; returns the sweep's
+# analysis, whose spectra `held`, an earlier sweep's on fields of the same shape, receives in place.
 function _coarse_grain_sweep!(
     result::CoarseGrainResult{T}, u, v, w, grid, kernel, scales, ws, plans, dplan, rate, execution, strat, policy, L,
+    held = nothing,
 ) where {T}
     outputs = _result_outputs(result, L)
-    _sweep!(result, outputs, u, v, w, grid, kernel, scales, ws, plans, dplan, rate, execution, strat)
+    analyzed = _sweep!(result, outputs, u, v, w, grid, kernel, scales, ws, plans, dplan, rate, execution, strat, held)
     result.wavenumber .= T(L) ./ result.scales
     Diagnostics.filtering_density!(result.filtering_spectrum, result.cumulative_energy, result.wavenumber, policy,
                                    rate, result.scales, L)
     Diagnostics.finish_slopes!(outputs, result.filtering_spectrum, result.wavenumber, policy, rate)
-    return result
+    return analyzed
 end
+
+# A sweep's scale-independent part into `held`'s spectra where an earlier sweep left them, freshly otherwise.
+@inline _sweep_analysis(_held, u, v, w, grid, ws, plan) = Diagnostics.analyze_sweep(u, v, w, grid, ws, plan)
+@inline _sweep_analysis(held::NamedTuple{(:velocity, :product)}, u, v, w, grid, ws, plan) =
+    Diagnostics.analyze_sweep!(held, u, v, w, grid, ws, plan)
 
 # How a sweep takes `⟨ū·∂_ℓū⟩`, and to `order` its second derivative, resolved once from its plans; none where no
 # density is filled.
@@ -608,15 +625,16 @@ end
     Diagnostics._rate_route(sd, kernel, ws, _read_plan(plans, strat), u, v, w, order)
 
 # `Π`, `E(ℓ)` and, on an exact rate route, `⟨ū·∂_ℓū⟩` (into `filtering_spectrum`) with the slopes and maps the outputs
-# holds, of every scale into `result`; `plans` is `nothing` for a sweep reading none.
+# holds, of every scale into `result`; `plans` is `nothing` for a sweep reading none. Returns the analysis.
 function _sweep!(
     result::CoarseGrainResult{T}, outputs, u, v, w, grid, kernel, scales, ws, plans, dplan, rate, execution, strat,
+    held = nothing,
 ) where {T}
     # `energy_from_filtered` reads the filtered velocities `compute_Π!` leaves in `ws`.
     total_area = Diagnostics.active_area(grid)
     # The scale-independent part shared by every scale (spectral forward transforms, the spin analysis of
     # the generalized convolution, or the rotation into ambient Cartesian components), or `nothing`.
-    analyzed = Diagnostics.analyze_sweep(u, v, w, grid, ws, _read_plan(_scale_plan(plans, 1), strat))
+    analyzed = _sweep_analysis(held, u, v, w, grid, ws, _read_plan(_scale_plan(plans, 1), strat))
     for s_idx in eachindex(scales)
         scale = T(scales[s_idx])
         result.scales[s_idx] = scale
@@ -630,7 +648,7 @@ function _sweep!(
         Diagnostics._store_rate!(outputs, s_idx, rate, ws, _read_plan(plan, strat), kernel, scale, u, v, w, total_area,
                                  analyzed)
     end
-    return result
+    return analyzed
 end
 
 # ---------------------------------------------------------------------------
@@ -661,10 +679,8 @@ _batch_driver!(backend::ComputationalBackends.AbstractExecutionBackend, args...)
 ))
 
 # Host-serial slice loop over one set of scratch.
-function _batch_driver!(::ComputationalBackends.SerialBackend, batch, u, v, w, grid, valR, ctx)
-    isempty(batch.slices) && return batch
-    return _run_slices!(batch, u, v, w, grid, valR, ctx, eachindex(batch.slices), _worker_scratch(ctx, grid, w, 1))
-end
+_batch_driver!(::ComputationalBackends.SerialBackend, batch, u, v, w, grid, valR, ctx) =
+    _run_base!(batch, u, v, w, grid, valR, ctx, eachindex(batch.slices))
 
 # GPU: each scale is computed for the whole batch in one pass; the filter engines, the tensor algebra and
 # the stencil derivatives carry the trailing batch axes. `E(ℓ)` reduces the spatial axes to one energy
@@ -862,7 +878,8 @@ and `batch` in its memory (`CoarseGrainBatchResult(…; execution)`).
 
 `workspaces`, `filter_plans` and `deriv_plans` are scratch pools indexed by worker: vectors of equal
 length, at least the concurrency used (`Threads.nthreads()` suffices), make a repeated batch
-allocation-free. Each pool left `nothing` is built per worker.
+allocation-free; [`Filtering.worker_copy`](@ref) of one family makes a pool sharing its tables. A pool left
+`nothing` is built once and each further worker takes a worker copy of it.
 
 [`coarse_grain_slices!`](@ref) takes slices on different grids. `vector_filter`, `transform` and the
 `spectrum` policy behave as in [`coarse_grain`](@ref).
@@ -929,23 +946,24 @@ function _check_batch_shape(
 end
 
 """
-    coarse_grain_batch_slice!(batch, u, v, w, grid, Val(R), ctx, t, scratch, rate) -> batch.slices[t]
+    coarse_grain_batch_slice!(batch, u, v, w, grid, Val(R), ctx, t, scratch, rate[, held]) -> analysis
 
-Slice `t`'s sweep on one worker's `scratch` (see `_worker_scratch`) and rate route, with the slice's execution
-backend `ctx.inner`. Every host batch driver runs its slices through this.
+Slice `t`'s sweep into `batch.slices[t]` on one worker's `scratch` (see `_worker_scratch`) and rate route, with the
+slice's execution backend `ctx.inner`; `held` is the analysis an earlier slice of the worker returned, whose spectra
+this one refills. Every host batch driver runs its slices through this.
 """
 function coarse_grain_batch_slice!(
-    batch::CoarseGrainBatchResult, u, v, w, grid, ::Val{R}, ctx, t::Integer, scratch::NamedTuple, rate,
+    batch::CoarseGrainBatchResult, u, v, w, grid, ::Val{R}, ctx, t::Integer, scratch::NamedTuple, rate, held = nothing,
 ) where {R}
     J = CartesianIndices(batch.batch_size)[t]
     result = batch.slices[t]
     _check_result_shape(result, grid, ctx.scales)
-    isempty(ctx.scales) && return result
+    isempty(ctx.scales) && return held
     ws = scratch.workspace
     return _coarse_grain_sweep!(
         result, _slice_view(u, Val(R), J), _slice_view(v, Val(R), J), _slice_view(w, Val(R), J), grid, ctx.kernel,
         ctx.scales, ws, scratch.filter_plans, Diagnostics._placed(ws.at, scratch.deriv_plan), rate, ctx.inner,
-        ctx.mask_strategy, ctx.spectrum, ctx.L,
+        ctx.mask_strategy, ctx.spectrum, ctx.L, held,
     )
 end
 
@@ -984,21 +1002,67 @@ function batch_concurrency(ctx, nslices::Integer)
 end
 
 """
-    _worker_scratch(ctx, grid, w, p) -> (; workspace, filter_plans, deriv_plan)
+    _batch_base(batch, u, v, w, grid, Val(R), ctx, t) -> (; scratch, rate)
 
-One worker's scratch for a batch sweep: entry `p` of each pool the caller supplied, and a workspace,
-per-scale filter plans or derivative plan built here for each pool left `nothing`; `filter_plans` stays
-`nothing` where the workspace's generalized convolution reads none (`_sweep_setup`). A worker builds it
-once and runs every one of its slices on it.
+What a batch's workers share, built once: entry 1 of each pool the caller supplied, and a workspace, per-scale filter
+plans and derivative route built here for each pool left `nothing` (`filter_plans` stays `nothing` where the
+workspace's generalized convolution reads none, `_sweep_setup`), with the rate route of slice `t`'s fields. A family
+whose rate route is its real-space scale rates holds them, so the workers' copies share their tables. Worker 1 sweeps
+on `scratch` itself.
 """
-function _worker_scratch(ctx, grid, w, p::Integer)
+function _batch_base(batch, u, v, w, grid, valR, ctx, t::Integer)
     workspace, filter_plans = _sweep_setup(
-        grid, (), w, _pool_get(ctx.workspaces, p), _pool_get(ctx.filter_plans, p), ctx.kernel, ctx.scales,
+        grid, (), w, _pool_get(ctx.workspaces, 1), _pool_get(ctx.filter_plans, 1), ctx.kernel, ctx.scales,
         ctx.inner, ctx.mask_strategy, ctx.method, ctx.vector_filter, ctx.transform,
     )
-    deriv_plan = _sweep_route(ctx.derivative, _pool_get(ctx.deriv_plans, p), workspace, filter_plans,
+    deriv_plan = _sweep_route(ctx.derivative, _pool_get(ctx.deriv_plans, 1), workspace, filter_plans,
                               ctx.mask_strategy, grid)
+    rate = _slice_rate(batch, u, v, w, valR, ctx, t, (; workspace, filter_plans, deriv_plan))
+    plans = _holding_rates(filter_plans, rate, _result_order(batch))
+    return (; scratch = (; workspace, filter_plans = plans, deriv_plan), rate)
+end
+
+# A family holding the scale rates its rate route was built from.
+_holding_rates(plans, _rate, _order) = plans
+_holding_rates(f::Filtering.FilterPlanFamily{<:Any,<:Any,<:Any,<:Any,Nothing}, rate::Diagnostics._WindowRate, order) =
+    Filtering.FilterPlanFamily(f.grid_plan, f.plans, f.scratch, rate.parts, order)
+
+"""
+    _worker_scratch(ctx, base, grid, p) -> (; workspace, filter_plans, deriv_plan)
+
+Worker `p`'s scratch for a batch sweep: entry `p` of each pool the caller supplied, and for each pool left `nothing`
+a worker copy of the base's (`Filtering.worker_copy`), which shares its tables and holds its own buffers. A derivative
+plan is read-only and shared; a series gradient holds buffers and is built from the worker's plans.
+"""
+function _worker_scratch(ctx, base, grid, p::Integer)
+    p == 1 && return base.scratch
+    workspace = _pool_or_copy(ctx.workspaces, p, base.scratch.workspace)
+    filter_plans = _pool_or_copy(ctx.filter_plans, p, base.scratch.filter_plans)
+    deriv_plan = _worker_route(_pool_get(ctx.deriv_plans, p), base.scratch.deriv_plan, ctx, workspace, filter_plans, grid)
     return (; workspace, filter_plans, deriv_plan)
+end
+
+_pool_or_copy(::Nothing, _p, x) = _worker_copy(x)
+_pool_or_copy(pool::AbstractVector, p::Integer, _) = pool[p]
+_worker_copy(::Nothing) = nothing
+_worker_copy(x) = Filtering.worker_copy(x)
+_worker_copy(f::Filtering.FilterPlanFamily) = Filtering.worker_copy(f)
+_worker_copy(v::AbstractVector{<:Filtering.AbstractFilterPlan}) = map(Filtering.worker_copy, v)
+
+_worker_route(given, _route, _ctx, _ws, _plans, _grid) = given
+_worker_route(::Nothing, route, _ctx, _ws, _plans, _grid) = route
+_worker_route(::Nothing, ::Diagnostics.SeriesStrain, ctx, ws, plans, grid) =
+    _sweep_route(ctx.derivative, nothing, ws, plans, ctx.mask_strategy, grid)
+
+"""
+    _run_base!(batch, u, v, w, grid, Val(R), ctx, slices) -> batch
+
+Sweep `slices` on one base built from the first of them: the loop of a driver whose workers are separate processes.
+"""
+function _run_base!(batch, u, v, w, grid, valR, ctx, slices)
+    isempty(slices) && return batch
+    base = _batch_base(batch, u, v, w, grid, valR, ctx, first(slices))
+    return _run_slices!(batch, u, v, w, grid, valR, ctx, slices, base.scratch, base.rate)
 end
 
 """
@@ -1014,8 +1078,15 @@ function _run_slices!(batch, u, v, w, grid, valR, ctx, slices, scratch)
 end
 
 function _run_slices!(batch, u, v, w, grid, valR, ctx, slices, scratch, rate)
+    isempty(slices) && return batch
+    held = coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, first(slices), scratch, rate)
+    return _run_rest!(batch, u, v, w, grid, valR, ctx, Iterators.drop(slices, 1), scratch, rate, held)
+end
+
+# The worker's later slices, each refilling the analysis spectra the first one left.
+function _run_rest!(batch, u, v, w, grid, valR, ctx, slices, scratch, rate, held)
     for t in slices
-        coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, t, scratch, rate)
+        coarse_grain_batch_slice!(batch, u, v, w, grid, valR, ctx, t, scratch, rate, held)
     end
     return batch
 end

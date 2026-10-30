@@ -6,15 +6,59 @@
     NodeFilterPlan{T}
 
 Real-space filter footprint for a node set: per-node CSR neighbour blocks (`nbrs`, `w`, offsets `ptr`)
-with their geometric weights `w = kernel_weight(d) · control volume`, found once at plan time.
+with their geometric weights `w = kernel_weight(d) · control volume`, found once at plan time, in the plan's node
+order: a point cloud's space-filling order, its node `s` the grid's node `perm[s]`, so a row's neighbours lie near
+it in memory; the grid's own (`perm` `nothing`) where its ids follow space, as a pixelization's do. A host apply
+reads the field and the mask into that order once (`vals`, `act`) and writes each node's result to its own id.
 
-Each node's block includes the node itself, which `Connectivity.neighbors_within` leaves out.
+Each node's block includes the node itself, which `Connectivity.neighbors_within` leaves out. A neighbour is an
+`Int32` node index; a node set of more nodes raises at build.
 """
-struct NodeFilterPlan{T<:AbstractFloat, VI<:AbstractVector{Int}, VT<:AbstractVector{T}}
-    nbrs::VI
+struct NodeFilterPlan{T<:AbstractFloat, VN<:AbstractVector{Int32}, VT<:AbstractVector{T}, VI<:AbstractVector{Int}, P, V, B}
+    nbrs::VN
     w::VT
     ptr::VI
+    perm::P
+    vals::V
+    act::B
 end
+
+NodeFilterPlan(nbrs::AbstractVector{Int32}, w::AbstractVector{T}, ptr::AbstractVector{Int}, ::Nothing) where {T} =
+    NodeFilterPlan(nbrs, w, ptr, nothing, nothing, nothing)
+NodeFilterPlan(nbrs::AbstractVector{Int32}, w::AbstractVector{T}, ptr::AbstractVector{Int}, perm::AbstractVector{Int}) where {T} =
+    NodeFilterPlan(nbrs, w, ptr, perm, Vector{T}(undef, length(perm)), Vector{Bool}(undef, length(perm)))
+
+# The grid's id of the plan's node `s`.
+@inline _node_id(fp::NodeFilterPlan, s::Int) = _node_id(fp.perm, s)
+@inline _node_id(::Nothing, s::Int) = s
+@inline _node_id(perm::AbstractVector{Int}, s::Int) = @inbounds perm[s]
+
+# Node `s`'s value and activity read into the plan's order.
+@inline _node_stage!(fp::NodeFilterPlan, field, grid, s::Int) = _node_stage!(fp.perm, fp, field, grid, s)
+@inline _node_stage!(::Nothing, _, _, _, ::Int) = nothing
+@inline function _node_stage!(perm::AbstractVector{Int}, fp::NodeFilterPlan{T}, field, grid, s::Int) where {T}
+    @inbounds begin
+        t = perm[s]
+        fp.vals[s] = T(field[t])
+        fp.act[s] = FlowGeometries.Grids.isactive(grid, t)
+    end
+    return nothing
+end
+
+# The values and activities the plan's rows read, by the plan's node index.
+@inline _node_inputs(fp::NodeFilterPlan, field, grid) = _node_inputs(fp.perm, fp, field, grid)
+@inline _node_inputs(::Nothing, _, field, grid) = (field, _NodeActivity(grid))
+@inline _node_inputs(::AbstractVector{Int}, fp, _, _) = (fp.vals, fp.act)
+
+struct _NodeActivity{G}
+    grid::G
+end
+@inline Base.getindex(a::_NodeActivity, j::Integer) = FlowGeometries.Grids.isactive(a.grid, j)
+
+# A list in grid order: the plan's own, or its rows and neighbours renamed by `perm`.
+_grid_order_list(fp::NodeFilterPlan) = _grid_order_list(fp.perm, fp)
+_grid_order_list(::Nothing, fp) = (fp.nbrs, fp.w, fp.ptr)
+_grid_order_list(perm::AbstractVector{Int}, fp) = _renumbered((fp.nbrs, fp.w, fp.ptr), perm)
 
 """
     build_footprint(grid, kernel, scale; kwargs...) -> NodeFilterPlan
@@ -52,7 +96,8 @@ function _build_footprint_flat(
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.SerialBackend(),
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    return NodeFilterPlan(_node_list(grid, kernel, scale, _build_backend(execution))...)
+    built, perm = _build_order(grid)
+    return NodeFilterPlan(_node_list(built, kernel, scale, _build_backend(execution))..., perm)
 end
 
 # Whether a flat-cell grid's neighbour list is read from its bins, every image of a cell across a periodic
@@ -62,16 +107,14 @@ _binned_list(_) = false
 
 function _node_list(grid, kernel, scale, backend)
     _binned_list(grid) && return _binned_csr(grid, kernel, scale, backend)
-    built, perm = _build_order(grid)
-    return _renumbered(_node_csr(built, kernel, scale, backend), perm)
+    return _node_csr(grid, kernel, scale, backend)
 end
 
 # Points on a sphere's surface are searched by chord in three dimensions; a shell's, with a radius, by the grid's
 # own ball query.
 function _node_list(grid::FlowGeometries.Grids.AbstractGrid{G,T}, kernel, scale, backend) where {T, G<:FlowGeometries.Geometry.SphericalGeometry{T}}
     FlowGeometries.Grids.ncoordinates(grid) == 2 && return _sphere_csr(grid, kernel, scale, backend)
-    built, perm = _build_order(grid)
-    return _renumbered(_node_csr(built, kernel, scale, backend), perm)
+    return _node_csr(grid, kernel, scale, backend)
 end
 
 """
@@ -104,27 +147,14 @@ end
 _flat_mask(::FlowGeometries.Grids.AllActive, n::Int) = FlowGeometries.Grids.AllActive((n,))
 _flat_mask(m::AbstractArray{Bool}, ::Int) = BitVector(vec(m))
 
-# A neighbour list of `n` entries over `npts` points holds an `Int` and a weight per entry; one past the cache
-# budget is refused before it is allocated.
-function _check_list_bytes(n::Integer, npts::Integer, ::Type{T}) where {T}
-    bytes = n * (sizeof(Int) + sizeof(T))
-    bytes <= default_cache_byte_budget() || _list_too_large(n, npts, bytes)
-    return nothing
-end
-
-@noinline _list_too_large(n, npts, bytes) = throw(ArgumentError(
-    "this filter's neighbour list would hold $n entries, $(round(Int, n / max(npts, 1))) per point " *
-    "($(round(bytes / 2^30; digits = 1)) GiB), past the cache budget of a quarter of this machine's memory. Filter at " *
-    "a smaller scale or on fewer points, or with `method = Spectral()` where a transform serves the grid."))
-
 # The backend a node plan's build runs on: the host's threads where the plan's apply is threaded, each
 # thread taking rows as it finishes since their neighbour counts differ; the calling thread otherwise.
 _build_backend(::ComputationalBackends.AbstractThreadedBackend) = FlowGeometries.Execution.BalancedThreads()
 _build_backend(::ComputationalBackends.AbstractExecutionBackend) = ComputationalBackends.SerialBackend()
 
-# The order a node plan is built in. A point cloud's ids need not follow its points through space, and a
-# ball query then reads its candidates from all over memory, so the plan is built over the nodes in a
-# space-filling order (`spatial_order`) and renumbered back. A pixelization's ids already do.
+# The order a node plan is built and held in. A point cloud's ids need not follow its points through space, and a
+# ball query and an apply then read from all over memory, so the plan is built over the nodes in a space-filling
+# order (`spatial_order`) and keeps it. A pixelization's ids already do.
 _build_order(grid::FlowGeometries.Grids.UnstructuredGrid) =
     (perm = FlowGeometries.Grids.spatial_order(grid); (FlowGeometries.Grids.reorder(grid, perm), perm))
 _build_order(grid) = (grid, nothing)
@@ -180,8 +210,7 @@ function _node_csr(
     @inbounds for t in 1:n
         ptr[t + 1] += ptr[t]
     end
-    _check_list_bytes(ptr[n + 1] - 1, n, T)
-    nbrs = Vector{Int}(undef, ptr[n + 1] - 1)
+    nbrs = Vector{Int32}(undef, ptr[n + 1] - 1)
     w = Vector{T}(undef, ptr[n + 1] - 1)
     FlowGeometries.Execution.run_chunks(n, backend) do rng
         sc = FlowGeometries.Connectivity.ball_scratch(mt)
@@ -208,12 +237,12 @@ function _build_footprint_flat(
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     rad = _query_radius(grid, kernel, scale)
     mt = _query_topology(grid, rad)
-    scratch = FlowGeometries.Connectivity.ball_scratch()
-    fold = (f, acc, t) -> FlowGeometries.Connectivity.fold_within(
-        f, acc, grid, t; ball = rad, self = true, active_only = false, topology = mt, scratch = scratch,
+    fold = (f, acc, t, sc) -> FlowGeometries.Connectivity.fold_within(
+        f, acc, grid, t; ball = rad, self = true, active_only = false, topology = mt, scratch = sc,
     )
-    _, _, kept = _highorder_targets(grid, kernel, scale, rad, fold, nothing, Returns(true))
-    return NodeFilterPlan(kept...)
+    _, _, kept = _highorder_targets(grid, kernel, scale, rad, fold, FlowGeometries.Connectivity.ball_scratch, nothing,
+                                    true, false, _build_share(get(kwargs, :execution, ComputationalBackends.SerialBackend())))
+    return NodeFilterPlan(Vector{Int32}(kept[1]), kept[2], kept[3], nothing)
 end
 
 """
@@ -227,32 +256,36 @@ function apply_footprint!(
     out::AbstractVector{T}, field::AbstractVector, grid::FlowGeometries.Grids.AbstractGrid,
     fp::NodeFilterPlan{T}, strategy::AbstractMaskStrategy,
 ) where {T<:AbstractFloat}
-    @inbounds for t in eachindex(out)
-        out[t] = _footprint_node_point(field, grid, fp, strategy, t)
+    for s in eachindex(out)
+        _node_stage!(fp, field, grid, s)
+    end
+    vals, act = _node_inputs(fp, field, grid)
+    @inbounds for s in eachindex(out)
+        out[_node_id(fp, s)] = _footprint_node_point(field, vals, act, fp, strategy, s)
     end
     return out
 end
 
-# Node `t`'s filtered value, shared by the serial and parallel drivers. A flat-cell grid has no lattice
-# past its cells, so no exterior mass enters the normalization.
+# The plan's node `s`'s filtered value from the values and activities in the plan's order, shared by the serial
+# and parallel drivers; `field` decides what is emitted. A flat-cell grid has no lattice past its cells, so no
+# exterior mass enters the normalization.
 @inline function _footprint_node_point(
-    field::AbstractVector, grid::FlowGeometries.Grids.AbstractGrid,
-    fp::NodeFilterPlan{T}, strategy::AbstractMaskStrategy, t::Integer,
+    field::AbstractVector, vals, act, fp::NodeFilterPlan{T}, strategy::AbstractMaskStrategy, s::Integer,
 ) where {T<:AbstractFloat}
-    _filters_target(strategy, FlowGeometries.Grids.isactive(grid, t)) || return zero(T)
+    _filters_target(strategy, act[s]) || return zero(T)
     ws = zero(T)
     wn = zero(T)
-    @inbounds for k in fp.ptr[t]:(fp.ptr[t+1] - 1)
+    @inbounds for k in fp.ptr[s]:(fp.ptr[s+1] - 1)
         j = fp.nbrs[k]
         wj = fp.w[k]
-        active = FlowGeometries.Grids.isactive(grid, j)
+        active = act[j]
         if strategy isa ZeroFill
             wn += wj
-            active && (ws += wj * field[j])
+            active && (ws += wj * vals[j])
         else
             active || continue
             wn += wj
-            ws += wj * field[j]
+            ws += wj * vals[j]
         end
     end
     return _emit(field, ws, wn)

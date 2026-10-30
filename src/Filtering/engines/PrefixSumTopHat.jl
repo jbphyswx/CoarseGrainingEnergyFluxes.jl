@@ -397,7 +397,7 @@ end
 
 Build the exact `O(N·dj_lim)` prefix-sum top-hat plan for one scale. `grid_plan`/`scratch` let a sweep
 hand in the shared pieces; omitted, they are built here. A given `grid_plan` fixes the mask strategy,
-and `mask_strategy` is then unused. `kwargs...` absorbs and ignores `cache_strategy`/`cache_byte_budget`.
+and `mask_strategy` is then unused. `kwargs...` absorbs and ignores `cache_strategy`.
 """
 function _build_prefixsum_tophat(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2},

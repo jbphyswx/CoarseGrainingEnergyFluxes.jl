@@ -153,8 +153,7 @@ _serial_ft(f) = Base.ScopedValues.with(f, FTB.FASTTRANSFORMS_THREADS => 1)
 # result arrays must be backed by a `SharedArray`: a worker's writes to a plain array stay on the worker.
 function _batch_block!(batch, u, v, w, grid, valR, ctx, block::UnitRange{Int})
     _serial_ft() do
-        CGEF.Pipeline._run_slices!(batch, u, v, w, grid, valR, ctx, block,
-                                   CGEF.Pipeline._worker_scratch(ctx, grid, w, 1))
+        CGEF.Pipeline._run_base!(batch, u, v, w, grid, valR, ctx, block)
     end
     return nothing
 end

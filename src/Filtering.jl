@@ -11,10 +11,10 @@ using StaticArrays: StaticArrays as SA
 
 export AbstractMaskStrategy, ZeroFill, Deformable
 export AbstractFilterMethod, RealSpace, Spectral
-export AbstractCacheStrategy, AutoCache, AlwaysCache, NeverCache
+export AbstractCacheStrategy, AlwaysCache, NeverCache
 export filter_field!, filter_fields!, filter_slices!
 export AbstractFilterPlan, plan_filter, filter_apply!, filter_apply_batch!, analysis_status
-export AbstractGridPlan, AbstractFilterScratch, FilterPlanFamily, plan_filter_sweep
+export AbstractGridPlan, AbstractFilterScratch, FilterPlanFamily, plan_filter_sweep, worker_copy
 export AbstractVectorFilter, GeneralizedConvolution, CartesianComponents, resolve_vector_filter
 export AbstractAnalysis, AutoAnalysis, Quadrature, LeastSquares
 
@@ -51,5 +51,6 @@ include("Filtering/engines/NodeSpectral.jl")
 include("Filtering/engines/NUFFTSpectral.jl")
 include("Filtering/engines/FFTSpectral.jl")
 include("Filtering/Slices.jl")
+include("Filtering/Workers.jl")
 
 end # module

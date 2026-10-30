@@ -147,6 +147,38 @@ The literature-standard "vertical structure" method (Aluie, Hecht & Vallis 2018)
 
 ![Vertical profile](docs/src/assets/profile.png)
 
+### Top-hat cell weights
+The default `CellOverlap()` weighs each cell by its area inside the disk, so `E(ℓ)` and the filtering spectrum
+vary smoothly with `ℓ`; the centre test, `CellCentre()`, steps as `ℓ` crosses the cell centres.
+
+![Top-hat cell weights](docs/src/assets/cell_overlap.png)
+
+### The filtering spectrum's derivative in ℓ, slope and local spectrum
+`dE/dℓ = ⟨ū·∂ℓū⟩` through the filter itself, the spectrum's slope per scale, and the local spectrum and slope per
+cell.
+
+![Scale derivative](docs/src/assets/scale_derivative.png)
+
+### Derivatives of the filtered field
+The strain from the filter's own series against stencils of 3, 5 and 7 nodes.
+
+![Derivatives](docs/src/assets/derivatives.png)
+
+### Spheroids
+The top-hat over the geodesic disk on WGS84, and Π there against the mean-radius sphere.
+
+![Spheroids](docs/src/assets/spheroid.png)
+
+### Analysis on the sphere
+Quadrature against the least-squares fit for a band-limited field on a Fejér grid.
+
+![Analysis on the sphere](docs/src/assets/sphere_analysis.png)
+
+### Spectral filtering on a bounded domain
+Padding by the kernel's reach, and the sharp kernel's exact lattice brick wall.
+
+![Bounded spectral filtering](docs/src/assets/bounded_spectral.png)
+
 ## Quick Start
 
 ```julia
@@ -199,28 +231,35 @@ coarse-graining engine on top of them.
 
 ```
 src/
+  Geometry.jl     — a cell's area or volume inside a top-hat's support: box and polygon against a disk,
+                    lat–lon cell against a cap or a geodesic disk, box and shell cell against a ball
   Kernels.jl      — TopHatKernel, GaussianKernel, SmoothHatKernel, HyperGaussianKernel,
-                    HighOrderKernel{P}, SharpSpectralKernel, and the spectrum policies
+                    HighOrderKernel{P}, SharpSpectralKernel, their derivatives in ℓ
   Filtering.jl    — filter_field! (real-space footprint engine + spectral plan dispatch)
   Filtering/      — the module's files: Strategies, Lifetimes, CacheStrategy, Hooks, Api, Apply,
-                    Plans, Selection, Slices, and engines/ (Exterior, HighOrder, Footprint,
-                    PrefixSumTopHat, Separable, NDim, PrefixSumTopHat3D, NodeSpectral, FFTSpectral,
-                    NUFFTSpectral — the nonuniform FFT through FlowTransformBindings)
-  Derivatives.jl  — derivative_plan: FlowGeometries' stencil plans on a StructuredGrid, its
-                    least-squares gradient plan elsewhere; ddz! for a stack of levels. The
-                    strain, curl and frame rotations are FlowGeometries.Operators'
+                    Plans, Selection, Slices, Shares (process backends), Rates (ℓ-derivatives),
+                    VectorFilter, SpinDirect, SpinRings, SpinFit (the generalized convolution), and
+                    engines/ (Exterior, Overlap, HighOrder, Footprint, Banded, PrefixSumTopHat,
+                    PrefixSumTopHat3D, Separable, NDim, ScatteredND, BinnedTopHat, Nodes, NodeSpectral,
+                    FFTSpectral, NUFFTSpectral — the nonuniform FFT through FlowTransformBindings)
+  Derivatives.jl  — the derivative tags, derivative_plan: FlowGeometries' stencil plans on a
+                    StructuredGrid, its least-squares gradient plan elsewhere; ddz! for a stack of
+                    levels. The strain, curl and frame rotations are FlowGeometries.Operators'
   Diagnostics.jl  — compute_Π!, compute_Π_decomposed, compute_Π_strain_convergence,
                     tau_decomposition, tracer_variance_flux, enstrophy_flux, band_energies,
                     compressible_flux, cumulative_energy, filtering_spectrum
-  Diagnostics/    — the module's files: SpectrumPolicy, Flux, TensorDriver, Spectrum, Stress,
-                    Helmholtz, StrainConvergence, Tracer, Favre, Bands, Enstrophy
+  Diagnostics/    — the module's files: SpectrumPolicy, Flux, TensorDriver, SpinFilter, Spectrum,
+                    Stress, Helmholtz, StrainConvergence, Tracer, Favre, Bands, Enstrophy
   Pipeline.jl     — coarse_grain / coarse_grain! / coarse_grain_profile / coarse_grain_batch! /
                     coarse_grain_slices!, check_setup (high-level orchestration)
   Visualization.jl — plot_Π_map / plot_spectrum stubs (methods provided by the CairoMakie ext)
 ext/
-  FFTWExt                       — FFT spectral filtering (uniform Cartesian StructuredGrid; bounded axes zero-padded)
-  FFTWDistributedExt            — FFT spectral filtering across Distributed worker processes (SharedArrays)
-  FastSphericalHarmonicsExt     — spherical-harmonic transform (StructuredGrid on ClenshawCurtisSampling, nlon = 2·nlat − 1),
+  AbstractFFTsExt               — FFT spectral filtering (uniform Cartesian StructuredGrid; bounded axes zero-padded
+                                  by the kernel's reach) and the padded and zonal FFT engines, through any provider
+  FFTWExt                       — declares FFTW the host FFT provider and passes it the thread count
+  AbstractFFTsDistributedExt    — FFT spectral filtering across Distributed worker processes (SharedArrays)
+  KernelAbstractionsAbstractFFTsExt — declares the FFT provider of device arrays
+  FastSphericalHarmonicsExt     — spherical-harmonic transform (StructuredGrid on Fejer1Sampling, nlon = 2·nlat − 1),
                                   scalar and spin-weighted
   NUFSHTExt                     — non-uniform spherical-harmonic transform (scattered spherical UnstructuredGrid), and
                                   the spin-weighted transforms over any spherical grid's cells
@@ -242,7 +281,7 @@ names one.
 
 | Grid | Dimensionality | Real-space filter | Spectral filter | Derivatives | `compute_Π!` |
 |------|-----------------|--------------------|-----------------|--------------|--------------|
-| `StructuredGrid` | 1D, 2D, true 3D (Cartesian or spherical-volumetric) | Yes | Yes (FFTW on two uniform Cartesian axes; FastSphericalHarmonics on `structured_grid(ClenshawCurtisSampling(), N)`; any other over its cells by the nonuniform transform) | `Derivatives.derivative_plan`: `FG.Operators.stencil_plans` per direction | Yes, all dimensionalities + a 2.5D vertical-profile wrapper (`coarse_grain_profile`) |
+| `StructuredGrid` | 1D, 2D, true 3D (Cartesian, spherical or spheroidal; a 3-D sphere or spheroid is a volumetric shell) | Yes | Yes (an FFT on uniform Cartesian axes; FastSphericalHarmonics on `structured_grid(Fejer1Sampling(), N)`; any other over its cells by the nonuniform transform) | `Derivatives.derivative_plan`: `FG.Operators.stencil_plans` per direction | Yes, all dimensionalities + a 2.5D vertical-profile wrapper (`coarse_grain_profile`) |
 | `CurvilinearGrid` | 2D (model-native, orthogonal curvilinear meshes) | Yes (per-point footprint, no translation invariance assumed) | Yes, over its cells by the nonuniform FFT | `FG.Operators.gradient_plan` + `FG.Operators.gradient!` (least-squares tangent plane) | Yes |
 | `UnstructuredGrid` | 1D (scattered points) | Yes, and the default (`RealSpace()` — ball query over the grid's own adjacency) | Yes (nonuniform FFT for 1–3 Cartesian coordinates; NUFSHT spherical) | the same, over the grid's k-d tree adjacency | Yes |
 | `RingGrid`, `CubedSphereGrid`, `HEALPixGrid`, `IcosahedralGrid`, `YinYangGrid` | 1D (sphere pixelizations: one index names a cell) | Yes, and the default — the same node CSR gather over each grid's own ball query | Yes, over its cells by NUFSHT | `Derivatives.derivative_plan`: `FG.Operators.gradient_plan`, through each grid's own adjacency | Yes |
@@ -264,7 +303,7 @@ ug = FlowGeometries.Grids.UnstructuredGrid(geom, x, y, mask; k = 8)  # k-nearest
 
 | Kernel | Description | Use case |
 |--------|-------------|----------|
-| `TopHatKernel()` | Uniform weight within radius ℓ/2 | Standard, most common (spectral transfer needs `using SpecialFunctions`) |
+| `TopHatKernel(; cells = CellOverlap())` | Uniform weight within radius ℓ/2, each cell weighed by its area inside the disk, cap or geodesic disk (`CellCentre()`: by its centre) | Standard, most common (spectral transfer needs `using SpecialFunctions`) |
 | `GaussianKernel(; α = 6)` | Gaussian, variance-matched to a box of width ℓ (`σ² = ℓ²/12`) | Smooth, differentiable, has an exact spectral transfer |
 | `SharpSpectralKernel()` | Ideal low-pass, `Ĝ = 1` for `k ≤ π/ℓ`; in real space its inverse transform in the grid's dimension (sinc, jinc, spherical Bessel), truncated near `10ℓ` | Scale separation with `method = Spectral()`; in real space the 2-D form needs `using SpecialFunctions` |
 | `SmoothHatKernel(; steepness = 10)` | Tanh-tapered top-hat (Storer et al.) | A box without the discontinuity; real space only on the plane |
@@ -290,8 +329,8 @@ a given configuration takes.
 
 | Kernel | Grid | Real-space algorithm | Cost |
 |--------|------|----------------------|------|
-| `TopHatKernel` | any rectilinear 2D `StructuredGrid` (Cartesian or spherical, uniform or nonuniform) | per-row prefix sums + monotone two-pointer interval sweep | `O(N · w_y)`, exact |
-| `TopHatKernel` | uniform Cartesian 3D `StructuredGrid` | per-plane prefix sums; the ball's `x`-interval is contiguous at each `(dy, dz)` | `O(N · w_y · w_z)`, exact |
+| `TopHatKernel` | a rectilinear 2D `StructuredGrid` (Cartesian, spherical or spheroidal) with a uniform axis 1, or any axes under `CellCentre` but a spheroid's | per-row prefix sums + monotone two-pointer interval sweep, each row's rim cells added with their overlap weights | `O(N · w_y)` plus the rim cells, exact |
+| `TopHatKernel` | uniform Cartesian 3D `StructuredGrid` | per-plane prefix sums; the ball's `x`-interval is contiguous at each `(dy, dz)` | `O(N · w_y · w_z)` plus the rim cells, exact |
 | `GaussianKernel`, `HighOrderKernel` | Cartesian `StructuredGrid`, 1D/2D/3D, uniform or stretched axes | one separable pass per axis | `O(N · Σᵈwᵈ)`, exact up to the square-vs-disk truncation shape |
 | any radial | 2D grid with a uniform axis 1, any axis 2 (one band on a uniform Cartesian grid, one per row otherwise, a Mercator latitude included) | banded footprint, contiguous axpy along `x` | `O(N · wx · wy)` |
 | `HighOrderKernel` | sphere of uniform longitude, any latitude axis | banded footprint, one correction per latitude row | `O(N · wx · wy)` |
@@ -299,7 +338,10 @@ a given configuration takes.
 
 The per-point engine stores each point's neighbour list when it fits the cache budget, a quarter of the
 memory available to the process by default and shared by every scale of a `plan_filter_sweep`;
-otherwise it recomputes the list on every apply.
+otherwise it recomputes the list on every apply. A node set's neighbour list past that budget raises before
+it is allocated. `plan_filter(…; engine)` names an engine (`Filtering.AbstractEngine`), and the smooth
+kernels' footprints end where the weight falls to `Kernels.truncation_tol(T)` of its peak, `1e-10` or
+`8 eps(T)` where the element type resolves less.
 
 Two further engines evaluate that **same** convolution by transform. On a CPU backend `RealSpace()`
 takes one where it applies and costs fewer operations than the kernel's own engine above (a fused
@@ -340,6 +382,16 @@ plans is. `coarse_grain` builds one internally for a one-shot sweep; `coarse_gra
 one, along with the result and workspace to write through. One family may not be applied from several
 tasks at once — the scratch is shared — so give each concurrent worker its own.
 
+### Derivatives and the filtering spectrum
+
+The strain differentiates the filtered velocity through the filter's own series where it filters spectrally
+(`method = Spectral()`, and the generalized convolution on a sphere), and by 5-node differences or the
+least-squares gradient elsewhere; `derivative = Derivatives.PhysicalDerivative(; nodes)` or
+`Derivatives.SpectralDerivative()` names one. The filtering spectrum takes `dE/dℓ = ⟨ū·∂_ℓū⟩` through the
+filter where the kernel has a derivative in `ℓ` (`scale_derivative`), and a sweep returns the spectrum's slope
+per scale under `slopes = Diagnostics.Slopes()` and the local spectrum per cell under
+`spectrum_maps = Diagnostics.SpectrumMaps()`.
+
 ## Execution Backends
 
 The execution backend, the `execution` keyword of every entry point, changes only *how* a call runs.
@@ -356,9 +408,9 @@ builds a workspace there, and a workspace built for the host refuses a device pl
 | `SerialBackend()` | — | Everything | The reference every other backend is asserted bit-identical to |
 | `ThreadedBackend()` | OhMyThreads | 2D structured/curvilinear (row-parallel); 1D and true-3D structured, and every flat-cell grid (cell-parallel) | |
 | `GPUBackend()` | KernelAbstractions | the same three shapes | Device residency established once with the plan; kernels run the grid's own ball query, so device and host maps are bit-identical |
-| `DistributedBackend()` | Distributed + SharedArrays | the same three shapes | Multi-process on one shared-memory node via `SharedArray` |
-| `MPIBackend()` | MPI | the same three shapes | Multi-node, round-robin decomposition + `Allreduce!`; exercised by `test/mpi_runtests.jl` under `mpiexec` |
-| `AutoBackend()` | — | — | Picks `ThreadedBackend` when `nthreads() > 1`, else `SerialBackend` |
+| `DistributedBackend()` | Distributed + SharedArrays | the same three shapes | Multi-process on one shared-memory node; each worker holds its block and workspace from plan build and writes a `SharedArray` |
+| `MPIBackend()` | MPI | the same three shapes | Multi-node, a contiguous block per rank + in-place `Allreduce!`; exercised by `test/mpi_runtests.jl` under `mpiexec` |
+| `AutoBackend()` | — | — | Picks `ThreadedBackend` where OhMyThreads is loaded and `nthreads() > 1`, else `SerialBackend` |
 
 `DistributedBackend`/`MPIBackend` are parametric over an inner local backend (e.g.
 `MPIBackend(ThreadedBackend())`) for hybrid execution.
@@ -381,8 +433,10 @@ res = coarse_grain(u, v, grid; scales, kernel = GaussianKernel())
 With neither library loaded the transforms are an in-core direct sum, `O(M·lmax²)` over `M` cells.
 `vector_filter = Filtering.CartesianComponents()` filters the ambient Cartesian components and rotates
 them back, the method `Deformable` and a spheroid take; `vector_filter =
-Filtering.GeneralizedConvolution(; lmax)` sets the transforms' degree, and `transform` chooses their
-library. The theory page derives the spin-weighted form.
+Filtering.GeneralizedConvolution(; lmax, analysis)` sets the transforms' degree and how they take a field's
+coefficients, by quadrature or a least-squares fit (by default the fit where the grid's quadrature is not
+exact at its band limit), and `transform` chooses their library. The theory page derives the spin-weighted
+form.
 
 `compute_Π_decomposed` takes the rotational part of the velocity, from
 [HelmholtzDecomposition.jl](https://github.com/jbphyswx/HelmholtzDecomposition.jl), and filters it and

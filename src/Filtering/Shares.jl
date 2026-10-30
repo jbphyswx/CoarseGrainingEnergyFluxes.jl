@@ -55,6 +55,11 @@ _share_run(_, inner::ComputationalBackends.AbstractExecutionBackend, _) = throw(
     "a process's share of a real-space filter runs on $(nameof(typeof(inner))) through that backend's " *
     "extension: `using OhMyThreads` for a threaded inner backend"))
 
+# The backend a plan's build divides its independent rows among, through `_share_run`: a threaded plan's threads,
+# one chunk for any other plan.
+_build_share(b::ComputationalBackends.AbstractThreadedBackend) = b
+_build_share(::ComputationalBackends.AbstractExecutionBackend) = ComputationalBackends.SerialBackend()
+
 # ---- 2-D rows: the banded and cell-by-cell footprints, one pass -----------------------------------
 
 const _RowFootprint = Union{FilterFootprint, ScatteredFilterPlan}
@@ -292,9 +297,13 @@ _share_dst(out, ::NodeFilterPlan, ::Val{1}) = (out,)
 function _share_pass!(
     out, field, grid, fp::NodeFilterPlan, strategy::AbstractMaskStrategy, ::Val{1}, k::Int, nk::Int, inner,
 )
-    _share_run(inner, _share_block(k, nk, length(out))) do ts
-        for t in ts
-            out[t] = _footprint_node_point(field, grid, fp, strategy, t)
+    for s in eachindex(out)
+        _node_stage!(fp, field, grid, s)
+    end
+    vals, act = _node_inputs(fp, field, grid)
+    _share_run(inner, _share_block(k, nk, length(out))) do ss
+        for s in ss
+            out[_node_id(fp, s)] = _footprint_node_point(field, vals, act, fp, strategy, s)
         end
         return nothing
     end

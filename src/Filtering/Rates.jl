@@ -22,8 +22,8 @@ rate_plans(plan::PhysicalFilterPlan) = _rate_plans(plan, _rate_kernels(_weight_f
 
 function _rate_plans(plan::PhysicalFilterPlan, kernels::Tuple)
     fp = _host_footprint(plan.footprint)
-    kw = (; mask_strategy = plan.strategy, cache_strategy = AutoCache(), cache_byte_budget = _cache_bytes(fp),
-            scratch = _pass_buffers(fp), execution = plan.execution)
+    kw = (; mask_strategy = plan.strategy, cache_strategy = _cache_strategy_of(fp), scratch = _pass_buffers(fp),
+            execution = plan.execution)
     return map(kernels) do k
         _physical_plan(plan.execution, _engine_of(fp), plan.grid, k, plan.scale, plan.strategy, kw)
     end

@@ -45,14 +45,14 @@ outside a `HighOrderKernel`'s support box.
 """
     ScatteredCache{T}
 
-The full per-target neighbour list for a [`ScatteredFilterPlan`](@ref) (absolute neighbour indices and
-weights), built only when the plan's [`AbstractCacheStrategy`](@ref) calls for it. CSR layout: target
-`t = i + (j-1)*Nx` holds entries `ptr[t]:ptr[t+1]-1`.
+The full per-target neighbour list for a [`ScatteredFilterPlan`](@ref) (each neighbour's linear cell index and
+its weight), built only when the plan's [`AbstractCacheStrategy`](@ref) calls for it. CSR layout: target
+`t = i + (j-1)*Nx` holds entries `ptr[t]:ptr[t+1]-1`. A cell index is an `Int32`; a grid of more cells raises
+at build.
 """
-struct ScatteredCache{T<:AbstractFloat, VI<:AbstractVector{Int}, VT<:AbstractVector{T}}
-    ii::VI    # absolute neighbour axis-1 (x) index (periodic wrap already resolved)
-    jj::VI    # absolute neighbour axis-2 (y) index
-    w::VT       # the cell's weight under the plan's rule, `_cell_weight`'s `w`
+struct ScatteredCache{T<:AbstractFloat, VC<:AbstractVector{Int32}, VT<:AbstractVector{T}, VI<:AbstractVector{Int}}
+    cell::VC  # the neighbour's linear index `ii + (jj − 1)·Nx`, the periodic wrap resolved
+    w::VT     # the cell's weight under the plan's rule, `_cell_weight`'s `w`
     ptr::VI
 end
 
@@ -90,24 +90,14 @@ end
 @inline _query_topology(grid::FlowGeometries.Grids.AbstractGrid, ball) =
     FlowGeometries.Connectivity.default_sweep_topology(grid, ball, false)
 
-# Bytes one cache entry holds: its neighbour index, one `Int` per axis, and its weight.
-@inline _cache_entry_bytes(::Val{N}, ::Type{T}) where {N,T} = N * sizeof(Int) + sizeof(T)
-
 """
-    _cache_entries(count, strategy, budget, entry_bytes) -> Union{Int,Nothing}
+    _cache_entries(count, strategy) -> Union{Int,Nothing}
 
-The number of entries a neighbour cache holds, or `nothing` when the plan streams. `count(limit)` returns
-the number of entries the cache build's ball query yields, and may stop at any count above `limit`.
-`AutoCache` sets `limit` to the budget in entries.
+The number of entries a neighbour cache holds, `count()`, the entries the cache build's ball query yields; or
+`nothing` when the plan streams.
 """
-function _cache_entries(
-    count::F, strategy::AbstractCacheStrategy, budget::Integer, entry_bytes::Integer,
-) where {F}
-    strategy isa NeverCache && return nothing
-    limit = strategy isa AlwaysCache ? typemax(Int) : Int(budget) ÷ entry_bytes
-    n = count(limit)
-    return n > limit ? nothing : n
-end
+_cache_entries(count::F, ::AlwaysCache) where {F} = count()
+_cache_entries(_count, ::NeverCache) = nothing
 
 """
     _rule_fold(f, acc, rule, grid, t, I, rad, mt, sc) -> acc
@@ -136,78 +126,80 @@ Fold `acc = f(acc, J, w)` over the cells the plan's weight `rule` reaches about 
     end
 end
 
-# A `CellOverlap` top-hat's query on a curvilinear grid or a sphere with a radius reaches every cell its support
-# touches.
+# A `CellOverlap` top-hat's query on a curvilinear grid, or a sphere with a radius or a spheroid with heights, reaches
+# every cell its support touches.
 _query_radius(grid::FlowGeometries.Grids.CurvilinearGrid{T}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale) where {T} =
     T(OverlapPolygons(grid, Kernels.kernel_radius(kernel, scale)).reach)
 function _query_radius(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale,
-) where {T, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
+) where {T, G<:FlowGeometries.Geometry.AbstractLonLatGeometry{T}}
     F = _overlap_float(T)
     faces = ntuple(d -> _cell_faces(grid, d, F), Val(3))
     x = ntuple(d -> F.(collect(FlowGeometries.Grids.coordinates(grid, d))), Val(3))
     return T(F(Kernels.kernel_radius(kernel, scale)) + _shell_extent(grid, faces, x))
 end
 
-# Entries of a 2-D cache, counted in target order, stopping once past `limit`.
-function _count_scattered(grid, rule, rad, mt, sc, limit::Int)
+# The 2-D cache in target order `t = i + (j-1)·Nx`: each target's entry count into `ptr`, their running sum, then
+# each target's entries from its offset. Every row writes its own targets' slots, so both passes divide the rows
+# among `execution`'s threads, each with its own query buffer.
+function _scattered_list(
+    grid::FlowGeometries.Grids.AbstractGrid{G,T}, rule, rad, mt, execution,
+) where {G,T}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    n = 0
-    for j in 1:Ny, i in 1:Nx
-        n = _rule_fold((m, _, _) -> m + 1, n, rule, grid, i + (j - 1) * Nx, (i, j), rad, mt, sc)
-        n > limit && break
-    end
-    return n
-end
-
-# The 2-D cache, `n` entries from `_count_scattered`, filled in target order `t = i + (j-1)·Nx`.
-function _fill_scattered(grid::FlowGeometries.Grids.AbstractGrid{G,T}, rule, rad, mt, sc, n::Int) where {G,T}
-    Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    ii = Vector{Int}(undef, n)
-    jj = Vector{Int}(undef, n)
-    w = Vector{T}(undef, n)
     ptr = Vector{Int}(undef, Nx * Ny + 1)
     ptr[1] = 1
-    k = 0
-    for j in 1:Ny, i in 1:Nx
-        t = i + (j - 1) * Nx
-        k = _rule_fold(k, rule, grid, t, (i, j), rad, mt, sc) do m, J, wt
-            m += 1
-            ii[m] = J[1]
-            jj[m] = J[2]
-            w[m] = wt
-            m
+    _share_run(execution, 1:Ny) do js
+        sc = FlowGeometries.Connectivity.ball_scratch()
+        for j in js, i in 1:Nx
+            t = i + (j - 1) * Nx
+            ptr[t + 1] = _rule_fold((m, _, _) -> m + 1, 0, rule, grid, t, (i, j), rad, mt, sc)
         end
-        ptr[t + 1] = k + 1
     end
-    return ScatteredCache(ii, jj, w, ptr)
+    for t in 1:(Nx * Ny)
+        ptr[t + 1] += ptr[t]
+    end
+    cell = Vector{Int32}(undef, ptr[end] - 1)
+    w = Vector{T}(undef, ptr[end] - 1)
+    _share_run(execution, 1:Ny) do js
+        sc = FlowGeometries.Connectivity.ball_scratch()
+        for j in js, i in 1:Nx
+            t = i + (j - 1) * Nx
+            _rule_fold(ptr[t] - 1, rule, grid, t, (i, j), rad, mt, sc) do m, J, wt
+                m += 1
+                cell[m] = J[1] + (J[2] - 1) * Nx
+                w[m] = wt
+                m
+            end
+        end
+    end
+    return ScatteredCache(cell, w, ptr)
 end
 
 # A 2-D cell-by-cell plan's neighbour cache (or `nothing`), its mass past a bounded edge (or `nothing`)
 # and its weight rule.
 function _scattered_parts(
-    grid, kernel::Kernels.AbstractFilterKernel, scale::T, rad, mt, strategy, budget,
+    grid, kernel::Kernels.AbstractFilterKernel, scale::T, rad, mt, strategy, execution,
 ) where {T}
     rule = RadialWeights(kernel, scale, _kernel_dim(grid))
-    cache = _scattered_cache(grid, rule, rad, mt, strategy, budget)
-    return cache, _plan_exterior(grid, kernel, scale), rule
+    cache = _scattered_cache(grid, rule, rad, mt, strategy, execution)
+    return cache, _plan_exterior(grid, kernel, scale, execution), rule
 end
 
 function _scattered_parts(
     grid::FlowGeometries.Grids.StructuredGrid, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T,
-    rad, mt, strategy, budget,
+    rad, mt, strategy, execution,
 ) where {T}
     rule = OverlapWeights(grid, rad)
-    cache = _scattered_cache(grid, rule, rad, mt, strategy, budget)
+    cache = _scattered_cache(grid, rule, rad, mt, strategy, execution)
     return cache, _overlap_exterior(grid, rule, kernel, scale), rule
 end
 
 function _scattered_parts(
     grid::FlowGeometries.Grids.CurvilinearGrid{T,G,2}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T,
-    rad, mt, strategy, budget,
+    rad, mt, strategy, execution,
 ) where {T, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     rule = OverlapPolygons(grid, Kernels.kernel_radius(kernel, scale))
-    cache = _scattered_cache(grid, rule, rad, mt, strategy, budget)
+    cache = _scattered_cache(grid, rule, rad, mt, strategy, execution)
     return cache, _polygon_exterior(grid, rule, rad, mt), rule
 end
 
@@ -224,29 +216,28 @@ function _polygon_exterior(grid::FlowGeometries.Grids.CurvilinearGrid{T}, rule::
     return E
 end
 
-function _scattered_cache(grid::FlowGeometries.Grids.AbstractGrid{G,T}, rule, rad, mt, strategy, budget) where {G,T}
-    sc = FlowGeometries.Connectivity.ball_scratch()
-    n = _cache_entries(strategy, budget, _cache_entry_bytes(Val(2), T)) do limit
-        _count_scattered(grid, rule, rad, mt, sc, limit)
-    end
-    return n === nothing ? nothing : _fill_scattered(grid, rule, rad, mt, sc, n)
-end
+# The neighbour cache `strategy` keeps, built on `execution`'s threads, or `nothing`.
+_scattered_cache(
+    grid::FlowGeometries.Grids.AbstractGrid, rule, rad, mt, strategy,
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.SerialBackend(),
+) = _cache_keep(strategy) ? _scattered_list(grid, rule, rad, mt, _build_share(execution)) : nothing
 
 function _scattered_parts(
-    grid, kernel::Kernels.HighOrderKernel, scale::T, rad, mt, strategy, budget,
+    grid, kernel::Kernels.HighOrderKernel, scale::T, rad, mt, strategy, execution,
 ) where {T}
-    sc = FlowGeometries.Connectivity.ball_scratch()
-    fold = (f, acc, I) -> _ball_fold(f, acc, grid, I[1], I[2], rad, mt, sc)
-    keep = _cache_keep(strategy, budget, _cache_entry_bytes(Val(2), T))
-    weights, exterior, kept = _highorder_targets(grid, kernel, scale, rad, fold, _ho_lattice(grid, rad), keep)
-    cache = kept === nothing ? nothing :
-        ScatteredCache(map(first, kept[1]), map(last, kept[1]), kept[2], kept[3])
+    fold = (f, acc, I, sc) -> _ball_fold(f, acc, grid, I[1], I[2], rad, mt, sc)
+    keep = _cache_keep(strategy)
+    weights, exterior, kept = _highorder_targets(grid, kernel, scale, rad, fold, FlowGeometries.Connectivity.ball_scratch,
+                                                 _ho_lattice(grid, rad), keep, !keep, _build_share(execution))
+    Nx = FlowGeometries.Grids.size_tuple(grid)[1]
+    cache = kept === nothing ? nothing : ScatteredCache(Int32[J[1] + (J[2] - 1) * Nx for J in kept[1]], kept[2], kept[3])
     return cache, exterior, weights
 end
 
 # A rectilinear grid continues its lattice past a bounded edge; a curvilinear mesh carries none.
-_plan_exterior(grid::FlowGeometries.Grids.StructuredGrid, kernel, scale) = _exterior_mass(grid, kernel, scale)
-_plan_exterior(_, _, _) = nothing
+_plan_exterior(grid::FlowGeometries.Grids.StructuredGrid, kernel, scale, execution) =
+    _exterior_mass(grid, kernel, scale, execution)
+_plan_exterior(_, _, _, _) = nothing
 
 """
     _scattered_window_bounds(grid::StructuredGrid{...,2}, rad) -> (di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period)
@@ -305,7 +296,7 @@ end
     FlowGeometries.Connectivity.NearestImage()
 
 """
-    _build_footprint_scattered(grid, kernel, scale; cache_strategy=AutoCache(), cache_byte_budget=default_cache_byte_budget()) -> ScatteredFilterPlan
+    _build_footprint_scattered(grid, kernel, scale; cache_strategy = AlwaysCache()) -> ScatteredFilterPlan
 
 The [`ScatteredFilterPlan`](@ref) of a 2-D `StructuredGrid` of any spacing and geometry, with a
 [`ScatteredCache`](@ref) when `cache_strategy` calls for one. Other keywords, `mask_strategy` among them,
@@ -315,14 +306,14 @@ function _build_footprint_scattered(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    cache_strategy::AbstractCacheStrategy = AutoCache(),
-    cache_byte_budget::Integer = default_cache_byte_budget(),
+    cache_strategy::AbstractCacheStrategy = AlwaysCache(),
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     rad = _query_radius(grid, kernel, scale)
     di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period = _scattered_window_bounds(grid, rad)
     mt = _query_topology(grid, rad)
-    cache, exterior, weights = _scattered_parts(grid, kernel, scale, rad, mt, cache_strategy, cache_byte_budget)
+    cache, exterior, weights = _scattered_parts(grid, kernel, scale, rad, mt, cache_strategy,
+                                                get(kwargs, :execution, ComputationalBackends.SerialBackend()))
     return _scattered_plan(kernel, scale, rad, di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period,
                            cache, mt, exterior, weights)
 end
@@ -333,11 +324,11 @@ end
     kernel::K, scale::T, rad::T, di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period,
     cache, mt::MT, exterior, weights::W,
 ) where {K,T,MT,W} = ScatteredFilterPlan{
-    T, K, Union{Nothing,ScatteredCache{T,Vector{Int},Vector{T}}}, MT, Union{Nothing,Matrix{T}}, W,
+    T, K, Union{Nothing,ScatteredCache{T,Vector{Int32},Vector{T},Vector{Int}}}, MT, Union{Nothing,Matrix{T}}, W,
 }(kernel, scale, rad, di_lim, dj_lim, periodic_x, periodic_y, x_period, y_period, cache, mt, exterior, weights)
 
 """
-    _build_footprint_curvilinear(grid, kernel, scale; cache_strategy=AutoCache(), cache_byte_budget=default_cache_byte_budget()) -> ScatteredFilterPlan
+    _build_footprint_curvilinear(grid, kernel, scale; cache_strategy = AlwaysCache()) -> ScatteredFilterPlan
 
 The [`ScatteredFilterPlan`](@ref) of a `FlowGeometries.Grids.CurvilinearGrid`, with its cache when
 `cache_strategy` calls for one. `di_lim`/`dj_lim` are the index window the smallest adjacent-node
@@ -348,8 +339,7 @@ function _build_footprint_curvilinear(
     grid::FlowGeometries.Grids.CurvilinearGrid{T},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    cache_strategy::AbstractCacheStrategy = AutoCache(),
-    cache_byte_budget::Integer = default_cache_byte_budget(),
+    cache_strategy::AbstractCacheStrategy = AlwaysCache(),
     kwargs...,
 ) where {T<:AbstractFloat}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
@@ -373,7 +363,8 @@ function _build_footprint_curvilinear(
     di_lim = isfinite(min_di) && min_di > 0 ? ceil(Int, rad / min_di) : 0
     dj_lim = isfinite(min_dj) && min_dj > 0 ? ceil(Int, rad / min_dj) : 0
     mt = _query_topology(grid, rad)
-    cache, exterior, weights = _scattered_parts(grid, kernel, scale, rad, mt, cache_strategy, cache_byte_budget)
+    cache, exterior, weights = _scattered_parts(grid, kernel, scale, rad, mt, cache_strategy,
+                                                get(kwargs, :execution, ComputationalBackends.SerialBackend()))
     return _scattered_plan(kernel, scale, rad, di_lim, dj_lim, false, false, zero(T), zero(T),
                            cache, mt, exterior, weights)
 end
@@ -469,6 +460,12 @@ Base.@propagate_inbounds Base.getindex(::_MassOnly{T,N}, ::Vararg{Int,N}) where 
 @inline _emit(::AbstractArray, ws, wn) = _normalized(ws, wn)
 @inline _emit(::_MassOnly, _, wn) = wn
 
+# Whether linear cell `c` of `mask` is active, or the cell an index tuple names; an `AllActive` mask's every cell.
+@inline _cell_active(::FlowGeometries.Grids.AllActive, ::Integer) = true
+@inline _cell_active(::FlowGeometries.Grids.AllActive, ::Tuple) = true
+@inline _cell_active(m::AbstractArray{Bool}, c::Integer) = @inbounds m[c]
+@inline _cell_active(m::AbstractArray{Bool}, J::Tuple) = @inbounds m[J...]
+
 # Whether a target is filtered: every one under `ZeroFill`, the active ones under `Deformable`.
 @inline _filters_target(::ZeroFill, ::Bool) = true
 @inline _filters_target(::AbstractMaskStrategy, active::Bool) = active
@@ -516,9 +513,9 @@ row_scratch(fp::ScatteredFilterPlan) = FlowGeometries.Connectivity.ball_scratch(
     apply_footprint_row!(out, field, grid, fp::ScatteredFilterPlan, strategy, periodic_x, periodic_y, j, sc = row_scratch(fp))
 
 Fill output row `j` from a [`ScatteredFilterPlan`](@ref): if `fp.cache !== nothing`, read the
-precomputed per-point neighbour list (absolute `(ii,jj)` indices, periodic wrap resolved at build
-time); otherwise recompute each point's neighbours and weights through the grid's ball query, the
-enumeration the cache was built from, reusing `sc`. A target the strategy skips is left unwritten.
+precomputed per-point neighbour list (linear cell indices, periodic wrap resolved at build time); otherwise
+recompute each point's neighbours and weights through the grid's ball query, the enumeration the cache was
+built from, reusing `sc`. A target the strategy skips is left unwritten.
 """
 function apply_footprint_row!(
     out::AbstractMatrix{T},
@@ -542,18 +539,18 @@ function apply_footprint_row!(
             hi = cache.ptr[t+1] - 1
             weighted_sum = zero(T)
             weight_norm = zero(T)
+            mask = FlowGeometries.Grids.mask(grid)
             @inbounds for k in lo:hi
-                ii = cache.ii[k]
-                jj = cache.jj[k]
-                active = FlowGeometries.Grids.isactive(grid, ii, jj)
+                c = cache.cell[k]
+                active = _cell_active(mask, c)
                 w = cache.w[k]
                 if zerofill
                     weight_norm += w
-                    active && (weighted_sum += w * field[ii, jj])
+                    active && (weighted_sum += w * field[c])
                 else
                     active || continue
                     weight_norm += w
-                    weighted_sum += w * field[ii, jj]
+                    weighted_sum += w * field[c]
                 end
             end
             zerofill && (weight_norm = _add_exterior(weight_norm, fp.exterior, i, j))

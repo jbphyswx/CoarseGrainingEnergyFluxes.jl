@@ -37,6 +37,36 @@ struct SpinFilter{
     execution::B
 end
 
+# A worker's filter: the transforms' node tables, the mask and the cell positions shared; the transforms' buffers
+# (a library's plans planned anew), the fit's scratch, the field, the coefficient arrays, the transfers and the
+# quadrature's sums its own.
+_worker_spin(::Nothing) = nothing
+_worker_spin(sf::SpinFilter{TR,FT,T}) where {TR,FT,T} = SpinFilter(
+    Filtering._worker_transforms(sf.transforms), Filtering._worker_fit(sf.fit), sf.mask, sf.position, sf.ncells,
+    sf.radius, zero(sf.field), Filtering._fresh_buffer(sf.stage), map(zero, sf.coeffs), zero(sf.work),
+    similar(sf.transfer), similar(sf.dtransfer), Kernels.LegendreQuadrature(T), sf.execution,
+)
+
+"""
+    worker_copy(ws::ΠWorkspace) -> ΠWorkspace
+    worker_copy(ws::EnergyWorkspace) -> EnergyWorkspace
+
+A workspace a concurrent worker sweeps on beside `ws`: the placement's grid copies and frame plans and the generalized
+convolution's node tables shared; every buffer, and the convolution's transform and fit scratch, its own. Fields
+that share a buffer in `ws` share one in the copy.
+"""
+Filtering.worker_copy(ws::ΠWorkspace) = ΠWorkspace(_worker_fields(ws)...)
+Filtering.worker_copy(ws::EnergyWorkspace) = EnergyWorkspace(_worker_fields(ws)...)
+
+@inline function _worker_fields(ws::W) where {W}
+    copies = IdDict{AbstractArray,AbstractArray}()
+    return ntuple(i -> _worker_part(copies, getfield(ws, i)), Val(fieldcount(W)))
+end
+_worker_part(copies, a::A) where {A<:AbstractArray} = get!(() -> zero(a), copies, a)::A
+_worker_part(_, ::Nothing) = nothing
+_worker_part(_, sf::SpinFilter) = _worker_spin(sf)
+_worker_part(_, at::Placement) = at
+
 # One line: the transforms hold plans of C libraries.
 Base.show(io::IO, sf::SpinFilter) =
     print(io, "SpinFilter(", nameof(typeof(sf.transforms)), ", ", sf.ncells, " cells, degrees 0:",

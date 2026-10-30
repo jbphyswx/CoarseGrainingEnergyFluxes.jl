@@ -66,6 +66,43 @@ Test.@testset "Real-space engines on spherical grids" begin
     foreach(_cgef_engine_matches, _cgef_spherical_rows())
 end
 
+Test.@testset "Real-space engines on spheroid grids" begin
+    foreach(_cgef_engine_matches, _cgef_spheroid_rows())
+    # Between the nearest cut locus, `πb`, and the half meridian the geodesic circle stops bounding the disk.
+    E = FG.Geometry.SpheroidGeometry(6.378137e6, 1 / 298.257223563)
+    Test.@test_throws ArgumentError CGEF.Filtering._overlap_rule(E, 1.999e7)
+    Test.@test CGEF.Filtering._overlap_rule(E, 2.01e7).whole
+end
+
+# A spheroid with heights, at the chord. Smooth kernels and the centre test on a grid cut from a whole lattice (latitude
+# rows to the poles, heights past the kernel's reach): `ZeroFill` against the sum over the whole lattice with the field
+# zero outside the cut, `Deformable` against the sum over the grid's own cells. The cell overlap against its definition.
+Test.@testset "Real-space engines on spheroid grids with heights" begin
+    E = FG.Geometry.SpheroidGeometry(6.378137e6, 1 / 298.257223563)
+    top = (FG.Grids.Periodic(), FG.Grids.Bounded(), FG.Grids.Bounded())
+    lat = deg2rad.(collect(-85.0:10.0:85.0))
+    hw = collect(-1600e3:100e3:1900e3)
+    rows, levels = 8:12, 17:20
+    for λ in (FG.Axes.PeriodicUniformAxis(0.0, 2π, 12), deg2rad.(collect(0.0:30.0:330.0)))
+        whole = FG.Grids.StructuredGrid(E, λ, lat, hw; topology = top)
+        cut = FG.Grids.StructuredGrid(E, λ, lat[rows], hw[levels]; topology = top)
+        f = _cgef_field(FG.Grids.size_tuple(cut))
+        fw = zeros(FG.Grids.size_tuple(whole))
+        fw[:, rows, levels] .= f
+        for k in (_CGEF_GA, _CGEF_SH, _CGEF_THC), ℓ in (3e5, 7.7e5)
+            for (st, ref) in ((CGEF.Filtering.Deformable(), _cgef_cellset_filter(cut, k, ℓ, f, CGEF.Filtering.Deformable())),
+                              (CGEF.Filtering.ZeroFill(), _cgef_cellset_filter(whole, k, ℓ, fw)[:, rows, levels]))
+                p = CGEF.Filtering.plan_filter(cut, k, ℓ; mask_strategy = st, execution = _CGEF_SERIAL)
+                Test.@test p.footprint isa CGEF.Filtering.NDScatteredFilterPlan
+                Test.@test _cgef_relerr(CGEF.Filtering.filter_apply!(zero(f), f, p), ref) < 1e-12
+            end
+        end
+        for ℓ in (7.7e5, 2.3e6)
+            _cgef_engine_matches(cut, _CGEF_TH, ℓ, :NDScatteredFilterPlan; rtol = 1e-8)
+        end
+    end
+end
+
 Test.@testset "Real-space engines on meshes, node sets and sphere pixelizations" begin
     foreach(_cgef_engine_matches, _cgef_mesh_rows())
 end
@@ -92,7 +129,7 @@ Test.@testset "The nonuniform-FFT kernel sum over points" begin
 end
 
 # A window sum read off a running sum is a difference of two numbers `row length / window` times larger
-# than itself, and a periodic row is scanned over three copies of it. The rows are 10 apart, their cells 10
+# than itself, and across a periodic row's seam a sum of three. The rows are 10 apart, their cells 10
 # wide, and the support radius 3.5, so each target averages its own row: the centre test the 7 cells within
 # 3.5, the cell overlap each cell by its part inside the disk or ball. The reference is that mean summed in
 # Float64 from the same Float32 values.
@@ -195,26 +232,43 @@ Test.@testset "ZeroFill commutes with ∂/∂x and conserves the integral; Defor
     Test.@test drift[CGEF.Filtering.Deformable()] > 1e-6
 end
 
-# `AutoCache` keeps a scattered plan's neighbour cache exactly when its entries fit the budget, and one
-# budget bounds a whole sweep: each scale gets what the scales before it left.
-Test.@testset "The cache budget" begin
-    g = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(6.371e6), deg2rad.(collect(0.0:7.5:352.5)),
+# `AlwaysCache` keeps a scattered plan's neighbour list and `NeverCache` streams it; a plan built on a threaded
+# backend divides its rows among the threads and holds what a serial build holds.
+Test.@testset "Neighbour lists: kept or streamed, threaded builds" begin
+    g = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(6.371e6), deg2rad.(collect(0.0:7.5:352.5)) .+ 1e-4 .* sin.(1:48),
                                 deg2rad.(collect(range(-80.0, 80.0; length = 33))))
-    entries(ℓ) = length(CGEF.Filtering.build_footprint(g, _CGEF_GA, ℓ; cache_strategy = CGEF.Filtering.AlwaysCache()).cache.w)
-    bytes(ℓ) = entries(ℓ) * (2 * sizeof(Int) + sizeof(Float64))
-    cached(fp) = fp.cache !== nothing
-    full = bytes(500e3)
-    for b in (full, full - 1)
-        Test.@test cached(CGEF.Filtering.build_footprint(g, _CGEF_GA, 500e3; cache_strategy = CGEF.Filtering.AutoCache(),
-                                                         cache_byte_budget = b)) == (b == full)
-    end
-    scales = [400e3, 500e3, 600e3]
-    budget = bytes(scales[1]) + bytes(scales[2])
-    Test.@test bytes(scales[3]) <= budget
-    plans = CGEF.Filtering.plan_filter_sweep(g, _CGEF_GA, scales; cache_byte_budget = budget, execution = _CGEF_SERIAL)
-    Test.@test [cached(p.footprint) for p in plans] == [true, true, false]
-    # A node set's list has no streaming form: one past the budget is refused before it is allocated.
-    Test.@test_throws ArgumentError CGEF.Filtering._check_list_bytes(10^10, 10^6, Float64)
+    f = randn(48, 33)
+    kept = CGEF.Filtering.build_footprint(g, _CGEF_GA, 500e3; cache_strategy = CGEF.Filtering.AlwaysCache())
+    streamed = CGEF.Filtering.build_footprint(g, _CGEF_GA, 500e3; cache_strategy = CGEF.Filtering.NeverCache())
+    Test.@test kept.cache !== nothing && streamed.cache === nothing
+    p(strategy, ex) = CGEF.Filtering.plan_filter(g, _CGEF_GA, 500e3; cache_strategy = strategy, execution = ex)
+    Test.@test CGEF.Filtering.filter_apply!(similar(f), f, p(CGEF.Filtering.AlwaysCache(), _CGEF_SERIAL)) ≈
+               CGEF.Filtering.filter_apply!(similar(f), f, p(CGEF.Filtering.NeverCache(), _CGEF_SERIAL)) rtol = 1e-13
+    threaded = CGEF.ComputationalBackends.ThreadedBackend()
+    a, b = p(CGEF.Filtering.AlwaysCache(), _CGEF_SERIAL).footprint, p(CGEF.Filtering.AlwaysCache(), threaded).footprint
+    Test.@test (a.cache.cell, a.cache.w, a.cache.ptr) == (b.cache.cell, b.cache.w, b.cache.ptr)
+    box = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(6.371e6), FG.Axes.UniformAxis(deg2rad(230.0), deg2rad(0.1), 120),
+                                  FG.Axes.UniformAxis(deg2rad(30.0), deg2rad(0.09), 150))
+    Test.@test CGEF.Filtering._exterior_mass(box, _CGEF_GA, 600e3, _CGEF_SERIAL) ==
+               CGEF.Filtering._exterior_mass(box, _CGEF_GA, 600e3, threaded)
+end
+
+# The zonal transform keeps, per latitude row, the longitude modes of a Gaussian above `truncation_tol` of the row's
+# mass, and every mode of a kernel with edges; its output is the direct sum's to that tolerance.
+Test.@testset "Zonal transform: modes kept" begin
+    box = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(6.371e6), FG.Axes.UniformAxis(deg2rad(230.0), deg2rad(0.1), 120),
+                                  FG.Axes.UniformAxis(deg2rad(30.0), deg2rad(0.09), 150))
+    f = randn(120, 150)
+    zonal(k, ℓ) = CGEF.Filtering.plan_filter(box, k, ℓ; execution = _CGEF_SERIAL, engine = CGEF.Filtering.ZonalFFTEngine())
+    direct(k, ℓ) = CGEF.Filtering.plan_filter(box, k, ℓ; execution = _CGEF_SERIAL, engine = CGEF.Filtering.FootprintEngine())
+    pz = zonal(_CGEF_GA, 150e3)
+    Test.@test size(pz.footprint.Ŵ, 1) < size(pz.footprint.F, 1)
+    Test.@test CGEF.Filtering.filter_apply!(similar(f), f, pz) ≈ CGEF.Filtering.filter_apply!(similar(f), f, direct(_CGEF_GA, 150e3)) rtol = 1e-9
+    ph = zonal(CGEF.Kernels.HighOrderKernel(; order = 3), 300e3)
+    Test.@test size(ph.footprint.Ŵ, 1) == size(ph.footprint.F, 1)
+    threaded = CGEF.ComputationalBackends.ThreadedBackend()
+    pt = CGEF.Filtering.plan_filter(box, _CGEF_GA, 150e3; execution = threaded, engine = CGEF.Filtering.ZonalFFTEngine())
+    Test.@test pt.footprint.Ŵ == pz.footprint.Ŵ && pt.footprint.invden == pz.footprint.invden
 end
 
 # A `HighOrderKernel{P}`'s weights on a grid are corrected so their moments of degree 1…P vanish, so the
@@ -306,6 +360,20 @@ Test.@testset "HighOrderKernel on a sphere: one filter whichever engine runs it,
             Test.@test log(errs[i + 1] / errs[i]) / log(ℓs[i + 1] / ℓs[i]) ≈ order atol = 0.2
         end
     end
+end
+
+# The correction solved in the field's precision: on scattered points whose coordinates both precisions hold
+# exactly, a Float32 filter is the Float64 one to Float32's precision at all but a few ill-conditioned points.
+Test.@testset "HighOrderKernel in Float32" begin
+    n = 4000
+    px, py = Float64.(Float32.(90 .* rand(n))), Float64.(Float32.(90 .* rand(n)))
+    f = Float64.(Float32.(randn(n)))
+    out(T) = Float64.(CGEF.Filtering.filter_apply!(zeros(T, n), T.(f), CGEF.Filtering.plan_filter(
+        FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{T}(), T.(px), T.(py), fill(one(T), n), trues(n)),
+        CGEF.Kernels.HighOrderKernel(; order = 3), T(12); execution = _CGEF_SERIAL)))
+    o64, o32 = out(Float64), out(Float32)
+    e = sort(abs.(o32 .- o64) ./ maximum(abs, o64))
+    Test.@test e[ceil(Int, 0.999 * n)] < 1e-5
 end
 
 # On a periodic lattice with `k_c ≤ π/Δx` the real-space brick wall transforms to the transfer function of

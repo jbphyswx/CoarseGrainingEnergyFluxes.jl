@@ -206,10 +206,10 @@ function compute_Π_strain_convergence!(
 
     _fill_stress_strain!(u, v, nothing, grid, ws, plan, dplan, kernel, scale, nothing)
 
-    # The filtered velocity and products are spent once the stress and strain are built, and hold the
-    # outputs.
+    # The filtered velocity and the ambient buffers are spent once the stress and strain are built, and hold
+    # the outputs.
     mask = FlowGeometries.Grids.mask(_output(ws.at, plan))
-    δ, α, Πα = ws.uu_filt, ws.uv_filt, ws.vv_filt
+    δ, α, Πα = ws.ux, ws.uy, ws.uz
     Πδ, total = ws.u_filt, ws.v_filt
     @. δ = ifelse(mask, ws.S_xx + ws.S_yy, zero(T))
     @. α = ifelse(mask, sqrt((ws.S_xx - ws.S_yy)^2 + (T(2) * ws.S_xy)^2), zero(T))

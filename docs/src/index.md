@@ -43,10 +43,16 @@ does not change — transform objects, measure prefix scans, point sorts — onc
 every diagnostic has an in-place form whose workspace holds only the buffers its configuration
 reaches.
 
+The top-hat weighs each grid cell by its area inside the disk, cap or geodesic disk about the target
+(`Kernels.CellOverlap`), the continuous filter integrated over the cell. The strain differentiates the filtered
+velocity by the filter's own series where the filter is spectral, and otherwise by 5-node stencils or the
+least-squares gradient ([`Derivatives.AbstractDerivative`](@ref)).
+
 Every diagnostic works across the full grid×dimensionality matrix — `StructuredGrid` (1D, 2D, and
-true 3D Cartesian or spherical-volumetric), `CurvilinearGrid` (model-native orthogonal curvilinear meshes), and
+true 3D Cartesian or spherical-volumetric), `CurvilinearGrid` (model-native orthogonal curvilinear meshes),
 `UnstructuredGrid` (scattered points, via k-d tree neighbors, Voronoi cell areas, and non-uniform
-spectral transforms) — see [Architecture](architecture.md) for the full capability matrix.
+spectral transforms) and the sphere pixelizations, on a plane, a sphere or a spheroid — see
+[Architecture](architecture.md) for the full capability matrix.
 
 ## Installation
 
@@ -103,7 +109,9 @@ with respect to the filtering wavenumber `k_ℓ = L/ℓ`:
 ```
 
 `coarse_grain` returns both (`result.cumulative_energy`, `result.filtering_spectrum`,
-`result.wavenumber`).
+`result.wavenumber`). `dE/dℓ = ⟨ū·∂_ℓū⟩` is taken through the filter itself where its kernel has a
+derivative in `ℓ` ([`Diagnostics.AbstractScaleDerivative`](@ref)); `slopes = Diagnostics.Slopes()` adds the
+spectrum's slope per scale and `spectrum_maps = Diagnostics.SpectrumMaps()` the local spectrum per cell.
 
 `Ẽ(k_ℓ) ≥ 0` is guaranteed for a kernel whose `|Ĝ(k)|²` is monotone decreasing; the default
 `TopHatKernel`'s is not, so by default (`spectrum = AutoSpectrum()`) `coarse_grain` fills its

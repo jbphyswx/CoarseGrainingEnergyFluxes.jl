@@ -78,7 +78,8 @@ end
 """
     spin_fit!(C, F, tr, fit, s) -> C
 
-The spin-`s` coefficients of the field `F` into `C`: the quadrature [`spin_analyze!`](@ref) where `fit` is `nothing`,
+The spin-`s` coefficients of the field `F` into `C`: the quadrature `spin_analyze!` ([`AbstractSpinTransforms`](@ref))
+where `fit` is `nothing`,
 the least-squares fit of a [`SpinFit`](@ref) otherwise, its outcome folded into the fit's status.
 """
 spin_fit!(C, F, tr::AbstractSpinTransforms, ::Nothing, s::Int) = spin_analyze!(C, F, tr, s)

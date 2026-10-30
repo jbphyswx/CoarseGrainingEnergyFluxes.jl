@@ -186,8 +186,10 @@ The cross-scale kinetic energy flux `Π = −S̄_ij τ_ij` at filter scale `scal
 
 `S̄_ij = ½(∂ū_i/∂x_j + ∂ū_j/∂x_i)` is the strain rate of the filtered velocity and
 `τ_ij = (u_i u_j)‾ − ū_i ū_j` the subfilter stress. `derivative` ([`Derivatives.AbstractDerivative`](@ref))
-takes the strain: by default the derivative of the filter's own series under `method = Spectral()` and
-differences of the filtered field otherwise, by `deriv_plan` when given. On a sphere the velocity `ū` and the stress
+takes the strain: by default the derivative of the filter's own series where its output is one (`method =
+Spectral()`, and the generalized convolution on a sphere) and differences of the filtered field otherwise (a
+5-node stencil on a `StructuredGrid`, the least-squares gradient elsewhere), by `deriv_plan` when given. On a
+sphere the velocity `ū` and the stress
 `(u_i u_j)‾` are filtered by `vector_filter` ([`Filtering.resolve_vector_filter`](@ref)): by default the
 generalized convolution of Aluie (2019) under `ZeroFill`, which commutes with the surface derivatives,
 its spin transforms chosen by `transform`; `Filtering.CartesianComponents()` filters the ambient

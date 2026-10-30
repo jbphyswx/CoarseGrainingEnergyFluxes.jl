@@ -6,7 +6,7 @@ const CGEF = CoarseGrainingEnergyFluxes
 Documenter.makedocs(;
     modules = [
         CGEF,
-        CGEF.Kernels, CGEF.Filtering, CGEF.Derivatives, CGEF.Diagnostics,
+        CGEF.Geometry, CGEF.Kernels, CGEF.Filtering, CGEF.Derivatives, CGEF.Diagnostics,
         CGEF.Pipeline, CGEF.Visualization,
     ],
     sitename = "CoarseGrainingEnergyFluxes.jl",
@@ -25,7 +25,11 @@ Documenter.makedocs(;
             "Pipeline" => "reference/pipeline.md",
             "Diagnostics" => "reference/diagnostics.md",
             "Filtering" => "reference/filtering.md",
+            "Filtering on the sphere" => "reference/filtering_sphere.md",
+            "Filtering engines" => "reference/filtering_engines.md",
+            "Spectral plans" => "reference/spectral_plans.md",
             "Kernels and derivatives" => "reference/kernels.md",
+            "Cell geometry" => "reference/geometry.md",
         ],
     ],
 )

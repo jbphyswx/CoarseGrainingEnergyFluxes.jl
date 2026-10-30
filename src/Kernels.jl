@@ -34,8 +34,10 @@ abstract type AbstractCellWeight end
 """
     CellOverlap()
 
-A cell weighs its measure inside the disk (in three dimensions the ball) of radius `ℓ/2` about the target: the
-continuous top-hat integrated over each cell. On a node set, whose points carry no cells, the centre test.
+A cell weighs its measure inside the support of radius `ℓ/2` about the target, the continuous top-hat
+integrated over each cell: the segment, disk or ball of a Cartesian grid, the cap on a sphere, the geodesic disk
+on a spheroid, and the chord ball in a spherical or spheroidal shell. On a node set, whose points carry no cells,
+the centre test.
 """
 struct CellOverlap <: AbstractCellWeight end
 

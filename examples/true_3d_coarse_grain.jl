@@ -2,7 +2,7 @@
 # (examples/profile_coarse_grain.jl): here the filter kernel genuinely blends all three directions at
 # once, and Π is the full nine-component (six independent) strain/stress contraction with real
 # vertical derivatives — the homogeneous/isotropic-turbulence regime (Rayleigh-Taylor, boundary
-# layers), not the thin-layer/quasi-geostrophic level-stacking regime.
+# layers). The thin-layer/quasi-geostrophic regime stacks levels instead: profile_coarse_grain.jl.
 
 using Random: Random
 using Statistics: Statistics
@@ -15,7 +15,7 @@ Random.seed!(3)
 N = 24
 dx = 500.0
 geom = FG.Geometry.CartesianGeometry()
-x = 0.0:dx:(N - 1) * dx   # a Range, not `collect`ed — keeps the fast translation-invariant footprint path
+x = 0.0:dx:(N - 1) * dx   # a range: a uniform axis, which the translation-invariant engines take
 grid = FG.Grids.StructuredGrid(geom, x, x, x)
 
 u = randn(N, N, N); v = randn(N, N, N); w = randn(N, N, N)
@@ -34,7 +34,7 @@ for (k, ℓ) in enumerate(scales)
 end
 
 # ── Spherical volumetric shell: (lon, lat, radius) ────────────────────────────
-# A small regional patch at mid-latitude with roughly ISOTROPIC grid spacing in all three
+# A small regional patch at mid-latitude with roughly isotropic grid spacing in all three
 # directions (~30 km horizontal and vertical) — the true-3D method assumes one filter scale ℓ
 # applies equally in all three directions, so the demo needs comparable spacing. In a real atmosphere
 # or ocean the horizontal scales are orders of magnitude larger than the vertical extent: on a global
@@ -42,8 +42,9 @@ end
 # scale dependence.
 R = 6.371e6
 sgeom = FG.Geometry.SphericalGeometry(R)
-lon = deg2rad.(collect(0.0:0.3:3.3))                # ~28 km spacing at this latitude
-lat = deg2rad.(collect(30.0:0.3:33.0))               # ~33 km spacing
+# Ranges: a uniform longitude, along which the top-hat's cell weights are shared.
+lon = range(0.0; step = deg2rad(0.3), length = 12)                  # ~28 km spacing at this latitude
+lat = range(deg2rad(30.0); step = deg2rad(0.3), length = 11)        # ~33 km spacing
 r = collect((R - 200e3):20e3:R)                     # 11 levels, 20 km spacing, 200 km total vertical extent
 sgrid = FG.Grids.StructuredGrid(sgeom, lon, lat, r)
 

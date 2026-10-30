@@ -12,44 +12,25 @@ Whether a real-space footprint over a nonuniform axis (`StructuredGrid` with a `
 abstract type AbstractCacheStrategy end
 
 """
-    AutoCache <: AbstractCacheStrategy
-
-Store the per-point neighbour-list cache when it fits in `cache_byte_budget` (default
-[`default_cache_byte_budget`](@ref)), and recompute neighbours at apply time otherwise. The size is the
-exact entry count, counted by the build's ball query before anything is allocated; counting stops once
-it passes the budget.
-"""
-struct AutoCache <: AbstractCacheStrategy end
-
-"""
     AlwaysCache <: AbstractCacheStrategy
 
-Store the per-point neighbour-list cache whatever its size; `cache_byte_budget` is ignored.
+Store the per-point neighbour list, the default: built in one pass of the ball query, it makes every apply a pass
+over the list. It holds each target's neighbours, an index and a weight per neighbour.
 """
 struct AlwaysCache <: AbstractCacheStrategy end
 
 """
     NeverCache <: AbstractCacheStrategy
 
-Recompute neighbours at every `filter_apply!`/`filter_apply_batch!` call and store no cache, for a
-memory ceiling `cache_byte_budget` does not cover, such as a GPU's device memory.
+Recompute neighbours at every `filter_apply!`/`filter_apply_batch!` call and store no list: each apply runs the
+ball query the list is built from, in no memory beyond the plan's.
 """
 struct NeverCache <: AbstractCacheStrategy end
 
 """
-    default_cache_byte_budget() -> Int
+    _cache_keep(strategy) -> Bool
 
-[`AutoCache`](@ref)'s default byte budget: a quarter of the memory available to the process
-(`Sys.total_memory()`, which honours a cgroup limit), shared by every scale of a sweep.
+Whether a footprint built under `strategy` keeps its neighbour list.
 """
-default_cache_byte_budget() = Int(Sys.total_memory() ÷ 4)
-
-"""
-    _cache_keep(strategy, budget, entry_bytes) -> (n -> Bool)
-
-Whether a neighbour cache of `n` entries is kept under `strategy`: always, never, or while it fits the
-byte budget.
-"""
-_cache_keep(::AlwaysCache, _, _) = Returns(true)
-_cache_keep(::NeverCache, _, _) = Returns(false)
-_cache_keep(::AutoCache, budget::Integer, entry_bytes::Integer) = n -> n <= Int(budget) ÷ entry_bytes
+_cache_keep(::AlwaysCache) = true
+_cache_keep(::NeverCache) = false

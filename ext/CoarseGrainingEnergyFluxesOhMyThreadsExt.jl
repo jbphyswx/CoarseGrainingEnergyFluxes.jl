@@ -275,8 +275,12 @@ function CGEF.Filtering.threaded_filter_field!(
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
     fp::CGEF.Filtering.NodeFilterPlan,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    OhMyThreads.tforeach(eachindex(out); scheduler = _sched()) do t
-        out[t] = CGEF.Filtering._footprint_node_point(field, grid, fp, mask_strategy, t)
+    OhMyThreads.tforeach(eachindex(out); scheduler = _sched()) do s
+        CGEF.Filtering._node_stage!(fp, field, grid, s)
+    end
+    vals, act = CGEF.Filtering._node_inputs(fp, field, grid)
+    OhMyThreads.tforeach(eachindex(out); scheduler = _sched()) do s
+        out[CGEF.Filtering._node_id(fp, s)] = CGEF.Filtering._footprint_node_point(field, vals, act, fp, mask_strategy, s)
     end
     return out
 end
@@ -290,10 +294,8 @@ function CGEF.Filtering.threaded_filter_fields!(
     mask_strategy::CGEF.Filtering.AbstractMaskStrategy,
     fp::CGEF.Filtering.NodeFilterPlan,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
-    OhMyThreads.tforeach(eachindex(first(outs)); scheduler = _sched()) do t
-        for k in eachindex(outs)
-            outs[k][t] = CGEF.Filtering._footprint_node_point(fields[k], grid, fp, mask_strategy, t)
-        end
+    for k in eachindex(outs)
+        CGEF.Filtering.threaded_filter_field!(outs[k], fields[k], grid, kernel, scale, mask_strategy, fp)
     end
     return outs
 end
@@ -338,19 +340,25 @@ function CGEF.Filtering.threaded_filter_slices!(outs, fields, plans)
 end
 
 # Batch-parallel pipeline sweeps over one shared grid; slices write disjoint views of the batched result.
-# Chunk `ci` owns scratch pool entry `ci`, built in its task when the caller supplied none.
+# The tables are built once; chunk `ci` owns scratch pool entry `ci`, a worker copy of the base built in its
+# task when the caller supplied none, so its buffers are first touched by the thread that uses them.
 function CGEF.Pipeline.threaded_coarse_grain_batch!(batch, u, v, w, grid, valR, ctx)
     n = length(batch.slices)
     n == 0 && return batch
     groups = OhMyThreads.chunks(1:n; n = CGEF.Pipeline.batch_concurrency(ctx, n))
     _farm() do
+        base = CGEF.Pipeline._batch_base(batch, u, v, w, grid, valR, ctx, 1)
         OhMyThreads.tforeach(enumerate(groups); scheduler = _sched()) do (ci, group)
-            CGEF.Pipeline._run_slices!(batch, u, v, w, grid, valR, ctx, group,
-                                       CGEF.Pipeline._worker_scratch(ctx, grid, w, ci))
+            _run_worker!(batch, u, v, w, grid, valR, ctx, group, base, ci)
         end
     end
     return batch
 end
+
+# Worker 1 sweeps on the base and its rate route; any other on its copy, its rate route built from its first slice.
+_run_worker!(batch, u, v, w, grid, valR, ctx, group, base, ci::Int) = ci == 1 ?
+    CGEF.Pipeline._run_slices!(batch, u, v, w, grid, valR, ctx, group, base.scratch, base.rate) :
+    CGEF.Pipeline._run_slices!(batch, u, v, w, grid, valR, ctx, group, CGEF.Pipeline._worker_scratch(ctx, base, grid, ci))
 
 # Pipeline sweeps whose slices carry their own grids, each with its own scratch.
 function CGEF.Pipeline.threaded_coarse_grain_slices!(results, us, vs, ws, grids, ctx)

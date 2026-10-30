@@ -127,13 +127,13 @@ end
 
 # A spherical longitude identifies, so each cell counts once however far the support reaches. A uniform
 # longitude takes the kernel's own engine or, where it costs fewer operations, the transform along
-# longitude; on these grids the cell overlap's edge cells put the top-hat on the transform, and the rows
-# naming the prefix-sum engine keep its pole, seam and orientation cases.
+# longitude; the cell overlap's top-hat takes the prefix sums on these grids and the transform on the box spanning
+# its gap, where a row naming the prefix sums keeps their seam case.
 function _cgef_spherical_rows()
     sph = FG.Geometry.SphericalGeometry(6.371e6)
     rows = Any[]
     row(args...; kw...) = push!(rows, _cgef_row(args...; kw...))
-    tophat(g, ℓ) = (row(g, _CGEF_TH, ℓ, :ZonalFFTFootprint); row(g, _CGEF_TH, ℓ, :PrefixSumTopHatPlan; engine = _CGEF_FE))
+    tophat(g, ℓ) = row(g, _CGEF_TH, ℓ, :PrefixSumTopHatPlan)
 
     # Global, the support reaching over a pole and round the ring.
     ring = range(0.0; step = deg2rad(10.0), length = 36)
@@ -169,7 +169,8 @@ function _cgef_spherical_rows()
     # neighbours across the gap.
     λw = range(0.0; step = deg2rad(10.0), length = 33)
     φw = range(deg2rad(50.0), deg2rad(70.0); length = 5)
-    tophat(FG.Grids.StructuredGrid(sph, λw, φw), 3.1e6)
+    row(FG.Grids.StructuredGrid(sph, λw, φw), _CGEF_TH, 3.1e6, :ZonalFFTFootprint)
+    row(FG.Grids.StructuredGrid(sph, λw, φw), _CGEF_TH, 3.1e6, :PrefixSumTopHatPlan; engine = _CGEF_FE)
     row(FG.Grids.StructuredGrid(sph, λw, φw), _CGEF_TH, 5.0e6, :ZonalFFTFootprint)
     row(FG.Grids.StructuredGrid(sph, λw, φw), _CGEF_SH, 3.5e6, :ZonalFFTFootprint)
     for cs in _CGEF_CACHES
@@ -200,6 +201,35 @@ function _cgef_spherical_rows()
     end
     row(gn, _CGEF_GA, 1.2e6, :FilterFootprint)
     row(gn, _CGEF_GA, 4.0e6, :ZonalFFTFootprint)
+    return rows
+end
+
+# WGS 84, at the geodesic distance. A uniform longitude takes the banded sum for smooth kernels and the prefix sums
+# for the cell overlap; the centre test, and every kernel on a longitude vector, the per-point plan. The cell
+# overlap's 10-point quadrature leaves its weights within 1e-8 on 10° cells, which a `ZeroFill` window reaching
+# both poles divides by the disk's area in the reference and by the summed weights in the engines.
+function _cgef_spheroid_rows()
+    E = FG.Geometry.SpheroidGeometry(6.378137e6, 1 / 298.257223563)
+    rows = Any[]
+    row(args...; kw...) = push!(rows, _cgef_row(args...; kw...))
+    lat = deg2rad.(collect(-85.0:10.0:85.0))
+    gw = FG.Grids.StructuredGrid(E, FG.Axes.PeriodicUniformAxis(0.0, 2π, 36), lat)
+    gm = FG.Grids.StructuredGrid(E, FG.Axes.PeriodicUniformAxis(0.0, 2π, 36), lat, (m = trues(36, 18); m[5:9, 4:7] .= false; m))
+    gr = FG.Grids.StructuredGrid(E, range(0.0; step = deg2rad(5.0), length = 19), deg2rad.(collect(-40.0:5.0:40.0)))
+    gs = FG.Grids.StructuredGrid(E, sort(vcat(deg2rad.(0.0:12.0:348.0), deg2rad.(3.0:12.0:351.0))), lat;
+                                 topology = (FG.Grids.Periodic(), FG.Grids.Bounded()), period = (2π, nothing))
+    for g in (gw, gm, gr), ℓ in (1.5e6, 4.0e6)
+        row(g, _CGEF_GA, ℓ, :FilterFootprint)
+        row(g, _CGEF_SH, ℓ, :FilterFootprint)
+        row(g, _CGEF_THC, ℓ, :ScatteredFilterPlan)
+        row(g, _CGEF_TH, ℓ, :PrefixSumTopHatPlan; rtol = g === gr ? 1e-11 : 1e-8)
+    end
+    for k in (_CGEF_GA, _CGEF_THC, _CGEF_TH)
+        row(gs, k, 4.0e6, :ScatteredFilterPlan; rtol = k === _CGEF_TH ? 1e-8 : 1e-11)
+    end
+    # The equator, a circle of radius `a`.
+    g1 = FG.Grids.StructuredGrid(E, range(0.0; step = 2π / 24, length = 24); topology = FG.Grids.Periodic())
+    row(g1, _CGEF_TH, 4.0e6, :NDScatteredFilterPlan)
     return rows
 end
 

@@ -246,6 +246,42 @@ CGEF.Filtering.spectral_grid_plan(
 
 CGEF.Filtering.spectral_scratch(gp::NUFSHTGridPlan) = _nufsht_scratch(gp)
 
+# A worker's copy: the transfer, renormalization, weights and the mask's coefficients shared; the NUSHT plans,
+# planned anew on the same nodes, and the scratch its own.
+CGEF.Filtering._scratch(plan::NUFSHTFilterPlan) = plan.scratch
+CGEF.Filtering._with_scratch(plan::NUFSHTFilterPlan, sc::NUFSHTScratch) =
+    NUFSHTFilterPlan(plan.grid_plan, plan.filter, plan.invrenorm, plan.strategy, sc)
+CGEF.Filtering._grid_plan(plan::NUFSHTFilterPlan) = plan.grid_plan
+CGEF.Filtering._with_grid_plan(plan::NUFSHTFilterPlan, gp::NUFSHTGridPlan) =
+    NUFSHTFilterPlan(gp, plan.filter, plan.invrenorm, plan.strategy, plan.scratch)
+
+function CGEF.Filtering._fresh_grid_plan(gp::NUFSHTGridPlan{P,T}) where {P,T}
+    θ, φ = gp.nodes
+    L = gp.plan.lmax
+    nplan = _make_plan(T, θ, φ, L, gp.execution; nufft = gp.nufft)::P
+    bplan = _fresh_batched(gp.batched, T, θ, φ, L, gp)
+    return NUFSHTGridPlan(
+        nplan, gp.radius, gp.mask, gp.C_mask, gp.mask_fit, gp.npts, bplan, _weighted_op(nplan, gp.weights, gp.execution),
+        bplan === nothing ? nothing : _weighted_op(bplan, gp.weights, gp.execution), gp.weights, gp.execution, gp.own,
+        gp.nodes, gp.nufft, gp.analysis,
+    )
+end
+_fresh_batched(::Nothing, ::Type, _θ, _φ, _L, _gp) = nothing
+_fresh_batched(bp::B, ::Type{T}, θ, φ, L, gp) where {B,T} =
+    _make_plan(T, θ, φ, L, gp.execution; ntrans = bp.B, nufft = gp.nufft)::B
+
+CGEF.Filtering._fresh(sc::NUFSHTScratch{T}) where {T} = NUFSHTScratch(
+    similar(sc.masked_input), similar(sc.coeffs), _fresh_ws(sc.ws), CGEF.Filtering._fresh_buffer(sc.local_out),
+    _fresh_batch(sc.batched), Base.RefValue(CGEF.Filtering._exact_status(T)),
+)
+CGEF.Filtering._alike(a::S, b::S) where {S<:NUFSHTScratch} = size(a.coeffs) == size(b.coeffs)
+# An LSMR workspace holds its arrays alone.
+_fresh_ws(::Nothing) = nothing
+_fresh_ws(ws::FTB.LSMRWorkspace) = deepcopy(ws)
+_fresh_batch(::Nothing) = nothing
+_fresh_batch(b::NamedTuple) = (masked_input = similar(b.masked_input), coeffs = similar(b.coeffs), ws = _fresh_ws(b.ws),
+                               local_out = CGEF.Filtering._fresh_buffer(b.local_out))
+
 function CGEF.Filtering.spectral_filter_plan(
     ::Union{CGEF.SpectralBackends.AbstractAutoSpectralBackend, CGEF.SpectralBackends.AbstractNUFSHTSpectralBackend},
     grid::FlowGeometries.Grids.UnstructuredGrid{T,G,2},
@@ -490,12 +526,15 @@ loops read them. The analysis is the quadrature `Σ_k w_k F_k conj(ₛY_ℓm(x_k
 degree at most `lmax` on a grid whose measure is a quadrature exact to degree `2lmax`; a cell holding zero
 contributes nothing.
 """
-struct NUFSHTSpinTransforms{P, W<:AbstractVector{<:AbstractFloat}, B} <: CGEF.Filtering.AbstractSpinTransforms
+struct NUFSHTSpinTransforms{P, W<:AbstractVector{<:AbstractFloat}, B, ND<:Tuple, NF} <: CGEF.Filtering.AbstractSpinTransforms
     plans::NTuple{3,P}  # spin 0, 1, 2
     weights::W
     transfer::W         # Ĝ(ℓ) where the plans read it
     lmax::Int
     execution::B
+    nodes::ND           # (θ, φ) the plans were built on
+    nthreads::Int
+    nufft::NF
 end
 
 Base.show(io::IO, tr::NUFSHTSpinTransforms) =
@@ -536,8 +575,20 @@ function _nufsht_spin_transforms(
     L >= 2 || throw(ArgumentError("the generalized convolution's spin-2 transform needs lmax ≥ 2; got $L"))
     put(a) = FlowGeometries.Execution.on_backend(execution, a)
     θ, φ, w = map(put, CGEF.Filtering._spin_nodes(grid))
-    plan(s) = NUFSHT.make_spin_plan(Complex{T}, θ, φ, L, s; nthreads = Int(nthreads), nufft = nufft)
-    return NUFSHTSpinTransforms((plan(0), plan(1), plan(2)), w, put(zeros(T, L + 1)), L, execution)
+    plans = _spin_plans(T, θ, φ, L, Int(nthreads), nufft)
+    return NUFSHTSpinTransforms(plans, w, put(zeros(T, L + 1)), L, execution, (θ, φ), Int(nthreads), nufft)
+end
+
+_spin_plans(::Type{T}, θ, φ, L::Int, nthreads::Int, nufft) where {T} =
+    ntuple(k -> NUFSHT.make_spin_plan(Complex{T}, θ, φ, L, k - 1; nthreads, nufft), Val(3))
+
+# A worker's transforms: the nodes and weights shared, the plans, which hold their execution's buffers, and the
+# transfer its own.
+function CGEF.Filtering._worker_transforms(tr::NUFSHTSpinTransforms{P}) where {P}
+    θ, φ = tr.nodes
+    plans = _spin_plans(real(eltype(tr.weights)), θ, φ, tr.lmax, tr.nthreads, tr.nufft)::NTuple{3,P}
+    return NUFSHTSpinTransforms(plans, tr.weights, similar(tr.transfer), tr.lmax, tr.execution, tr.nodes, tr.nthreads,
+                                tr.nufft)
 end
 
 CGEF.Filtering.spin_field(tr::NUFSHTSpinTransforms) =

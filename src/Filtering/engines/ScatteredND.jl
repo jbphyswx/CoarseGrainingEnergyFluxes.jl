@@ -18,13 +18,15 @@ _structured_footprint(
 """
     NDScatteredCache{N, T}
 
-The full per-target-point neighbour list for an [`NDScatteredFilterPlan`](@ref) (absolute neighbour
-multi-indices + weights), built only when the plan's [`AbstractCacheStrategy`](@ref) calls for it.
+The full per-target-point neighbour list for an [`NDScatteredFilterPlan`](@ref) (each neighbour's linear cell
+index in the grid of size `dims`, and its weight), built only when the plan's [`AbstractCacheStrategy`](@ref) calls
+for it. A cell index is an `Int32`; a grid of more cells raises at build.
 """
-struct NDScatteredCache{N, T<:AbstractFloat, VO<:AbstractVector{NTuple{N,Int}}, VT<:AbstractVector{T}, VI<:AbstractVector{Int}}
-    nbrs::VO
+struct NDScatteredCache{N, T<:AbstractFloat, VC<:AbstractVector{Int32}, VT<:AbstractVector{T}, VI<:AbstractVector{Int}}
+    cell::VC
     w::VT
     ptr::VI   # target t = LinearIndices(dims)[I]; entries ptr[t]:ptr[t+1]-1
+    dims::NTuple{N,Int}
 end
 
 """
@@ -34,7 +36,7 @@ The neighbour lists of an [`NDScatteredFilterPlan`](@ref) whose targets along a 
 share their cells and weights: one list per index of the other directions, about the target in column 1. Target
 `(i, J...)` reads cell `(mod1(i + c₁ − 1, dims[1]), c₂, …)` for each stored cell `c`, `c₁ ∈ 1:dims[1]`.
 """
-struct NDRingCache{N, T<:AbstractFloat, VO<:AbstractVector{NTuple{N,Int}}, VT<:AbstractVector{T}, VI<:AbstractVector{Int}}
+struct NDRingCache{N, T<:AbstractFloat, VO<:AbstractVector{NTuple{N,Int32}}, VT<:AbstractVector{T}, VI<:AbstractVector{Int}}
     nbrs::VO
     w::VT
     ptr::VI   # row r = LinearIndices(dims[2:N])[J]; entries ptr[r]:ptr[r+1]-1
@@ -43,7 +45,7 @@ end
 
 # The entries target `I` (linear index `t`) reads, and entry `k`'s cell.
 @inline _entries_of(c::NDScatteredCache, t::Int, ::CartesianIndex) = @inbounds c.ptr[t]:(c.ptr[t + 1] - 1)
-@inline _cell_of(c::NDScatteredCache, k::Int, ::CartesianIndex) = @inbounds c.nbrs[k]
+@inline _cell_of(c::NDScatteredCache, k::Int, ::CartesianIndex) = @inbounds c.cell[k]
 @inline function _entries_of(c::NDRingCache{N}, ::Int, I::CartesianIndex{N}) where {N}
     r = LinearIndices(Base.tail(c.dims))[Base.tail(Tuple(I))...]
     return @inbounds c.ptr[r]:(c.ptr[r + 1] - 1)
@@ -58,8 +60,9 @@ end
 _expanded(c::NDScatteredCache) = c
 function _expanded(c::NDRingCache{N,T}) where {N,T}
     targets = CartesianIndices(c.dims)
+    lin = LinearIndices(c.dims)
     n = sum(I -> length(_entries_of(c, 0, I)), targets)
-    nbrs = Vector{NTuple{N,Int}}(undef, n)
+    cell = Vector{Int32}(undef, n)
     w = Vector{T}(undef, n)
     ptr = Vector{Int}(undef, length(targets) + 1)
     ptr[1] = 1
@@ -67,12 +70,12 @@ function _expanded(c::NDRingCache{N,T}) where {N,T}
     for (t, I) in enumerate(targets)
         for k in _entries_of(c, 0, I)
             m += 1
-            nbrs[m] = _cell_of(c, k, I)
+            cell[m] = lin[_cell_of(c, k, I)...]
             w[m] = c.w[k]
         end
         ptr[t + 1] = m + 1
     end
-    return NDScatteredCache(nbrs, w, ptr)
+    return NDScatteredCache(cell, w, ptr, c.dims)
 end
 
 """
@@ -124,12 +127,11 @@ index `t`), through the grid's ball query or, for an [`OverlapWeightsND`](@ref) 
         f(a, J, A * oftype(A, fr))
     end
 
-# Entries of an N-D cache, counted in target order, stopping once past `limit`.
-function _count_nd_scattered(grid, rule, rad, mt, limit::Int)
+# Entries of an N-D cache, counted in target order.
+function _count_nd_scattered(grid, rule, rad, mt)
     n = 0
     for (t, I) in enumerate(CartesianIndices(FlowGeometries.Grids.size_tuple(grid)))
         n = _nd_rule_fold((m, _, _) -> m + 1, n, rule, grid, t, Tuple(I), rad, mt)
-        n > limit && break
     end
     return n
 end
@@ -139,7 +141,8 @@ function _fill_nd_scattered(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, rule, rad, mt, n::Int,
 ) where {T, G, N}
     dims = FlowGeometries.Grids.size_tuple(grid)
-    nbrs = Vector{NTuple{N,Int}}(undef, n)
+    lin = LinearIndices(dims)
+    cell = Vector{Int32}(undef, n)
     w = Vector{T}(undef, n)
     ptr = Vector{Int}(undef, prod(dims) + 1)
     ptr[1] = 1
@@ -147,73 +150,126 @@ function _fill_nd_scattered(
     for (t, I) in enumerate(CartesianIndices(dims))
         k = _nd_rule_fold(k, rule, grid, t, Tuple(I), rad, mt) do m, J, wt
             m += 1
-            nbrs[m] = J
+            cell[m] = lin[J...]
             w[m] = wt
             m
         end
         ptr[t + 1] = k + 1
     end
-    return NDScatteredCache(nbrs, w, ptr)
+    return NDScatteredCache(cell, w, ptr, dims)
 end
 
 # An N-D cell-by-cell plan's neighbour cache (or `nothing`), its mass past a bounded edge (or `nothing`)
 # and its weight rule, as `_scattered_parts` gives them in two dimensions.
 function _nd_scattered_parts(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::Kernels.AbstractFilterKernel, scale::T,
-    rad, mt, strategy, budget,
+    rad, mt, strategy,
 ) where {T, G, N}
     rule = RadialWeights(kernel, scale, Val(N))
-    return _nd_cache(grid, rule, rad, mt, strategy, budget), _exterior_mass(grid, kernel, scale), rule
+    return _nd_cache(grid, rule, rad, mt, strategy), _exterior_mass(grid, kernel, scale), rule
 end
 
 function _nd_scattered_parts(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T,
-    rad, mt, strategy, budget,
+    rad, mt, strategy,
 ) where {T, N, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}}
     rule = OverlapWeightsND(grid, rad)
-    return _nd_cache(grid, rule, rad, mt, strategy, budget), _overlap_exterior(grid, rule, kernel, scale), rule
+    return _nd_cache(grid, rule, rad, mt, strategy), _overlap_exterior(grid, rule, kernel, scale), rule
 end
 
 # A sphere's or spheroid's single ring of longitude, the equator.
 function _nd_scattered_parts(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,1}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T,
-    rad, mt, strategy, budget,
+    rad, mt, strategy,
 ) where {T, G<:FlowGeometries.Geometry.AbstractLonLatGeometry{T}}
     rule = OverlapWeightsND(grid, rad)
-    return _nd_cache(grid, rule, rad, mt, strategy, budget), _overlap_exterior(grid, rule, kernel, scale), rule
+    return _nd_cache(grid, rule, rad, mt, strategy), _overlap_exterior(grid, rule, kernel, scale), rule
 end
 
-# A sphere with a radius: the ball of the chord distance over shell sectors.
+# A sphere with a radius or a spheroid with heights: the ball of the chord distance over their cells.
 function _nd_scattered_parts(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T,
-    rad, mt, strategy, budget,
-) where {T, G<:FlowGeometries.Geometry.AbstractSphericalGeometry{T}}
+    rad, mt, strategy,
+) where {T, G<:FlowGeometries.Geometry.AbstractLonLatGeometry{T}}
     rule = OverlapShells(grid, Kernels.kernel_radius(kernel, scale))
-    return _nd_cache(grid, rule, rad, mt, strategy, budget), _overlap_exterior(grid, rule, kernel, scale, rad, mt), rule
+    cache, exterior = _shell_parts(grid, rule, rad, mt, strategy, _reaches_exterior(grid, kernel, scale))
+    return cache, exterior, rule
 end
 
-_nd_cache(grid::FlowGeometries.Grids.StructuredGrid, rule, rad, mt, strategy, budget) =
-    _nd_cache_each(grid, rule, rad, mt, strategy, budget)
+_nd_cache(grid::FlowGeometries.Grids.StructuredGrid, rule, rad, mt, strategy) = _nd_cache_each(grid, rule, rad, mt, strategy)
+_nd_cache(grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, rule::OverlapShells, rad, mt, strategy) where {T,G} =
+    first(_shell_parts(grid, rule, rad, mt, strategy, false))
 
 # The cache folded about every target.
-function _nd_cache_each(grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, rule, rad, mt, strategy, budget) where {T,G,N}
-    n = _cache_entries(strategy, budget, _cache_entry_bytes(Val(N), T)) do limit
-        _count_nd_scattered(grid, rule, rad, mt, limit)
+function _nd_cache_each(grid::FlowGeometries.Grids.StructuredGrid, rule, rad, mt, strategy)
+    n = _cache_entries(strategy) do
+        _count_nd_scattered(grid, rule, rad, mt)
     end
     return n === nothing ? nothing : _fill_nd_scattered(grid, rule, rad, mt, n)
 end
 
-# On a uniform periodic ring of longitude a shell target's cells and weights are its row and level's shifted along
-# longitude, so each (row, level) folds once.
-function _nd_cache(grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, rule::OverlapShells, rad, mt, strategy, budget) where {T,G}
-    _shell_ring(grid) || return _nd_cache_each(grid, rule, rad, mt, strategy, budget)
+"""
+    _shell_parts(grid, rule::OverlapShells, rad, mt, strategy, exterior::Bool) -> (cache, exterior)
+
+A shell's neighbour cache (`nothing` where the plan streams) and, where `exterior`, the ball's volume less each
+target's summed weights, every cell's fraction computed once. Along a uniform direction 1 a target's cells and
+weights are its row and level's shifted along it: a periodic ring keeps one list per (row, level) about column 1,
+an [`NDRingCache`](@ref); a bounded axis one table of offsets per (row, level), from the folds about its two end
+columns, each target reading the offsets that stay on the grid. Any other shell folds each target once.
+"""
+function _shell_parts(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, rule::OverlapShells, rad, mt, strategy, exterior::Bool,
+) where {T,G}
+    FlowGeometries.Grids.isuniform(grid, 1) || return _shell_parts_each(grid, rule, rad, mt, strategy, exterior)
+    lists = _shell_row_lists(grid, rule, rad, mt, 1)
+    FlowGeometries.Grids.isperiodic(grid, 1) && return _shell_parts_ring(grid, lists, rule, strategy, exterior)
+    Nx = FlowGeometries.Grids.size_tuple(grid)[1]
+    tables = _shell_offset_tables(lists, _shell_row_lists(grid, rule, rad, mt, Nx), Nx)
+    return _shell_parts_band(grid, tables, rule, strategy, exterior)
+end
+
+# The cells and weights about column `i0` of each (row, level).
+function _shell_row_lists(grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, rule::OverlapShells, rad, mt, i0::Int) where {T,G}
+    _, Ny, Nz = FlowGeometries.Grids.size_tuple(grid)
+    return [_nd_rule_fold((acc, J, wt) -> (push!(acc, (J, wt)); acc), Tuple{NTuple{3,Int},T}[], rule, grid, 0, (i0, j, k), rad, mt)
+            for j in 1:Ny, k in 1:Nz]
+end
+
+# Each (row, level)'s cells as offsets along direction 1: those at or past the target from the fold about column 1,
+# those before it from the fold about column `Nx`.
+function _shell_offset_tables(first_lists, last_lists, Nx::Int)
+    return map(first_lists, last_lists) do up, down
+        before = [((J[1] - Nx, J[2], J[3]), wt) for (J, wt) in down if J[1] < Nx]
+        after = [((J[1] - 1, J[2], J[3]), wt) for (J, wt) in up]
+        vcat(before, after)
+    end
+end
+
+@inline _shell_mass(rule::OverlapShells, ::Type{T}) where {T} = T(4 * π * rule.R^3 / 3)
+
+function _shell_parts_ring(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, lists, rule, strategy, exterior::Bool,
+) where {T,G}
     dims = FlowGeometries.Grids.size_tuple(grid)
-    lists = _shell_row_lists(grid, rule, rad, mt)
-    n = _cache_entries(strategy, budget, _cache_entry_bytes(Val(3), T)) do _
+    n = _cache_entries(strategy) do
         sum(length, lists)
     end
-    n === nothing && return nothing
-    nbrs = Vector{NTuple{3,Int}}(undef, n)
+    cache = n === nothing ? nothing : _ring_cache(lists, n, dims, T)
+    exterior || return cache, nothing
+    M = _shell_mass(rule, T)
+    E = Array{T,3}(undef, dims)
+    for k in 1:dims[3], j in 1:dims[2]
+        s = zero(T)
+        for (_, wt) in lists[j, k]
+            s += wt
+        end
+        E[:, j, k] .= M - s
+    end
+    return cache, E
+end
+
+function _ring_cache(lists, n::Int, dims::NTuple{3,Int}, ::Type{T}) where {T}
+    nbrs = Vector{NTuple{3,Int32}}(undef, n)
     w = Vector{T}(undef, n)
     ptr = Vector{Int}(undef, length(lists) + 1)
     ptr[1] = 1
@@ -229,23 +285,94 @@ function _nd_cache(grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, rule::Overl
     return NDRingCache(nbrs, w, ptr, dims)
 end
 
-@inline _shell_ring(grid) = FlowGeometries.Grids.isperiodic(grid, 1) && FlowGeometries.Grids.isuniform(grid, 1)
-
-# The cells and weights about column 1 of each (row, level).
-function _shell_row_lists(grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, rule::OverlapShells, rad, mt) where {T,G}
-    _, Ny, Nz = FlowGeometries.Grids.size_tuple(grid)
-    return [_nd_rule_fold((acc, J, wt) -> (push!(acc, (J, wt)); acc), Tuple{NTuple{3,Int},T}[], rule, grid, 0, (1, j, k), rad, mt)
-            for j in 1:Ny, k in 1:Nz]
+function _shell_parts_band(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, tables, rule, strategy, exterior::Bool,
+) where {T,G}
+    dims = FlowGeometries.Grids.size_tuple(grid)
+    Nx = dims[1]
+    n = _cache_entries(strategy) do
+        sum(table -> sum(e -> Nx - abs(first(e)[1]), table; init = 0), tables)
+    end
+    cache = n === nothing ? nothing : _band_cache(tables, n, dims, T)
+    exterior || return cache, nothing
+    M = _shell_mass(rule, T)
+    E = Array{T,3}(undef, dims)
+    for I in CartesianIndices(dims)
+        s = zero(T)
+        for (D, wt) in tables[I[2], I[3]]
+            1 <= I[1] + D[1] <= Nx && (s += wt)
+        end
+        E[I] = M - s
+    end
+    return cache, E
 end
+
+function _band_cache(tables, n::Int, dims::NTuple{3,Int}, ::Type{T}) where {T}
+    lin = LinearIndices(dims)
+    cell = Vector{Int32}(undef, n)
+    w = Vector{T}(undef, n)
+    ptr = Vector{Int}(undef, prod(dims) + 1)
+    ptr[1] = 1
+    m = 0
+    for (t, I) in enumerate(CartesianIndices(dims))
+        for (D, wt) in tables[I[2], I[3]]
+            i = I[1] + D[1]
+            1 <= i <= dims[1] || continue
+            m += 1
+            cell[m] = lin[i, D[2], D[3]]
+            w[m] = wt
+        end
+        ptr[t + 1] = m + 1
+    end
+    return NDScatteredCache(cell, w, ptr, dims)
+end
+
+function _shell_parts_each(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, rule, rad, mt, strategy, exterior::Bool,
+) where {T,G}
+    dims = FlowGeometries.Grids.size_tuple(grid)
+    keep = !(strategy isa NeverCache)
+    (keep || exterior) || return nothing, nothing
+    lin = LinearIndices(dims)
+    cell = Int32[]
+    w = T[]
+    ptr = Int[1]
+    E = exterior ? Array{T,3}(undef, dims) : nothing
+    M = _shell_mass(rule, T)
+    for (t, I) in enumerate(CartesianIndices(dims))
+        if keep
+            s = _shell_fold_push!(cell, w, lin, rule, grid, t, Tuple(I), rad, mt)
+            push!(ptr, length(w) + 1)
+        else
+            s = _nd_rule_fold((a, _, wt) -> a + wt, zero(T), rule, grid, t, Tuple(I), rad, mt)
+        end
+        _set_exterior!(E, I, M - s)
+    end
+    return (keep ? NDScatteredCache(cell, w, ptr, dims) : nothing), E
+end
+
+# Target `Ti`'s entries appended to `cell` (linear indices `lin`) and `w` in fold order, and their summed weight.
+_shell_fold_push!(cell, w, lin, rule, grid::FlowGeometries.Grids.StructuredGrid{T}, t, Ti, rad, mt) where {T} =
+    _nd_rule_fold(zero(T), rule, grid, t, Ti, rad, mt) do s, J, wt
+        push!(cell, lin[J...])
+        push!(w, wt)
+        s + wt
+    end
+
+@inline _set_exterior!(::Nothing, _, _) = nothing
+@inline _set_exterior!(E::AbstractArray, I, v) = (E[I] = v; nothing)
 
 function _nd_scattered_parts(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, kernel::Kernels.HighOrderKernel, scale::T,
-    rad, mt, strategy, budget,
+    rad, mt, strategy,
 ) where {T, G, N}
-    fold = (f, acc, I) -> _nd_foldl(f, acc, grid, I, rad, mt)
-    keep = _cache_keep(strategy, budget, _cache_entry_bytes(Val(N), T))
-    weights, exterior, kept = _highorder_targets(grid, kernel, scale, rad, fold, _ho_lattice(grid, rad), keep)
-    cache = kept === nothing ? nothing : NDScatteredCache(kept...)
+    fold = (f, acc, I, _) -> _nd_foldl(f, acc, grid, I, rad, mt)
+    keep = _cache_keep(strategy)
+    weights, exterior, kept = _highorder_targets(grid, kernel, scale, rad, fold, Returns(nothing), _ho_lattice(grid, rad),
+                                                 keep, !keep, ComputationalBackends.SerialBackend())
+    dims = FlowGeometries.Grids.size_tuple(grid)
+    lin = LinearIndices(dims)
+    cache = kept === nothing ? nothing : NDScatteredCache(Int32[lin[J...] for J in kept[1]], kept[2], kept[3], dims)
     return cache, exterior, weights
 end
 
@@ -253,21 +380,20 @@ function _build_footprint_nd_scattered(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,N},
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
-    cache_strategy::AbstractCacheStrategy = AutoCache(),
-    cache_byte_budget::Integer = default_cache_byte_budget(),
+    cache_strategy::AbstractCacheStrategy = AlwaysCache(),
     kwargs...,   # absorbs and ignores the other engines' keywords, such as `mask_strategy`
 ) where {N, T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     rad = _query_radius(grid, kernel, scale)
     # Per-axis index bound at the worst cell; the traversal is the grid's.
     lim = FlowGeometries.Connectivity.metric_window(grid, rad)
     mt = _query_topology(grid, rad)
-    cache, exterior, weights = _nd_scattered_parts(grid, kernel, scale, rad, mt, cache_strategy, cache_byte_budget)
+    cache, exterior, weights = _nd_scattered_parts(grid, kernel, scale, rad, mt, cache_strategy)
     # `cache` and `exterior` are typed `Union{Nothing,…}`, so the plan's type depends on the grid and
     # the kernel alone.
     return NDScatteredFilterPlan{
         N, T, typeof(kernel),
-        Union{Nothing,NDScatteredCache{N,T,Vector{NTuple{N,Int}},Vector{T},Vector{Int}},
-              NDRingCache{N,T,Vector{NTuple{N,Int}},Vector{T},Vector{Int}}}, typeof(mt),
+        Union{Nothing,NDScatteredCache{N,T,Vector{Int32},Vector{T},Vector{Int}},
+              NDRingCache{N,T,Vector{NTuple{N,Int32}},Vector{T},Vector{Int}}}, typeof(mt),
         Union{Nothing,Array{T,N}}, typeof(weights),
     }(kernel, scale, rad, lim, cache, mt, exterior, weights)
 end
@@ -293,7 +419,7 @@ end
     zerofill = strategy isa ZeroFill
     @inbounds for k in _entries_of(cache, lin[I], I)
         J = _cell_of(cache, k, I)
-        active = mask[J...]
+        active = _cell_active(mask, J)
         wk = cache.w[k]
         if zerofill
             wn += wk

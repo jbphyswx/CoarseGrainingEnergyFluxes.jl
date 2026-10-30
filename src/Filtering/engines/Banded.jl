@@ -344,7 +344,9 @@ function _structured_footprint(
     rad = Kernels.kernel_radius(kernel, scale, Val(2))
     if !(G <: FlowGeometries.Geometry.CartesianGeometry{T})
         di, dj, w, ptr = _sphere_band_rows(grid, kernel, scale, rad)
-        return _banded_footprint(grid, di, dj, w, ptr, Ny, mask_strategy, kernel, scale)
+        execution = get(kwargs, :execution, ComputationalBackends.SerialBackend())
+        return _banded_footprint(grid, di, dj, w, ptr, Ny, mask_strategy, kernel, scale;
+                                 exterior = mask_strategy isa ZeroFill ? _exterior_mass(grid, kernel, scale, execution) : nothing)
     end
 
     di = Int[]
@@ -388,47 +390,129 @@ row.
 function _sphere_band_rows(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.AbstractFilterKernel, scale::T, rad::T,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
+    di, dj, w, ptr, _ = _collect_rows(SphereBandRows(grid, kernel, scale, rad), T)
+    return di, dj, w, ptr
+end
+
+"""
+    SphereBandRows(grid, kernel, scale, rad)
+
+The taps of a sphere of uniform longitude, one latitude row at a time ([`_row_taps!`](@ref)): each row's
+window from `metric_window`, which holds every row its ball reaches (a row nearer a pole spans more longitude at
+the same radius), as longitude offsets ([`_banded_lon_offsets`](@ref)) and a latitude half-width.
+"""
+struct SphereBandRows{GR, K, T<:AbstractFloat, VO<:AbstractVector{NTuple{3,UnitRange{Int}}}, VI<:AbstractVector{Int}}
+    grid::GR
+    kernel::K
+    scale::T
+    rad::T
+    offsets::VO
+    dj_lims::VI
+end
+
+function SphereBandRows(
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.AbstractFilterKernel, scale::T, rad::T,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
     Nx, Ny = FlowGeometries.Grids.size_tuple(grid)
-    geo = FlowGeometries.Grids.grid_geometry(grid)
-    lat = FlowGeometries.Grids.coordinates(grid, 2)
-    # Band `j`'s window, from `metric_window`, holds for every row its ball reaches: a row nearer a pole
-    # spans more longitude at the same radius. `_banded_lon_offsets` turns it into offsets.
     dλ = step(FlowGeometries.Grids.coordinates(grid, 1))
     periodic_λ = FlowGeometries.Grids.isperiodic(grid, 1)
     offsets = Vector{NTuple{3,UnitRange{Int}}}(undef, Ny)
     dj_lims = Vector{Int}(undef, Ny)
-    total_entries = 0
     for j in 1:Ny
         dl, djl = FlowGeometries.Connectivity.metric_window(grid, (1, j), rad)
         offsets[j] = _banded_lon_offsets(dl, Nx, dλ, periodic_λ)
         dj_lims[j] = djl
-        for ddj in -djl:djl
-            (1 <= j + ddj <= Ny) && (total_entries += sum(length, offsets[j]))
+    end
+    return SphereBandRows(grid, kernel, scale, rad, offsets, dj_lims)
+end
+
+_nrows(r::SphereBandRows) = length(r.dj_lims)
+
+# The widest latitude offset and the widest longitude offset any row's taps can take.
+_row_dj_lim(r::SphereBandRows) = min(maximum(r.dj_lims; init = 0), _nrows(r) - 1)
+_row_reach(r::SphereBandRows) = maximum(o -> maximum(q -> isempty(q) ? 0 : max(abs(first(q)), abs(last(q))), o), r.offsets; init = 0)
+
+# An upper bound on the taps of every row, from the windows.
+_row_entries(r::SphereBandRows) =
+    sum(j -> sum(length, r.offsets[j]) * count(ddj -> 1 <= j + ddj <= _nrows(r), -r.dj_lims[j]:r.dj_lims[j]), 1:_nrows(r); init = 0)
+
+"""
+    _row_taps!(f, rows, j) -> mass or nothing
+
+Call `f(di, dj, w)` for every tap of latitude row `j`: its longitude and latitude offsets and weight, the same for
+every target of the row. Returns the row's whole support mass where the taps leave part of it out (the cells
+past a bounded latitude), `nothing` otherwise.
+"""
+function _row_taps!(f::F, r::SphereBandRows{GR,K,T}, j::Int) where {F, GR, K, T}
+    grid = r.grid
+    geo = FlowGeometries.Grids.grid_geometry(grid)
+    lat = FlowGeometries.Grids.coordinates(grid, 2)
+    dλ = step(FlowGeometries.Grids.coordinates(grid, 1))
+    Ny = _nrows(r)
+    djl = r.dj_lims[j]
+    for ddj in -djl:djl
+        jj = j + ddj
+        (1 <= jj <= Ny) || continue
+        A = FlowGeometries.Grids.area(grid, 1, jj)   # spherical cell area depends only on latitude
+        for range in r.offsets[j], ddi in range
+            d = FlowGeometries.Geometry.distance(
+                geo, SA.SVector{2,T}(zero(T), lat[j]), SA.SVector{2,T}(T(ddi) * dλ, lat[jj]),
+            )
+            d <= r.rad && f(ddi, ddj, Kernels.kernel_weight(r.kernel, d, r.scale, Val(2)) * A)
         end
     end
-    di = sizehint!(Int[], total_entries)
-    dj = sizehint!(Int[], total_entries)
-    w = sizehint!(T[], total_entries)
+    return nothing
+end
+
+_has_row_mass(::SphereBandRows) = false
+
+# The rows as a concurrent worker generates them: the same object where it holds no scratch.
+_row_worker(rows) = rows
+
+# Every row's taps as the flat lists `(di, dj, w, ptr)` the banded engine groups into runs, and each row's whole
+# support mass where the rows give one, `nothing` otherwise.
+function _collect_rows(rows, ::Type{T}) where {T}
+    n = _row_entries(rows)
+    di = sizehint!(Int[], n)
+    dj = sizehint!(Int[], n)
+    w = sizehint!(T[], n)
     ptr = Int[1]
-    for j in 1:Ny
-        for ddj in -dj_lims[j]:dj_lims[j]
-            jj = j + ddj
-            (1 <= jj <= Ny) || continue
-            A = FlowGeometries.Grids.area(grid, 1, jj)   # spherical cell area depends only on latitude
-            for range in offsets[j], ddi in range
-                d = FlowGeometries.Geometry.distance(
-                    geo, SA.SVector{2,T}(zero(T), lat[j]), SA.SVector{2,T}(T(ddi) * dλ, lat[jj]),
-                )
-                if d <= rad
-                    push!(di, ddi)
-                    push!(dj, ddj)
-                    push!(w, Kernels.kernel_weight(kernel, d, scale, Val(2)) * A)
-                end
-            end
+    mass = _has_row_mass(rows) ? Vector{T}(undef, _nrows(rows)) : nothing
+    for j in 1:_nrows(rows)
+        m = _row_taps!(rows, j) do ddi, ddj, wt
+            push!(di, ddi)
+            push!(dj, ddj)
+            push!(w, wt)
         end
+        mass === nothing || (mass[j] = m)
         push!(ptr, length(di) + 1)
     end
-    return di, dj, w, ptr
+    return di, dj, w, ptr, mass
+end
+
+"""
+    ListedBandRows(di, dj, w, ptr)
+
+Taps already listed by row, `ptr[j]:ptr[j+1]-1` for row `j`, served one row at a time ([`_row_taps!`](@ref)).
+"""
+struct ListedBandRows{VI<:AbstractVector{Int}, VT<:AbstractVector}
+    di::VI
+    dj::VI
+    w::VT
+    ptr::VI
+end
+
+_nrows(r::ListedBandRows) = length(r.ptr) - 1
+_row_dj_lim(r::ListedBandRows) = maximum(abs, r.dj; init = 0)
+_row_reach(r::ListedBandRows) = maximum(abs, r.di; init = 0)
+_row_entries(r::ListedBandRows) = length(r.w)
+_has_row_mass(::ListedBandRows) = false
+
+function _row_taps!(f::F, r::ListedBandRows, j::Int) where {F}
+    @inbounds for q in r.ptr[j]:(r.ptr[j + 1] - 1)
+        f(r.di[q], r.dj[q], r.w[q])
+    end
+    return nothing
 end
 
 """

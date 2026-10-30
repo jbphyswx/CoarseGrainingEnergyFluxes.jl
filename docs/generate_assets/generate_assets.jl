@@ -17,6 +17,7 @@ using FINUFFT: FINUFFT        # triggers CGEF's scattered-Cartesian (FINUFFT) ex
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 using NUFSHT: NUFSHT          # triggers CGEF's scattered-spherical (NUFSHT) extension
 using NearestNeighbors: NearestNeighbors   # triggers FlowGeometries' k-d tree neighbor-search extension
+using SpecialFunctions: SpecialFunctions   # the planar top-hat's transfer function, for the kernel table
 using Random: Random
 using Statistics: Statistics
 
@@ -26,7 +27,7 @@ mkpath(ASSETS)
 MK.set_theme!(
     MK.Theme(;
         fontsize = 15,
-        # Right margin sized for a rightmost colorbar carrying BOTH scientific-notation ticks
+        # Right margin sized for a rightmost colorbar carrying both scientific-notation ticks
         # (`2×10⁻⁶`) and a rotated label; anything narrower clips one or the other.
         figure_padding = (12, 100, 12, 12),
         Axis = (; titlesize = 16, titlefont = :bold, xgridvisible = false, ygridvisible = false),
@@ -37,7 +38,7 @@ MK.set_theme!(
 # Diverging map for signed fields/flux: white at 0, warm = forward cascade (Π>0), cool = inverse.
 const CASCADE = :balance
 const FIELDMAP = :balance
-# Sequential map for non-negative magnitudes (speed): WHITE at 0, deepening with magnitude.
+# Sequential map for non-negative magnitudes (speed): white at 0, deepening with magnitude.
 const SPEEDMAP = MK.cgrad([:white, :skyblue3, :midnightblue])
 
 save_fig(name, fig; px = 2) = (p = joinpath(ASSETS, name); MK.save(p, fig; px_per_unit = px); println("saved ", name))
@@ -52,8 +53,8 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 # Canonical fields (fixed seed) reused across figures.
 #
-# (1) eddy_noise_flow: a non-divergent flow whose VORTICITY has a spectral bump at a chosen eddy scale
-#     (~18 km) plus a small-scale noise tail — coherent eddies you can watch decompose, not "noise→0".
+# (1) eddy_noise_flow: a non-divergent flow whose vorticity has a spectral bump at a chosen eddy scale
+#     (~18 km) plus a small-scale noise tail: coherent eddies that stay visible as they decompose.
 # (2) fractal_field:   a deterministic sum of sinusoids at large/medium/small scales — the clearest
 #     possible "filtering coarsens the field" demonstration.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,7 +63,7 @@ step_of(xs) = xs[2] - xs[1]
 # The synthetic fields are periodic, so filter on a periodic grid — the footprint wraps and there are
 # no domain-edge artifacts in the filtered fields or in Π.
 cartgrid(xs) = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs;
-    periodic = (true, true))
+    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()))
 
 function eddy_noise_flow(; N = 192, dx = 1000.0, seed = 7, λ_eddy_km = 18.0, λ_large_km = 55.0,
         width = 2.6, amp_large = 0.8, noise = 0.14, n_noise_max = 60.0)
@@ -75,7 +76,7 @@ function eddy_noise_flow(; N = 192, dx = 1000.0, seed = 7, λ_eddy_km = 18.0, λ
     KY = [kfreq[j] for _ in 1:N, j in 1:N]
     K2 = KX .^ 2 .+ KY .^ 2
     # Prescribe the vorticity spectrum: a large-scale bump + an eddy bump + a weak broadband tail, so
-    # there is genuine energy at large AND small scales (filtering reveals structure at every ℓ).
+    # there is genuine energy at large and small scales (filtering reveals structure at every ℓ).
     ωh = zeros(ComplexF64, N, N)
     for j in 1:N, i in 1:N
         n = sqrt(kfreq[i]^2 + kfreq[j]^2) * L / (2π)
@@ -120,7 +121,7 @@ function radial_KE_spectrum(u, v)
 end
 
 # Power-law flow: streamfunction ψ̂ ∝ k⁻³ over an inertial band ⇒ kinetic-energy spectrum E(k) ∝ k⁻³
-# (the 2D enstrophy-cascade slope). Used to show the filtering spectrum RECOVERS the Fourier slope.
+# (the 2D enstrophy-cascade slope), whose Fourier slope the filtering spectrum recovers.
 function powerlaw_flow(; N = 320, dx = 1000.0, seed = 11, slope = -3.0, nmin = 3.0, nmax = 130.0)
     Random.seed!(seed)
     L = N * dx
@@ -144,8 +145,7 @@ end
 blankaxis!(ax) = (MK.hidedecorations!(ax); MK.hidespines!(ax))
 
 # A heatmap panel with no ticks (clean image tiles).
-# `lo` defaults to `-cl`, which is what a signed field wants. A magnitude has to pass `lo = 0`, or half
-# the colour range is unreachable and the panel washes out.
+# `lo` defaults to `-cl`, a signed field's range; a magnitude passes `lo = 0` to use the whole colour range.
 function tile!(fig, r, c, km, A, cmap, cl; title = "", lo = -cl)
     ax = MK.Axis(fig[r, c]; title = title, aspect = MK.DataAspect(),
         xticksvisible = false, yticksvisible = false,
@@ -185,7 +185,7 @@ function fig_hero()
     for (k, ℓ) in enumerate(scales_km)
         hmΠ = tile!(fig, 2, k + 1, km, Π[k], CASCADE, clΠ; title = "flux Π  (ℓ = $ℓ km)")
     end
-    MK.Colorbar(fig[2, 5], hmΠ; width = 11, label = "Π (W/m³)")
+    MK.Colorbar(fig[2, 5], hmΠ; width = 11, label = "Π (m²/s³)")
     MK.colgap!(fig.layout, 8); MK.rowgap!(fig.layout, 10)
     save_fig("hero.png", fig)
 end
@@ -258,7 +258,7 @@ function fig_filtering_spectrum()
         "   gaussian ≈ ", round(sg; digits = 2))
 
     fig = MK.Figure(; size = (1580, 480))
-    MK.Label(fig[0, 1:3], "Recover the energy spectrum by filtering — no FFT, no periodicity needed (Sadek & Aluie 2018)";
+    MK.Label(fig[0, 1:3], "Recover the energy spectrum by filtering (Sadek & Aluie 2018)";
         fontsize = 18, font = :bold)
 
     clω = symclim(t.ω; q = 0.995)
@@ -267,7 +267,7 @@ function fig_filtering_spectrum()
     MK.heatmap!(axf, km, km, t.ω; colormap = FIELDMAP, colorrange = (-clω, clω))
 
     ax1 = MK.Axis(fig[1, 2]; title = "cumulative coarse KE  E(ℓ)   [Eq. 15]",
-        xlabel = "filter scale  ℓ  (km)", ylabel = "E(ℓ)  (J/m³)",
+        xlabel = "filter scale  ℓ  (km)", ylabel = "E(ℓ)  (m²/s²)",
         xscale = log10, yscale = log10, xgridvisible = true, ygridvisible = true)
     MK.scatterlines!(ax1, scales ./ 1e3, Ecum; linewidth = 3, markersize = 5, color = :steelblue)
     MK.ylims!(ax1, maximum(Ecum) / 3e3, maximum(Ecum) * 2)
@@ -311,25 +311,27 @@ function fig_kernels()
 
     ax1 = MK.Axis(fig[1, 1]; title = "real-space profile  G(r)", xlabel = "r / ℓ",
         ylabel = "weight (peak 1)", xgridvisible = true, ygridvisible = true)
+    # A point's weight: the top-hat's centre test, its profile in distance.
+    weight(k, d, ℓ) = CGEF.Kernels.kernel_weight(CGEF.Kernels.point_kernel(k), d, ℓ)
     for (lab, c, ls, k) in radial
-        MK.lines!(ax1, r, [CGEF.Kernels.kernel_weight(k, d, ℓ) for d in r];
+        MK.lines!(ax1, r, [weight(k, d, ℓ) for d in r];
                   linewidth = 3, color = c, linestyle = ls, label = lab)
     end
-    # The high-order kernels are SEPARABLE: G(x,y) = G(x)G(y), so what is plotted is the 1-D profile,
-    # and it takes negative values — which is what buys the vanishing moments.
+    # The high-order kernels are separable, G(x,y) = G(x)G(y), so the plotted curve is the 1-D profile; its
+    # negative lobes give the vanishing moments.
     for (lab, c, k) in (("M^I (p=3), 1-D", :royalblue, hi), ("M^II (p=5), 1-D", :black, hii))
         MK.lines!(ax1, r, [CGEF.Kernels.kernel_profile(k, d, ℓ) for d in r];
                   linewidth = 2.5, color = c, linestyle = :dashdot, label = lab)
     end
     MK.hlines!(ax1, [0.0]; color = :gray60, linewidth = 1)
-    MK.axislegend(ax1; position = :rt, framevisible = false, labelsize = 11)
+    MK.axislegend(ax1; position = :rb, framevisible = false, labelsize = 11)
 
     # 1-D transfer by direct quadrature, so every kernel is on the same footing (the high-order ones
     # have no isotropic Ghat, and smooth-hat/hyper-Gaussian have no closed form at all).
     function ghat1d(k, κ; n = 6000)
         R = CGEF.Kernels.kernel_radius(k, 1.0); dr = R / n
         num = 0.0; den = 0.0
-        prof = k isa CGEF.Kernels.HighOrderKernel ? CGEF.Kernels.kernel_profile : CGEF.Kernels.kernel_weight
+        prof = k isa CGEF.Kernels.HighOrderKernel ? CGEF.Kernels.kernel_profile : weight
         for i in 1:n
             rr = (i - 0.5) * dr; w = prof(k, rr, 1.0)
             num += w * cos(κ * rr); den += w
@@ -365,7 +367,7 @@ function fig_kernels()
              align = (:left, :bottom), fontsize = 10, color = :red)
     MK.axislegend(ax3; position = :lb, framevisible = false, labelsize = 10)
 
-    # A capability table, so the figure answers "which one do I use" and not just "what do they look like".
+    # A capability table: which kernel serves which diagnostic, from the kernels' own traits.
     rows = [("top-hat", CGEF.TopHatKernel()), ("Gaussian α=6", CGEF.GaussianKernel()),
             ("sharp-spectral", CGEF.SharpSpectralKernel()), ("smooth-hat", CGEF.Kernels.SmoothHatKernel()),
             ("hyper-Gaussian", CGEF.Kernels.HyperGaussianKernel()),
@@ -375,21 +377,16 @@ function fig_kernels()
         yticklabelsvisible = false, xgridvisible = false, ygridvisible = false)
     MK.xlims!(axt, 0, 10); MK.ylims!(axt, 0, length(rows) + 1.6)
     for (cx, hdr) in ((1.0, "kernel"), (4.2, "valid for Π\n(non-negative)"),
-                      (6.3, "filtering spectrum\n(|Ĝ|² monotone)"), (8.4, "method = Spectral()\n(isotropic Ĝ)"))
+                      (6.3, "filtering spectrum\n(|Ĝ|² monotone)"), (8.4, "method = Spectral()\n(transfer function)"))
         MK.text!(axt, cx, length(rows) + 0.7; text = hdr, align = (:left, :center),
                  fontsize = 12, font = :bold)
     end
     for (i, (lab, k)) in enumerate(rows)
         y = length(rows) - i + 0.4
-        radial_ok = CGEF.Kernels.is_radial(k)
-        nonneg = if radial_ok
-            R = CGEF.Kernels.kernel_radius(k, 1.0)
-            all(t -> CGEF.Kernels.kernel_weight(k, t, 1.0) >= 0, range(0.0, R; length = 800))
-        else
-            all(>=(0), CGEF.Kernels.limb_amplitudes(k, Float64))
-        end
+        nonneg = CGEF.Kernels.is_nonnegative(k)
         spec = CGEF.Kernels.transfer_monotone(k)
-        iso = try (CGEF.Kernels.spectral_transfer(k, 1.0, 1.0); true) catch; false end
+        # The planar transfer at a 2-D wavevector, as `check_setup` probes it.
+        iso = try (CGEF.Kernels.spectral_transfer(k, (1.0, 1.0), 1.0); true) catch; false end
         MK.text!(axt, 1.0, y; text = lab, align = (:left, :center), fontsize = 12)
         for (cx, ok) in ((4.2, nonneg), (6.3, spec), (8.4, iso))
             MK.text!(axt, cx, y; text = ok ? "✓" : "✗", align = (:left, :center),
@@ -437,14 +434,15 @@ function fig_rigid_rotation()
     ax3 = MK.Axis(fig[1, 3]; title = "Π — circular domain  (edge effect at the rim)", aspect = MK.DataAspect(),
         xlabel = "x (km)", ylabel = "y (km)")
     hm3 = MK.heatmap!(ax3, km, km, Πci_disp; colormap = CASCADE, colorrange = (-1e-12, 1e-12))
-    MK.Colorbar(fig[1, 3, MK.Right()], hm3; width = 11, label = "Π (W/m³)")
+    MK.Colorbar(fig[1, 3, MK.Right()], hm3; width = 11, label = "Π (m²/s³)")
 
     MK.Label(fig[2, 1:3],
         "Interior Π ≈ machine zero in both domains; nonzero values are finite-domain filtering artifacts that " *
-        "live only at the boundary — the square's corners and the circular mask's rim (max ≈ $(round(mxsq; sigdigits = 2)) and " *
-        "$(round(mxci; sigdigits = 2)) W/m³). Cropping a boundary band (or a larger domain) removes them.";
+        "live only at the boundary — the square's corners and the circular mask's rim\n(max ≈ " *
+        "$(round(mxsq; sigdigits = 2)) and $(round(mxci; sigdigits = 2)) m²/s³). Cropping a boundary band " *
+        "(or a larger domain) removes them.";
         fontsize = 11.5, color = :gray35)
-    MK.colgap!(fig.layout, 26)
+    MK.colgap!(fig.layout, 60)
     save_fig("rigid_rotation_validation.png", fig; px = 1.4)   # keep < 2000 px wide
 end
 
@@ -483,7 +481,7 @@ function fig_helmholtz()
             ("cross", dec.cross), ("divergent", dec.divergent)))
         hm = tile!(fig, 1, k, km, A, CASCADE, cl; title = ttl)
     end
-    MK.Colorbar(fig[1, 5], hm; width = 11, label = "Π (W/m³)")
+    MK.Colorbar(fig[1, 5], hm; width = 11, label = "Π (m²/s³)")
     MK.colgap!(fig.layout, 8)
     save_fig("helmholtz_decomposition.png", fig)
 end
@@ -561,17 +559,23 @@ function fig_spherical()
     Ndeg = 48; N = Ndeg + 1; M = 2N - 1
     Θ, Φ = FSH.sph_points(N)
     R = 6.371e6
-    sgrid = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(R), collect(Φ), π / 2 .- collect(Θ))
+    # FastSphericalHarmonics' own grid, `N` Fejér latitudes by `2N − 1` longitudes.
+    sgrid = FG.Connectivity.structured_grid(FG.SphericalSampling.Fejer1Sampling(), N;
+                                            geometry = FG.Geometry.SphericalGeometry(R))
     Random.seed!(9)
     C = zeros(N, M)
     for l in 1:30, m in (-l):l
         C[FSH.sph_mode(l, m)] = (l^(-1.3)) * (2 * rand() - 1)
     end
-    field = permutedims(FSH.sph_evaluate(C))            # [lon, lat] = M×N
+    fsh_field = permutedims(FSH.sph_evaluate(C))        # [lon, lat] = M×N in FSH's node order
+    fsh_λ = collect(Φ); fsh_φ = π / 2 .- collect(Θ)
+    # The grid's cells sit on FSH's nodes; its own order, matched node by node.
+    Φv = [FG.Grids.coords(sgrid, i, 1)[1] for i in 1:M]
+    latgrid = [FG.Grids.coords(sgrid, 1, j)[2] for j in 1:N]
+    field = fsh_field[[argmin(abs.(mod.(fsh_λ .- λ .+ π, 2π) .- π)) for λ in Φv],
+                      [argmin(abs.(fsh_φ .- φ)) for φ in latgrid]]
     ℓ = π * R / 10                                       # keep ~degree ≲ 10
     out = zero(field); CGEF.Filtering.filter_field!(out, field, sgrid, CGEF.GaussianKernel(), ℓ; method = CGEF.Filtering.Spectral())
-
-    Φv = collect(Φ); latgrid = π / 2 .- collect(Θ)
     londeg = rad2deg.(Φv); latdeg = rad2deg.(latgrid)
     p = sortperm(latdeg); lats = latdeg[p]
     cl = symclim(field; q = 0.999)
@@ -582,9 +586,10 @@ function fig_spherical()
     sφ = [mod(ga * k, 2π) for k in 0:(Mpts - 1)]
     slat = π / 2 .- sθ
     obs = [field[argmin(abs.(Φv .- sφ[q])), argmin(abs.(latgrid .- slat[q]))] for q in 1:Mpts]
-    # Supplying the measure explicitly means the mask is positional too — `(x, y, measure)` alone would
-    # be ambiguous with `(x, y, mask)`.
-    ug = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(R), sφ, slat, ones(Mpts), trues(Mpts))   # no adjacency needed for spectral-only filtering
+    # The two-direction node grid takes its measure and mask positionally, `(x, y, measure, mask)`. A
+    # Fibonacci sphere's points hold equal areas, the measure the analysis integrates by and the band
+    # limit reads; spectral filtering needs no adjacency.
+    ug = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(R), sφ, slat, fill(4π * R^2 / Mpts, Mpts), trues(Mpts))
     fobs = zero(obs); CGEF.Filtering.filter_field!(fobs, obs, ug, CGEF.GaussianKernel(), ℓ; method = CGEF.Filtering.Spectral())
 
     fig = MK.Figure(; size = (1660, 440))
@@ -735,10 +740,13 @@ function fig_profile()
 
     L = N * dx
     decay = [exp(-2.5 * (k - 1) / (Nz - 1)) for k in 1:Nz]     # surface-intensified eddy field
+    # Two non-divergent modes of different wavenumbers, u = ∂ψ/∂y, v = −∂ψ/∂x with
+    # ψ = sin(k₃x)sin(k₃y)/k₃ + ½ sin(k₇x)sin(k₅y)/k₇: a single cellular mode carries next to no flux.
+    k3, k5, k7 = (2π / L) .* (3, 5, 7)
     u = zeros(N, N, Nz); v = zeros(N, N, Nz)
     for k in 1:Nz, (a, x) in enumerate(xs), (b, y) in enumerate(xs)
-        u[a, b, k] = decay[k] * sin(2π * 3 * x / L) * cos(2π * 3 * y / L)
-        v[a, b, k] = -decay[k] * cos(2π * 3 * x / L) * sin(2π * 3 * y / L)
+        u[a, b, k] = decay[k] * (sin(k3 * x) * cos(k3 * y) + 0.5 * (k5 / k7) * sin(k7 * x) * cos(k5 * y))
+        v[a, b, k] = -decay[k] * (cos(k3 * x) * sin(k3 * y) + 0.5 * cos(k7 * x) * sin(k5 * y))
     end
 
     scales = collect(6e3:6e3:30e3)
@@ -750,15 +758,15 @@ function fig_profile()
     clΠ = symclim(Πxz; q = 0.98)   # no `interior` crop here — Nz is small, an 8-deep symmetric crop leaves nothing
 
     fig = MK.Figure(; size = (1360, 440))
-    MK.Label(fig[0, 1:2], "Vertical profile (2.5D-per-level) vertical structure — the literature-standard method (Aluie, Hecht & Vallis 2018)";
+    MK.Label(fig[0, 1:3], "Vertical profile (2.5D-per-level) vertical structure — the literature-standard method (Aluie, Hecht & Vallis 2018)";
         fontsize = 16, font = :bold)
 
     ax1 = MK.Axis(fig[1, 1]; title = "x–level cross-section of Π  (ℓ = 12 km, y = mid-domain)",
         xlabel = "x (km)", ylabel = "level (km, nominal)", yreversed = true)
     hm1 = MK.heatmap!(ax1, km, level_km, Πxz; colormap = CASCADE, colorrange = (-clΠ, clΠ))
-    MK.Colorbar(fig[1, 1, MK.Right()], hm1; width = 10, label = "Π")
+    MK.Colorbar(fig[1, 2], hm1; width = 10, label = "Π (m²/s³)")
 
-    ax2 = MK.Axis(fig[1, 2]; title = "mean|Π| vs. level, by scale", xlabel = "mean|Π|", ylabel = "level (km, nominal)", yreversed = true)
+    ax2 = MK.Axis(fig[1, 3]; title = "mean|Π| vs. level, by scale", xlabel = "mean|Π|", ylabel = "level (km, nominal)", yreversed = true)
     for (sidx, ℓ) in enumerate(scales)
         sidx % 2 == 1 || continue
         prof = [Statistics.mean(abs, @view result.Π[:, :, sidx, k]) for k in 1:Nz]
@@ -766,7 +774,7 @@ function fig_profile()
         MK.scatter!(ax2, prof, level_km; markersize = 8)
     end
     MK.axislegend(ax2; position = :rb, framevisible = false, labelsize = 11)
-    MK.colgap!(fig.layout, 26)
+    MK.colgap!(fig.layout, 60)
     save_fig("profile.png", fig)
 end
 
@@ -805,19 +813,20 @@ function fig_strain_convergence()
     MK.hlines!(ax4, [0.0]; color = :gray60, linestyle = :dash)
     MK.text!(ax4, 0.02, 0.02; text = "max|Π_α−Π_δ − (−S̄:τ̄)| / max|Π| = $(round(res; sigdigits = 2))",
              space = :relative, align = (:left, :bottom), fontsize = 11, color = :gray30)
-    MK.colgap!(fig.layout, 12)
+    MK.colgap!(fig.layout, 40)
     save_fig("strain_convergence.png", fig)
 end
 
 # ─── Enstrophy flux: the 2-D companion to Π ──────────────────────────────────
 function fig_enstrophy()
-    fr = fractal_field(); xs = fr.xs; km = xs ./ 1e3
-    geom = FG.Geometry.CartesianGeometry()
-    grid = FG.Grids.StructuredGrid(geom, xs, xs)
+    # A random-phase periodic flow on its periodic grid: its domain-mean fluxes are the cascade's, where a
+    # symmetric pattern's cancel.
+    t = eddy_noise_flow(); xs = t.xs; km = xs ./ 1e3
+    grid = cartgrid(xs)
     ℓ = 16e3; ker = CGEF.GaussianKernel()
-    ω = CGEF.Diagnostics.vorticity(fr.u, fr.v, grid)
-    Z = CGEF.Diagnostics.enstrophy_flux(fr.u, fr.v, grid, ker, ℓ)
-    Π = zero(fr.u); CGEF.Diagnostics.compute_Π!(Π, fr.u, fr.v, nothing, grid, ker, ℓ)
+    ω = CGEF.Diagnostics.vorticity(t.u, t.v, grid)
+    Z = CGEF.Diagnostics.enstrophy_flux(t.u, t.v, grid, ker, ℓ)
+    Π = zero(t.u); CGEF.Diagnostics.compute_Π!(Π, t.u, t.v, nothing, grid, ker, ℓ)
 
     fig = MK.Figure(; size = (1760, 470))
     MK.Label(fig[0, 1:4], "Enstrophy flux  Z_ℓ = −∇ω̄·τ̄(u,ω)  — same deformation gauge as Π";
@@ -835,16 +844,16 @@ function fig_enstrophy()
     scales = collect(range(6e3, 40e3; length = 9))
     mΠ = Float64[]; mZ = Float64[]
     for s in scales
-        Pt = zero(fr.u); CGEF.Diagnostics.compute_Π!(Pt, fr.u, fr.v, nothing, grid, ker, s)
+        Pt = zero(t.u); CGEF.Diagnostics.compute_Π!(Pt, t.u, t.v, nothing, grid, ker, s)
         push!(mΠ, Statistics.mean(Pt))
-        push!(mZ, Statistics.mean(CGEF.Diagnostics.enstrophy_flux(fr.u, fr.v, grid, ker, s)))
+        push!(mZ, Statistics.mean(CGEF.Diagnostics.enstrophy_flux(t.u, t.v, grid, ker, s)))
     end
-    ax4 = MK.Axis(fig[1, 4]; title = "domain mean vs scale", xlabel = "ℓ  (km)", ylabel = "⟨Π⟩ / max|⟨Π⟩|,  ⟨Z⟩ / max|⟨Z⟩|")
-    MK.lines!(ax4, scales ./ 1e3, mΠ ./ max(maximum(abs, mΠ), eps()); linewidth = 3, color = :firebrick, label = "⟨Π⟩")
-    MK.lines!(ax4, scales ./ 1e3, mZ ./ max(maximum(abs, mZ), eps()); linewidth = 3, color = :royalblue, label = "⟨Z⟩")
+    ax4 = MK.Axis(fig[1, 4]; title = "domain mean vs scale, each over its peak", xlabel = "ℓ  (km)")
+    MK.lines!(ax4, scales ./ 1e3, mΠ ./ max(maximum(abs, mΠ), floatmin()); linewidth = 3, color = :firebrick, label = "⟨Π⟩")
+    MK.lines!(ax4, scales ./ 1e3, mZ ./ max(maximum(abs, mZ), floatmin()); linewidth = 3, color = :royalblue, label = "⟨Z⟩")
     MK.hlines!(ax4, [0.0]; color = :gray60, linestyle = :dash)
     MK.axislegend(ax4; position = :rt, framevisible = false)
-    MK.colgap!(fig.layout, 12)
+    MK.colgap!(fig.layout, 70)
     save_fig("enstrophy_flux.png", fig)
 end
 
@@ -855,15 +864,16 @@ function fig_band_energies()
     # Periodic, unmasked: the identity is exact there, and the figure should show it being exact.
     dx = xs[2] - xs[1]
     xp = range(0.0, dx * N; length = N + 1)[1:N]
-    grid = FG.Grids.StructuredGrid(geom, xp, xp; periodic = (true, true))
+    grid = FG.Grids.StructuredGrid(geom, xp, xp; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()))
     scales = [6e3, 12e3, 24e3]
-    r = CGEF.Diagnostics.band_energies(fr.u, fr.v, grid, CGEF.GaussianKernel(), scales)
+    r = CGEF.Diagnostics.band_energies(fr.u, fr.v, grid, CGEF.GaussianKernel(), scales;
+                                       maps = CGEF.Diagnostics.BandMaps())
     Etot = 0.5 * Statistics.mean(fr.u .^ 2 .+ fr.v .^ 2)
 
     fig = MK.Figure(; size = (1760, 470))
     MK.Label(fig[0, 1:4], "Energy by scale band (repeated-filter Germano identity): the bands sum to the total";
         fontsize = 18, font = :bold)
-    # Band n is what the n-th filter REMOVED, i.e. the interval between successive scales.
+    # Band n is what the n-th filter removed: the interval between successive scales.
     lo = [0.0; scales[1:end-1]]
     for (k, km_) in enumerate(r.band_maps)
         cl = maximum(abs, km_)
@@ -879,19 +889,18 @@ function fig_band_energies()
     MK.barplot!(ax4, 1:4, [r.bands..., r.resolved]; color = [:skyblue3, :steelblue, :midnightblue, :gray60])
     MK.barplot!(ax4, [5], [r.total]; color = :seagreen)
     MK.hlines!(ax4, [Etot]; color = :firebrick, linestyle = :dash, linewidth = 2)
-    MK.text!(ax4, 5.0, Etot; text = " ½⟨|u|²⟩", align = (:left, :center), fontsize = 11, color = :firebrick)
+    MK.text!(ax4, 5.45, Etot; text = " ½⟨|u|²⟩", align = (:left, :bottom), fontsize = 11, color = :firebrick)
     MK.text!(ax4, 0.03, 0.60; text = "Σ/½⟨|u|²⟩ − 1\n= $(round(r.total/Etot - 1; sigdigits = 2))",
              space = :relative, align = (:left, :top), fontsize = 11, color = :gray30)
     MK.xlims!(ax4, 0.3, 6.3)
-    MK.colgap!(fig.layout, 12)
+    MK.colgap!(fig.layout, 40)
     save_fig("band_energies.png", fig)
 end
 
 # ─── Favre (variable-density) budget: Π, baropycnal work Λ, pressure dilatation ──
 function fig_compressible()
     fr = fractal_field(); xs = fr.xs; km = xs ./ 1e3; N = length(xs)
-    geom = FG.Geometry.CartesianGeometry()
-    grid = FG.Grids.StructuredGrid(geom, xs, xs)
+    grid = cartgrid(xs)   # every field below is periodic on the grid
     # A density field misaligned with the pressure field, so ∇ρ × ∇P ≠ 0 and Λ is genuinely active.
     ρ = [1.0 + 0.25 * sin(2π * 2 * i / N) * cos(2π * 3 * j / N) for i in 1:N, j in 1:N]
     P = [10.0 + 2.0 * cos(2π * 3 * i / N) * sin(2π * 2 * j / N) for i in 1:N, j in 1:N]
@@ -907,7 +916,7 @@ function fig_compressible()
     expo(v) = (e = floor(Int, log10(max(v, eps()))); "$(round(v / 10.0^e; digits = 2))×10^$e")
     for (k, (ttl, A)) in enumerate((("density ρ", ρ), ("Π  deformation work", d.Π),
                                     ("Λ  baropycnal work", d.Λ),
-                                    ("P̄ ∇·ū  (UNWEIGHTED ū)", d.pressure_dilatation)))
+                                    ("P̄ ∇·ū  (unweighted ū)", d.pressure_dilatation)))
         ax = MK.Axis(fig[1, k]; aspect = MK.DataAspect(),
             xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
         if k == 1
@@ -922,11 +931,298 @@ function fig_compressible()
         end
     end
     MK.Label(fig[2, 1:4],
-        "Λ is a cross-scale transfer in its own right. Folding it into the pressure term by writing P̄∇·ũ " *
-        "instead of P̄∇·ū destroys it.";
+        "Λ is a cross-scale transfer in its own right, kept apart from the pressure dilatation P̄∇·ū by " *
+        "taking the unweighted ū there; the Favre-weighted P̄∇·ũ absorbs it.";
         fontsize = 12, color = :gray30)
-    MK.colgap!(fig.layout, 12)
+    MK.colgap!(fig.layout, 40)
     save_fig("compressible_flux.png", fig)
+end
+
+# ─── Top-hat cell weights: the centre test against each cell's overlap with the disk ─────────────────
+function fig_cell_overlap()
+    N = 128; dx = 1.0
+    t = powerlaw_flow(; N, dx, seed = 12, slope = -7 / 3, nmin = 2.0, nmax = 60.0)
+    grid = cartgrid(t.xs)
+    centre = CGEF.TopHatKernel(; cells = CGEF.Kernels.CellCentre())
+    overlap = CGEF.TopHatKernel()
+    # A unit value at one cell, filtered: each target's weight on that cell over its window's mass, so the
+    # response is the disk about the cell as each rule weighs it.
+    ℓf = 9.3dx; c = N ÷ 2
+    imp = zeros(N, N); imp[c, c] = 1.0
+    response(k) = (o = zero(imp); CGEF.Filtering.filter_field!(o, imp, grid, k, ℓf); o ./ maximum(o))
+    win = (c - 7):(c + 7); off = collect(-7:7)
+
+    scales = collect(range(2.0, 12.0; length = 81) .* dx)
+    L = N * dx; kℓ = L ./ scales
+    energy(k) = CGEF.coarse_grain(t.u, t.v, grid; scales, kernel = k, L,
+                                  spectrum = CGEF.Diagnostics.NoSpectrum()).cumulative_energy
+    Ec, Eo = energy(centre), energy(overlap)
+    # The continuous disk over the field's own modes: ½ Σ_k |û_k|² Ĝ(|k|)², Ĝ = 2J₁(x)/x at x = |k|ℓ/2.
+    kf = 2π .* FFTW.fftfreq(N, 1 / dx)
+    P = (abs2.(FFTW.fft(t.u)) .+ abs2.(FFTW.fft(t.v))) ./ N^4
+    jinc(x) = iszero(x) ? 1.0 : 2SpecialFunctions.besselj1(x) / x
+    Ex = [0.5 * sum(P[i, j] * jinc(hypot(kf[i], kf[j]) * ℓ / 2)^2 for i in 1:N, j in 1:N) for ℓ in scales]
+
+    fig = MK.Figure(; size = (1800, 470))
+    MK.Label(fig[0, 1:5], "Top-hat cell weights: the centre test steps as ℓ crosses cell centres; each cell's overlap with the disk varies smoothly";
+        fontsize = 17, font = :bold)
+    θc = range(0, 2π; length = 200)
+    local hm
+    for (col, (ttl, k)) in enumerate((("CellCentre(): the whole cell or nothing", centre),
+                                      ("CellOverlap(), the default: its area inside", overlap)))
+        ax = MK.Axis(fig[1, col]; title = ttl, aspect = MK.DataAspect(), xlabel = "cells")
+        hm = MK.heatmap!(ax, off, off, response(k)[win, win]; colormap = SPEEDMAP, colorrange = (0, 1))
+        MK.lines!(ax, (ℓf / 2) .* cos.(θc), (ℓf / 2) .* sin.(θc); color = :firebrick, linewidth = 2)
+    end
+    MK.Colorbar(fig[1, 3], hm; width = 10, label = "weight / peak  (ℓ = 9.3Δ)")
+    ax3 = MK.Axis(fig[1, 4]; title = "E(ℓ) against the continuous disk's", xlabel = "ℓ / Δ",
+        ylabel = "E(ℓ) / E_disk(ℓ) − 1")
+    MK.lines!(ax3, scales ./ dx, Ec ./ Ex .- 1; color = :darkorange, linewidth = 2, label = "CellCentre()")
+    MK.lines!(ax3, scales ./ dx, Eo ./ Ex .- 1; color = :royalblue, linewidth = 2, label = "CellOverlap()")
+    MK.hlines!(ax3, [0.0]; color = :gray60, linestyle = :dash)
+    MK.axislegend(ax3; position = :rt, framevisible = false)
+    ax4 = MK.Axis(fig[1, 5]; title = "filtering spectrum from E(ℓ)", xlabel = "k_ℓ = L/ℓ", ylabel = "Ẽ(k_ℓ)",
+        xscale = log10, yscale = log10)
+    dx_ref = CGEF.Diagnostics.spectral_density(Ex, kℓ)
+    for (E, col, lab) in ((Ex, :black, "continuous disk"), (Ec, :darkorange, "CellCentre()"), (Eo, :royalblue, "CellOverlap()"))
+        d = CGEF.Diagnostics.spectral_density(E, kℓ); p = d .> 0
+        MK.lines!(ax4, kℓ[p], d[p]; color = col, linewidth = 2, label = lab)
+    end
+    # The centre test's density falls to zero between its steps; the axis spans the continuous disk's range.
+    MK.ylims!(ax4, minimum(dx_ref) / 30, 30 * maximum(dx_ref))
+    MK.axislegend(ax4; position = :lb, framevisible = false)
+    MK.colgap!(fig.layout, 30)
+    save_fig("cell_overlap.png", fig)
+end
+
+# ─── The filtering spectrum's derivative in ℓ, its slope and the local spectrum ─────────────────────
+function fig_scale_derivative()
+    N = 256; dx = 1000.0
+    t = powerlaw_flow(; N, dx, seed = 13, slope = -7 / 3, nmin = 2.0, nmax = 110.0)    # E(k) ∝ k^(-5/3)
+    grid = cartgrid(t.xs); km = t.xs ./ 1e3; L = N * dx
+    ker = CGEF.GaussianKernel(); D = CGEF.Diagnostics
+    scales = collect(dx .* exp.(range(log(4.0), log(64.0); length = 24)))
+    ex = CGEF.coarse_grain(t.u, t.v, grid; scales, kernel = ker, L, slopes = D.Slopes(), spectrum_maps = D.SpectrumMaps())
+    coarse = scales[1:3:end]
+    df = CGEF.coarse_grain(t.u, t.v, grid; scales = coarse, kernel = ker, L, slopes = D.Slopes(),
+                           scale_derivative = D.DifferenceScaleDerivative())
+    s0 = 12
+
+    fig = MK.Figure(; size = (1800, 470))
+    MK.Label(fig[0, 1:6], "The filtering spectrum from the filter's own derivative in ℓ: dE/dℓ = ⟨ū·∂ℓū⟩, its slope, and the local spectrum (Gaussian, E(k) ∝ k^-5/3)";
+        fontsize = 17, font = :bold)
+    ax1 = MK.Axis(fig[1, 1]; title = "Ẽ(k_ℓ)", xlabel = "k_ℓ = L/ℓ", xscale = log10, yscale = log10)
+    MK.lines!(ax1, ex.wavenumber, ex.filtering_spectrum; color = :royalblue, linewidth = 2.5, label = "ExactScaleDerivative()")
+    MK.scatter!(ax1, df.wavenumber, df.filtering_spectrum; color = :darkorange, markersize = 9, label = "DifferenceScaleDerivative()")
+    k0 = ex.wavenumber[s0]; E0 = ex.filtering_spectrum[s0]
+    MK.lines!(ax1, ex.wavenumber, E0 .* (ex.wavenumber ./ k0) .^ (-5 / 3); color = :gray40, linestyle = :dash, label = "k^-5/3")
+    MK.axislegend(ax1; position = :lb, framevisible = false, labelsize = 11)
+    ax2 = MK.Axis(fig[1, 2]; title = "slope d ln Ẽ / d ln k_ℓ", xlabel = "k_ℓ = L/ℓ", xscale = log10)
+    MK.lines!(ax2, ex.wavenumber, ex.spectral_slope; color = :royalblue, linewidth = 2.5, label = "exact")
+    MK.scatter!(ax2, df.wavenumber, df.spectral_slope; color = :darkorange, markersize = 9, label = "difference")
+    MK.hlines!(ax2, [-5 / 3]; color = :gray40, linestyle = :dash)
+    MK.axislegend(ax2; position = :lb, framevisible = false, labelsize = 11)
+    smap = ex.spectrum_map[:, :, s0]
+    cls = symclim(smap; q = 0.99)
+    ax3 = MK.Axis(fig[1, 3]; title = "local spectrum Ẽ(x, k_ℓ),  ℓ = $(round(scales[s0] / 1e3; digits = 1)) km",
+        aspect = MK.DataAspect(), xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
+    h3 = MK.heatmap!(ax3, km, km, smap; colormap = CASCADE, colorrange = (-cls, cls))
+    MK.Colorbar(fig[1, 4], h3; width = 10)
+    pmap = ex.slope_map[:, :, s0]
+    ax4 = MK.Axis(fig[1, 5]; title = "its local slope, centred on −5/3", aspect = MK.DataAspect(),
+        xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
+    h4 = MK.heatmap!(ax4, km, km, pmap; colormap = :PuOr, colorrange = (-5 / 3 - 3, -5 / 3 + 3))
+    MK.Colorbar(fig[1, 6], h4; width = 10)
+    MK.colgap!(fig.layout, 24)
+    save_fig("scale_derivative.png", fig)
+end
+
+# ─── Derivatives of the filtered field: stencils against the filter's own series ─────────────────────
+function fig_derivatives()
+    N = 256; dx = 1000.0
+    t = powerlaw_flow(; N, dx, seed = 14, slope = -7 / 3, nmin = 2.0, nmax = 120.0)
+    grid = cartgrid(t.xs); km = t.xs ./ 1e3
+    ker = CGEF.GaussianKernel(); S = CGEF.Filtering.Spectral(); D = CGEF.Derivatives
+    flux(ℓ, d) = (o = zero(t.u);
+                  CGEF.Diagnostics.compute_Π!(o, t.u, t.v, nothing, grid, ker, ℓ; method = S, derivative = d); o)
+    rms(A) = sqrt(Statistics.mean(abs2, A))
+    ratios = 2.0 .^ range(1, 5; length = 9)
+    refs = [flux(r * dx, D.SpectralDerivative()) for r in ratios]
+    errs = [n => [rms(flux(r * dx, D.PhysicalDerivative(; nodes = n)) .- ref) / rms(ref) for (r, ref) in zip(ratios, refs)]
+            for n in (3, 5, 7)]
+    ref4 = flux(4dx, D.SpectralDerivative()); st4 = flux(4dx, D.PhysicalDerivative(; nodes = 3))
+
+    fig = MK.Figure(; size = (1700, 470))
+    MK.Label(fig[0, 1:5], "Derivatives of the filtered field: the filter's own series (exact) against stencils of 3, 5 and 7 nodes (Gaussian, method = Spectral())";
+        fontsize = 17, font = :bold)
+    cl = symclim(ref4; q = 0.995)
+    ax1 = MK.Axis(fig[1, 1]; title = "Π, SpectralDerivative(),  ℓ = 4Δ", aspect = MK.DataAspect(),
+        xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
+    h1 = MK.heatmap!(ax1, km, km, ref4; colormap = CASCADE, colorrange = (-cl, cl))
+    MK.Colorbar(fig[1, 2], h1; width = 10, label = "Π (m²/s³)")
+    ax2 = MK.Axis(fig[1, 3]; title = "3-node stencil − exact, same colour scale", aspect = MK.DataAspect(),
+        xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
+    MK.heatmap!(ax2, km, km, st4 .- ref4; colormap = CASCADE, colorrange = (-cl, cl))
+    ax3 = MK.Axis(fig[1, 4:5]; title = "rms(Π_stencil − Π_exact) / rms(Π_exact)", xlabel = "ℓ / Δ",
+        xscale = log10, yscale = log10)
+    for ((n, e), col) in zip(errs, (:firebrick, :darkorange, :royalblue))
+        MK.scatterlines!(ax3, ratios, e; color = col, linewidth = 2, label = "$n nodes (order $(n - 1))")
+        # The order's slope, through the largest ℓ, where the asymptotic order holds.
+        MK.lines!(ax3, ratios, e[end] .* (ratios ./ ratios[end]) .^ (1 - n); color = col, linestyle = :dash, linewidth = 1)
+    end
+    MK.axislegend(ax3; position = :lb, framevisible = false)
+    MK.colgap!(fig.layout, 24)
+    save_fig("derivatives.png", fig)
+end
+
+# ─── Spheroids: the geodesic-disk top-hat and Π against the mean-radius sphere ──────────────────────
+function fig_spheroid()
+    wgs = FG.Geometry.SpheroidGeometry(6378137.0, 1 / 298.257223563)
+    lon = FG.Axes.PeriodicUniformAxis(0.0, 2π, 360)
+    lat = range(deg2rad(-89.5); step = deg2rad(1.0), length = 180)
+    g = FG.Grids.StructuredGrid(wgs, lon, lat)
+    plan = CGEF.Filtering.plan_filter(g, CGEF.TopHatKernel(), 3.0e6)
+    λd = [rad2deg(FG.Grids.coords(g, i, 1)[1]) for i in 1:360]; φd = rad2deg.(collect(lat))
+    # A unit value at one cell, filtered, is nonzero over the targets whose disk reaches it: the geodesic disk
+    # about that cell.
+    resp = zeros(360, 180)
+    for φ0 in (0.5, 45.5, 75.5)
+        imp = zeros(360, 180); imp[180, argmin(abs.(φd .- φ0))] = 1.0
+        o = CGEF.Filtering.filter_apply!(zero(imp), imp, plan)
+        resp .= max.(resp, o ./ maximum(o))
+    end
+
+    ed = eddy_noise_flow(; N = 160)
+    u, v = ed.u[:, 1:120], ed.v[:, 1:120]
+    lonr = range(deg2rad(-60.0); step = deg2rad(0.25), length = 160)
+    latr = range(deg2rad(30.0); step = deg2rad(0.25), length = 120)
+    gs = FG.Grids.StructuredGrid(wgs, lonr, latr)
+    gp = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(6371008.8), lonr, latr)
+    ℓ = 300e3; k = CGEF.TopHatKernel()
+    Πs = CGEF.Diagnostics.compute_Π!(zeros(160, 120), u, v, nothing, gs, k, ℓ)
+    # The sphere filtered as the spheroid is, by Cartesian components, so the difference is the metric's alone.
+    Πp = CGEF.Diagnostics.compute_Π!(zeros(160, 120), u, v, nothing, gp, k, ℓ;
+                                     vector_filter = CGEF.Filtering.CartesianComponents())
+    rel = (Πs .- Πp) ./ maximum(abs, Πp)
+    ldeg, pdeg = rad2deg.(collect(lonr)), rad2deg.(collect(latr))
+
+    fig = MK.Figure(; size = (1800, 480))
+    MK.Label(fig[0, 1:6], "Spheroids (WGS84): the top-hat over the geodesic disk, and Π against the mean-radius sphere";
+        fontsize = 18, font = :bold)
+    ax1 = MK.Axis(fig[1, 1]; title = "geodesic disks of radius 1500 km at 0°, 45°, 75°", xlabel = "longitude (°)",
+        ylabel = "latitude (°)")
+    h1 = MK.heatmap!(ax1, λd, φd, resp; colormap = SPEEDMAP, colorrange = (0, 1))
+    MK.Colorbar(fig[1, 2], h1; width = 10, label = "weight / peak")
+    cl = symclim(Πs; q = 0.995)
+    ax2 = MK.Axis(fig[1, 3]; title = "Π on WGS84,  ℓ = 300 km", xlabel = "longitude (°)", ylabel = "latitude (°)")
+    h2 = MK.heatmap!(ax2, ldeg, pdeg, Πs; colormap = CASCADE, colorrange = (-cl, cl))
+    MK.Colorbar(fig[1, 4], h2; width = 10, label = "Π (m²/s³)")
+    clr = maximum(abs, rel)
+    ax3 = MK.Axis(fig[1, 5]; title = "(Π_WGS84 − Π_sphere) / max|Π|", xlabel = "longitude (°)", ylabel = "latitude (°)")
+    h3 = MK.heatmap!(ax3, ldeg, pdeg, rel; colormap = :PuOr, colorrange = (-clr, clr))
+    MK.Colorbar(fig[1, 6], h3; width = 10)
+    MK.colgap!(fig.layout, 24)
+    save_fig("spheroid.png", fig)
+end
+
+# ─── Analysis on the sphere: quadrature against the least-squares fit ───────────────────────────────
+function fig_sphere_analysis()
+    N = 32; M = 2N - 1; R = 6.371e6
+    Θ, Φ = FSH.sph_points(N)
+    sgrid = FG.Connectivity.structured_grid(FG.SphericalSampling.Fejer1Sampling(), N;
+                                            geometry = FG.Geometry.SphericalGeometry(R))
+    Random.seed!(17)
+    C = zeros(N, M)
+    for l in 1:(N - 1), m in (-l):l
+        C[FSH.sph_mode(l, m)] = (2 * rand() - 1) / l
+    end
+    fsh_field = permutedims(FSH.sph_evaluate(C))
+    fsh_λ = collect(Φ); fsh_φ = π / 2 .- collect(Θ)
+    λg = [FG.Grids.coords(sgrid, i, 1)[1] for i in 1:M]
+    φg = [FG.Grids.coords(sgrid, 1, j)[2] for j in 1:N]
+    field = fsh_field[[argmin(abs.(mod.(fsh_λ .- λ .+ π, 2π) .- π)) for λ in λg], [argmin(abs.(fsh_φ .- φ)) for φ in φg]]
+    F = CGEF.Filtering; SB = CGEF.SpectralBackends; ker = CGEF.GaussianKernel()
+    filt(ℓ, tr; kw...) = F.filter_apply!(zero(field), field,
+                                         F.plan_filter(sgrid, ker, ℓ; method = F.Spectral(), transform = tr, kw...))
+    # FastSphericalHarmonics' transform is exact on its own grid for a field of degree below N: the reference.
+    scales = R .* (π ./ (6:3:30))
+    errs = Dict(name => Float64[] for name in ("Quadrature()", "LeastSquares()"))
+    maps = Dict{String,Matrix{Float64}}()
+    for ℓ in scales
+        ref = filt(ℓ, SB.FSHTSpectralBackend())
+        for (name, a) in (("Quadrature()", F.Quadrature()), ("LeastSquares()", F.LeastSquares()))
+            e = filt(ℓ, SB.NUFSHTSpectralBackend(); analysis = a) .- ref
+            push!(errs[name], maximum(abs, e) / maximum(abs, ref))
+            ℓ == scales[end - 2] && (maps[name] = log10.(abs.(e) ./ maximum(abs, ref) .+ 1e-17))
+        end
+    end
+    ld, pd = rad2deg.(λg), rad2deg.(φg); p = sortperm(pd)
+
+    fig = MK.Figure(; size = (1800, 460))
+    MK.Label(fig[0, 1:6], "Analysis on the sphere: a band-limited field on a Fejér grid, filtered by NUFSHT under each analysis, against FastSphericalHarmonics (exact there)";
+        fontsize = 17, font = :bold)
+    cl = symclim(field)
+    ax1 = MK.Axis(fig[1, 1]; title = "field, degree < $N", xlabel = "longitude (°)", ylabel = "latitude (°)")
+    MK.heatmap!(ax1, ld, pd[p], field[:, p]; colormap = FIELDMAP, colorrange = (-cl, cl))
+    local h
+    for (col, name) in zip((2, 3), ("Quadrature()", "LeastSquares()"))
+        ax = MK.Axis(fig[1, col]; title = "log₁₀ relative error, $name", xlabel = "longitude (°)")
+        h = MK.heatmap!(ax, ld, pd[p], maps[name][:, p]; colormap = :viridis, colorrange = (-16, -1))
+    end
+    MK.Colorbar(fig[1, 4], h; width = 10)
+    ax4 = MK.Axis(fig[1, 5:6]; title = "max relative error against FSH", xlabel = "ℓ (km)", yscale = log10)
+    MK.scatterlines!(ax4, scales ./ 1e3, errs["Quadrature()"]; color = :firebrick, linewidth = 2, label = "Quadrature()")
+    MK.scatterlines!(ax4, scales ./ 1e3, max.(errs["LeastSquares()"], 1e-17); color = :royalblue, linewidth = 2,
+                     label = "LeastSquares()")
+    MK.axislegend(ax4; position = :rc, framevisible = false)
+    MK.colgap!(fig.layout, 24)
+    save_fig("sphere_analysis.png", fig)
+end
+
+# ─── Spectral filtering on a bounded domain: padding by the kernel's reach, the sharp kernel's lattice ─
+function fig_bounded_spectral()
+    N = 48; dx = 1.0
+    xs = range(0.0; step = dx, length = N)
+    g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry(), xs, xs)     # bounded in both directions
+    f = [exp(-((x - 38)^2 + (y - 8)^2) / 18) + 0.5 * sin(2π * x / 17) * cos(2π * y / 23) for x in xs, y in xs]
+    S = CGEF.Filtering.Spectral()
+    ℓg = N * dx / 2
+    gs = zero(f); CGEF.Filtering.filter_field!(gs, f, g, CGEF.GaussianKernel(), ℓg; method = S)
+    gr = zero(f); CGEF.Filtering.filter_field!(gr, f, g, CGEF.GaussianKernel(), ℓg)
+    ℓs = 6.0
+    sp = zero(f); CGEF.Filtering.filter_field!(sp, f, g, CGEF.SharpSpectralKernel(), ℓs; method = S)
+    # The brick wall `|k| ≤ π/ℓ` on the field zero-padded to a box `p` times the domain, cropped back.
+    function box(p)
+        P = p * N
+        Fp = zeros(P, P); Fp[1:N, 1:N] .= f
+        k = 2π .* FFTW.fftfreq(P, 1 / dx)
+        H = [hypot(a, b) <= π / ℓs ? 1.0 : 0.0 for a in k, b in k]
+        return real.(FFTW.ifft(FFTW.fft(Fp) .* H))[1:N, 1:N]
+    end
+    ps = [2, 4, 8, 16, 32]
+    errs = [maximum(abs, box(p) .- sp) / maximum(abs, sp) for p in ps]
+
+    fig = MK.Figure(; size = (1800, 460))
+    MK.Label(fig[0, 1:6], "Spectral filtering on a bounded domain: padding by the kernel's reach, and the sharp kernel's exact lattice brick wall";
+        fontsize = 17, font = :bold)
+    cl = symclim(f)
+    ax1 = MK.Axis(fig[1, 1]; title = "field (bounded, $(N)×$(N))", aspect = MK.DataAspect(),
+        xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
+    MK.heatmap!(ax1, xs, xs, f; colormap = FIELDMAP, colorrange = (-cl, cl))
+    d = gs .- gr; cd = max(maximum(abs, d), floatmin())
+    ax2 = MK.Axis(fig[1, 2]; title = "Gaussian ℓ = L/2: FFT path − real space\nmax $(round(cd / maximum(abs, gr); sigdigits = 2)) of max|f̄|",
+        aspect = MK.DataAspect(), xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
+    h2 = MK.heatmap!(ax2, xs, xs, d; colormap = :PuOr, colorrange = (-cd, cd))
+    MK.Colorbar(fig[1, 3], h2; width = 10)
+    cs = symclim(sp)
+    ax3 = MK.Axis(fig[1, 4]; title = "sharp kernel ℓ = $(Int(ℓs))Δ, lattice brick wall", aspect = MK.DataAspect(),
+        xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
+    MK.heatmap!(ax3, xs, xs, sp; colormap = FIELDMAP, colorrange = (-cs, cs))
+    ax4 = MK.Axis(fig[1, 5:6]; title = "zero-padded box → the lattice result", xlabel = "box side / domain side",
+        ylabel = "max|box − lattice| / max|lattice|", xscale = log2, yscale = log10)
+    MK.scatterlines!(ax4, ps, errs; color = :royalblue, linewidth = 2)
+    MK.colgap!(fig.layout, 24)
+    save_fig("bounded_spectral.png", fig)
 end
 
 const FIGURES = (
@@ -947,6 +1243,12 @@ const FIGURES = (
     "enstrophy" => fig_enstrophy,
     "band_energies" => fig_band_energies,
     "compressible" => fig_compressible,
+    "cell_overlap" => fig_cell_overlap,
+    "scale_derivative" => fig_scale_derivative,
+    "derivatives" => fig_derivatives,
+    "spheroid" => fig_spheroid,
+    "sphere_analysis" => fig_sphere_analysis,
+    "bounded_spectral" => fig_bounded_spectral,
 )
 
 # Name figures on the command line to regenerate a subset; no arguments regenerates all of them.

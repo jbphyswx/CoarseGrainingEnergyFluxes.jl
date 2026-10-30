@@ -29,7 +29,8 @@ Test.@testset "Geometry Module Tests" begin
         Test.@test Geometry.disk_fraction(q_sq, 1.0) ≈ π / 4.0 atol=1e-15
         Test.@test Geometry.disk_fraction(0.0, 1.0, 0.0, 1.0, 1.0) ≈ π / 4.0 atol=1e-15
 
-        # Corner-miss test: box [0.8, 1.8]^2 overlaps [-1, 1]^2 AABB, but closest point (0.8, 0.8) has r^2 = 1.28 > 1
+        # Corner-miss test: box [0.8, 1.8]^2 overlaps the disk's bounding box [-1, 1]^2, but its closest point (0.8, 0.8)
+        # has r^2 = 1.28 > 1
         far_sq = [(0.8, 0.8), (1.8, 0.8), (1.8, 1.8), (0.8, 1.8)]
         Test.@test Geometry.disk_fraction(far_sq, 1.0) == 0.0
         Test.@test Geometry.disk_fraction(0.8, 1.8, 0.8, 1.8, 1.0) == 0.0
@@ -177,5 +178,78 @@ Test.@testset "Geometry Module Tests" begin
             end
             Test.@test total ≈ 4π / 3 * R^3 rtol = 1e-10
         end
+    end
+
+    # On a spheroid the disk's edge lies at its radius from the centre by FlowGeometries' geodesic inverse; a
+    # latitude–longitude grid over the whole surface tiles the disk, so the cells' overlaps add to its area; and with
+    # no flattening it is the sphere's cap. Disks smaller than a cell, wider than a hemisphere, centred on a pole,
+    # with an edge passing 1 km short of a pole and covering one by 1 km.
+    Test.@testset "10. Geodesic disk ∩ latitude–longitude cells" begin
+        E = FG.Geometry.SpheroidGeometry(6.378137e6, 1 / 298.257223563)
+        reach = FG.Geometry.meridian_distance(E, π / 2) - FG.Geometry.meridian_distance(E, 1.2)
+        nλ, nφ = 72, 36
+        λf = range(-π, π; length = nλ + 1)
+        φf = range(-π / 2, π / 2; length = nφ + 1)
+        for (t, R) in ((0.5, 7e5), (1.4, 1.5e6), (-0.2, 1.4e7), (π / 2, 9e5), (0.3, 2e3), (1.2, reach - 1e3), (1.2, reach + 1e3))
+            d = _cgef_geodesic_disk(E, R, t)
+            worst = 0.0
+            for φ in range(d.span...; length = 41)[2:(end - 1)]
+                w = Geometry.geodesic_half_width(d, φ)
+                0 < w < Float64(π) && (worst = max(worst, abs(FG.Geometry.distance(E, (0.0, t), (w, φ)) - R) / R))
+            end
+            Test.@test worst < 1e-10
+            total = 0.0
+            for j in 1:nφ, i in 1:nλ
+                fr = Geometry.geodesic_cell_fraction(d, λf[i], λf[i + 1], φf[j], φf[j + 1], nodes)
+                total += fr * (λf[i + 1] - λf[i]) * _cgef_zone(E, φf[j], φf[j + 1])
+            end
+            Test.@test total ≈ Geometry.geodesic_disk_area(d, nodes) rtol = 1e-10
+        end
+        d = _cgef_geodesic_disk(E, 7e5, 0.5)
+        Test.@test Geometry.geodesic_cell_fraction(d, -0.01, 0.01, 0.49, 0.51, nodes) === 1.0
+        Test.@test Geometry.geodesic_cell_fraction(d, 0.3, 0.4, 0.49, 0.51, nodes) === 0.0
+        S = FG.Geometry.SpheroidGeometry(6.371e6, 0.0)
+        worst = 0.0
+        for (t, R) in ((-1.2, 4e5), (0.3, 2e6), (1.5, 9e6))
+            d = _cgef_geodesic_disk(S, R, t)
+            for j in 1:nφ, i in 1:nλ
+                g = Geometry.geodesic_cell_fraction(d, λf[i], λf[i + 1], φf[j], φf[j + 1], nodes)
+                c = Geometry.cap_cell_fraction(λf[i], λf[i + 1], φf[j], φf[j + 1], t, R / 6.371e6, nodes)
+                worst = max(worst, abs(g - c))
+            end
+        end
+        Test.@test worst < 1e-11
+    end
+
+    # Geodetic cells of longitude, latitude and height tile the space about a ball, so their overlaps add to `4πR³/3`:
+    # balls beside the equator, below the surface and over a pole. With no flattening a cell is the sphere's shell
+    # sector between radii `a + h`.
+    Test.@testset "11. Ball ∩ geodetic cells" begin
+        a, f = 6.378137e6, 1 / 298.257223563
+        λf = range(-π, π; length = 37)
+        φf = range(-π / 2, π / 2; length = 37)
+        for (t, h0, R) in ((0.5, 0.0, 3e5), (-0.2, -2e5, 1.2e6), (1.45, 1e5, 8e5))
+            b = Geometry.geodetic_ball(a, f * (2 - f), R, t, h0)
+            hf = range(h0 - 1.05R, h0 + 1.05R; length = 9)
+            total = 0.0
+            for k in 1:8, j in 1:36, i in 1:36
+                fr = Geometry.geodetic_cell_fraction(b, λf[i], λf[i + 1], φf[j], φf[j + 1], hf[k], hf[k + 1], nodes)
+                iszero(fr) && continue
+                total += fr * Geometry._geodetic_cell_volume(b, λf[i + 1] - λf[i], φf[j], φf[j + 1], hf[k], hf[k + 1], nodes)
+            end
+            Test.@test total ≈ 4π / 3 * R^3 rtol = 1e-10
+        end
+        worst = 0.0
+        for (t, h0, R) in ((0.3, 50e3, 2e5), (1.4, 0.0, 6e5), (-0.8, 200e3, 1.5e6))
+            b = Geometry.geodetic_ball(6.371e6, 0.0, R, t, h0)
+            hf = range(h0 - R - 1e4, h0 + R + 1e4; length = 9)
+            for k in 1:8, j in 1:36, i in 1:36
+                g = Geometry.geodetic_cell_fraction(b, λf[i], λf[i + 1], φf[j], φf[j + 1], hf[k], hf[k + 1], nodes)
+                s = Geometry.shell_cell_fraction(λf[i], λf[i + 1], φf[j], φf[j + 1], 6.371e6 + hf[k], 6.371e6 + hf[k + 1], t,
+                                                 6.371e6 + h0, R, nodes)
+                worst = max(worst, abs(g - s))
+            end
+        end
+        Test.@test worst < 1e-10
     end
 end

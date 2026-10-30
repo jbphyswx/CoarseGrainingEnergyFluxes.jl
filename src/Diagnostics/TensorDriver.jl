@@ -368,11 +368,12 @@ function _ambient_strain!(ws::ΠWorkspace{T}, _F, w, _grid, og, _fr, deriv_plan,
     return nothing
 end
 
-# The same from the filter's series (`_ambient_series_strain!`), through the six product buffers, free once
-# the stress is formed: `∂_e w̄ = r̂·∂_e p̄ + ū_e/R` and `∂_n w̄ = r̂·∂_n p̄ + v̄_n/R`.
+# The same from the filter's series (`_ambient_series_strain!`), through the strain's own buffers and
+# `scratch`: `∂_e w̄ = r̂·∂_e p̄ + ū_e/R` and `∂_n w̄ = r̂·∂_n p̄ + v̄_n/R`. A sweep's analysis holds the ambient
+# components across scales, and the stress holds the product buffers.
 function _ambient_strain!(ws::ΠWorkspace{T}, F, w, grid, _og, fr, route::SeriesStrain, plan, b) where {T}
-    Ge = (ws.uu_filt, ws.uv_filt, ws.uw_filt)
-    Gn = (ws.vv_filt, ws.vw_filt, ws.ww_filt)
+    Ge = (ws.S_xx, ws.S_xy, ws.S_xz)
+    Gn = (ws.scratch, ws.S_yy, ws.S_yz)
     R = _sphere_radius(grid, T)
     _ambient_series_strain!((ws.S_xx, ws.S_yy, ws.S_xy), Ge, Gn, F, (ws.ux_filt, ws.uy_filt, ws.uz_filt),
                             ws.w_filt, fr, R, route, plan, b)
@@ -710,7 +711,8 @@ Cross-scale kinetic energy flux Π = -S̄_ij τ_ij on a grid with no structured 
 physics of the `StructuredGrid` 2-D method, its vector filter on a sphere included. The grid resolves two
 tangent directions, or on a Cartesian node set given `w` three. `derivative`
 ([`Derivatives.AbstractDerivative`](@ref)) takes the strain: by default the derivative of the filter's
-own series under `method = Spectral()` and the least-squares gradient of
+own series where its output is one (`method = Spectral()`, and the generalized convolution on a sphere) and
+the least-squares gradient of
 [`Derivatives.derivative_plan`](@ref) otherwise. Fields may carry trailing batch axes past the grid's own.
 `RealSpace()` applies the kernel as written, with compact support; a transform's support is global. A
 prebuilt `deriv_plan = Derivatives.derivative_plan(output_grid(grid, mask_strategy))` (see

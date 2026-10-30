@@ -4,10 +4,10 @@
 
 Test.@testset "JET: every engine's plan and apply, and the flux" begin
     if isempty(VERSION.prerelease)
-        targets = (CGEF, CGEF.Kernels, CGEF.Filtering, CGEF.Derivatives, CGEF.Diagnostics, CGEF.Pipeline,
+        targets = (CGEF, CGEF.Kernels, CGEF.Filtering, CGEF.Derivatives, CGEF.Diagnostics, CGEF.Pipeline, CGEF.Geometry,
                    map(n -> Base.get_extension(CGEF, n), _CGEF_EXTENSIONS)...)
         ser = CGEF.ComputationalBackends.SerialBackend()
-        for r in (_cgef_cartesian_rows()..., _cgef_spherical_rows()..., _cgef_mesh_rows()...),
+        for r in (_cgef_cartesian_rows()..., _cgef_spherical_rows()..., _cgef_spheroid_rows()..., _cgef_mesh_rows()...),
             s in (CGEF.Filtering.ZeroFill(), CGEF.Filtering.Deformable())
             f = _cgef_field(size(FG.Grids.mask(r.grid)))
             p = CGEF.Filtering.plan_filter(r.grid, r.kernel, r.ℓ; execution = ser, mask_strategy = s, r.kw...)

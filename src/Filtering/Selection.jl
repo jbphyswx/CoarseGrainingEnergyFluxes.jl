@@ -12,7 +12,7 @@ was built with [`ScaleRates`](@ref) or [`ScaleCurvatures`](@ref), the tag `rate_
 otherwise. A family is an `AbstractVector` of its plans.
 
 The plans of one family share one scratch, so they must not be applied concurrently; give each
-concurrent worker its own family.
+concurrent worker a [`worker_copy`](@ref) of the family, which shares its tables.
 """
 struct FilterPlanFamily{
     P, GP<:Union{Nothing,AbstractGridPlan}, PV<:AbstractVector{P},
@@ -80,18 +80,17 @@ end
 
 """
     plan_filter_sweep(grid, kernel, scales; mask_strategy = ZeroFill(), method = nothing,
-                      cache_byte_budget = default_cache_byte_budget(), scale_rates = NoScaleRates(),
-                      kwargs...) -> FilterPlanFamily
+                      scale_rates = NoScaleRates(), kwargs...) -> FilterPlanFamily
 
 One [`plan_filter`](@ref) per scale in `scales`, all sharing one grid-determined half of the engine
-and one per-apply scratch. For the prefix-sum top-hat engine the shared half is the measure prefix
-scans, the ordered axis-1 coordinates and the mask scan. `method = nothing` takes the grid's default method.
+and one per-apply scratch: the scales' plans whose buffers have the same shapes hold one set of them. For the
+prefix-sum top-hat engine the shared half is the measure prefix scans, the ordered axis-1 coordinates and the
+mask scan. `method = nothing` takes the grid's default method.
 `scale_rates = ScaleRates()` also builds each real-space plan's [`scale_rate`](@ref), which a sweep's exact
 filtering spectrum reads, so a family reused across calls builds them once; `ScaleCurvatures()` builds their
 second derivatives too, which the spectral slopes read.
 
-Forwards every other [`plan_filter`](@ref) keyword. `cache_byte_budget` bounds the neighbour caches of
-the whole sweep: each scale's plan is given what the scales before it left.
+Forwards every other [`plan_filter`](@ref) keyword.
 
 ```julia
 family = plan_filter_sweep(grid, TopHatKernel(), scales)
@@ -106,7 +105,6 @@ function plan_filter_sweep(
     scales::AbstractVector;
     mask_strategy::AbstractMaskStrategy = ZeroFill(),
     method::Union{Nothing,AbstractFilterMethod} = nothing,
-    cache_byte_budget::Integer = default_cache_byte_budget(),
     scale_rates::AbstractScaleRates = NoScaleRates(),
     kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractGeometry{T}}
@@ -114,7 +112,7 @@ function plan_filter_sweep(
     gp, sc = _all_transform_engines(grid, kernel, scales, meth, kwargs) ? (nothing, nothing) :
              _sweep_shared(grid, kernel, mask_strategy, meth; max_scale = maximum(scales; init = zero(T)), kwargs...)
     kw = (; mask_strategy = mask_strategy, method = meth, _shared_keywords(gp, sc)..., kwargs...)
-    plans = _plan_each_scale(grid, kernel, scales, kw, Int(cache_byte_budget))
+    plans = _share_scratch(map(s -> plan_filter(grid, kernel, T(s); kw...), scales))
     return FilterPlanFamily(gp, plans, sc, _family_rates(scale_rates, plans), scale_rates)
 end
 
@@ -123,20 +121,6 @@ end
 _shared_keywords(::Nothing, ::Nothing) = (;)
 _shared_keywords(gp, ::Nothing) = (; grid_plan = gp)
 _shared_keywords(gp, sc) = (; grid_plan = gp, scratch = sc)
-
-# One plan per scale, each given the neighbour-cache budget the scales before it left.
-function _plan_each_scale(
-    grid::FlowGeometries.Grids.AbstractGrid{G,T}, kernel, scales, kw::NamedTuple, budget::Int,
-) where {G,T}
-    left = Ref(budget)
-    return map(scales) do s
-        p = plan_filter(grid, kernel, T(s); _budget_keywords(grid, left[])..., kw...)
-        left[] -= _cache_bytes(p)
-        p
-    end
-end
-
-_budget_keywords(grid, left::Int) = _takes_cache_budget(grid) ? (; cache_byte_budget = max(left, 0)) : (;)
 
 # Whether every scale of a real-space sweep takes a transform engine, which reads none of the shared
 # half the real-space engines build.
@@ -148,17 +132,10 @@ function _all_transform_engines(grid::FlowGeometries.Grids.AbstractGrid{G,T}, ke
     return all(s -> _engine(engine, grid, kernel, T(s), resolved) isa Union{PaddedFFTEngine,ZonalFFTEngine}, scales)
 end
 
-# The grids whose real-space plans hold an optional neighbour cache under a byte budget.
-_takes_cache_budget(::Union{FlowGeometries.Grids.StructuredGrid, FlowGeometries.Grids.CurvilinearGrid}) = true
-_takes_cache_budget(::FlowGeometries.Grids.AbstractGrid) = false
-
-# The bytes a plan's neighbour cache holds, counted as the budget counts them.
-_cache_bytes(plan::PhysicalFilterPlan) = _cache_bytes(plan.footprint)
-_cache_bytes(fp::ScatteredFilterPlan{T}) where {T} =
-    fp.cache === nothing ? 0 : length(fp.cache.w) * _cache_entry_bytes(Val(2), T)
-_cache_bytes(fp::NDScatteredFilterPlan{N,T}) where {N,T} =
-    fp.cache === nothing ? 0 : length(fp.cache.w) * _cache_entry_bytes(Val(N), T)
-_cache_bytes(_) = 0
+# The cache strategy a footprint was built under: whether it holds its neighbour list.
+_cache_strategy_of(fp::Union{ScatteredFilterPlan, NDScatteredFilterPlan}) =
+    fp.cache === nothing ? NeverCache() : AlwaysCache()
+_cache_strategy_of(_) = AlwaysCache()
 
 """
     _default_method(grid) -> AbstractFilterMethod
@@ -360,9 +337,8 @@ end
     _zonal_fft_ops(grid, kernel, scale) -> (transform, realspace)
 
 The operations of one apply on a sphere of uniform longitude by the transform along longitude and by
-the real-space engine: the prefix-sum top-hat for `TopHatKernel`, the banded sum otherwise. Per pair of
-latitude rows the taps are the longitude offsets within great-circle distance `rad`,
-`sin²(Δλ/2) ≤ (sin²(rad/2R) − sin²(Δφ/2)) / (cos φ cos φ′)`, and a pair with any is a band.
+the banded sum. Per pair of latitude rows the taps are the longitude offsets within great-circle distance
+`rad`, `sin²(Δλ/2) ≤ (sin²(rad/2R) − sin²(Δφ/2)) / (cos φ cos φ′)`.
 """
 function _zonal_fft_ops(
     grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, kernel::Kernels.AbstractFilterKernel, scale::T,
@@ -377,23 +353,18 @@ function _zonal_fft_ops(
     h = sin(min(rad / (2R), T(π) / 2))^2
     taps = 0
     pairs = 0
-    bands = 0
     reach = 0
     for j in 1:Ny, jj in max(1, j - dj_lim):min(Ny, j + dj_lim)
         pairs += 1
         s = sin((lat[jj] - lat[j]) / 2)^2
         s <= h || continue
-        bands += 1
         c = cos(lat[j]) * cos(lat[jj])
         half = (c <= 0 || h - s >= c) ? Nx : floor(Int, 2 * asin(sqrt((h - s) / c)) / dλ)
         taps += min(Nx, 2 * half + 1)
         reach = max(reach, min(half, Nx - 1))
     end
     Px = FlowGeometries.Grids.isperiodic(grid, 1) ? Nx : _even_smooth_length(Nx + reach)
-    realspace = kernel isa Kernels.TopHatKernel ?
-        _prefixsum_ops(Nx * Ny, Nx * bands) + _edge_ops(kernel, Nx * Ny, rad, (R * dλ, min_dφ)) :
-        T(taps) * Nx
-    return 2 * Ny * _rfft_ops(Px) + 2 * (Px ÷ 2 + 1) * pairs, realspace
+    return 2 * Ny * _rfft_ops(Px) + 2 * (Px ÷ 2 + 1) * pairs, T(taps) * Nx
 end
 
 # The padded transform evaluates the direct footprint sum of any kernel on a uniform Cartesian grid.
@@ -425,6 +396,13 @@ function _takes_zonal_fft(
     return transform < realspace
 end
 
+# A top-hat takes the prefix sums: their tables hold a few numbers per pair of rows a support spans, the
+# transform's a longitude spectrum per pair.
+_takes_zonal_fft(
+    ::Tuple{FlowGeometries.Axes.UniformSpacing,Any}, ::FlowGeometries.Grids.StructuredGrid{T,G,2},
+    ::Kernels.TopHatKernel, _, _,
+) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.SphericalGeometry{T}} = false
+
 # The Cartesian grids filtered over their cells as points: node sets and curvilinear meshes.
 const _CartesianPoints{T,G} = Union{FlowGeometries.Grids.UnstructuredGrid{T,G}, FlowGeometries.Grids.CurvilinearGrid{T,G}}
 
@@ -436,8 +414,7 @@ _takes_binned_tophat(grid, kernel) = false
 _takes_binned_tophat(::_CartesianPoints{T,G}, ::Kernels.TopHatKernel) where {T, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}} = true
 
 # A kernel with a transfer cutoff over Cartesian points takes the nonuniform-FFT sum where building its plan
-# and applying it once costs fewer operations than building the neighbour list and applying it once, or
-# where the list's bytes exceed the cache budget.
+# and applying it once costs fewer operations than building the neighbour list and applying it once.
 _takes_nufft_sum(grid, kernel, scale) = false
 function _takes_nufft_sum(
     grid::_CartesianPoints{T,G}, kernel::Kernels.AbstractFilterKernel, scale,
@@ -445,7 +422,7 @@ function _takes_nufft_sum(
     K = Kernels.transfer_cutoff(kernel, T(scale))
     (K === nothing || _nufft_library(SpectralBackends.AutoSpectralBackend()) === nothing) && return false
     transform, entries, build = _nufft_sum_ops(grid, kernel, T(scale), K)
-    return 2 * transform < build + entries || entries * (sizeof(Int) + sizeof(T)) > default_cache_byte_budget()
+    return 2 * transform < build + entries
 end
 
 """
@@ -488,7 +465,7 @@ The engine `AutoEngine` takes on the resolved backend. On a backend whose applie
 loops: the binned top-hat and the nonuniform-FFT sum over Cartesian points; there and on a GPU backend,
 the padded and zonal transforms over rectilinear grids where an FFT library serves the backend's memory;
 each where it applies and costs fewer operations than the footprint, the footprint otherwise.
-[`check_setup`](@ref) reports from the same choice.
+[`check_setup`](@ref CoarseGrainingEnergyFluxes.Pipeline.check_setup) reports from the same choice.
 """
 function _select_engine(grid, kernel, scale, resolved::ComputationalBackends.AbstractExecutionBackend)
     if _host_backend(resolved)
@@ -505,7 +482,7 @@ end
 _engine(::AutoEngine, grid, kernel, scale, resolved) = _select_engine(grid, kernel, scale, resolved)
 _engine(e::AbstractEngine, grid, kernel, scale, resolved) = e
 
-# `k` of the footprint of `engine` for the spacing tuple `sp` ([`_with_spacings`](@ref)), called where the
+# `k` of the footprint of `engine` for the spacing tuple `sp` (`_with_spacings`), called where the
 # footprint's type is concrete; `kwargs` reach the grid's own `build_footprint`.
 _build_engine(k::K, ::PaddedFFTEngine, sp, grid, kernel, scale, strategy, resolved; fft_options::NamedTuple = (;),
               kwargs...) where {K} =
@@ -626,8 +603,7 @@ function plan_filter(
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     method::AbstractFilterMethod = RealSpace(),
     transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
-    cache_strategy::AbstractCacheStrategy = AutoCache(),
-    cache_byte_budget::Integer = default_cache_byte_budget(),
+    cache_strategy::AbstractCacheStrategy = AlwaysCache(),
     engine::AbstractEngine = AutoEngine(),
     kwargs...,
 ) where {T<:AbstractFloat}
@@ -640,7 +616,7 @@ function plan_filter(
     resolved = _resolve_backend(execution, grid)
     _check_backend_compatible(grid, execution)
     return _physical_plan(resolved, engine, grid, kernel, scale, mask_strategy,
-                          (; cache_strategy = cache_strategy, cache_byte_budget = cache_byte_budget))
+                          (; cache_strategy = cache_strategy, execution = resolved))
 end
 
 """

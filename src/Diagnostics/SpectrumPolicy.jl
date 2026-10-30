@@ -292,7 +292,8 @@ struct ΠWorkspace{
     S_yz::AZ
     S_zz::AZ
 
-    # Subfilter-scale stress components (local coordinates)
+    # Subfilter-scale stress components (local coordinates): the product buffers above, each component
+    # formed in place of its product
     τ_xx::A
     τ_xy::A
     τ_xz::AZ
@@ -326,13 +327,14 @@ On the surface of a sphere the workspace holds the transforms of the vector filt
 chosen by `transform` and `nufft`, by default. A plan filtering under `Deformable` needs
 `vector_filter = Filtering.CartesianComponents()`.
 
-Only the buffers the configuration reaches are allocated, fixed by the grid, the vector filter and `w`:
+Only the buffers the configuration reaches are allocated, fixed by the grid, the vector filter and `w`; the
+stress `τ_*` occupies the filtered products' buffers:
 
 | configuration | full-size buffers |
 |---|---|
-| 2-D Cartesian, or a sphere under `GeneralizedConvolution`, no `w` | 15 |
-| either with `w` (the 2.5-D path), or true 3-D Cartesian | 28 |
-| `CartesianComponents` on another geometry (a sphere, a spheroid, a shell) | 30 |
+| 2-D Cartesian, or a sphere under `GeneralizedConvolution`, no `w` | 12 |
+| either with `w` (the 2.5-D path), or true 3-D Cartesian | 22 |
+| `CartesianComponents` on another geometry (a sphere, a spheroid, a shell) | 24 |
 
 A workspace built for `w = nothing` throws when given a `w`. The last row and true-3-D grids always carry
 the vertical set.
@@ -355,12 +357,13 @@ function ΠWorkspace(
     zv() = vertical ? z() : nothing
     zs() = ambient ? z() : nothing
 
+    products = (z(), z(), zv(), z(), zv(), zv())
     return ΠWorkspace(
         z(), z(), zv(),
         z(), z(), z(), zv(), zv(), zv(),
+        products...,
         z(), z(), zv(), z(), zv(), zv(),
-        z(), z(), zv(), z(), zv(), zv(),
-        z(), z(), zv(), z(), zv(), zv(),
+        products...,
         z(), zs(), zs(), spin, at,
     )
 end

@@ -107,7 +107,8 @@ struct NoSeries <: AbstractSeriesForm end
 """
     Series()
 
-A plan whose output is `ū(x) = Σ_k w_k Ĝ(k) F̂(k) e^{ik·x}`, `F̂` the analysis [`filter_analyze!`](@ref) writes.
+A plan whose output is `ū(x) = Σ_k w_k Ĝ(k) F̂(k) e^{ik·x}`, `F̂` the analysis `filter_analyze!` writes
+([`analyze_buffer`](@ref)).
 """
 struct Series <: AbstractSeriesForm end
 
@@ -278,12 +279,13 @@ end
 
 """
     plan_filter(grid, kernel, scale; mask_strategy = ZeroFill(), execution = AutoBackend(),
-                method = RealSpace(), transform = AutoSpectralBackend(),
-                cache_strategy = AutoCache(), cache_byte_budget = default_cache_byte_budget(),
-                grid_plan = nothing, scratch = nothing, fft_options = (;)) -> AbstractFilterPlan
+                method = RealSpace(), transform = AutoSpectralBackend(), cache_strategy = AlwaysCache(),
+                grid_plan = nothing, scratch = nothing, engine = AutoEngine(), fft_options = (;)) -> AbstractFilterPlan
 
 A reusable filter plan for `execution`, applied by `filter_apply!(out, field, plan)`: the real-space
-footprint, or under `method = Spectral()` the transform plan. A spectral plan also takes `batch = nb`
+footprint, or under `method = Spectral()` the transform plan. `engine` names the real-space engine
+([`AbstractEngine`](@ref)); `AutoEngine()` takes the one with the fewest operations ([`_select_engine`](@ref)). A
+spectral plan also takes `batch = nb`
 for a trailing batch axis and, over a spherical node set, `nufft`, the NUFFT library NUFSHT runs, and
 `analysis` ([`AbstractAnalysis`](@ref)); a keyword the method does not take raises an `ArgumentError`.
 `grid_plan` and `scratch` are the parts a sweep shares; see [`plan_filter_sweep`](@ref). `fft_options` are
@@ -308,8 +310,7 @@ function plan_filter(
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     method::AbstractFilterMethod = RealSpace(),
     transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
-    cache_strategy::AbstractCacheStrategy = AutoCache(),
-    cache_byte_budget::Integer = default_cache_byte_budget(),
+    cache_strategy::AbstractCacheStrategy = AlwaysCache(),
     grid_plan::Union{Nothing,AbstractGridPlan} = nothing,
     scratch::Union{Nothing,AbstractFilterScratch} = nothing,
     engine::AbstractEngine = AutoEngine(),
@@ -329,7 +330,7 @@ function plan_filter(
     _check_backend_compatible(grid, execution)
     return _physical_plan(
         resolved, engine, grid, kernel, scale, mask_strategy,
-        (; mask_strategy = mask_strategy, cache_strategy = cache_strategy, cache_byte_budget = cache_byte_budget,
-           grid_plan = grid_plan, scratch = scratch, _fft_keywords(fft_options)...),
+        (; mask_strategy = mask_strategy, cache_strategy = cache_strategy, grid_plan = grid_plan, scratch = scratch,
+           execution = resolved, _fft_keywords(fft_options)...),
     )
 end

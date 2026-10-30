@@ -212,7 +212,7 @@ end
     _separable_tables(sp, grid, kernel::SeparableKernel, scale) -> (; g, lim, periodic, mf)
 
 The separable engines' per-axis weight tables `g` ([`_separable_axis_weights`](@ref)) by the spacing
-tuple `sp` ([`_with_spacings`](@ref)) and stencil half-widths `lim`, from the smallest gap on each axis so
+tuple `sp` (`_with_spacings`) and stencil half-widths `lim`, from the smallest gap on each axis so
 the stencil covers the kernel's radius everywhere, with each axis's periodicity and the grid's measure
 factors `mf`. Axis `d` takes the profile of `Kernels._axis_kernel(kernel, Val(d))`.
 """
@@ -250,7 +250,7 @@ end
 
 Build the per-axis weight tables for the spacing tuple `sp`, the denominator for `mask_strategy`, and the
 pass buffers of the separable engine. A given `scratch`, a `SeparableScratch`, supplies the buffers.
-`kwargs...` absorbs and ignores `cache_strategy`/`cache_byte_budget`.
+`kwargs...` absorbs and ignores `cache_strategy`.
 """
 function _build_separable_footprint(
     sp::Tuple,

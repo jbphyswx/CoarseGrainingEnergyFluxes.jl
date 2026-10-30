@@ -19,6 +19,9 @@ using FlowGeometries: FlowGeometries
 @inline _setI!(A::AbstractArray{<:Any,N}, I::CartesianIndex{N}, ::Int, v) where {N} = @inbounds A[I] = v
 @inline _setI!(A::AbstractArray{<:Any,M}, I::CartesianIndex{N}, b::Int, v) where {M,N} = @inbounds A[I, b] = v
 
+# Spatial cell `c` (a linear index over the leading `N` axes) of field `b`.
+@inline _atc(A::AbstractArray, c::Integer, b::Int, ncell::Int) = @inbounds A[c + (b - 1) * ncell]
+
 # Every kernel below writes the outputs of a block of its units, rows `j0 + 1 …` of a 2-D grid or linear
 # cells `lin0 + 1 …`, launched over the block; a whole-grid apply passes `0` and the whole range.
 
@@ -125,10 +128,10 @@ end
     return nothing
 end
 
-# Cached ND scattered footprint: `nbrs` holds neighbour multi-indices with the periodic wrap applied at
+# Cached ND scattered footprint: `cell` holds each neighbour's linear index with the periodic wrap applied at
 # build time.
 @kernel function _cgef_filter_kernel_nd_cached!(
-    out, @Const(field), @Const(mask), @Const(nbrs), @Const(w), @Const(ptr), exterior, dims, strategy, lin0::Int,
+    out, @Const(field), @Const(mask), @Const(cell), @Const(w), @Const(ptr), exterior, dims, strategy, lin0::Int,
 )
     ll, b = @index(Global, NTuple)
     lin = ll + lin0
@@ -142,17 +145,17 @@ end
             ws = zero(T)
             wn = zero(T)
             for k in ptr[lin]:(ptr[lin+1] - 1)
-                JI = CartesianIndex(nbrs[k])
-                active = mask[JI]
+                c = cell[k]
+                active = CGEF.Filtering._cell_active(mask, c)
                 wk = w[k]
                 if is_zerofill
                     wn += wk
                     if active
-                        ws += wk * _atI(field, JI, b)
+                        ws += wk * _atc(field, c, b, nspatial)
                     end
                 elseif active
                     wn += wk
-                    ws += wk * _atI(field, JI, b)
+                    ws += wk * _atc(field, c, b, nspatial)
                 end
             end
             is_zerofill && (wn = CGEF.Filtering._add_exterior(wn, exterior, I))
@@ -165,8 +168,8 @@ end
 
 # Node sets: a gather over each node's CSR neighbour block, in any embedding dimension. `size(A, 2)` is
 # 1 for a node vector, so an unbatched apply is the `Nb == 1` case.
-@inline _at1(A::AbstractVector, t::Int, ::Int) = @inbounds A[t]
-@inline _at1(A::AbstractMatrix, t::Int, b::Int) = @inbounds A[t, b]
+@inline _at1(A::AbstractVector, t::Integer, ::Int) = @inbounds A[t]
+@inline _at1(A::AbstractMatrix, t::Integer, b::Int) = @inbounds A[t, b]
 @inline _set1!(A::AbstractVector, t::Int, ::Int, v) = @inbounds A[t] = v
 @inline _set1!(A::AbstractMatrix, t::Int, b::Int, v) = @inbounds A[t, b] = v
 
@@ -203,11 +206,10 @@ end
     end
 end
 
-# Cached scattered footprint: `ii_arr`/`jj_arr` hold absolute neighbour indices with the periodic wrap
-# resolved at build time (`ScatteredCache`'s convention).
+# Cached scattered footprint: `cell` holds each neighbour's linear index with the periodic wrap resolved at
+# build time (`ScatteredCache`'s convention).
 @kernel function _cgef_filter_kernel_scattered!(
-    out, @Const(field), @Const(mask), @Const(ii_arr), @Const(jj_arr), @Const(w), @Const(ptr),
-    exterior, strategy, j0::Int,
+    out, @Const(field), @Const(mask), @Const(cell), @Const(w), @Const(ptr), exterior, strategy, j0::Int,
 )
     i, jl, b = @index(Global, NTuple)
     j = jl + j0
@@ -222,18 +224,17 @@ end
             ws = zero(T)
             wn = zero(T)
             for k in lo:hi
-                ii = ii_arr[k]
-                jj = jj_arr[k]
-                active = mask[ii, jj]
+                c = cell[k]
+                active = CGEF.Filtering._cell_active(mask, c)
                 wk = w[k]
                 if is_zerofill
                     wn += wk
                     if active
-                        ws += wk * _at(field, ii, jj, b)
+                        ws += wk * _atc(field, c, b, Nx * Ny)
                     end
                 elseif active
                     wn += wk
-                    ws += wk * _at(field, ii, jj, b)
+                    ws += wk * _atc(field, c, b, Nx * Ny)
                 end
             end
             is_zerofill && (wn = CGEF.Filtering._add_exterior(wn, exterior, i, j))
@@ -678,11 +679,10 @@ struct GPUBandedFootprint{F, VI, VW, MA, IN} <: GPUResident
     invden::IN   # reciprocal window mass, built once on the host with the plan
 end
 
-# Scattered footprint with a materialized neighbour cache: absolute neighbour indices per point.
-struct GPUScatteredCached{F, II, JJ, VW, VP, MA, EX} <: GPUResident
+# Scattered footprint with a materialized neighbour cache: each neighbour's linear cell index per point.
+struct GPUScatteredCached{F, VC, VW, VP, MA, EX} <: GPUResident
     fp::F
-    ii::II
-    jj::JJ
+    cell::VC
     w::VW
     ptr::VP
     maskd::MA
@@ -719,11 +719,11 @@ _device_cache(
     grid, fp::CGEF.Filtering.ScatteredFilterPlan,
     w::Union{CGEF.Filtering.OverlapWeights, CGEF.Filtering.OverlapPolygons},
 ) = fp.cache === nothing ?
-    CGEF.Filtering._scattered_cache(grid, w, fp.rad, fp.topology, CGEF.Filtering.AlwaysCache(), 0) : fp.cache
+    CGEF.Filtering._scattered_cache(grid, w, fp.rad, fp.topology, CGEF.Filtering.AlwaysCache()) : fp.cache
 _device_cache(
     grid, fp::CGEF.Filtering.NDScatteredFilterPlan, w::Union{CGEF.Filtering.OverlapWeightsND, CGEF.Filtering.OverlapShells},
 ) = CGEF.Filtering._expanded(
-    fp.cache === nothing ? CGEF.Filtering._nd_cache(grid, w, fp.rad, fp.topology, CGEF.Filtering.AlwaysCache(), 0) :
+    fp.cache === nothing ? CGEF.Filtering._nd_cache(grid, w, fp.rad, fp.topology, CGEF.Filtering.AlwaysCache()) :
     fp.cache)
 
 # Separable Gaussian: the two weight tables, the two pass buffers, and the footprint's denominator.
@@ -750,9 +750,9 @@ struct GPUSeparableND{F, BB<:Base.RefValue} <: GPUResident
 end
 
 # Cached ND scattered footprint, device-resident.
-struct GPUScatteredNDCached{F, VN, VW, VP, MA, EX} <: GPUResident
+struct GPUScatteredNDCached{F, VC, VW, VP, MA, EX} <: GPUResident
     fp::F
-    nbrs::VN
+    cell::VC
     w::VW
     ptr::VP
     maskd::MA
@@ -975,7 +975,7 @@ function CGEF.Filtering.prepare_workspace(
     exterior = _moved(dev, fp.exterior)
     cache = _device_cache(grid, fp, fp.weights)
     cache === nothing || return GPUScatteredNDCached(
-        fp, move(dev, cache.nbrs), move(dev, cache.w), move(dev, cache.ptr), maskd, exterior,
+        fp, move(dev, cache.cell), move(dev, cache.w), move(dev, cache.ptr), maskd, exterior,
     )
     return GPUStreamingND(
         fp, KA.adapt(dev, grid), KA.adapt(dev, fp.topology), maskd, exterior, _device_weights(dev, fp.weights),
@@ -1013,7 +1013,8 @@ function CGEF.Filtering.prepare_workspace(
     fp::CGEF.Filtering.NodeFilterPlan,
 )
     dev = b.backend
-    return GPUNodeFootprint(fp, move(dev, fp.nbrs), move(dev, fp.w), move(dev, fp.ptr), _maskd(dev, grid))
+    nbrs, w, ptr = CGEF.Filtering._grid_order_list(fp)
+    return GPUNodeFootprint(fp, move(dev, nbrs), move(dev, w), move(dev, ptr), _maskd(dev, grid))
 end
 
 function CGEF.Filtering.prepare_workspace(
@@ -1025,8 +1026,7 @@ function CGEF.Filtering.prepare_workspace(
     exterior = _moved(dev, fp.exterior)
     cache = _device_cache(grid, fp, fp.weights)
     cache === nothing || return GPUScatteredCached(
-        fp, move(dev, cache.ii), move(dev, cache.jj), move(dev, cache.w), move(dev, cache.ptr), maskd,
-        exterior,
+        fp, move(dev, cache.cell), move(dev, cache.w), move(dev, cache.ptr), maskd, exterior,
     )
     # The streaming kernel queries device copies of the grid and topology (moved by FlowGeometries'
     # `Adapt` methods), visiting each point's candidates in the host's order.
@@ -1198,7 +1198,7 @@ function _run_gpu_kernel!(
 )
     dims = FlowGeometries.Grids.size_tuple(grid)
     _cgef_filter_kernel_nd_cached!(dev)(
-        out, field, ws.maskd, ws.nbrs, ws.w, ws.ptr, ws.exterior, dims, strategy, first(cells) - 1;
+        out, field, ws.maskd, ws.cell, ws.w, ws.ptr, ws.exterior, dims, strategy, first(cells) - 1;
         ndrange = (length(cells), size(out, length(dims) + 1)),
     )
 end
@@ -1243,7 +1243,7 @@ function _run_gpu_kernel!(
     dev, out, field, ws::GPUScatteredCached, grid, strategy::CGEF.Filtering.AbstractMaskStrategy, rows::UnitRange{Int},
 )
     _cgef_filter_kernel_scattered!(dev)(
-        out, field, ws.maskd, ws.ii, ws.jj, ws.w, ws.ptr, ws.exterior, strategy, first(rows) - 1;
+        out, field, ws.maskd, ws.cell, ws.w, ws.ptr, ws.exterior, strategy, first(rows) - 1;
         ndrange = (size(out, 1), length(rows), size(out, 3)),
     )
 end

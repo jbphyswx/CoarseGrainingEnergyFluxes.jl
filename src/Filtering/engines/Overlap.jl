@@ -48,35 +48,46 @@ end
     GeodesicOverlap{F,N}
 
 The support of a top-hat on a spheroid of equatorial radius `a` and flattening `f`: the geodesic disk of radius
-`R`, with the Gauss–Legendre `nodes` its cell fractions integrate by ([`Geometry.geodesic_cell_fraction`](@ref)).
+`R` (the whole surface where `whole`), with the Gauss–Legendre `nodes` its cell fractions integrate by
+([`Geometry.geodesic_cell_fraction`](@ref)).
 """
 struct GeodesicOverlap{F<:AbstractFloat, N}
     a::F
     f::F
     R::F
+    whole::Bool
     nodes::N
 end
 
+# Every geodesic of length below `πb` is the shortest between its ends (the nearest cut locus, an equatorial point's,
+# lies `πb` away), and no two points lie farther apart than half a meridian.
 function _overlap_rule(geo::FlowGeometries.Geometry.AbstractEllipsoidalGeometry{T}, R::Real) where {T}
     F = _overlap_float(T)
-    return GeodesicOverlap(F(FlowGeometries.Geometry.semimajor_axis(geo)), F(FlowGeometries.Geometry.flattening(geo)),
-                           F(R), _overlap_nodes(F))
+    a, f = F(FlowGeometries.Geometry.semimajor_axis(geo)), F(FlowGeometries.Geometry.flattening(geo))
+    half = 2 * F(FlowGeometries.Geometry.meridian_distance(geo, F(π) / 2))
+    F(π) * a * (1 - f) <= R < half && throw(ArgumentError(
+        "a top-hat of radius $R reaches past some points' cut locus, where the circle of geodesic radius $R stops " *
+        "bounding the disk; this spheroid's top-hats take radii below $(F(π) * a * (1 - f)), or from $half (the whole " *
+        "surface)"))
+    return GeodesicOverlap(a, f, F(R), R >= half, _overlap_nodes(F))
 end
 
 """
     _overlap_target(ov, t)
 
 What the support's fractions about a target at axis-2 coordinate `t` read: `t` itself, or on a spheroid the
-geodesic disk about latitude `t` ([`Geometry.geodesic_disk`](@ref)), built once per target row.
+geodesic disk about latitude `t` ([`Geometry.geodesic_disk`](@ref)), built once per target row from the edge points
+of FlowGeometries' direct geodesic problem.
 """
 _overlap_target(::Union{PlanarOverlap,CapOverlap}, t) = t
 
 function _overlap_target(ov::GeodesicOverlap{F}, t::F) where {F}
     g = FlowGeometries.Geometry._GeodesicConstants(ov.a, ov.f)
-    inverse = (λ, φ) -> FlowGeometries.Geometry._geodesic_inverse(g, (λ, φ), (zero(F), t))
+    R = ov.R
+    direct = α -> FlowGeometries.Geometry._geodesic_direct(g, (zero(F), t), α, R)
     a, e² = ov.a, ov.f * (2 - ov.f)
     metric = φ -> (s = sin(φ); w = 1 - e² * s * s; (a * (1 - e²) / (w * sqrt(w)), a * cos(φ) / sqrt(w)))
-    return Geometry.geodesic_disk(inverse, metric, ov.R, t, a)
+    return Geometry.geodesic_disk(direct, metric, R, t, ov.whole)
 end
 
 """
@@ -603,28 +614,36 @@ end
 end
 
 """
-    OverlapShells{F,VF,N}
+    OverlapShells{F,VF,N,B}
 
-A [`Kernels.CellOverlap`](@ref) top-hat's weights on a 3-D spherical `StructuredGrid`, whose distance is the chord:
-the ball of radius `R` about the target, and each cell the sector between its longitude, latitude and radius faces
-(latitude faces clamped at the poles, radius faces at the origin), inside it by
-[`Geometry.shell_cell_fraction`](@ref) with the Gauss–Legendre `nodes`. `reach`, `R` plus the farthest any cell's
-corner lies from its centre, is the ball a query needs to find every cell the support touches.
+A [`Kernels.CellOverlap`](@ref) top-hat's weights on a 3-D spherical or spheroidal `StructuredGrid`, whose distance
+is the chord: the ball of radius `R` about the target, and each cell the region between its longitude, latitude and
+third-direction faces (latitude faces clamped at the poles), inside it with the Gauss–Legendre `nodes`: a sphere's
+radius sector by [`Geometry.shell_cell_fraction`](@ref) (`body` `nothing`, radius faces clamped at the origin), a
+spheroid's geodetic cell of heights by [`Geometry.geodetic_cell_fraction`](@ref) (`body` its equatorial radius and
+squared eccentricity). `reach`, `R` plus the farthest any cell's corner lies from its centre, is the ball a query needs
+to find every cell the support touches.
 """
-struct OverlapShells{F<:AbstractFloat, VF<:AbstractVector{F}, N}
+struct OverlapShells{F<:AbstractFloat, VF<:AbstractVector{F}, N, B}
     R::F
     nodes::N
     faces::NTuple{3,VF}
     x::NTuple{3,VF}
     reach::F
+    body::B
 end
 
 function OverlapShells(grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, R::Real) where {T,G}
     F = _overlap_float(T)
     faces = ntuple(d -> _cell_faces(grid, d, F), Val(3))
     x = ntuple(d -> F.(collect(FlowGeometries.Grids.coordinates(grid, d))), Val(3))
-    return OverlapShells(F(R), _overlap_nodes(F), faces, x, F(R) + _shell_extent(grid, faces, x))
+    body = _shell_body(FlowGeometries.Grids.grid_geometry(grid), F)
+    return OverlapShells(F(R), _overlap_nodes(F), faces, x, F(R) + _shell_extent(grid, faces, x), body)
 end
+
+_shell_body(::FlowGeometries.Geometry.AbstractSphericalGeometry, ::Type{F}) where {F} = nothing
+_shell_body(geo::FlowGeometries.Geometry.AbstractEllipsoidalGeometry, ::Type{F}) where {F} =
+    (F(FlowGeometries.Geometry.semimajor_axis(geo)), (f = F(FlowGeometries.Geometry.flattening(geo)); f * (2 - f)))
 
 # The farthest any cell's corner lies from its centre along the chord.
 function _shell_extent(grid::FlowGeometries.Grids.StructuredGrid{T}, faces, x) where {T}
@@ -641,11 +660,19 @@ function _shell_extent(grid::FlowGeometries.Grids.StructuredGrid{T}, faces, x) w
 end
 
 # Cell `J`'s fraction inside the ball about target `I`.
-@inline function _shell_fraction(r::OverlapShells{F}, I::NTuple{3,Int}, J::NTuple{3,Int}) where {F}
+@inline function _shell_fraction(r::OverlapShells{F,VF,N,Nothing}, I::NTuple{3,Int}, J::NTuple{3,Int}) where {F,VF,N}
     fλ, fφ, fr = r.faces
     λt = r.x[1][I[1]]
     return Geometry.shell_cell_fraction(fλ[J[1]] - λt, fλ[J[1] + 1] - λt, fφ[J[2]], fφ[J[2] + 1], fr[J[3]], fr[J[3] + 1],
                                         r.x[2][I[2]], r.x[3][I[3]], r.R, r.nodes)
+end
+
+@inline function _shell_fraction(r::OverlapShells{F,VF,N,NTuple{2,F}}, I::NTuple{3,Int}, J::NTuple{3,Int}) where {F,VF,N}
+    fλ, fφ, fh = r.faces
+    λt = r.x[1][I[1]]
+    ball = Geometry.geodetic_ball(r.body[1], r.body[2], r.R, r.x[2][I[2]], r.x[3][I[3]])
+    return Geometry.geodetic_cell_fraction(ball, fλ[J[1]] - λt, fλ[J[1] + 1] - λt, fφ[J[2]], fφ[J[2] + 1], fh[J[3]],
+                                           fh[J[3] + 1], r.nodes)
 end
 
 """
@@ -676,24 +703,6 @@ function _overlap_exterior(
     E = Array{T,N}(undef, dims)
     for I in CartesianIndices(dims)
         E[I] = M - _overlap_fold_nd((a, _, w) -> a + w, zero(T), r, grid, Tuple(I))
-    end
-    return E
-end
-
-# The ball's volume less the weights a target's window sums over a shell grid's own cells, through the query of
-# radius `rad`.
-function _overlap_exterior(
-    grid::FlowGeometries.Grids.StructuredGrid{T,G,3}, r::OverlapShells, kernel, scale, rad, mt,
-) where {T,G}
-    _reaches_exterior(grid, kernel, scale) || return nothing
-    dims = FlowGeometries.Grids.size_tuple(grid)
-    M = T(4 * π * r.R^3 / 3)
-    E = Array{T,3}(undef, dims)
-    # On a uniform ring every column of a (row, level) has its first column's mass.
-    ring = _shell_ring(grid)
-    for k in 1:dims[3], j in 1:dims[2], i in 1:dims[1]
-        E[i, j, k] = (ring && i > 1) ? E[1, j, k] :
-                     M - _nd_rule_fold((a, _, w) -> a + w, zero(T), r, grid, 0, (i, j, k), rad, mt)
     end
     return E
 end

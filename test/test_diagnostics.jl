@@ -786,9 +786,10 @@ Test.@testset "Generalized convolution of tensors: Ĝ(n) per degree" begin
         tr = 1.49 * 2 / 3 .+ Ĝ1 .* 1.4 .* y .- Ĝ2 .* ((x .^ 2 .- 1 / 3) .+ 0.49 .* (z .^ 2 .- 1 / 3))
         d = Ĝ2 .* (u .^ 2 .- v .^ 2)
         scale = maximum(u .^ 2 .+ v .^ 2)
-        Test.@test maximum(abs, ws.uu_filt .- (tr .+ d) ./ 2) < tol * scale
-        Test.@test maximum(abs, ws.vv_filt .- (tr .- d) ./ 2) < tol * scale
-        Test.@test maximum(abs, ws.uv_filt .- Ĝ2 .* u .* v) < tol * scale
+        # The flux forms the stress `τ = (u⊗u)‾ − ū⊗ū` in the products' buffers.
+        Test.@test maximum(abs, ws.τ_xx .+ ws.u_filt .^ 2 .- (tr .+ d) ./ 2) < tol * scale
+        Test.@test maximum(abs, ws.τ_yy .+ ws.v_filt .^ 2 .- (tr .- d) ./ 2) < tol * scale
+        Test.@test maximum(abs, ws.τ_xy .+ ws.u_filt .* ws.v_filt .- Ĝ2 .* u .* v) < tol * scale
 
         sf = ws.spin
         D._spin_transfer!(sf, kern, ℓ)

@@ -12,6 +12,7 @@ coarse-graining engine built on them:
 
 ```
 CoarseGrainingEnergyFluxes (main module)
+├── Geometry      — a cell's area or volume inside a top-hat's support: box, polygon, cap, geodesic disk, ball
 ├── Kernels       — filter kernels + spectral transfer functions Ĝ(|k|, ℓ)
 ├── Filtering     — real-space footprint convolution engine + spectral plan dispatch
 ├── Derivatives   — `derivative_plan`: FlowGeometries' stencil plans on a StructuredGrid and its
@@ -84,17 +85,21 @@ Two orthogonal choices control *how* a filter is evaluated:
 
 2. **Execution backend** (`execution = …`, for the `RealSpace()` engine): `SerialBackend`, `ThreadedBackend`
    (OhMyThreads), `GPUBackend` (KernelAbstractions), `DistributedBackend` (Distributed +
-   SharedArrays), `MPIBackend` (MPI), or `AutoBackend` (picks threaded when `nthreads() > 1`). All
+   SharedArrays), `MPIBackend` (MPI), or `AutoBackend` (`ThreadedBackend` where OhMyThreads is loaded and
+   `nthreads() > 1`, `SerialBackend` otherwise). All
    backends share the *same* footprint engine, so every map is identical to the serial path's, and
    every backend applies the footprint/plan built once per `(grid, kernel, scale)`. Under `GPUBackend`
    the diagnostics run on the device too: a workspace holds device buffers and device copies of the
    grid, the strain, rotations and contractions run there, and a domain sum is a device reduction,
    equal to the serial one to round-off. Coverage differs by backend:
    - Every parallel backend covers 2D `StructuredGrid`/`CurvilinearGrid`, decomposed by latitude row,
-     and 1D/true-3D `StructuredGrid` plus every flat-cell grid, decomposed by output point — threads
-     over `CartesianIndices`, Distributed over a `SharedArray`, MPI round-robin with an `Allreduce!`,
-     and the device over one linear index. All of them reuse the per-point kernel the serial n-D
-     engine uses.
+     and 1D/true-3D `StructuredGrid` plus every flat-cell grid, decomposed by output point or line, and
+     each runs the row and point bodies the serial engines run.
+   - A process backend's plan places each share at plan build. A Distributed worker holds its block, its
+     workspace on the inner backend and the shared field and output buffers, in a `Future` it owns; an MPI
+     rank holds its contiguous block. An apply runs every block on the inner backend, serial, threaded or a
+     device, and assembles the output in the shared buffers or by an in-place `Allreduce!`. A named
+     transform or binned engine on a process backend raises.
    - An explicit request for a backend on a grid shape it has no hook for raises an `ArgumentError`;
      only `AutoBackend` downgrades to serial.
    - Every flat-cell layout — a node set, and the ring/cubed-sphere/healpix/icosahedral/Yin–Yang
@@ -109,15 +114,20 @@ evaluates it is chosen from the grid and kernel:
 
 | engine | selected for | cost |
 |---|---|---|
-| prefix-sum top-hat | `TopHatKernel`, any rectilinear 2-D grid | `O(N·w_y)`, exact |
-| prefix-sum top-hat (3-D) | `TopHatKernel`, uniform Cartesian volume | `O(N·w_y·w_z)`, exact |
+| prefix-sum top-hat | `TopHatKernel` on a rectilinear 2-D grid of separable measure: any axes under `CellCentre` (but a spheroid's), a uniform axis 1 under `CellOverlap`, each row's whole cells by one interval sum and its rim cells by their overlap weights | `O(N·w_y)` plus the rim cells, exact |
+| prefix-sum top-hat (3-D) | `TopHatKernel`, uniform Cartesian volume | `O(N·w_y·w_z)` plus the rim cells, exact |
 | separable two-pass | `GaussianKernel`/`HighOrderKernel`, Cartesian | `O(N·(wx+wy))` |
 | separable N-pass | the same, 1-D or true 3-D Cartesian | `O(N·Σ w_d)` |
 | banded footprint | other radial kernels on a 2-D grid whose axis 1 is uniform, one band on a uniform Cartesian grid and one per row otherwise (a stretched `y` or any latitude axis); `HighOrderKernel` on a sphere of uniform longitude, one correction per latitude | `O(N·wx·wy)` |
-| scattered footprint | a nonuniform axis 1, or a curvilinear mesh; `HighOrderKernel` corrected per point | `O(N·wx·wy)`, optional neighbour cache |
-| binned prefix-sum top-hat | `TopHatKernel` over Cartesian points, a node set or a curvilinear mesh: points binned about one spacing wide, per line of bins a scan of the bin totals | `O(N·(r/h)^{D−1})`, exact |
+| scattered per-point footprint | a nonuniform axis 1, a curvilinear mesh, a spheroid's centre-test top-hat; `HighOrderKernel` corrected per point | `O(N·wx·wy)`, optional neighbour cache |
+| N-dimensional footprint | 1-D and true 3-D grids the separable and prefix-sum engines do not take; on a spherical or spheroidal shell of uniform longitude, a ring or a regional span, one weight table per latitude row and level, shifted along longitude | `O(N·∏ w_d)`, optional neighbour cache |
+| binned prefix-sum top-hat | `TopHatKernel` over Cartesian points, a node set or a curvilinear mesh: points binned about one spacing wide, per line of bins a scan of the bin totals; under `CellOverlap` a mesh's rim cells by polygon overlap | `O(N·(r/h)^{D−1})`, exact |
 | nonuniform-FFT kernel sum | a kernel with a transfer cutoff (`GaussianKernel`) over Cartesian points, where it costs fewer operations than the neighbour list or the list exceeds the cache budget | `O(N log N)`, to the transform's tolerance |
-| node CSR gather | any flat-cell layout: a node set, its list read from the point bins where Cartesian, or a ring/cubed-sphere/healpix/icosahedral/Yin–Yang pixelization | `O(N·⟨neighbours⟩)` |
+| node CSR gather | any flat-cell layout: a node set, its list read from the point bins where Cartesian and from chord bins on a sphere, or a ring/cubed-sphere/healpix/icosahedral/Yin–Yang pixelization; a list past the cache budget raises before it is built | `O(N·⟨neighbours⟩)` |
+
+`plan_filter(…; engine)` names an engine ([`Filtering.AbstractEngine`](@ref)); the default `AutoEngine()` takes
+the one above, or a transform below where it costs fewer operations. A node set's list is built and held in a
+space-filling order of its points, so a ball query and an apply read nearby memory.
 
 Every one of these has a device kernel. The prefix-sum engines run as two launches — a scan that is
 sequential along axis 1 and parallel across the rows (2-D) or planes (3-D), then a per-point window
@@ -161,13 +171,21 @@ harmonic degree, and inverse transforms):
 
 | Grid | Sampling | Library | Transform |
 |------|----------|---------|-----------|
-| `StructuredGrid{Cartesian}`   | uniform           | `FFTW`                        | real FFT, zero-padded along bounded axes |
+| `StructuredGrid{Cartesian}`   | uniform           | an AbstractFFTs provider (`FFTW` on the host) | real FFT, zero-padded along bounded axes by the kernel's reach |
 | `UnstructuredGrid{Cartesian}` | scattered, 1–3 D  | `NonuniformFFTs` or `FINUFFT` | type-1/2 NUFFT through FlowTransformBindings |
-| `StructuredGrid{Spherical}`   | `ClenshawCurtisSampling`, `nlon = 2·nlat − 1` | `FastSphericalHarmonics` | scalar SHT |
-| `UnstructuredGrid{Spherical}` | scattered         | `NUFSHT`                      | non-uniform SHT |
+| `StructuredGrid{Spherical}`   | `Fejer1Sampling`, `nlon = 2·nlat − 1` | `FastSphericalHarmonics` | scalar SHT |
+| `UnstructuredGrid{Spherical}` | scattered         | `NUFSHT`                      | non-uniform SHT, by quadrature or a fit (`analysis`) |
 
 Any other grid is filtered over its cells as a node set, by the nonuniform transform of its geometry;
 a regional sphere is completed to the whole sphere by its lattice continued past each bounded edge.
+
+The FFT path runs on the AbstractFFTs interface for host and device arrays alike. `AutoSpectralBackend()` takes
+it where an extension declares a provider for the field's memory: FFTW's on the host, and on a device the
+`KernelAbstractions` + `AbstractFFTs` extension's; `transform = FFTSpectralBackend()` names it with any
+provider loaded. `plan_filter(…; fft_options)` passes planner keywords to the provider's `plan_*` unchanged,
+`(; flags = FFTW.MEASURE)` under FFTW, whose extension adds the thread count. Along a bounded axis the
+transform pads by the kernel's reach at the largest scale it serves, and the sharp kernel there takes the
+lattice brick wall exactly (see [Theory](theory.md)).
 
 A spectral plan runs where its `execution` backend does. The library runs on one thread under `SerialBackend()`
 and on `Threads.nthreads()` under `ThreadedBackend()`, `AutoBackend()` and `GPUBackend()`, whose plans
@@ -192,9 +210,9 @@ row, by rows) in the synthesis.
 
 ```
 AbstractGeometry{T}                 AbstractFilterKernel
-├── CartesianGeometry{T}            ├── TopHatKernel
-└── SphericalGeometry{T}            ├── GaussianKernel{T}       (α: 6 = Pope, 4 = FlowSieve)
-                                    ├── SmoothHatKernel{T}      (tanh-tapered top hat)
+├── CartesianGeometry{T}            ├── TopHatKernel{C}         (C: CellOverlap or CellCentre)
+├── SphericalGeometry{T}            ├── GaussianKernel{T}       (α: 6 = Pope, 4 = FlowSieve)
+└── SpheroidGeometry{T}             ├── SmoothHatKernel{T}      (tanh-tapered top hat)
                                     ├── HyperGaussianKernel{T}  (exp(-D⁴), flatter core)
                                     ├── HighOrderKernel{P,T}    (P = 3, 5 vanishing moments; product on
                                     │                            the plane, isotropic on a sphere; signed)
@@ -206,11 +224,12 @@ AbstractSpectrumPolicy              (what to do when |Ĝ|² is not monotone decr
 ├── ForceSpectrum                   compute anyway, warn once
 └── NoSpectrum                      skip; fill NaN
 AbstractGrid{G,T}
-├── StructuredGrid{G,T,N}      N = 1, 2, 3   (rectilinear; N-D cell measure + mask; N=3 spherical
+├── StructuredGrid{T,G,N,…}    N = 1, 2, 3   (rectilinear; N-D cell measure + mask; N=3 spherical
 │                              is a volumetric shell — lon,lat,radius axes, r²cosφ volume)
-├── CurvilinearGrid{T,G,...}   2D, model-native (orthogonal curvilinear meshes); exact corner-based
+├── CurvilinearGrid{T,G,…}     2D, model-native (orthogonal curvilinear meshes); exact corner-based
 │                              quadrilateral cell areas
-└── UnstructuredGrid{T,G,...}  1D, scattered points; k-d tree adjacency (CSR) + Voronoi cell areas
+├── UnstructuredGrid{T,G,…}    1D, scattered points; k-d tree adjacency (CSR) + Voronoi cell areas
+└── RingGrid, CubedSphereGrid, HEALPixGrid, IcosahedralGrid, YinYangGrid   1D sphere pixelizations
 
 AbstractExecutionBackend            AbstractFilterMethod    AbstractMaskStrategy
 ├── SerialBackend                   ├── RealSpace           ├── ZeroFill
@@ -219,6 +238,16 @@ AbstractExecutionBackend            AbstractFilterMethod    AbstractMaskStrategy
 ├── DistributedBackend{Inner}
 ├── MPIBackend{Inner}
 └── AutoBackend
+
+AbstractDerivative                  AbstractScaleDerivative           AbstractEngine
+├── AutoDerivative                  ├── AutoScaleDerivative           ├── AutoEngine
+├── PhysicalDerivative              ├── ExactScaleDerivative          ├── PaddedFFTEngine
+└── SpectralDerivative              └── DifferenceScaleDerivative     ├── ZonalFFTEngine
+                                                                      ├── BinnedTopHatEngine
+AbstractVectorFilter                AbstractAnalysis                  ├── NUFFTSumEngine
+├── GeneralizedConvolution          ├── AutoAnalysis                  └── FootprintEngine
+└── CartesianComponents             ├── Quadrature
+                                    └── LeastSquares
 ```
 
 ## Grid construction: neighbor search & cell areas
@@ -226,13 +255,13 @@ AbstractExecutionBackend            AbstractFilterMethod    AbstractMaskStrategy
 `UnstructuredGrid`'s adjacency and per-node area are not required at construction time (a
 zero-neighbor grid still supports spectral filtering), but the convenience constructor
 `UnstructuredGrid(geometry, x, y, mask; k, radius, areas)` builds both, dispatched on geometry, via
-three additional weak-dependency extensions:
+three of FlowGeometries' weak-dependency extensions:
 
-| Need | Extension | Method |
+| Need | Load | Method |
 |------|-----------|--------|
-| k-d tree neighbor search (both geometries) | `NearestNeighborsExt` | Cartesian: tree on `(x,y)` directly. Spherical: tree on the exact 3D unit-sphere Cartesian embedding, where chord distance is a monotone function of great-circle distance, so the neighbour sets are exact |
-| Voronoi cell area, Cartesian | `DelaunayTriangulationExt` | Planar Delaunay triangulation → clipped Voronoi dual |
-| Voronoi cell area, spherical | `QuickhullExt` | 3D convex hull of the unit-sphere embedding (facets ≡ spherical Delaunay) → L'Huilier spherical-triangle fan-area summation |
+| k-d tree neighbor search (both geometries) | `NearestNeighbors` | Cartesian: tree on `(x,y)` directly. Spherical: tree on the exact 3D unit-sphere Cartesian embedding, where chord distance is a monotone function of great-circle distance, so the neighbour sets are exact |
+| Voronoi cell area, Cartesian | `DelaunayTriangulation` | Planar Delaunay triangulation → clipped Voronoi dual |
+| Voronoi cell area, spherical | `Quickhull` | 3D convex hull of the unit-sphere embedding (facets ≡ spherical Delaunay) → L'Huilier spherical-triangle fan-area summation |
 
 Unless the relevant extension is loaded or `areas`/adjacency are supplied explicitly, the constructor
 raises an `ArgumentError` naming the package needed.
@@ -266,15 +295,16 @@ reuses it across every velocity component, quadratic product, and vertical layer
 pre-allocated `ΠWorkspace` to avoid per-scale allocations when sweeping scales:
 
 ```julia
-ws = CGEF.Diagnostics.ΠWorkspace(grid; has_w = w !== nothing)   # allocate once
+ws = CGEF.Diagnostics.ΠWorkspace(grid, (), w)   # allocate once; `w` an array or `nothing`
 for ℓ in scales
     CGEF.Diagnostics.compute_Π!(Π, u, v, w, grid, kernel, ℓ; workspace = ws)
 end
 ```
 
-`has_w` is a construction argument: the vertical-component buffers have to exist before the first call,
-so a workspace built without them refuses a `w` and names the fix. `execution` places the workspace
-where a plan's outputs live, `ΠWorkspace(grid; execution = CGEF.Filtering.plan_execution(plan))`; a
-workspace in host memory refuses a plan whose outputs are in device memory.
+The workspace reads `w`'s type alone: the vertical-component buffers have to exist before the first call,
+so a workspace built for `nothing` refuses a `w` and names the fix. The second argument, a tuple of batch
+sizes, sizes the buffers for trailing batch axes. `execution` places the workspace where a plan's outputs
+live, `ΠWorkspace(grid; execution = CGEF.Filtering.plan_execution(plan))`; a workspace in host memory refuses
+a plan whose outputs are in device memory.
 
 The high-level [`coarse_grain`](@ref) handles plan reuse and the scale sweep automatically.

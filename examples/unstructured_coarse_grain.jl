@@ -1,8 +1,8 @@
 # UnstructuredGrid demo: genuinely scattered observations (e.g. moorings, drifters, along-track
 # altimetry), where no rectilinear or curvilinear grid structure exists at all. k-d tree neighbor
 # search (NearestNeighbors) and exact Voronoi cell areas (DelaunayTriangulation)
-# are built at construction time; ddx!/ddy! use weighted-least-squares gradients over that
-# adjacency. Filtering defaults to `RealSpace()`, the compact kernel gathered over each point's own
+# are built at construction time; derivatives are FlowGeometries' weighted-least-squares gradients over
+# that adjacency. Filtering defaults to `RealSpace()`, the compact kernel gathered over each point's own
 # metric ball, and a nonuniform-FFT library (FINUFFT below, or NonuniformFFTs) enables the opt-in
 # `Spectral()` transform; both are run at the end.
 
@@ -23,9 +23,8 @@ x_pts = L .* rand(npts)
 y_pts = L .* rand(npts)
 grid = FG.Grids.UnstructuredGrid(geom, x_pts, y_pts; k = 8)   # k-nearest adjacency + auto Voronoi areas
 
-# The Voronoi tessellation is clipped to the CONVEX HULL of the sample, not the full [0,L]^2 square —
-# for 2000 uniform random points that hull is a few tenths of a percent smaller than L^2 (it can't
-# quite reach the corners), so the areas should sum to the hull area exactly, not L^2 exactly.
+# The Voronoi tessellation is clipped to the convex hull of the sample, which misses the corners of the
+# [0,L]^2 square: the areas sum to the hull's area, a little below L^2.
 println("total Voronoi cell area / L^2 (expect slightly < 1 — hull misses the domain corners): ",
     round(sum(FG.Grids.measure(grid)) / L^2; sigdigits = 6))
 

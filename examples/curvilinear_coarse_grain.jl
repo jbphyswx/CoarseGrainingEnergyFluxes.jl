@@ -1,7 +1,7 @@
 # CurvilinearGrid demo: a sheared/rotated model-native mesh (the kind a structured-grid ocean or
 # atmosphere model stores at its cell centers) — no rectilinear axis anywhere. Filtering,
 # derivatives, and Π all work directly off the 2D (x, y) coordinate arrays via a per-point
-# footprint and weighted-least-squares (WLSQ) gradients, not a fast-path that assumes uniform spacing.
+# footprint and weighted-least-squares (WLSQ) gradients.
 
 using Random: Random
 using Statistics: Statistics
@@ -28,7 +28,7 @@ grid = FG.Grids.CurvilinearGrid(geom, x, y)   # exact corner-based quad areas, a
 true_area = N^2 * dx^2 * (cos(θ) + shear)
 println("total curvilinear cell area / true area: ", round(sum(FG.Grids.measure(grid)) / true_area; sigdigits = 10))
 
-# Synthetic non-divergent flow so Π should be small in the interior for a coarse scale.
+# A white-noise velocity, whose energy sits at the grid scale.
 u = randn(N, N); v = randn(N, N)
 
 scales = collect(10e3:10e3:60e3)

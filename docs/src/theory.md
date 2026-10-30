@@ -16,7 +16,8 @@ The coarse-grained (filtered) field at scale ℓ is a convolution with a normali
 `ZeroFill` strategy filters the field extended by zero over land and past a bounded edge — land is
 fluid at rest (Aluie et al. 2018; Grooms et al. 2021, eq. 7) — with `G_ℓ` unchanged: the denominator
 is the kernel's mass over the lattice continued past each bounded edge at its edge spacing, a latitude
-to the pole and a regional longitude around the ring. That preserves the property the rest of this
+to the pole and a regional longitude around the ring, and for the top-hat weighing cells by their overlap
+the measure of its support itself. That preserves the property the rest of this
 page depends on: a position-independent kernel **commutes with spatial derivatives**, which is the
 step that turns the pointwise momentum equation into the filtered energy budget below. `ū_ℓ` and `Π`
 are therefore defined over land too, `Π` vanishing beyond the kernel's reach of the coast, and a domain
@@ -52,6 +53,30 @@ per unit mass, in m² s⁻³; `ρ₀ Π_ℓ` is the flux per unit volume.
 In 2D the contraction is `S_xx τ_xx + 2 S_xy τ_xy + S_yy τ_yy`; in 3D it gains
 `+ S_zz τ_zz + 2 S_xz τ_xz + 2 S_yz τ_yz` (see [`Diagnostics.compute_Π!`](@ref)).
 
+### Derivatives of the filtered field
+
+`S̄` differentiates `ū`, which every filter defines at every point. Every diagnostic that differentiates a
+filtered field takes `derivative` ([`Derivatives.AbstractDerivative`](@ref)):
+
+- `PhysicalDerivative(; nodes = 5)` differences `ū`'s values: FlowGeometries' stencils of `nodes` nodes on a
+  `StructuredGrid`, a window that reaches an inactive cell shrinking to the cell's active run, and its
+  least-squares tangent-plane gradient on every other grid. A centred stencil of `n` nodes is of order `n − 1`,
+  so its error on `ū`, smooth on the scale `ℓ`, falls as `(Δ/ℓ)^{n−1}`.
+- `SpectralDerivative()` differentiates the filter's own output. A spectral filter's output is the series
+  `ū(x) = Σ_k w_k Ĝ(k) F̂(k) e^{ik·x}` (`w_k` splitting each Nyquist pair), and `Σ_k w_k i k_d Ĝ(k) F̂(k) e^{ik·x}`
+  is its derivative, exact for that series; a renormalized filter `ū = N/M` takes the quotient rule
+  `∂ū = (∂N − ū ∂M)/M`. Under the generalized convolution the strain comes from the filtered spin-1
+  coefficients through one spin-0 and one spin-2 synthesis, the spin-lowering and raising operators scaling a
+  degree-`ℓ` coefficient by `√(ℓ(ℓ+1))/R` and `√((ℓ−1)(ℓ+2))/R`; under `CartesianComponents` each ambient
+  component's surface gradient is a spin-1 synthesis of its scalar coefficients scaled by `√(ℓ(ℓ+1))/R`, rotated
+  to the local frame. A plan with no series raises.
+- `AutoDerivative()`, the default, takes the spectral derivative where the caller filters spectrally
+  (`method = Spectral()`, and the generalized convolution) and `PhysicalDerivative()` elsewhere, whichever
+  engine evaluates a `RealSpace()` filter.
+
+`enstrophy_flux` takes the vorticity of the unfiltered velocity by differences under every route, since only a
+filtered field is a series; the gradient of the filtered vorticity follows the route.
+
 ### What a `Π`-only diagnostic does not tell you
 
 `Π` is the cross-scale transfer term of the filtered kinetic-energy budget, one term of several.
@@ -86,8 +111,10 @@ The results above hold for a kernel that is:
    negative values, which breaks realizability of `τ`: the flux and the spectrum ask opposite things
    of the kernel here.
 
-Requirements 1 and 2 are gated in `runtests.jl` against closed forms; 3 is gated by the
-`filter ∘ ∇ == ∇ ∘ filter` test. `TopHatKernel` and `GaussianKernel` satisfy all four.
+Requirements 1 and 2 hold by construction: every engine divides by the window mass, and every kernel is a
+function of distance or, for `HighOrderKernel` on the plane, a product of even profiles. Requirement 3 is
+gated by the `filter ∘ ∇ == ∇ ∘ filter` test (`test_filtering.jl`), and 4 by the sign checks of
+`test_kernels.jl`. `TopHatKernel` and `GaussianKernel` satisfy all four.
 `SharpSpectralKernel` satisfies 1–3 but its real-space form takes negative values, so it fails 4 —
 usable for the spectrum, questionable for a pointwise `Π`.
 
@@ -104,6 +131,21 @@ filtering routines divide by the running area/volume-weighted sum.
 Unit weight inside the disk/ball of radius `ℓ/2`, zero outside. The literature default
 (Aluie et al. 2018, Storer et al. 2022). Spectral filtering needs `using SpecialFunctions` to load
 the exact planar transfer function (Bessel `J₁`); see below.
+
+On a grid the top-hat's sum over cells weighs each cell as `cells` says ([`Kernels.AbstractCellWeight`](@ref)).
+The default, `CellOverlap()`, weighs a cell by its measure inside the support, the continuous top-hat integrated
+over the cell, so the filtered field varies continuously with `ℓ` and with the target's position. The support is
+the segment, disk or ball of a Cartesian grid, the spherical cap on a sphere, the geodesic disk on a spheroid,
+and the ball of chord radius `ℓ/2` in a spherical or spheroidal shell. Each fraction is a closed form (a box or a
+polygon against a disk) or a Gauss–Legendre quadrature of one between the exact breakpoints of the integrand.
+`CellCentre()` weighs a cell by its whole measure where its centre lies within `ℓ/2` and by nothing otherwise,
+so the filter steps as `ℓ` crosses the cell centres. A node set, whose points carry no cells, takes the centre
+test under either.
+
+A top-hat's `Π` on a grid converges to the continuous filter's at first order in `Δ/ℓ` under either rule: the
+kernel's edge passes grid-scale content into `ū`. The centre test's steps add to that error at small `ℓ/Δ`, and
+dominate the filtering spectrum there, which differentiates `E(ℓ)` in `ℓ`. A smooth kernel's `Π` converges
+faster than any power of `Δ/ℓ` on a uniform grid.
 
 ### Gaussian — `GaussianKernel(; α = 6)`
 
@@ -156,6 +198,21 @@ For spectral filtering, each mode of wavenumber magnitude `k` is multiplied by
 | `SharpSpectralKernel` | `1` if `k ≤ π/ℓ`, else `0` |
 | `TopHatKernel`        | `2 J₁(kR)/(kR)`, `R = ℓ/2` (needs `using SpecialFunctions`) |
 | `HighOrderKernel`     | `∏_d Ĝ₁(k_d)` over the wavevector, `Ĝ₁(k) = Σₙ cₙ 2ρₙ sinc(kρₙ) / Σₙ cₙ 2ρₙ` with `ρₙ = ℓ/2 + nb` and `cₙ = aₙ − aₙ₊₁` |
+
+Along a bounded direction the spectral filter is, as the real-space one is, the convolution of the field
+extended by zero. The transform pads the direction until the kernel at the largest scale it serves
+(`max_scale` of [`Filtering.spectral_grid_plan`](@ref), the largest of a sweep's scales) stays clear of the
+domain's periodic copies, and a plan applied at a larger scale raises. Where a kernel's transfer at the grid's
+Nyquist wavenumber is not negligible (a Gaussian below `ℓ ≈ 8Δ`), the lattice cuts it and leaves a slowly
+decaying tail in real space, so the result depends on the padding by about `Ĝ(π/Δ)/(π g)` for a gap of `g`
+cells.
+
+The sharp kernel reaches without bound, so no padding serves it. On a uniform grid of two directions the FFT
+path filters by the lattice brick-wall kernel over the offsets the domain holds, whose transform on the padded
+box is exact: with both directions bounded `h(o) = ΔxΔy k_c²/(4π) · 2J₁(k_c r)/(k_c r)`, `r = |o|`, and with one
+periodic, per wavenumber `k` of the periodic direction `h(o) = Δ sin(a oΔ)/(π oΔ)` along the bounded one,
+`a = √(k_c² − k²)`, zero where `|k| > k_c`. It needs `ℓ ≥ Δ` along a bounded direction. A nonuniform-FFT plan with
+a bounded direction raises for the sharp kernel.
 
 On a sphere of radius `R` a radial kernel multiplies every harmonic of degree `l` by its Legendre
 transform (Aluie 2019, eq. 34, normalized as eq. 10; the Funk–Hecke theorem, eqs. 36–37), taken over the
@@ -225,6 +282,32 @@ another code therefore means nothing unless the conventions have been matched fi
   [`coarse_grain`](@ref) fills its density with `NaN`; `Diagnostics.ForceSpectrum()` computes the
   density anyway and leaves the sign check to the caller. See
   [`Diagnostics.AbstractSpectrumPolicy`](@ref) and [`Kernels.transfer_monotone`](@ref).
+
+### The derivative in `ℓ`
+
+`E(ℓ) = ½⟨|ū_ℓ|²⟩` gives `dE/dℓ = ⟨ū_ℓ · ∂_ℓ ū_ℓ⟩` exactly, and `Ẽ(k_ℓ) = −(ℓ²/L) dE/dℓ`. `scale_derivative`
+([`Diagnostics.AbstractScaleDerivative`](@ref)) chooses how `∂_ℓ ū` is taken:
+
+- `ExactScaleDerivative()` through the filter itself. A spectral filter or the generalized convolution
+  synthesizes with the transfer `∂_ℓĜ`, and a renormalized one takes the quotient rule over its mask's
+  series. A real-space filter is `ū = N_G/M_G`, `N_G = Σ g(r/ℓ) u A` and `M_G` its window mass, so with
+  `H(s) = −s g′(s)` ([`Kernels.ScaleRate`](@ref)), `∂_ℓ ū = (M_H/M_G)(ū_H − ū)/ℓ`, `ū_H` the filter of kernel `H`
+  over the same taps: the derivative of the discrete filter as it is evaluated.
+- `DifferenceScaleDerivative()`, the slope at each scale of the quadratic through the three nearest scales'
+  `E`, second order in the scale spacing.
+- `AutoScaleDerivative()`, the default: exact where the kernel has the derivative on the filter's route, and
+  differences elsewhere. The Gaussian, smooth hat and hyper-Gaussian have it in real space; the Gaussian,
+  top-hat and `HighOrderKernel` in a planar spectral filter; the Gaussian, smooth hat, hyper-Gaussian and top-hat
+  by degree on a sphere. The top-hat's `H` is a ring at its rim, `HighOrderKernel`'s sits at its edges and the
+  sharp kernel's `∂_ℓĜ` is a delta, so their real-space footprints take differences.
+
+With `slopes = Slopes()` a sweep also returns the spectrum's slope `d ln Ẽ/d ln k_ℓ` at each scale. With
+`a = ℓ∂_ℓū` and `b = ℓ²∂²_ℓū` it is `−(2⟨ū·a⟩ + ⟨a·a⟩ + ⟨ū·b⟩)/⟨ū·a⟩` on an exact route, the second derivative
+taken as the first is, and the slope of the quadratic through the three nearest scales' `ln Ẽ` in `ln k_ℓ`
+otherwise. `spectrum_maps = SpectrumMaps()` keeps the local spectrum `Ẽ(x, k_ℓ) = −(ℓ/L) ū·a` at every cell
+(shaped like `Π`, its area mean the filtering spectrum) and, with `Slopes()`, its slope per cell.
+[`Filtering.plan_filter_sweep`](@ref)`(…; scale_rates = ScaleRates())` builds a real-space family's rate plans
+with it, for a sweep repeated over timesteps.
 
 ## Decompositions
 
@@ -340,6 +423,14 @@ with horizontal arc-length spacing `r[k] cos φ · Δλ` / `r[k] · Δφ` and ra
 derivative stencils, and the 3×3 ambient Cartesian tensor rotation of `compute_Π!` keeping the
 radial direction.
 
+On a spheroid the distance is the geodesic's (Karney 2013), and a vector is filtered by its ambient Cartesian
+components. The top-hat's support on the surface is the geodesic disk, whose edge FlowGeometries' direct
+geodesic problem gives at a set of azimuths, its half-width in longitude held as a Chebyshev series in latitude.
+A circle of geodesic radius `R` bounds the disk while `R < πb`, the distance to the nearest cut locus; no two
+points lie farther apart than half a meridian, and a top-hat that wide covers the whole surface. A top-hat of
+radius between the two raises. A `(λ, φ, h)` grid of geodetic heights filters over the ball of chord radius
+`R`, each cell's fraction integrated over its heights.
+
 ### Filtering vectors and tensors on the sphere
 
 Filtering each local (east, north) component of a vector as a scalar does not commute with the surface
@@ -392,7 +483,7 @@ multiply every degree-`ℓ` coefficient by `Ĝ(ℓ)`, and synthesize. A vertical
 `wU` a spin-1 field. A flux sweep analyzes its fields once and synthesizes them at every scale.
 
 **Transforms.** [`Filtering.GeneralizedConvolution`](@ref) runs FastSphericalHarmonics' spin transforms on
-a `Float64` `ClenshawCurtisSampling` grid of `2N − 1` longitudes by `N` latitudes, exact for a field of
+a `Float64` `Fejer1Sampling` grid of `2N − 1` longitudes by `N` latitudes, exact for a field of
 degree below `N`; NUFSHT's on every other spherical grid where it and a NUFFT library are loaded; and
 otherwise the same sums
 evaluated directly, the Wigner `d` from their three-term recurrence in `ℓ`: on a latitude–longitude
@@ -403,12 +494,22 @@ row, so the sums along the rows are one product with `e^{imφ_i}` and the recurr
 the floating-point range where `ℓ_max · sin θ · log₁₀(1/sin θ)` exceeds the decimal exponent range, about
 `ℓ_max ≈ 240` in `Float32` and `1900` in `Float64`, for orders that still reach `O(ℓ^{−1/2})` past the
 turning point `ℓ sin θ = |m|`; the recurrence carries such a value as a significand and its own binary
-exponent. Both scattered transforms analyze by the quadrature
-`Σ_k (A_k/R²) F_k conj(ₛY_ℓm(x_k))` over the grid's cells, exact for a field of degree at most `ℓ_max` where
-the measure is a quadrature exact to degree `2ℓ_max` (Gauss–Legendre, Driscoll–Healy), and second order
-in the cell size elsewhere. `ℓ_max` is a spectral-quadrature sampling's band limit, and on any other grid
-the degree whose half wavelength is the side `√A` of the largest cell, `⌈πR/√A⌉ − 1`;
-`GeneralizedConvolution(; lmax)` sets it. The transforms run in the grid's element type; the libraries
+exponent. NUFSHT's and the direct transforms take a field's coefficients as `analysis` says
+([`Filtering.AbstractAnalysis`](@ref)). `Quadrature()` is the sum `Σ_k (A_k/R²) F_k conj(ₛY_ℓm(x_k))` over the
+grid's cells, exact for a field of degree at most `ℓ_max` where the measure integrates degree `2ℓ_max` exactly
+(Gauss–Legendre rows), and over a regional grid the integral of the field extended by zero. `LeastSquares()`
+minimizes `Σ_k A_k |F_k − Σ C_ℓm ₛY_ℓm(x_k)|²` by LSMR in the inner product of the cell measures, starting from the
+quadrature, and recovers a field of degree at most `ℓ_max` wherever the cells determine its coefficients; a fit
+that stops at its iteration limit keeps its last iterate and reports through
+[`Filtering.analysis_status`](@ref). `AutoAnalysis()`, the default, keeps the quadrature on Gauss–Legendre and
+reduced Gaussian samplings, where it is exact, and on grids that may be regional (no sampling,
+latitude–longitude, scattered), and fits on every other spherical sampling, whose quadrature is not exact at its
+band limit (Fejér, Driscoll–Healy, McEwen–Wiaux, HEALPix, cubed sphere, icosahedral, Yin–Yang); a
+latitude–longitude grid over the whole sphere takes `LeastSquares()` by name. `ℓ_max` is the band limit of a
+sampling that ties one to its ring count, and on any other grid the degree whose half wavelength is the side
+`√A` of the largest cell, `⌈πR/√A⌉ − 1` ([`Filtering.spin_band_limit`](@ref)); `GeneralizedConvolution(; lmax)`
+sets it, and the vector filter cuts sharply there. A `method = Spectral()` plan over a spherical node set takes
+`analysis` the same way. The transforms run in the grid's element type; the libraries
 run in host memory, through which a device workspace stages its fields, and the direct sum runs in the
 workspace's own memory under its execution backend.
 
@@ -459,11 +560,12 @@ first order on strongly skewed local stencils.
 
 - Aluie, H. (2011). Compressible turbulence: the cascade and its locality. *Phys. Rev. Lett.* 106(17).
 - Aluie, H. (2019). Convolutions on the sphere: commutation with differential operators. *GEM* 10(1). doi:10.1007/s13137-019-0123-9
-- Aluie, H., Hecht, M., & Vallis, G. K. (2018). Mapping the energy cascade in the North Atlantic Ocean. *J. Phys. Oceanogr.* 48(8). doi:10.1175/JPO-D-17-0100.1
+- Aluie, H., Hecht, M., & Vallis, G. K. (2018). Mapping the energy cascade in the North Atlantic Ocean: the coarse-graining approach. *J. Phys. Oceanogr.* 48(2), 225–244. doi:10.1175/JPO-D-17-0100.1
 - Barkan, R., Srinivasan, K., & McWilliams, J. C. (2024). Eddy–internal wave interactions: stimulated cascades in cross-scale kinetic energy and enstrophy fluxes. *J. Phys. Oceanogr.* 54(6), 1309–1326. doi:10.1175/JPO-D-23-0191.1
 - Germano, M. (1992). Turbulence: the filtering approach. *J. Fluid Mech.* 238. doi:10.1017/S0022112092001733
 - Grooms, I., Loose, N., Abernathey, R., Steinberg, J. M., Bachman, S. D., Marques, G., Guillaumin, A. P., & Yankovsky, E. (2021). Diffusion-based smoothers for spatial filtering of gridded geophysical data. *J. Adv. Model. Earth Syst.* 13, e2021MS002552. doi:10.1029/2021MS002552
 - Jekeli, C. (1981). *Alternative methods to smooth the Earth's gravity field.* Rep. 327, Dept. of Geodetic Science and Surveying, Ohio State University.
+- Karney, C. F. F. (2013). Algorithms for geodesics. *J. Geodesy* 87(1), 43–55. doi:10.1007/s00190-012-0578-z
 - Loose, N., Bachman, S., Grooms, I., & Jansen, M. (2023). Diagnosing scale-dependent energy cycles in a high-resolution isopycnal ocean model. *J. Phys. Oceanogr.* 53, 157.
 - Pedlosky, J. (1987). *Geophysical Fluid Dynamics* (2nd ed.). Springer.
 - Sadek, M., & Aluie, H. (2018). Extracting the spectrum of a flow by spatial filtering. *Phys. Rev. Fluids* 3, 124610. doi:10.1103/PhysRevFluids.3.124610

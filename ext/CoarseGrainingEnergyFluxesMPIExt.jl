@@ -87,8 +87,7 @@ function CGEF.Pipeline.mpi_coarse_grain_batch!(
     nproc = MPI.Comm_size(comm)
     _zero_batch!(batch)
     mine = (rank + 1):nproc:length(batch.slices)
-    isempty(mine) || CGEF.Pipeline._run_slices!(batch, u, v, w, grid, valR, ctx, mine,
-                                                CGEF.Pipeline._worker_scratch(ctx, grid, w, 1))
+    CGEF.Pipeline._run_base!(batch, u, v, w, grid, valR, ctx, mine)
     MPI.Allreduce!(batch.Π, +, comm)
     MPI.Allreduce!(batch.scales, +, comm)
     MPI.Allreduce!(batch.cumulative_energy, +, comm)

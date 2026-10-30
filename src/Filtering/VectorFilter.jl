@@ -35,8 +35,10 @@ struct Quadrature <: AbstractAnalysis end
 The coefficients minimizing `Σ_k w_k |F_k − Σ_ℓm C_ℓm ₛY_ℓm(x_k)|²` over the grid's cells, by FlowTransformBindings'
 `lsmr!` in the inner product of the cells' measures, whose first iterate is the [`Quadrature`](@ref). It
 recovers a field of degree at most `lmax` wherever the cells determine its coefficients, whatever the
-quadrature's accuracy. `rtol` bounds `‖Aᴴ W r‖ / ‖Aᴴ W F‖`, `nothing` taking `max(1e-12, 100 eps(T))`; a fit
-that stops at `maxiter` keeps its last iterate and reports through [`analysis_status`](@ref).
+quadrature's accuracy. `rtol` bounds `‖Aᴴ W r‖ / ‖Aᴴ W F‖`. `nothing` takes `max(1e-12, 100 eps(T))` in the
+generalized convolution's transforms, and `max(10 tol, √eps(T))` in a NUFSHT spectral plan, whose NUFFT tolerance
+`tol` bounds the fit's accuracy. A fit that stops at `maxiter` keeps its last iterate and reports through
+[`analysis_status`](@ref).
 """
 struct LeastSquares{R<:Union{Nothing,Real}} <: AbstractAnalysis
     rtol::R

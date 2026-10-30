@@ -169,6 +169,20 @@ CGEF.Filtering.spectral_grid_plan(
 
 CGEF.Filtering.spectral_scratch(gp::FSHGridPlan) = _fsh_scratch(gp)
 
+# A worker's copy: the multiplier and renormalization shared, the plan cache and scratch its own.
+CGEF.Filtering._scratch(plan::FSHFilterPlan) = plan.scratch
+CGEF.Filtering._with_scratch(plan::FSHFilterPlan, sc::FSHScratch) =
+    _fsh_plan(plan.mult, plan.grid_plan, plan.invrenorm, plan.strategy, sc)
+CGEF.Filtering._grid_plan(plan::FSHFilterPlan) = plan.grid_plan
+CGEF.Filtering._with_grid_plan(plan::FSHFilterPlan, gp::FSHGridPlan) =
+    _fsh_plan(plan.mult, gp, plan.invrenorm, plan.strategy, plan.scratch)
+CGEF.Filtering._fresh(sc::FSHScratch) =
+    FSHScratch(zero(sc.scratch), zero(sc.masked_input), CGEF.Filtering._fresh_buffer(sc.stage))
+CGEF.Filtering._alike(a::S, b::S) where {S<:FSHScratch} = size(a.scratch) == size(b.scratch)
+CGEF.Filtering._fresh_grid_plan(gp::FSHGridPlan{T,MK,B}) where {T,MK,B} = FSHGridPlan{T,MK,B}(
+    _warmed_cache(gp.N, gp.M, gp.nthreads), gp.N, gp.M, gp.lmax, gp.mmax, gp.radius, gp.mask, gp.nthreads, gp.execution,
+)
+
 CGEF.Filtering.spectral_filter_plan(
     ::CGEF.SpectralBackends.AbstractFSHTSpectralBackend, grid::_CCGrid{T}, kernel::CGEF.Kernels.AbstractFilterKernel,
     scale::T; kwargs...,
@@ -505,9 +519,13 @@ function _fsh_spin_transforms(grid::_CCGrid, lmax, nthreads::Integer)
         "`transform = AutoSpectralBackend()`, which takes NUFSHT where it is loaded and the direct sum " *
         "otherwise.",
     ))
+    return _warmed_spin(N, M, Int(nthreads))
+end
+
+# Every spin's plans, built by one transform and one evaluation each of a zero field.
+function _warmed_spin(N::Int, M::Int, nth::Int)
     cache = FSH.SpinSphPlanCache{ComplexF64}()
     F = zeros(ComplexF64, N, M)
-    nth = Int(nthreads)
     FFTW.set_num_threads(nth) do
         FTB.with_fasttransforms_threads(nth) do
             for s in 0:2
@@ -518,6 +536,9 @@ function _fsh_spin_transforms(grid::_CCGrid, lmax, nthreads::Integer)
     end
     return FSHSpinTransforms(cache, N, M, nth)
 end
+
+# A worker's transforms: a plan cache of its own, since a transform writes its cache's scratch.
+CGEF.Filtering._worker_transforms(tr::FSHSpinTransforms) = _warmed_spin(tr.N, tr.M, tr.nthreads)
 
 CGEF.Filtering.spin_transforms(
     ::CGEF.SpectralBackends.AbstractFSHTSpectralBackend, grid::_CCGrid;

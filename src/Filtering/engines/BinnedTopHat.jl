@@ -136,7 +136,7 @@ function binned_tophat_plan(
 end
 
 """
-    binned_tophat_plan(grid::CurvilinearGrid, kernel::TopHatKernel{CellOverlap}, scale; mask_strategy, cache_strategy, cache_byte_budget)
+    binned_tophat_plan(grid::CurvilinearGrid, kernel::TopHatKernel{CellOverlap}, scale; mask_strategy, cache_strategy)
 
 The binned top-hat over a Cartesian curvilinear mesh, each cell weighted by its area inside the disk: bins
 wholly within `R − ρ` of every target in a bin add as runs, points within `R − ρ` count whole, and the cells
@@ -146,8 +146,7 @@ area, the mesh having no lattice past its edge.
 """
 function binned_tophat_plan(
     grid::FlowGeometries.Grids.CurvilinearGrid{T,G,2}, kernel::Kernels.TopHatKernel{Kernels.CellOverlap}, scale::T;
-    mask_strategy::AbstractMaskStrategy = ZeroFill(), cache_strategy::AbstractCacheStrategy = AutoCache(),
-    cache_byte_budget::Integer = default_cache_byte_budget(), kwargs...,
+    mask_strategy::AbstractMaskStrategy = ZeroFill(), cache_strategy::AbstractCacheStrategy = AlwaysCache(), kwargs...,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.AbstractCartesianGeometry{T}}
     bp = BinnedPoints(grid, Val(2))
     poly = OverlapPolygons(grid, Kernels.kernel_radius(kernel, scale))
@@ -170,7 +169,7 @@ function binned_tophat_plan(
     open = BinnedEdgeCells(vx, vy, R, inner^2, (R + ρ)^2, nothing)
     fp = _binned_tophat_plan(bp, R + ρ, mask_strategy, open, inner)
     edge = BinnedEdgeCells(vx, vy, R, inner^2, (R + ρ)^2,
-                           _binned_edge_cache(fp, open, cache_strategy, cache_byte_budget))
+                           _binned_edge_cache(fp, open, cache_strategy))
     # `ZeroFill` divides by the disk's area; `Deformable` by the active cells' weights, found above.
     mask_strategy isa ZeroFill && fill!(fp.invden, _inv_mass(T(π) * R^2))
     return BinnedTopHatPlan(fp.points, fp.rad, fp.lines, fp.win, fp.wout, fp.buffers, fp.invden, fp.strategy,
@@ -213,18 +212,18 @@ end
 end
 
 # Every target's cells in the band between `rin2` and `rout2`, their fractions held in bin order, or `nothing`
-# where `strategy` does not keep them within `budget`.
-function _binned_edge_cache(fp::BinnedTopHatPlan{D,T}, e::BinnedEdgeCells{T}, strategy, budget) where {D,T}
+# where `strategy` keeps none.
+function _binned_edge_cache(fp::BinnedTopHatPlan{D,T}, e::BinnedEdgeCells{T}, strategy) where {D,T}
     n = length(fp.points.order)
-    count = _cache_entries(strategy, budget, sizeof(Int) + sizeof(T)) do limit
-        _binned_edge_pass((m, _, _, _) -> m + 1, 0, fp, e, limit)
+    count = _cache_entries(strategy) do
+        _binned_edge_pass((m, _, _, _) -> m + 1, 0, fp, e)
     end
     count === nothing && return nothing
     ptr = zeros(Int, n + 1)
-    src = Vector{Int}(undef, count)
+    src = Vector{Int32}(undef, count)
     frac = Vector{T}(undef, count)
     ptr[1] = 1
-    _binned_edge_pass(0, fp, e, typemax(Int)) do m, s, s1, fr
+    _binned_edge_pass(0, fp, e) do m, s, s1, fr
         m += 1
         src[m] = s1
         frac[m] = fr
@@ -239,8 +238,8 @@ function _binned_edge_cache(fp::BinnedTopHatPlan{D,T}, e::BinnedEdgeCells{T}, st
 end
 
 # Fold `acc = f(acc, s, s₁, fr)` over every target `s` (bin order) and each cell `s₁` in its band with fraction
-# `fr`, stopping once `acc` passes `limit`.
-function _binned_edge_pass(f::F, acc, fp::BinnedTopHatPlan{D,T}, e::BinnedEdgeCells{T}, limit::Int) where {F,D,T}
+# `fr`.
+function _binned_edge_pass(f::F, acc, fp::BinnedTopHatPlan{D,T}, e::BinnedEdgeCells{T}) where {F,D,T}
     bp = fp.points
     strides = accumulate(*, (1, Base.front(bp.nb)...))
     cart = CartesianIndices(bp.nb)
@@ -254,7 +253,6 @@ function _binned_edge_pass(f::F, acc, fp::BinnedTopHatPlan{D,T}, e::BinnedEdgeCe
                 fr = _edge_fraction(e, s1, p, shift)
                 iszero(fr) ? a : f(a, s, s1, fr)
             end
-            acc > limit && return acc
         end
     end
     return acc
@@ -624,8 +622,7 @@ function _binned_csr(bp::BinnedPoints{D,T}, kernel, scale::T, dim::Val, rad::T, 
     @inbounds for t in 1:n
         ptr[t + 1] += ptr[t]
     end
-    _check_list_bytes(ptr[n + 1] - 1, n, T)
-    nbrs = Vector{Int}(undef, ptr[n + 1] - 1)
+    nbrs = Vector{Int32}(undef, ptr[n + 1] - 1)
     w = Vector{T}(undef, ptr[n + 1] - 1)
     FlowGeometries.Execution.run_chunks(cld(nbins, _BINNED_BLOCK), backend) do ks
         for k in ks
