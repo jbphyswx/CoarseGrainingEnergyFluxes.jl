@@ -55,10 +55,14 @@ _share_run(_, inner::ComputationalBackends.AbstractExecutionBackend, _) = throw(
     "a process's share of a real-space filter runs on $(nameof(typeof(inner))) through that backend's " *
     "extension: `using OhMyThreads` for a threaded inner backend"))
 
-# The backend a plan's build divides its independent rows among, through `_share_run`: a threaded plan's threads,
-# one chunk for any other plan.
+# The backend a plan's build divides its independent rows among, through `_share_run`: a threaded plan's threads; for
+# any other plan the threads a batch driver lends while it builds the tables its serial workers share (`_BATCH_BUILD`),
+# one chunk otherwise. The plan's own transforms keep its backend's thread count.
+const _BATCH_BUILD = Base.ScopedValues.ScopedValue{Union{Nothing,ComputationalBackends.ThreadedBackend}}(nothing)
 _build_share(b::ComputationalBackends.AbstractThreadedBackend) = b
-_build_share(::ComputationalBackends.AbstractExecutionBackend) = ComputationalBackends.SerialBackend()
+_build_share(::ComputationalBackends.AbstractExecutionBackend) = _lent_build(_BATCH_BUILD[])
+_lent_build(::Nothing) = ComputationalBackends.SerialBackend()
+_lent_build(b::ComputationalBackends.ThreadedBackend) = b
 
 # ---- 2-D rows: the banded and cell-by-cell footprints, one pass -----------------------------------
 

@@ -340,14 +340,17 @@ function CGEF.Filtering.threaded_filter_slices!(outs, fields, plans)
 end
 
 # Batch-parallel pipeline sweeps over one shared grid; slices write disjoint views of the batched result.
-# The tables are built once; chunk `ci` owns scratch pool entry `ci`, a worker copy of the base built in its
-# task when the caller supplied none, so its buffers are first touched by the thread that uses them.
+# The tables are built once, their rows divided among the threads; chunk `ci` owns scratch pool entry `ci`, a worker
+# copy of the base built in its task when the caller supplied none, so its buffers are first touched by the thread
+# that uses them.
 function CGEF.Pipeline.threaded_coarse_grain_batch!(batch, u, v, w, grid, valR, ctx)
     n = length(batch.slices)
     n == 0 && return batch
     groups = OhMyThreads.chunks(1:n; n = CGEF.Pipeline.batch_concurrency(ctx, n))
     _farm() do
-        base = CGEF.Pipeline._batch_base(batch, u, v, w, grid, valR, ctx, 1)
+        base = Base.ScopedValues.with(CGEF.Filtering._BATCH_BUILD => CGEF.ComputationalBackends.ThreadedBackend()) do
+            CGEF.Pipeline._batch_base(batch, u, v, w, grid, valR, ctx, 1)
+        end
         OhMyThreads.tforeach(enumerate(groups); scheduler = _sched()) do (ci, group)
             _run_worker!(batch, u, v, w, grid, valR, ctx, group, base, ci)
         end

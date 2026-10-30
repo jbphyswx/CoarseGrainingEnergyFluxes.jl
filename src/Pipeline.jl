@@ -472,6 +472,7 @@ coarse_grain(u::AbstractArray, v::AbstractArray, grid::FlowGeometries.Grids.Abst
 # plans share their method and form, and a derivative plan's weights depend on the grid alone.
 @inline _sweep_route(derivative, deriv_plan, ws, plans, strat, grid) = Diagnostics._derivative_route(
     derivative, deriv_plan, Diagnostics._route_source(ws.spin, _read_plan(_scale_plan(plans, 1), strat)), grid,
+    ws.u_filt,
 )
 
 @inline _plan_filter_sweep(grid, kernel, scales, strat, backend, method, transform) =

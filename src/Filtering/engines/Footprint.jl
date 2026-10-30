@@ -276,8 +276,7 @@ function _scattered_parts(
     keep = _cache_keep(strategy)
     weights, exterior, kept = _highorder_targets(grid, kernel, scale, rad, fold, FlowGeometries.Connectivity.ball_scratch,
                                                  _ho_lattice(grid, rad), keep, !keep, _build_share(execution))
-    Nx = FlowGeometries.Grids.size_tuple(grid)[1]
-    cache = kept === nothing ? nothing : _run_cache([J[1] + (J[2] - 1) * Nx for J in kept[1]], kept[2], kept[3])
+    cache = kept === nothing ? nothing : _run_cache(kept[1], kept[2], kept[3])
     return cache, exterior, weights
 end
 

@@ -28,12 +28,11 @@ function _cgef_cartesian_rows()
 
     # Periods 16 and 8.4; the supports reach one, two and five periods, and a periodic Cartesian direction
     # counts a cell once per image. Each kernel takes its own engine (prefix sums, separable passes, the
-    # banded sum) while that costs fewer operations than the padded transform, and the transform past it; the
-    # cell overlap's edge cells put the top-hat past it here at every scale.
+    # banded sum) while that costs fewer operations than the padded transform, and the transform past it.
     gp = FG.Grids.StructuredGrid(cart, 0.0:1.0:15.0, 0.0:0.7:7.7; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()))
     row(gp, _CGEF_THC, 1.5, :PrefixSumTopHatPlan)
-    row(gp, _CGEF_TH, 1.5, :PaddedFFTFootprint)
-    row(gp, _CGEF_TH, 1.5, :PrefixSumTopHatPlan; engine = _CGEF_FE)
+    row(gp, _CGEF_TH, 1.5, :PrefixSumTopHatPlan)
+    row(gp, _CGEF_TH, 1.5, :PaddedFFTFootprint; engine = CGEF.Filtering.PaddedFFTEngine())
     row(gp, _CGEF_SH, 1.5, :FilterFootprint)
     row(gp, _CGEF_GA, 1.5, :SeparableFootprint; rtol = 1e-8)
     for ℓ in (4.8, 19.2, 40.8)

@@ -71,8 +71,9 @@ end
 """
     tracer_variance_flux!(Πθ, ws, u, v, θ, grid, kernel, scale; filter_plan=nothing, deriv_plan=nothing, execution=AutoBackend(), mask_strategy=ZeroFill()) -> Πθ
 
-In-place [`tracer_variance_flux`](@ref). With `ws`, `filter_plan` and `deriv_plan` all supplied, a
-repeated evaluation — over timesteps or scales — allocates nothing.
+In-place [`tracer_variance_flux`](@ref). With `ws`, `filter_plan` and `deriv_plan = derivative_route(grid,
+filter_plan, u)` ([`derivative_route`](@ref)) supplied, a repeated evaluation — over timesteps or scales — allocates
+no field.
 """
 function tracer_variance_flux!(
     Πθ::AbstractVecOrMat{T},
@@ -84,7 +85,7 @@ function tracer_variance_flux!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
+    deriv_plan::_DerivRoute{<:AnyDerivPlan} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
@@ -95,7 +96,7 @@ function tracer_variance_flux!(
         filter_plan
     _check_placement(ws.at, plan)
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid, u))
 
     @. ws.uθ = u * θ
     @. ws.vθ = v * θ
@@ -222,7 +223,7 @@ function tracer_variance_flux!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
+    deriv_plan::_DerivRoute{<:AnyDerivPlan} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
@@ -233,7 +234,7 @@ function tracer_variance_flux!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid, u))
     sf = _spin_of(ws.spin, plan)
     if sf === nothing
         Fθ = _cartesian_tracer_flux!(ws, u, v, θ, plan, _output_frames(ws.at, plan), b, dplan)
@@ -326,7 +327,7 @@ function tracer_variance_flux!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,FlowGeometries.Operators.StencilPlans} = nothing,
+    deriv_plan::_DerivRoute{<:FlowGeometries.Operators.StencilPlans} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
@@ -337,7 +338,7 @@ function tracer_variance_flux!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid, u))
     p, bp, pθ = ws.p, ws.bp, ws.pθ
 
     _fill_tau3_velocity!(p, u, v, w, ws.at.grid, ws.at.frames, b)

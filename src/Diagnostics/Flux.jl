@@ -3,16 +3,19 @@
 # ---------------------------------------------------------------------------
 
 """
-    SeriesStrain(gradient = nothing)
+    SeriesStrain(gradient, spectra)
 
 The derivative route of a diagnostic whose filtered fields are differentiated from their filter's own series
 ([`Derivatives.SpectralDerivative`](@ref)), in the place of a derivative plan; a sweep passes it as
-`deriv_plan` once resolved. `gradient` is the plan's [`Filtering.series_gradient`](@ref).
+`deriv_plan` once resolved. `gradient` is the plan's [`Filtering.series_gradient`](@ref), and `spectra` the
+analyses the diagnostic's filtered fields are synthesized from (`Filtering.analyze_buffer`s for fields of its
+shape, added as a call asks for more), or `nothing` where the filter keeps its own. Both hold buffers, so each
+concurrent caller resolves its own route.
 """
-struct SeriesStrain{G}
+struct SeriesStrain{G,S}
     gradient::G
+    spectra::S
 end
-SeriesStrain() = SeriesStrain(nothing)
 
 # A `deriv_plan` keyword: a derivative plan, a sweep's resolved series route, or `nothing`.
 const _DerivRoute{P} = Union{Nothing, P, SeriesStrain}
@@ -116,7 +119,7 @@ function analyze_sweep(
     return _ambient_analysis(Filtering.analyze_buffer(plan, ws.ux), ws, plan)
 end
 
-_ambient_analysis(::Nothing, _ws, _plan) = SphericalAnalysis()
+_ambient_analysis(::Nothing, ::ΠWorkspace, _plan) = SphericalAnalysis()
 function _ambient_analysis(F̂x, ws::ΠWorkspace, plan)
     a = (velocity = (F̂x, Filtering.analyze_buffer(plan, ws.uy), Filtering.analyze_buffer(plan, ws.uz)),
          product = ntuple(_ -> Filtering.analyze_buffer(plan, ws.ux), Val(6)))
@@ -280,6 +283,6 @@ function compute_Π!(
     )
     _check_workspace_w(ws, w)
     # The stencil weights depend only on the output grid, so one plan serves every scale.
-    route = _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid)
+    route = _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid, u)
     return _compute_Π!(Π, u, v, w, grid, ws, plan, route, kernel, scale, analyzed)
 end

@@ -303,3 +303,87 @@ Test.@testset "Scale-derivative routes, held rates and backends" begin
         Test.@test got ≈ ref rtol = 1e-12
     end
 end
+
+# Under `HighPass()` the spectrum of the residual `u′ = u − ū` (Zhao & Aluie 2025): on a sum of Fourier modes under a
+# spectral plan `E′ = Σ a²(1 − Ĝ)²/4` and `E′(k_ℓ) = ℓ² dE′/dℓ = −ℓ² Σ a²(1 − Ĝ)∂_ℓĜ/2`, and on the difference route
+# `−dE′/dk`. `ZeroFill` reads `u` as zero on land, `Deformable` sums the active cells; the local spectrum's mean is the
+# spectrum; the device whole-batch sweep gives each slice its own sweep's. A `k⁻⁴` field's high-pass slope recovers its
+# exponent, `α < 2p + 3 = 5` for the Gaussian, where the low-pass spectrum saturates near `k⁻³`.
+Test.@testset "The high-pass filtering spectrum" begin
+    D = CGEF.Diagnostics
+    K = CGEF.Kernels
+    F = CGEF.Filtering
+    HP = D.HighPass()
+    P = FG.Grids.Periodic()
+    cart = FG.Geometry.CartesianGeometry()
+    n = 32
+    x = range(0.0, 2π; length = n + 1)[1:n]
+    box = FG.Grids.StructuredGrid(cart, x, x; topology = (P, P))
+    modes = ((1, 0, 1.0), (3, 2, 0.6), (5, -4, 0.3), (9, 1, 0.2))
+    um = [sum(m[3] * cos(m[1] * p + m[2] * q) for m in modes) for p in x, q in x]
+    scales = collect(range(0.3, 1.2; length = 5))
+    Ĝ(k, m, ℓ) = K.spectral_transfer(k, hypot(m[1], m[2]), ℓ, Val(2))
+    ∂Ĝ(k, m, ℓ) = K.scale_rate_transfer(k, hypot(m[1], m[2]), ℓ, Val(2))
+    Logging.with_logger(Logging.NullLogger()) do
+        for k in (_CGEF_GA, _CGEF_TH)
+            E′ = [sum(m[3]^2 * (1 - Ĝ(k, m, ℓ))^2 for m in modes) / 4 for ℓ in scales]
+            dE′ = [-sum(m[3]^2 * (1 - Ĝ(k, m, ℓ)) * ∂Ĝ(k, m, ℓ) for m in modes) / 2 for ℓ in scales]
+            kw = (; scales, kernel = k, method = F.Spectral(), execution = _CGEF_SERIAL, spectrum = D.ForceSpectrum(), pass = HP)
+            r = CGEF.coarse_grain(um, zero(um), box; kw..., scale_derivative = D.ExactScaleDerivative())
+            Test.@test r.cumulative_energy ≈ E′ rtol = 1e-12
+            Test.@test r.filtering_spectrum ≈ scales .^ 2 .* dE′ rtol = 1e-12
+            rd = CGEF.coarse_grain(um, zero(um), box; kw..., scale_derivative = D.DifferenceScaleDerivative())
+            Test.@test rd.filtering_spectrum ≈ -D.spectral_density(E′, 1 ./ scales) rtol = 1e-10
+        end
+    end
+
+    xb = collect(0.0:1.0:39.0)
+    land = [!(12 <= i <= 20 && 8 <= j <= 15) for i in 1:40, j in 1:30]
+    g = FG.Grids.StructuredGrid(cart, xb, xb[1:30], land)
+    u = _cgef_field((40, 30))
+    w = _cgef_field((40, 30)) .^ 2
+    u[15, 10] = NaN
+    A, area = FG.Grids.measure(g), D.active_area(g)
+    for s in (F.ZeroFill(), F.Deformable())
+        p = F.plan_filter(g, _CGEF_GA, 5.0; mask_strategy = s, execution = _CGEF_SERIAL)
+        ū, w̄ = F.filter_apply!(zeros(40, 30), u, p), F.filter_apply!(zeros(40, 30), w, p)
+        keep = s isa F.ZeroFill ? trues(40, 30) : land
+        r2 = (ifelse.(land, u, 0.0) .- ū) .^ 2 .+ (ifelse.(land, w, 0.0) .- w̄) .^ 2
+        got = D.cumulative_energy(u, w, nothing, g, _CGEF_GA, [5.0]; mask_strategy = s, execution = _CGEF_SERIAL, pass = HP)[1]
+        Test.@test got ≈ sum(r2[keep] .* A[keep]) / (2area) rtol = 1e-12
+    end
+    w[15, 10] = 1.0
+    for sd in (D.ExactScaleDerivative(), D.DifferenceScaleDerivative())
+        r = CGEF.coarse_grain(u, w, g; scales = [3.0, 4.0, 5.0, 6.5], kernel = _CGEF_GA, execution = _CGEF_SERIAL, pass = HP,
+                              spectrum_maps = D.SpectrumMaps(), scale_derivative = sd)
+        Ao = FG.Grids.measure(D.output_grid(g, F.ZeroFill()))
+        Test.@test [sum(selectdim(r.spectrum_map, 3, s) .* Ao) for s in 1:4] ./ area ≈ r.filtering_spectrum rtol = 1e-12
+        Test.@test all(>(0), r.filtering_spectrum)
+    end
+    ub, wb = cat(um, 0.5 .* um .+ 0.1; dims = 3), cat(zero(um), 0.3 .* um; dims = 3)
+    dev = CGEF.ComputationalBackends.GPUBackend(KA.CPU())
+    b = CGEF.Pipeline.CoarseGrainBatchResult(box, length(scales), (2,); execution = dev, slopes = D.Slopes())
+    CGEF.Pipeline.coarse_grain_batch!(b, ub, wb, box; scales, kernel = _CGEF_GA, execution = dev, pass = HP,
+                                      scale_derivative = D.ExactScaleDerivative())
+    for t in 1:2
+        rt = CGEF.coarse_grain(ub[:, :, t], wb[:, :, t], box; scales, kernel = _CGEF_GA, execution = _CGEF_SERIAL, pass = HP,
+                               slopes = D.Slopes(), scale_derivative = D.ExactScaleDerivative())
+        Test.@test b.slices[t].cumulative_energy ≈ rt.cumulative_energy rtol = 1e-12
+        Test.@test b.slices[t].filtering_spectrum ≈ rt.filtering_spectrum rtol = 1e-12
+        Test.@test b.slices[t].spectral_slope ≈ rt.spectral_slope rtol = 1e-10
+    end
+
+    # Shell amplitudes `|F|² ∝ k^-(α+1)` with phases from a fixed sequence, so the shell spectrum is `k^-α`.
+    N = 256
+    torus = FG.Grids.StructuredGrid(cart, range(0.0; step = 2π / N, length = N), range(0.0; step = 2π / N, length = N);
+                                    topology = (P, P))
+    kf = FFTW.fftfreq(N, N)
+    powerlaw(α, s) = real.(FFTW.ifft([hypot(a, b) == 0 ? 0.0im : hypot(a, b)^(-(α + 1) / 2) * cis(1e3 * sin(s + 13a + 7b))
+                                      for a in kf, b in kf])) .* N^2
+    dense = exp.(range(log(0.12), log(0.9); length = 40))
+    middle(x) = sort(x[8:33])[13]
+    slope(pass) = middle(CGEF.coarse_grain(powerlaw(4.0, 1.0), powerlaw(4.0, 2.0), torus; scales = dense, kernel = _CGEF_GA,
+                                            method = F.Spectral(), execution = _CGEF_SERIAL, pass, slopes = D.Slopes()).spectral_slope)
+    Test.@test abs(slope(HP) + 4) < 0.15
+    Test.@test slope(D.LowPass()) > -3.1
+end

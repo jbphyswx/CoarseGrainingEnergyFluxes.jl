@@ -204,7 +204,7 @@ function compute_Π_decomposed!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
+    deriv_plan::_DerivRoute{<:AnyDerivPlan} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
@@ -215,7 +215,7 @@ function compute_Π_decomposed!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid, u))
     sf = _spin_of(ws.spin, plan)
     if sf === nothing
         fr = _output_frames(ws.at, plan)
@@ -309,7 +309,8 @@ end
         -> (; total, rotational, cross, divergent)
 
 In-place [`compute_Π_decomposed`](@ref). Returns views of `ws`'s buffers, valid until the next call on
-the same workspace. With `ws` and both plans supplied, a repeated evaluation allocates nothing.
+the same workspace. With `ws`, `filter_plan` and `deriv_plan = derivative_route(grid, filter_plan, u)`
+([`derivative_route`](@ref)) supplied, a repeated evaluation allocates no field.
 """
 function compute_Π_decomposed!(
     ws::PiDecomposedWorkspace{T},
@@ -321,7 +322,7 @@ function compute_Π_decomposed!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
+    deriv_plan::_DerivRoute{<:AnyDerivPlan} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
@@ -333,7 +334,7 @@ function compute_Π_decomposed!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid, u))
 
     @. ws.u_div = u - u_rot
     @. ws.v_div = v - v_rot

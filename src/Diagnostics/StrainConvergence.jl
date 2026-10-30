@@ -34,7 +34,8 @@ end
         -> (; total, strain, convergence, divergence, strain_magnitude)
 
 In-place [`compute_Π_strain_convergence`](@ref). Returns views of `ws`'s buffers, valid until the next
-call on the same workspace. With `ws` and both plans supplied, a repeated evaluation allocates nothing.
+call on the same workspace. With `ws`, `filter_plan` and `deriv_plan = derivative_route(grid, filter_plan, u)`
+([`derivative_route`](@ref)) supplied, a repeated evaluation allocates no field.
 """
 function compute_Π_strain_convergence!(
     ws::PiStrainWorkspace{T},
@@ -44,7 +45,7 @@ function compute_Π_strain_convergence!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
+    deriv_plan::_DerivRoute{<:AnyDerivPlan} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
@@ -56,7 +57,7 @@ function compute_Π_strain_convergence!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid, u))
 
     Fu, Fv = _filtered_with_spectra!((ws.ū, ws.v̄), (u, v), plan, dplan)
     _second_moment!(ws.τuu, u, u, ws.ū, ws.ū, ws.prod, ws.fbuf, plan)
@@ -193,7 +194,7 @@ function compute_Π_strain_convergence!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
+    deriv_plan::_DerivRoute{<:AnyDerivPlan} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
@@ -202,7 +203,7 @@ function compute_Π_strain_convergence!(
     plan = _plan_for(ws.spin, filter_plan, mask_strategy,
                      () -> Filtering.plan_filter(grid, kernel, scale; mask_strategy = mask_strategy, execution = execution))
     _check_placement(ws.at, plan)
-    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid, u))
 
     _fill_stress_strain!(u, v, nothing, grid, ws, plan, dplan, kernel, scale, nothing)
 
@@ -338,7 +339,8 @@ end
         -> (; total, rotational, cross, divergent)
 
 In-place true-3D [`compute_Π_decomposed`](@ref). Returns views of `ws`'s buffers, valid until the next
-call on the same workspace. With `ws` and both plans supplied, a repeated evaluation allocates nothing.
+call on the same workspace. With `ws`, `filter_plan` and `deriv_plan = derivative_route(grid, filter_plan, u)`
+([`derivative_route`](@ref)) supplied, a repeated evaluation allocates no field.
 """
 function compute_Π_decomposed!(
     ws::PiDecomposed3DWorkspace{T},
@@ -352,7 +354,7 @@ function compute_Π_decomposed!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,FlowGeometries.Operators.StencilPlans} = nothing,
+    deriv_plan::_DerivRoute{<:FlowGeometries.Operators.StencilPlans} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
@@ -363,7 +365,7 @@ function compute_Π_decomposed!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid, u))
 
     rot = (u_rot, v_rot, w_rot)
     dv, br, bd, pr = ws.div, ws.br, ws.bd, ws.prod
@@ -475,7 +477,7 @@ function compute_Π_decomposed!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,FlowGeometries.Operators.StencilPlans} = nothing,
+    deriv_plan::_DerivRoute{<:FlowGeometries.Operators.StencilPlans} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
@@ -486,7 +488,7 @@ function compute_Π_decomposed!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og, fr = _output(ws.at, plan), _output_frames(ws.at, plan)
-    dplan = _placed(ws.at, _shell_route(_derivative_route(derivative, deriv_plan, plan, grid)))
+    dplan = _placed(ws.at, _shell_route(_derivative_route(derivative, deriv_plan, plan, grid, u)))
     pr, pd, br, bd = ws.pr, ws.pd, ws.br, ws.bd
 
     _fill_tau3_velocity!(pr, u_rot, v_rot, w_rot, ws.at.grid, ws.at.frames, b)

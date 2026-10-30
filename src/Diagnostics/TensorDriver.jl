@@ -474,29 +474,54 @@ function _series_sphere!(sf::SpinFilter, u, v, w, _grid, ws::ΠWorkspace, _plan,
 end
 
 """
-    _derivative_route(derivative, deriv_plan, plan, grid) -> derivative plan or SeriesStrain()
+    _derivative_route(derivative, deriv_plan, plan, grid, x) -> derivative plan or SeriesStrain
 
-How a diagnostic on `grid` differentiates the fields `plan` filters: a derivative plan of
-[`output_grid`](@ref), or [`SeriesStrain`](@ref). A given `deriv_plan` stands for
+How a diagnostic on `grid` differentiates the fields `plan` filters, fields shaped like `x`: a derivative plan
+of [`output_grid`](@ref), or [`SeriesStrain`](@ref). A given `deriv_plan` stands for
 [`Derivatives.PhysicalDerivative`](@ref); `SpectralDerivative()` with one, or on a plan with no series
 form, raises.
 """
-@inline _derivative_route(::Derivatives.AutoDerivative, ::Nothing, plan, grid) = _auto_route(_spectral_form(plan), plan, grid)
-@inline _derivative_route(::Derivatives.AutoDerivative, deriv_plan, _, _) = deriv_plan
-@inline _derivative_route(d::Derivatives.PhysicalDerivative, ::Nothing, plan, grid) =
+@inline _derivative_route(::Derivatives.AutoDerivative, ::Nothing, plan, grid, x) =
+    _auto_route(_spectral_form(plan), plan, grid, x)
+@inline _derivative_route(::Derivatives.AutoDerivative, deriv_plan, _, _, _) = deriv_plan
+@inline _derivative_route(d::Derivatives.PhysicalDerivative, ::Nothing, plan, grid, _) =
     Derivatives.derivative_plan(output_grid(grid, plan); nodes = d.nodes)
-@inline _derivative_route(::Derivatives.PhysicalDerivative, deriv_plan, _, _) = deriv_plan
-@inline _derivative_route(::Derivatives.SpectralDerivative, ::Nothing, plan, _) = _series_route(Filtering.series_form(plan), plan)
-@inline _derivative_route(::Derivatives.SpectralDerivative, _, _, _) = _spectral_with_plan()
+@inline _derivative_route(::Derivatives.PhysicalDerivative, deriv_plan, _, _, _) = deriv_plan
+@inline _derivative_route(::Derivatives.SpectralDerivative, ::Nothing, plan, _, x) =
+    _series_route(Filtering.series_form(plan), plan, x)
+@inline _derivative_route(::Derivatives.SpectralDerivative, route::SeriesStrain, _, _, _) = route
+@inline _derivative_route(::Derivatives.SpectralDerivative, _, _, _, _) = _spectral_with_plan()
+@inline _derivative_route(::Derivatives.PhysicalDerivative, ::SeriesStrain, _, _, _) = _physical_with_series()
 
-@inline _auto_route(::Filtering.NoSeries, plan, grid) = Derivatives.derivative_plan(output_grid(grid, plan))
-@inline _auto_route(::Filtering.AbstractSeriesForm, plan, _) = SeriesStrain(Filtering.series_gradient(plan))
-@inline _series_route(::Filtering.AbstractSeriesForm, plan) = SeriesStrain(Filtering.series_gradient(plan))
-@inline _series_route(::Filtering.NoSeries, plan) = _no_series(plan)
+"""
+    derivative_route(grid, filter_plan, field; derivative = Derivatives.AutoDerivative()) -> deriv_plan
+
+The `deriv_plan` a diagnostic on `grid` filtered by `filter_plan` differentiates by, for fields shaped like `field`,
+built once for every call that passes it: under `derivative`'s choice, a derivative plan of [`output_grid`](@ref), or
+for a filter whose output is a series the [`SeriesStrain`](@ref) route holding the spectra and the gradient synthesis
+its calls read. A route holds buffers, so each concurrent caller builds its own.
+"""
+derivative_route(grid::FlowGeometries.Grids.AbstractGrid, filter_plan::Filtering.AbstractFilterPlan, field::AbstractArray;
+                 derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative()) =
+    _derivative_route(derivative, nothing, filter_plan, grid, field)
+
+@inline _auto_route(::Filtering.NoSeries, plan, grid, _) = Derivatives.derivative_plan(output_grid(grid, plan))
+@inline _auto_route(::Filtering.AbstractSeriesForm, plan, _, x) = _series_strain(plan, x)
+@inline _series_route(::Filtering.AbstractSeriesForm, plan, x) = _series_strain(plan, x)
+@inline _series_route(::Filtering.NoSeries, plan, _) = _no_series(plan)
+
+# A series route over `plan` holding one analysis for fields shaped like `x`; the generalized convolution keeps
+# its coefficients itself.
+_series_strain(plan, x) = SeriesStrain(Filtering.series_gradient(plan), [Filtering.analyze_buffer(plan, x)])
+_series_strain(sf::SpinFilter, _) = SeriesStrain(Filtering.series_gradient(sf), nothing)
 
 @noinline _spectral_with_plan() = throw(ArgumentError(
     "derivative = SpectralDerivative() differentiates the filter's own series, so a `deriv_plan` given with " *
     "it is never read: pass one or the other",
+))
+@noinline _physical_with_series() = throw(ArgumentError(
+    "derivative = PhysicalDerivative() differences the filtered fields, and the given `deriv_plan` is a series " *
+    "route: pass `Diagnostics.derivative_route(grid, filter_plan, field; derivative = PhysicalDerivative())`",
 ))
 @noinline _no_series(plan) = throw(ArgumentError(
     "derivative = SpectralDerivative() needs a filter whose output is a series, and " *
@@ -514,13 +539,13 @@ function _fill_stress_strain!(
     grid::FlowGeometries.Grids.AbstractGrid{G,T},
     ws::ΠWorkspace,
     plan::Filtering.AbstractFilterPlan,
-    ::SeriesStrain,
+    route::SeriesStrain,
     kernel::Kernels.AbstractFilterKernel,
     scale::T,
     analyzed = nothing,
 ) where {T<:AbstractFloat, G<:FlowGeometries.Geometry.CartesianGeometry{T}}
     has_w = w !== nothing
-    a = analyzed === nothing ? analyze_sweep(u, v, w, grid, ws, plan) : analyzed
+    a = analyzed === nothing ? _route_analysis!(route, u, v, w, ws, plan) : analyzed
     vel = _velocity_outs(ws, has_w)
     _synthesize_all!(vel, a.velocity, plan)
     _synthesize_all!(_product_outs(ws, has_w), a.product, plan)
@@ -549,16 +574,37 @@ function _series_shear!(S, (ûi, ūi), (ûj, ūj), i::Int, j::Int, plan, a, b)
 end
 
 # The filtered fields `outs` of `ins`, and under the series route the spectra they come from, one `nothing`
-# per field otherwise.
-function _filtered_with_spectra!(outs::Tuple, ins::Tuple, plan, _route)
+# per field otherwise. The spectra are the route's after the first `used`, which an earlier call of the same
+# diagnostic still reads.
+function _filtered_with_spectra!(outs::Tuple, ins::Tuple, plan, _route, _used::Int = 0)
     Filtering.filter_apply_batch!(outs, ins, plan)
     return map(_ -> nothing, ins)
 end
 
-function _filtered_with_spectra!(outs::Tuple, ins::Tuple, plan, ::SeriesStrain)
-    F = map(f -> Filtering.filter_analyze!(Filtering.analyze_buffer(plan, f), f, plan), ins)
+function _filtered_with_spectra!(outs::Tuple, ins::Tuple, plan, route::SeriesStrain, used::Int = 0)
+    F = _route_spectra!(route.spectra, plan, ins, used)
+    foreach((f̂, f) -> Filtering.filter_analyze!(f̂, f, plan), F, ins)
     _synthesize_all!(outs, F, plan)
     return F
+end
+
+# One call's analyses of the velocity and its products, as `analyze_sweep` takes them, into the route's spectra.
+function _route_analysis!(route::SeriesStrain, u, v, w, ws::ΠWorkspace, plan)
+    has_w = w !== nothing
+    _sweep_products!(ws, u, v, w, has_w)
+    vin, pin = _velocity_ins(u, v, w, has_w), _product_ins(ws, has_w)
+    a = (velocity = _route_spectra!(route.spectra, plan, vin, 0), product = _route_spectra!(route.spectra, plan, pin, length(vin)))
+    foreach((F̂, f) -> Filtering.filter_analyze!(F̂, f, plan), a.velocity, vin)
+    foreach((F̂, f) -> Filtering.filter_analyze!(F̂, f, plan), a.product, pin)
+    return a
+end
+
+# Analyses `used + 1 : used + N` of the route's for `N` fields, added as needed.
+function _route_spectra!(pool::AbstractVector, _plan, ins::NTuple{N,Any}, used::Int) where {N}
+    while length(pool) < used + N
+        push!(pool, similar(first(pool)))
+    end
+    return ntuple(i -> @inbounds(pool[used + i]), Val(N))
 end
 
 # Both tangent components of the gradient of the filtered field `f̄`, whose field's spectrum is `F`:
@@ -760,7 +806,7 @@ function compute_Π!(
         execution, mask_strategy, vector_filter, transform,
     )
     _check_workspace_w(ws, w)
-    route = _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid)
+    route = _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid, u)
     return _compute_Π!(Π, u, v, w, grid, ws, plan, route, kernel, scale, analyzed)
 end
 
@@ -794,7 +840,7 @@ function compute_Π!(
     ws = workspace === nothing ? ΠWorkspace(grid, (), w; execution = Filtering.plan_execution(plan)) : workspace
     _check_workspace_w(ws, w)
     _check_placement(ws.at, plan)
-    route = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid))
+    route = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid, u))
     return _volume_flux!(Π, u, v, w, grid, ws, plan, route, kernel, scale)
 end
 
@@ -876,7 +922,7 @@ function compute_Π!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, _shell_route(_derivative_route(derivative, deriv_plan, plan, grid)))
+    dplan = _placed(ws.at, _shell_route(_derivative_route(derivative, deriv_plan, plan, grid, u)))
 
     _to_ambient!(ws, u, v, w)
     Filtering.filter_apply_batch!((ws.ux_filt, ws.uy_filt, ws.uz_filt), (ws.ux, ws.uy, ws.uz), plan)
@@ -924,7 +970,7 @@ function compute_Π!(
     ws = workspace === nothing ? ΠWorkspace(grid; execution = Filtering.plan_execution(plan)) : workspace
     _check_placement(ws.at, plan)
     og = _output(ws.at, plan)
-    route = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid))
+    route = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid, u))
 
     @. ws.scratch = u * u
     _line_fields!(ws, u, plan, og, route)
@@ -942,11 +988,8 @@ function _line_fields!(ws::ΠWorkspace, u, plan, og, dplan)
     return ws
 end
 
-function _line_fields!(ws::ΠWorkspace, u, plan, _og, ::SeriesStrain)
-    Fu = Filtering.filter_analyze!(Filtering.analyze_buffer(plan, u), u, plan)
-    Fuu = Filtering.filter_analyze!(Filtering.analyze_buffer(plan, ws.scratch), ws.scratch, plan)
-    Filtering.filter_synthesize!(ws.u_filt, Fu, plan)
-    Filtering.filter_synthesize!(ws.uu_filt, Fuu, plan)
+function _line_fields!(ws::ΠWorkspace, u, plan, _og, route::SeriesStrain)
+    Fu, _ = _filtered_with_spectra!((ws.u_filt, ws.uu_filt), (u, ws.scratch), plan, route)
     Filtering.filter_synthesize_derivative!(ws.S_xx, Fu, ws.u_filt, plan, 1)
     return ws
 end

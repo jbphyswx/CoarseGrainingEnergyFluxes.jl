@@ -409,8 +409,7 @@ function _nd_scattered_parts(
     weights, exterior, kept = _highorder_targets(grid, kernel, scale, rad, fold, Returns(nothing), _ho_lattice(grid, rad),
                                                  keep, !keep, _build_share(execution))
     dims = FlowGeometries.Grids.size_tuple(grid)
-    lin = LinearIndices(dims)
-    cache = kept === nothing ? nothing : _nd_run_cache([lin[J...] for J in kept[1]], kept[2], kept[3], dims)
+    cache = kept === nothing ? nothing : _nd_run_cache(kept[1], kept[2], kept[3], dims)
     return cache, exterior, weights
 end
 

@@ -161,6 +161,12 @@ _cell_type(::FlowGeometries.Grids.FlatCells, _) = Int
 _cell_type(::FlowGeometries.Grids.CartesianCells, grid) = _index_tuple(FlowGeometries.Grids.size_tuple(grid))
 _index_tuple(::NTuple{N,Int}) where {N} = NTuple{N,Int}
 
+# Cell `J`'s linear index among `grid`'s cells, as a neighbour list stores it; past `typemax(Int32)` it raises.
+@inline _cell_id(grid::FlowGeometries.Grids.AbstractGrid, J) = _cell_id(_cell_address(grid), grid, J)
+@inline _cell_id(::FlowGeometries.Grids.FlatCells, _, t::Int) = Int32(t)
+@inline _cell_id(::FlowGeometries.Grids.CartesianCells, grid, J::Tuple) =
+    Int32(LinearIndices(FlowGeometries.Grids.size_tuple(grid))[J...])
+
 function _query_radius(
     grid::FlowGeometries.Grids.AbstractGrid, kernel::Kernels.HighOrderKernel, scale::T,
 ) where {T<:AbstractFloat}
@@ -592,9 +598,9 @@ The correction about every cell of `grid`. `fold(f, acc, I, sc)` folds `f(acc, J
 within `rad` of cell `I` with the query buffer `sc`, one per task from `scratch()`; `lattice` is
 [`_ho_lattice`](@ref)'s. Returns the [`HighOrderWeights`](@ref), holding each cell's coefficients where `stream` (a
 plan that forms its weights at every apply) and none otherwise, the mass past a bounded edge per cell (or
-`nothing`), and where `keep` every cell's in-grid neighbours and weights as `(cells, w, ptr)` in fold order, else
-`nothing`. The targets are divided among `execution`'s threads: a first pass counts each target's in-grid cells,
-the second corrects each target and writes its entries from its offset.
+`nothing`), and where `keep` every cell's in-grid neighbours and weights as `(ids, w, ptr)` in fold order, `ids` the
+neighbours' [`_cell_id`](@ref)s, else `nothing`. The targets are divided among `execution`'s threads: a first pass
+counts each target's in-grid cells, the second corrects each target and writes its entries from its offset.
 """
 function _highorder_targets(
     grid::FlowGeometries.Grids.AbstractGrid, kernel::Kernels.HighOrderKernel{P}, scale::T, rad::T,
@@ -625,7 +631,7 @@ function _highorder_targets(
             ptr[t + 1] += ptr[t]
         end
     end
-    cells = Vector{C}(undef, keep ? ptr[end] - 1 : 0)
+    ids = Vector{Int32}(undef, keep ? ptr[end] - 1 : 0)
     ws = Vector{T}(undef, keep ? ptr[end] - 1 : 0)
     _share_run(execution, 1:ntarget) do ts
         s = HighOrderScratch(T, D, nb, C)
@@ -656,14 +662,14 @@ function _highorder_targets(
                 @inbounds for q in eachindex(s.w)
                     s.outside[q] && continue
                     k += 1
-                    cells[k] = s.cell[q]
+                    ids[k] = _cell_id(grid, s.cell[q])
                     ws[k] = s.w[q]
                 end
             end
         end
     end
     weights = HighOrderWeights(kernel, scale, h, coeffs, sup, D)
-    return weights, exterior, keep ? (cells, ws, ptr) : nothing
+    return weights, exterior, keep ? (ids, ws, ptr) : nothing
 end
 
 # Target `t` of `grid`, as the index each traversal names a cell by (`_grid_cells`' `t`-th).

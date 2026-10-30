@@ -43,7 +43,8 @@ end
         -> (; Π, Λ, pressure_dilatation, ρ̄, P̄, ũ, ṽ)
 
 In-place [`compressible_flux`](@ref). Returns views of `ws`'s buffers, valid until the next call on the
-same workspace. With `ws` and both plans supplied, a repeated evaluation allocates nothing.
+same workspace. With `ws`, `filter_plan` and `deriv_plan = derivative_route(grid, filter_plan, u)`
+([`derivative_route`](@ref)) supplied, a repeated evaluation allocates no field.
 """
 function compressible_flux!(
     ws::FavreWorkspace{T},
@@ -55,7 +56,7 @@ function compressible_flux!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
+    deriv_plan::_DerivRoute{<:AnyDerivPlan} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
@@ -67,7 +68,7 @@ function compressible_flux!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid, u))
 
     Fρ, FP, Fu, Fv = _filtered_with_spectra!((ws.ρ̄, ws.P̄, ws.ū, ws.v̄), (ρ, P, u, v), plan, dplan)
 
@@ -78,7 +79,7 @@ function compressible_flux!(
     @. p[3] = ρ * u * u
     @. p[4] = ρ * u * v
     @. p[5] = ρ * v * v
-    Fm = _filtered_with_spectra!((ws.mx, ws.my, ws.τxx, ws.τxy, ws.τyy), p, plan, dplan)
+    Fm = _filtered_with_spectra!((ws.mx, ws.my, ws.τxx, ws.τxy, ws.τyy), p, plan, dplan, 4)
 
     # Favre velocities ũ_i = (ρu_i)‾/ρ̄, zero where no fluid lies under the kernel.
     @. ws.ũ = _favre(ws.mx, ws.ρ̄)
@@ -310,7 +311,7 @@ function compressible_flux!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,AnyDerivPlan} = nothing,
+    deriv_plan::_DerivRoute{<:AnyDerivPlan} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
@@ -321,7 +322,7 @@ function compressible_flux!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og = _output(ws.at, plan)
-    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, _route_source(ws.spin, plan), grid, u))
     τ, loc, S = ws.τ, ws.loc, ws.S
     sf = _spin_of(ws.spin, plan)
     if sf === nothing
@@ -542,7 +543,7 @@ function compressible_flux!(
     kernel::Kernels.AbstractFilterKernel,
     scale::T;
     filter_plan::Union{Nothing,Filtering.AbstractFilterPlan} = nothing,
-    deriv_plan::Union{Nothing,FlowGeometries.Operators.StencilPlans} = nothing,
+    deriv_plan::_DerivRoute{<:FlowGeometries.Operators.StencilPlans} = nothing,
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     mask_strategy::Filtering.AbstractMaskStrategy = Filtering.ZeroFill(),
     derivative::Derivatives.AbstractDerivative = Derivatives.AutoDerivative(),
@@ -553,7 +554,7 @@ function compressible_flux!(
     _check_placement(ws.at, plan)
     b = ws.at.execution
     og, fr = _output(ws.at, plan), _output_frames(ws.at, plan)
-    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid))
+    dplan = _placed(ws.at, _derivative_route(derivative, deriv_plan, plan, grid, u))
     p, bp, m, up, pr, τ = ws.p, ws.bp, ws.m, ws.up, ws.prod, ws.τ
 
     _fill_tau3_velocity!(p, u, v, w, ws.at.grid, ws.at.frames, b)

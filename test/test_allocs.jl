@@ -197,6 +197,26 @@ Test.@testset "Allocations" begin
         end
     end
 
+    # Under a spectral filter the held route (`Diagnostics.derivative_route`) holds the spectra and the gradient synthesis
+    # a call reads.
+    Test.@testset "diagnostics under a spectral filter with their route held" begin
+        BOUND = 4096
+        D = CGEF.Diagnostics
+        sz = (N, N)
+        u, v, t = field(sz), field(sz) .^ 2, field(sz) .^ 3
+        ρ, P = fill(2.5, sz), fill(1.0e5, sz)
+        pl = CGEF.Filtering.plan_filter(g2, ga, 5dx; execution = SER, method = CGEF.Filtering.Spectral())
+        dp = D.derivative_route(g2, pl, u)
+        Test.@test dp isa D.SeriesStrain
+        Test.@test _cgef_second(() -> _cgef_a_flux2(zeros(sz), u, v, g2, ga, 5dx, D.ΠWorkspace(g2), pl, dp)) == 0
+        Test.@test _cgef_second(() -> _cgef_a_sc(D.PiStrainWorkspace(g2), u, v, g2, ga, 5dx, pl, dp)) < BOUND
+        Test.@test _cgef_second(() -> _cgef_a_dec(D.PiDecomposedWorkspace(g2), u, v, g2, ga, 5dx, pl, dp)) < BOUND
+        Test.@test _cgef_second(() -> _cgef_a_fav(D.FavreWorkspace(g2), u, v, ρ, P, g2, ga, 5dx, pl, dp)) < BOUND
+        Test.@test _cgef_second(() -> _cgef_a_trc(zeros(sz), D.TracerFluxWorkspace(g2), u, v, t, g2, ga, 5dx, pl, dp)) < BOUND
+        Test.@test_throws ArgumentError D.compute_Π!(zeros(sz), u, v, nothing, g2, ga, 5dx; filter_plan = pl, deriv_plan = dp,
+                                                     derivative = CGEF.Derivatives.PhysicalDerivative())
+    end
+
     Test.@testset "parallel and device applies" begin
         CB = CGEF.ComputationalBackends
         u = field((N, N))

@@ -242,7 +242,7 @@ function _build_footprint_flat(
     )
     _, _, kept = _highorder_targets(grid, kernel, scale, rad, fold, FlowGeometries.Connectivity.ball_scratch, nothing,
                                     true, false, _build_share(get(kwargs, :execution, ComputationalBackends.SerialBackend())))
-    return NodeFilterPlan(Vector{Int32}(kept[1]), kept[2], kept[3], nothing)
+    return NodeFilterPlan(kept[1], kept[2], kept[3], nothing)
 end
 
 """
